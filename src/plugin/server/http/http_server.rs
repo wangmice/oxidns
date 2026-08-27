@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
-use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
+use crate::plugin::server::http::{extract_client_ip, request_body_limit};
 use crate::plugin::server::{ConnectionGuard, tcp};
 
 /// Main HTTP/1.1 + HTTP/2 server loop (over TCP)
@@ -223,7 +223,6 @@ async fn handle_http_stream<S>(
     }
 }
 
-const MAX_HTTP_BODY: usize = 64 * 1024;
 const INITIAL_HTTP_BODY_CAPACITY: usize = 2048;
 
 #[inline]
@@ -247,7 +246,8 @@ async fn handle_hyper_request(
         method, path, src, client_addr
     );
 
-    let body = match read_hyper_body(body, src).await {
+    let body_limit = request_body_limit(uri.path());
+    let body = match read_hyper_body(body, src, body_limit).await {
         Ok(body) => body,
         Err(status) => return Ok(error_response(status, src, alt_svc.as_deref())),
     };
@@ -265,6 +265,7 @@ async fn handle_hyper_request(
 async fn read_hyper_body(
     mut body: Incoming,
     src: SocketAddr,
+    body_limit: usize,
 ) -> StdResult<Bytes, http::StatusCode> {
     let mut collected = Vec::with_capacity(INITIAL_HTTP_BODY_CAPACITY);
 
@@ -281,7 +282,7 @@ async fn read_hyper_body(
             continue;
         };
 
-        if collected.len() + data.len() > MAX_HTTP_BODY {
+        if collected.len() + data.len() > body_limit {
             warn!(
                 "HTTP request body too large from {}: {}+{} bytes",
                 src,
@@ -342,6 +343,7 @@ mod tests {
     use crate::plugin::Plugin;
     use crate::plugin::executor::{ExecStep, Executor};
     use crate::plugin::server::RequestHandle;
+    use crate::plugin::server::http::DEFAULT_MAX_HTTP_BODY;
     use crate::plugin::server::http::entry::HttpDnsEntry;
     use crate::proto::{Message, Name, Question, Rcode, RecordType};
 
@@ -580,7 +582,10 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/dns-query")
-            .body(Full::new(Bytes::from(vec![0_u8; MAX_HTTP_BODY + 1])))
+            .body(Full::new(Bytes::from(vec![
+                0_u8;
+                DEFAULT_MAX_HTTP_BODY + 1
+            ])))
             .expect("http request should build");
 
         let response = sender

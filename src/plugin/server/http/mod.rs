@@ -49,6 +49,18 @@ pub(crate) use super::DEFAULT_SERVER_IDLE_TIMEOUT;
 type StartupResult = std::result::Result<(), String>;
 type StartupTx = oneshot::Sender<StartupResult>;
 
+pub(crate) const DEFAULT_MAX_HTTP_BODY: usize = 64 * 1024;
+const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
+
+#[inline]
+pub(crate) fn request_body_limit(path: &str) -> usize {
+    if path.starts_with("/api/plugins/") && path.ends_with("/load_dump") {
+        MAX_CACHE_DUMP_BODY
+    } else {
+        DEFAULT_MAX_HTTP_BODY
+    }
+}
+
 /// HTTP server configuration
 #[derive(Deserialize)]
 pub struct HttpServerConfig {
@@ -740,5 +752,18 @@ listen: 127.0.0.1:443
         let client = extract_client_ip(&headers, &Some(Arc::from("x-real-ip")), src);
 
         assert_eq!(client, src);
+    }
+
+    #[test]
+    fn test_request_body_limit_only_expands_cache_dump_load() {
+        assert_eq!(
+            request_body_limit("/api/plugins/cache/load_dump"),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            request_body_limit("/api/plugins/cache/entries"),
+            DEFAULT_MAX_HTTP_BODY
+        );
+        assert_eq!(request_body_limit("/dns-query"), DEFAULT_MAX_HTTP_BODY);
     }
 }

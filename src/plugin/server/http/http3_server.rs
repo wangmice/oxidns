@@ -13,11 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
-use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
+use crate::plugin::server::http::{extract_client_ip, request_body_limit};
 use crate::plugin::server::{ConnectionGuard, quic_endpoint};
-
-const MAX_HTTP3_BODY_SIZE: usize = 64 * 1024;
 
 /// Main HTTP/3 server loop (over QUIC)
 ///
@@ -197,7 +195,8 @@ async fn handle_h3_request(
         method, path, src, client_addr
     );
 
-    let body = match read_h3_body(&mut stream, src).await {
+    let body_limit = request_body_limit(uri.path());
+    let body = match read_h3_body(&mut stream, src, body_limit).await {
         Ok(body) => body,
         Err(status) => {
             let _ = send_h3_error_response(&mut stream, status, src).await;
@@ -251,6 +250,7 @@ async fn handle_h3_request(
 async fn read_h3_body(
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     src: SocketAddr,
+    body_limit: usize,
 ) -> Result<Bytes, http::StatusCode> {
     let mut buf = BytesMut::with_capacity(2048);
 
@@ -258,7 +258,7 @@ async fn read_h3_body(
         match stream.recv_data().await {
             Ok(Some(chunk)) => {
                 buf.put(chunk);
-                if buf.len() > MAX_HTTP3_BODY_SIZE {
+                if buf.len() > body_limit {
                     warn!(
                         "HTTP/3 request body too large from {}: {} bytes",
                         src,
