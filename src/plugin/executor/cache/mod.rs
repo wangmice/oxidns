@@ -11,9 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use ahash::AHashSet;
 use async_trait::async_trait;
-use dashmap::{DashMap, Entry};
+use dashmap::{DashMap, DashSet, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 use tokio::sync::{OnceCell, watch};
@@ -193,6 +192,18 @@ impl Drop for MissLeader<'_> {
         if !self.completed {
             self.coalescer.complete(&self.key, &self.sender, false);
         }
+    }
+}
+
+#[derive(Debug)]
+struct LazyRefreshGuard {
+    inflight: Arc<DashSet<CacheKey>>,
+    key: CacheKey,
+}
+
+impl Drop for LazyRefreshGuard {
+    fn drop(&mut self) {
+        self.inflight.remove(&self.key);
     }
 }
 
@@ -529,7 +540,7 @@ pub struct Cache {
     cleanup_task_id: Mutex<Option<u64>>,
 
     /// Deduplicates background refreshes for stale lazy cache hits.
-    lazy_refresh_inflight: Arc<Mutex<AHashSet<CacheKey>>>,
+    lazy_refresh_inflight: Arc<DashSet<CacheKey>>,
 
     /// Coalesces concurrent upstream fetches for the same cache miss key.
     miss_coalescer: MissCoalescer,
@@ -1183,23 +1194,20 @@ impl Cache {
             return;
         };
 
-        {
-            let mut inflight = self
-                .lazy_refresh_inflight
-                .lock()
-                .expect("lazy_refresh_inflight poisoned");
-            if !inflight.insert(key.clone()) {
-                return;
-            }
+        if !self.lazy_refresh_inflight.insert(key.clone()) {
+            return;
         }
         self.metrics
             .lazy_refresh_started_total
             .fetch_add(1, Ordering::Relaxed);
 
+        let refresh_guard = LazyRefreshGuard {
+            inflight: self.lazy_refresh_inflight.clone(),
+            key: key.clone(),
+        };
         let key = key.clone();
         let refresh_entry = refresh_entry.clone();
         let cache_map = cache_map.clone();
-        let inflight = self.lazy_refresh_inflight.clone();
         let mut sub_ctx = context.copy_for_subquery();
         sub_ctx.clear_response();
         let lazy_cache_ttl = self.config.lazy_cache_ttl;
@@ -1212,6 +1220,7 @@ impl Cache {
         let metrics = self.metrics.clone();
 
         tokio::spawn(async move {
+            let _refresh_guard = refresh_guard;
             let refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
                 let _ = next.next(&mut sub_ctx).await?;
                 Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
@@ -1292,11 +1301,6 @@ impl Cache {
                     warn!("lazy cache refresh timed out for {}", key.domain);
                 }
             }
-
-            inflight
-                .lock()
-                .expect("lazy_refresh_inflight poisoned")
-                .remove(&key);
         });
     }
 }
@@ -1804,7 +1808,7 @@ impl CacheFactory {
             metrics,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
-            lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
+            lazy_refresh_inflight: Arc::new(DashSet::new()),
             miss_coalescer: MissCoalescer::new(),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
@@ -1923,7 +1927,7 @@ mod tests {
             cache_size,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
-            lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
+            lazy_refresh_inflight: Arc::new(DashSet::new()),
             miss_coalescer: MissCoalescer::new(),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
