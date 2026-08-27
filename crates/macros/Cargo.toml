@@ -2,7 +2,7 @@
 name = "oxidns-macros"
 version = "0.1.0"
 edition = "2024"
-authors = ["Sven Shi <isvenshi@gmail.com>"]
+# authors = ["Sven Shi <isvenshi@gmail.com>"]
 description = "Proc macros for OxiDNS."
 repository = "https://github.com/svenshi/oxidns"
 license = "GPL-3.0-or-later"

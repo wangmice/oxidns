@@ -11,7 +11,6 @@ members = [
 name = "oxidns"
 version = "1.5.2"
 edition = "2024"
-authors = ["Sven Shi <isvenshi@gmail.com>"]
 description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
 repository = "https://github.com/svenshi/oxidns"
 license = "GPL-3.0-or-later"
@@ -26,6 +25,26 @@ exclude = [
     "webui/**",
 ]
 
+[package.metadata.deb]
+maintainer = "Sven Shi <isvenshi@gmail.com>"
+copyright = "2026, Sven Shi"
+depends = "$auto"
+section = "net"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability.
+"""
+assets = [
+    ["target/release/oxidns", "usr/bin/oxidns", "755"],
+    ["config.yaml", "etc/oxidns/config.yaml", "644"],
+    ["webui/out/**/*", "usr/share/oxidns/webui", "644"],
+]
+maintainer-scripts = "packaging/debian"
+
+[package.metadata.deb.systemd-units]
+enable = true
+unit-scripts = "packaging"
 
 [dependencies]
 # Core async runtime and shared infrastructure
@@ -124,6 +143,7 @@ zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/
 
 # Service management
 service-manager = "0.11.0"
+toml = "1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ripset = { package = "oxidns-ripset", version = "0.1.2", path = "crates/ripset", optional = true }
@@ -402,7 +422,6 @@ harness = false
 name = "response_classification"
 harness = false
 
-
 [[bin]]
 name = "oxidns"
 path = "src/main.rs"
@@ -418,25 +437,3 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-
-
-[package.metadata.deb]
-maintainer = "Sven Shi <isvenshi@gmail.com>"
-copyright = "2026, Sven Shi"
-depends = "$auto"
-section = "net"
-priority = "optional"
-license-file = ["LICENSE", "0"]
-extended-description = """\
-A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability.
-"""
-assets = [
-    ["target/release/oxidns", "usr/bin/oxidns", "755"],
-    ["config.yaml", "etc/oxidns/config.yaml", "644"],
-    ["webui/out/**/*", "usr/share/oxidns/webui", "644"],
-]
-maintainer-scripts = "packaging/debian"
-
-[package.metadata.deb.systemd-units]
-enable = true
-unit-scripts = "packaging"
