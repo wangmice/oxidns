@@ -80,6 +80,7 @@ const EVICTION_SAMPLE_SIZE: usize = 4096;
 const FULL_TRIM_CACHE_SIZE_LIMIT: usize = 100_000;
 const LARGE_CACHE_EVICTION_MAX_BATCH: usize = 65_536;
 const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
@@ -298,6 +299,7 @@ struct CacheMetrics {
     stale_hit_total: AtomicU64,
     miss_total: AtomicU64,
     miss_coalesced_total: AtomicU64,
+    miss_coalesce_timeout_total: AtomicU64,
     expired_total: AtomicU64,
     insert_total: AtomicU64,
     skip_truncated_total: AtomicU64,
@@ -319,6 +321,7 @@ impl CacheMetrics {
             stale_hit_total: AtomicU64::new(0),
             miss_total: AtomicU64::new(0),
             miss_coalesced_total: AtomicU64::new(0),
+            miss_coalesce_timeout_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
             insert_total: AtomicU64::new(0),
             skip_truncated_total: AtomicU64::new(0),
@@ -400,6 +403,12 @@ impl MetricSource for CacheMetrics {
             "Total cache misses served by a concurrent in-flight fetch.",
             &base,
             self.miss_coalesced_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_miss_coalesce_timeout_total",
+            "Total cache miss coalescing waits that timed out.",
+            &base,
+            self.miss_coalesce_timeout_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_expired_total",
@@ -1457,7 +1466,14 @@ impl Executor for Cache {
                 self.metrics
                     .miss_coalesced_total
                     .fetch_add(1, Ordering::Relaxed);
-                let _ = ready.changed().await;
+                if tokio::time::timeout(DEFAULT_MISS_COALESCE_TIMEOUT, ready.changed())
+                    .await
+                    .is_err()
+                {
+                    self.metrics
+                        .miss_coalesce_timeout_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
 
                 if ready.borrow().to_owned()
                     && let Some(entry) = cache_map.get_retained_cloned(
