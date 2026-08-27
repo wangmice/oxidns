@@ -545,33 +545,6 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn spawn_load_task(
-        &self,
-        cache_map: CacheMap,
-        dump_path: String,
-        ecs_in_key: bool,
-        cache_size: usize,
-    ) {
-        tokio::spawn(async move {
-            if let Err(e) = load_cache_from_file(&cache_map, &dump_path, ecs_in_key).await {
-                warn!("Failed to load cache from {}: {}", dump_path, e);
-                return;
-            }
-
-            let stats =
-                Cache::prune_cache_after_load(&cache_map, cache_size, AppClock::elapsed_millis());
-            if stats.total_removed() > 0 {
-                debug!(
-                    expired_removed = stats.expired_removed,
-                    evicted = stats.evicted,
-                    before = stats.before_len,
-                    after = stats.after_len,
-                    "Pruned cache after loading dump"
-                );
-            }
-        });
-    }
-
     fn spawn_dump_task(
         &self,
         cache_map: CacheMap,
@@ -1340,6 +1313,27 @@ impl Plugin for Cache {
         let _ = self.cache_map.set(cache_map.clone());
         self.metrics.set_cache_map(cache_map.clone());
 
+        if let Some(dump_file) = &self.config.dump_file {
+            if let Err(e) = load_cache_from_file(&cache_map, dump_file, self.ecs_in_key).await {
+                warn!("Failed to load cache from {}: {}", dump_file, e);
+            } else {
+                let stats = Cache::prune_cache_after_load(
+                    &cache_map,
+                    self.cache_size,
+                    AppClock::elapsed_millis(),
+                );
+                if stats.total_removed() > 0 {
+                    debug!(
+                        expired_removed = stats.expired_removed,
+                        evicted = stats.evicted,
+                        before = stats.before_len,
+                        after = stats.after_len,
+                        "Pruned cache after loading dump"
+                    );
+                }
+            }
+        }
+
         #[cfg(feature = "api")]
         api::register(
             &self.tag,
@@ -1350,12 +1344,6 @@ impl Plugin for Cache {
         register_metric_source(self.metrics.clone())?;
 
         if let Some(dump_file) = &self.config.dump_file {
-            self.spawn_load_task(
-                cache_map.clone(),
-                dump_file.clone(),
-                self.ecs_in_key,
-                self.cache_size,
-            );
             let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
             let task_id = self.spawn_dump_task(
                 cache_map.clone(),
