@@ -257,14 +257,16 @@ pub(super) fn load_cache_from_bytes(
         let fresh_until_ms = cache_time.saturating_add(u64::from(ttl) * 1000);
         let last_access_time = now.saturating_sub(entry.last_access_age_ms);
 
-        cache_map.insert_or_update_with_meta(
+        let inserted = cache_map.insert_if_not_newer(
             key,
             Arc::new(CacheItem::new_validated(resp, ttl, fresh_until_ms)),
             cache_time,
             expire_time,
             last_access_time,
         );
-        loaded += 1;
+        if inserted {
+            loaded += 1;
+        }
     }
 
     Ok(loaded)

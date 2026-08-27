@@ -126,6 +126,43 @@ where
         }
     }
 
+    /// Insert or update an entry unless a newer entry is already present.
+    ///
+    /// The comparison and update happen under the DashMap shard lock. This is
+    /// used when restoring a snapshot concurrently with live cache writes.
+    pub fn insert_if_not_newer(
+        &self,
+        key: K,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+    ) -> bool {
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                if e.get().cache_time_ms > cache_time_ms {
+                    return false;
+                }
+                e.insert(TtlCacheEntry {
+                    value,
+                    cache_time_ms,
+                    expire_at_ms,
+                    last_access_ms,
+                });
+                true
+            }
+            Entry::Vacant(e) => {
+                e.insert(TtlCacheEntry {
+                    value,
+                    cache_time_ms,
+                    expire_at_ms,
+                    last_access_ms,
+                });
+                true
+            }
+        }
+    }
+
     /// Get one retained, non-expired entry and optionally refresh its access
     /// timestamp.
     ///
@@ -407,5 +444,21 @@ mod tests {
         assert_eq!(stored.cache_time_ms, 30);
         assert_eq!(stored.expire_at_ms, 40);
         assert_eq!(stored.last_access_ms, 31);
+    }
+
+    #[test]
+    fn test_insert_if_not_newer_preserves_live_entry() {
+        let cache = TtlCache::with_capacity(4);
+        cache.insert_or_update_with_meta("k", 1u32, 200, 300, 200);
+
+        assert!(!cache.insert_if_not_newer("k", 2u32, 100, 150, 100));
+        let (_, stored) = cache
+            .iter_entries_cloned()
+            .into_iter()
+            .next()
+            .expect("entry should remain");
+
+        assert_eq!(stored.value, 1);
+        assert_eq!(stored.cache_time_ms, 200);
     }
 }
