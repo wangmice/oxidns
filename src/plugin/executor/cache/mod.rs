@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use ahash::AHashSet;
 use async_trait::async_trait;
+use dashmap::{DashMap, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{CacheKey, build_cache_key as build_cache_key_internal};
@@ -126,6 +127,75 @@ pub struct CacheConfig {
 
 type CacheMap = TtlCache<CacheKey, Arc<CacheItem>>;
 
+#[derive(Debug)]
+struct MissCoalescer {
+    inflight: DashMap<CacheKey, Arc<watch::Sender<bool>>>,
+}
+
+impl MissCoalescer {
+    fn new() -> Self {
+        Self {
+            inflight: DashMap::new(),
+        }
+    }
+
+    fn register(&self, key: CacheKey) -> MissRole<'_> {
+        match self.inflight.entry(key.clone()) {
+            Entry::Occupied(entry) => {
+                let receiver = entry.get().subscribe();
+                MissRole::Follower(receiver)
+            }
+            Entry::Vacant(entry) => {
+                let (sender, _receiver) = watch::channel(false);
+                let sender = Arc::new(sender);
+                entry.insert(sender.clone());
+                MissRole::Leader(MissLeader {
+                    coalescer: self,
+                    key,
+                    sender,
+                    completed: false,
+                })
+            }
+        }
+    }
+
+    fn complete(&self, key: &CacheKey, sender: &Arc<watch::Sender<bool>>, cached: bool) {
+        let _ = self
+            .inflight
+            .remove_if(key, |_, current| Arc::ptr_eq(current, sender));
+        let _ = sender.send(cached);
+    }
+}
+
+#[derive(Debug)]
+enum MissRole<'a> {
+    Leader(MissLeader<'a>),
+    Follower(watch::Receiver<bool>),
+}
+
+#[derive(Debug)]
+struct MissLeader<'a> {
+    coalescer: &'a MissCoalescer,
+    key: CacheKey,
+    sender: Arc<watch::Sender<bool>>,
+    completed: bool,
+}
+
+impl MissLeader<'_> {
+    fn complete(mut self, cached: bool) {
+        self.completed = true;
+        self.coalescer.complete(&self.key, &self.sender, cached);
+    }
+}
+
+impl Drop for MissLeader<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.coalescer.complete(&self.key, &self.sender, false);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheItem {
     /// Cached DNS response message.
@@ -216,6 +286,7 @@ struct CacheMetrics {
     fresh_hit_total: AtomicU64,
     stale_hit_total: AtomicU64,
     miss_total: AtomicU64,
+    miss_coalesced_total: AtomicU64,
     expired_total: AtomicU64,
     insert_total: AtomicU64,
     skip_truncated_total: AtomicU64,
@@ -236,6 +307,7 @@ impl CacheMetrics {
             fresh_hit_total: AtomicU64::new(0),
             stale_hit_total: AtomicU64::new(0),
             miss_total: AtomicU64::new(0),
+            miss_coalesced_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
             insert_total: AtomicU64::new(0),
             skip_truncated_total: AtomicU64::new(0),
@@ -311,6 +383,12 @@ impl MetricSource for CacheMetrics {
             "Total cache misses.",
             &base,
             self.miss_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_miss_coalesced_total",
+            "Total cache misses served by a concurrent in-flight fetch.",
+            &base,
+            self.miss_coalesced_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_expired_total",
@@ -452,6 +530,9 @@ pub struct Cache {
 
     /// Deduplicates background refreshes for stale lazy cache hits.
     lazy_refresh_inflight: Arc<Mutex<AHashSet<CacheKey>>>,
+
+    /// Coalesces concurrent upstream fetches for the same cache miss key.
+    miss_coalescer: MissCoalescer,
 
     /// Next timestamp when an inline write-side maintenance pass may run.
     next_inline_maintenance_ms: AtomicU64,
@@ -1372,37 +1453,80 @@ impl Executor for Cache {
             return continue_next!(next, context);
         }
 
-        let next_step = continue_next!(next, context)?;
+        let Some(key) = cache_lookup.as_ref().map(|lookup| lookup.key.clone()) else {
+            return continue_next!(next, context);
+        };
 
-        if let Some(key) = cache_lookup.and_then(|lookup| {
-            if lookup.hit_kind.is_none() {
-                Some(lookup.key)
-            } else {
-                None
-            }
-        }) {
-            let Some(response) = context.response() else {
-                return Ok(next_step);
-            };
-
-            if response.truncated() {
+        match self.miss_coalescer.register(key.clone()) {
+            MissRole::Follower(mut ready) => {
                 self.metrics
-                    .skip_truncated_total
+                    .miss_coalesced_total
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(next_step);
-            }
+                let _ = ready.changed().await;
 
-            let disposition = response_disposition_for_cache(response, &key);
-            match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
-                CacheTtlDecision::Cache(ttl) => {
-                    self.update_cache_entry(cache_map, key, response.clone(), ttl, disposition);
+                if ready.borrow().to_owned()
+                    && let Some(entry) = cache_map.get_retained_cloned(
+                        &key,
+                        AppClock::elapsed_millis(),
+                        self.current_touch_interval_ms(cache_map, AppClock::elapsed_millis()),
+                    )
+                {
+                    let remaining_ttl = entry
+                        .expire_at_ms
+                        .saturating_sub(AppClock::elapsed_millis())
+                        .saturating_div(1000) as u32;
+                    context.set_response(Self::restore_cached_message(
+                        &entry.value,
+                        context.request.id(),
+                        remaining_ttl,
+                    ));
+                    if self.should_short_circuit(true) {
+                        return Ok(ExecStep::Stop);
+                    }
+                    return continue_next!(next, context);
                 }
-                CacheTtlDecision::Skip(reason) => {
-                    self.metrics.record_skip(reason);
+
+                // The leader did not produce a cacheable response. Resolve
+                // this request directly instead of registering it again.
+                return continue_next!(next, context);
+            }
+            MissRole::Leader(leader) => {
+                let next_step = continue_next!(next, context)?;
+                let cached = if let Some(response) = context.response() {
+                    if response.truncated() {
+                        self.metrics
+                            .skip_truncated_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        false
+                    } else {
+                        let disposition = response_disposition_for_cache(response, &key);
+                        match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
+                            CacheTtlDecision::Cache(ttl) => {
+                                self.update_cache_entry(
+                                    cache_map,
+                                    key,
+                                    response.clone(),
+                                    ttl,
+                                    disposition,
+                                );
+                                true
+                            }
+                            CacheTtlDecision::Skip(reason) => {
+                                self.metrics.record_skip(reason);
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    false
+                };
+                leader.complete(cached);
+                if self.short_circuit && cached {
+                    return Ok(ExecStep::Stop);
                 }
+                return Ok(next_step);
             }
         }
-        Ok(next_step)
     }
 }
 
@@ -1693,6 +1817,7 @@ impl CacheFactory {
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
+            miss_coalescer: MissCoalescer::new(),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -1811,6 +1936,7 @@ mod tests {
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
+            miss_coalescer: MissCoalescer::new(),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -1837,6 +1963,30 @@ mod tests {
     fn parse_cache_quick_setup_supports_short_circuit() {
         let cfg = parse_cache_quick_setup("short_circuit=true").expect("quick setup should parse");
         assert_eq!(cfg.short_circuit, Some(true));
+    }
+
+    #[tokio::test]
+    async fn miss_coalescer_notifies_followers_and_releases_key() {
+        let coalescer = MissCoalescer::new();
+        let key = cache_key_for_domain("example.com");
+
+        let leader = match coalescer.register(key.clone()) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) => panic!("first request should become leader"),
+        };
+        let mut follower = match coalescer.register(key.clone()) {
+            MissRole::Follower(receiver) => receiver,
+            MissRole::Leader(_) => panic!("second request should become follower"),
+        };
+
+        leader.complete(true);
+        follower
+            .changed()
+            .await
+            .expect("leader completion should notify follower");
+        assert!(*follower.borrow());
+
+        assert!(matches!(coalescer.register(key), MissRole::Leader(_)));
     }
 
     #[test]
