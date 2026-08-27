@@ -581,6 +581,9 @@ impl Cache {
                         return;
                     }
                     if let Err(e) = dump_cache_to_file(&cache_map, &dump_path).await {
+                        // Preserve the updates consumed by `swap` so a
+                        // transient filesystem failure is retried later.
+                        updated_keys.fetch_add(changed, Ordering::Relaxed);
                         warn!("Failed to dump cache to {}: {}", dump_path, e);
                     }
                 }
