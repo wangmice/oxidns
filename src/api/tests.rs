@@ -11,7 +11,7 @@ use bytes::Bytes;
 use http::HeaderValue;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::{Request as HyperRequest, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -103,6 +103,10 @@ async fn start_test_api_hub(hub: &Arc<ApiHub>) {
 }
 
 fn http1_client() -> Client<HttpConnector, Empty<Bytes>> {
+    Client::builder(TokioExecutor::new()).build_http()
+}
+
+fn http1_body_client() -> Client<HttpConnector, Full<Bytes>> {
     Client::builder(TokioExecutor::new()).build_http()
 }
 
@@ -563,6 +567,32 @@ async fn test_hyper_http1_serves_auth_and_plugin_route() {
     assert!(body.contains("\"method\":\"POST\""));
     assert!(body.contains("\"path\":\"/plugins/test_plugin/echo\""));
 
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn test_api_rejects_oversized_body_for_unregistered_cache_load_path() {
+    AppClock::start();
+    let addr = reserve_local_addr();
+    let hub = test_api_hub(addr, None);
+    start_test_api_hub(&hub).await;
+
+    let client = http1_body_client();
+    let uri: Uri = format!("http://{addr}/api/plugins/not_cache/load_dump")
+        .parse()
+        .expect("request uri");
+    let response = client
+        .request(
+            HyperRequest::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Full::new(Bytes::from(vec![0_u8; 64 * 1024 + 1])))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     hub.stop().await;
 }
 

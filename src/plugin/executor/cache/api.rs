@@ -23,6 +23,8 @@ use crate::plugin::executor::rdata_json::{RDataPayloadMode, rdata_payload};
 use crate::proto::{DNSClass, Record, RecordType};
 use crate::register_plugin_api;
 
+const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
+
 pub(super) fn register(
     tag: &str,
     cache_map: CacheMap,
@@ -134,6 +136,10 @@ struct CacheLoadDumpResponse {
 
 #[async_trait]
 impl ApiHandler for CacheLoadDumpHandler {
+    fn max_request_body_bytes(&self) -> usize {
+        MAX_CACHE_DUMP_BODY
+    }
+
     async fn handle(&self, request: Request<Bytes>) -> crate::api::ApiResponse {
         match load_cache_from_bytes(&self.cache_map, request.body(), self.ecs_in_key, true) {
             Ok(loaded_entries) => {

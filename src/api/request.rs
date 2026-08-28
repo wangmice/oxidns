@@ -31,6 +31,7 @@ pub(crate) fn rewrite_request_path(
 
 pub(super) async fn read_hyper_request(
     request: Request<Incoming>,
+    max_body_size: usize,
 ) -> std::result::Result<Request<Bytes>, StatusCode> {
     let (parts, mut body) = request.into_parts();
     let mut collected = Vec::with_capacity(2048);
@@ -38,6 +39,9 @@ pub(super) async fn read_hyper_request(
     while let Some(frame_result) = body.frame().await {
         let frame = frame_result.map_err(|_| StatusCode::BAD_REQUEST)?;
         if let Ok(data) = frame.into_data() {
+            if data.len() > max_body_size.saturating_sub(collected.len()) {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
             collected.extend_from_slice(&data);
         }
     }
