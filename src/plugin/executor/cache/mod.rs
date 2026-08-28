@@ -1532,9 +1532,6 @@ impl Executor for Cache {
                     false
                 };
                 leader.complete(cached);
-                if self.short_circuit && cached {
-                    return Ok(ExecStep::Stop);
-                }
                 return Ok(next_step);
             }
         }
@@ -2793,6 +2790,32 @@ mod tests {
                 .load(AtomicOrdering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cache_miss_with_short_circuit_returns_downstream_step_after_caching() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.short_circuit = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+                calls: calls.clone(),
+            }));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+
+        let step = cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("cache execution should succeed");
+
+        assert_eq!(step, ExecStep::Next);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.cache_map.get().unwrap().len(), 1);
     }
 
     #[tokio::test]
