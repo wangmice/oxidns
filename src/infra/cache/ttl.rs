@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use ahash::RandomState as AHashBuilder;
 use dashmap::{DashMap, Entry};
+use rand::RngExt;
 
 /// Snapshot of one cached entry with metadata.
 #[derive(Debug, Clone)]
@@ -293,9 +294,34 @@ where
     /// Collect up to `limit` key + last-access pairs for sampled LRU eviction.
     #[inline]
     pub fn sample_last_access(&self, limit: usize) -> Vec<(K, u64)> {
-        let cap = self.map.len().min(limit);
+        let len = self.map.len();
+        if len == 0 || limit == 0 {
+            return Vec::new();
+        }
+
+        let start_offset = rand::rng().random_range(0..len);
+        self.sample_last_access_from_offset(limit, start_offset, len)
+    }
+
+    /// Collect a sample from an offset in DashMap's iteration order and wrap
+    /// around to avoid permanently favoring the first map shards.
+    #[inline]
+    fn sample_last_access_from_offset(
+        &self,
+        limit: usize,
+        start_offset: usize,
+        observed_len: usize,
+    ) -> Vec<(K, u64)> {
+        let cap = observed_len.min(limit);
         let mut sample = Vec::with_capacity(cap);
-        for item in self.map.iter().take(limit) {
+        let start_offset = start_offset % observed_len;
+        for item in self
+            .map
+            .iter()
+            .skip(start_offset)
+            .chain(self.map.iter().take(start_offset))
+            .take(cap)
+        {
             sample.push((item.key().clone(), item.value().last_access_ms));
         }
         sample
@@ -356,6 +382,27 @@ mod tests {
         let sample = cache.sample_last_access(10);
         assert_eq!(sample.len(), 1);
         assert_eq!(sample[0].0, "b");
+    }
+
+    #[test]
+    fn sample_last_access_wraps_from_the_selected_offset() {
+        let cache = TtlCache::with_capacity(4);
+        cache.insert_or_update_with_meta("a", 1u32, 10, 100, 11);
+        cache.insert_or_update_with_meta("b", 2u32, 10, 100, 12);
+        cache.insert_or_update_with_meta("c", 3u32, 10, 100, 13);
+
+        let iteration_order: Vec<_> = cache
+            .iter_entries_cloned()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let start_offset = iteration_order.len() - 1;
+
+        let sample = cache.sample_last_access_from_offset(2, start_offset, iteration_order.len());
+
+        assert_eq!(sample.len(), 2);
+        assert_eq!(sample[0].0, iteration_order[start_offset]);
+        assert_eq!(sample[1].0, iteration_order[0]);
     }
 
     #[test]
