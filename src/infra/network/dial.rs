@@ -27,7 +27,9 @@ use std::time::Duration;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 use quinn::crypto::rustls::QuicClientConfig;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
-use quinn::{ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt};
+use quinn::{
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt,
+};
 #[cfg(feature = "_tls-client")]
 use rustls::pki_types::ServerName;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -293,13 +295,38 @@ pub(crate) async fn connect_quic(
     options: QuicDialOptions,
 ) -> Result<quinn::Connection> {
     let remote_addr = udp_socket.peer_addr()?;
-    let mut endpoint = Endpoint::new(
+    let endpoint = Endpoint::new(
         EndpointConfig::default(),
         None,
         udp_socket,
         Arc::new(TokioRuntime),
     )?;
 
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+pub(crate) async fn connect_quic_abstract(
+    socket: Arc<dyn AsyncUdpSocket>,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
+    let endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(TokioRuntime),
+    )?;
+
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+async fn connect_quic_endpoint(
+    mut endpoint: Endpoint,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
     let mut client_config = if options.skip_cert {
         insecure_client_config()
     } else {

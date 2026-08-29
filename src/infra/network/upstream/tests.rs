@@ -520,7 +520,7 @@ fn test_connection_info_uses_default_outbound_proxy_for_udp_upstream() {
 }
 
 #[test]
-fn test_connection_info_ignores_outbound_proxy_for_doh3_upstream() {
+fn test_connection_info_uses_outbound_proxy_for_doh3_upstream() {
     let _guard = outbound_test_lock()
         .lock()
         .expect("outbound test lock should not be poisoned");
@@ -531,8 +531,33 @@ fn test_connection_info_ignores_outbound_proxy_for_doh3_upstream() {
     let info = ConnectionInfo::try_from(cfg).expect("DoH3 upstream should parse");
 
     assert!(info.enable_http3);
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
+}
+
+#[test]
+fn test_connection_info_preserves_local_socks5_for_doq_upstream() {
+    let mut cfg = make_upstream_config("doq://dns.example:853");
+    cfg.socks5 = Some("127.0.0.1:1081".to_string());
+
+    let info = ConnectionInfo::try_from(cfg).expect("DoQ upstream should parse");
+
+    assert_eq!(info.connection_type, ConnectionType::DoQ);
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("local proxy should be retained")
+            .socket_addr
+            .port(),
+        1081
+    );
 }
 
 #[test]
