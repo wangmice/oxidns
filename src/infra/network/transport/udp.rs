@@ -73,6 +73,13 @@ impl UdpTransport {
         })
     }
 
+    pub(crate) fn recv_buffer_size(&self, direct_size: usize) -> usize {
+        match self.socket {
+            UdpTransportSocket::Direct(_) => direct_size,
+            UdpTransportSocket::Socks5 { .. } => usize::from(u16::MAX),
+        }
+    }
+
     /// Receive one UDP datagram and decode it as a DNS message.
     /// Blocks until a datagram arrives or the socket errors.
     #[inline]
@@ -252,6 +259,7 @@ mod tests {
         )
         .await
         .expect("SOCKS5 UDP association should be established");
+        assert_eq!(transport.recv_buffer_size(8_196), 65_535);
 
         let relay_task = tokio::spawn(async move {
             let mut packet = [0u8; 1024];

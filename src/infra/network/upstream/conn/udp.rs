@@ -213,10 +213,11 @@ impl UdpConnection {
     /// the connection closes.
     ///
     /// # Buffer Size
-    /// Uses 4KB buffer which is sufficient for most DNS responses.
-    /// Larger responses would typically use TCP (with TC bit set).
+    /// Direct UDP keeps the bounded DNS-sized buffer. SOCKS5 uses a full UDP
+    /// payload buffer because `fast-socks5` copies the decoded payload into the
+    /// caller-provided slice without a length check.
     async fn listen_dns_response(self: Arc<Self>) {
-        let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
+        let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
         let mut closing = false;
 
         debug!(
