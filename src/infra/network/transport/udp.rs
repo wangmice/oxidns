@@ -351,4 +351,63 @@ mod tests {
         let _ = close_proxy.send(());
         proxy.await.expect("proxy task should complete");
     }
+
+    #[tokio::test]
+    async fn new_socks5_authenticates_udp_associate_with_password() {
+        let relay = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("UDP relay should bind");
+        let relay_addr = relay
+            .local_addr()
+            .expect("UDP relay should have an address");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("SOCKS5 listener should bind");
+        let proxy_addr = listener
+            .local_addr()
+            .expect("SOCKS5 listener should have an address");
+
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let mut greeting = [0u8; 4];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+            stream.write_all(&[0x05, 0x02]).await.unwrap();
+
+            let mut auth = [0u8; 15];
+            stream.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, *b"\x01\x04user\x08password");
+            stream.write_all(&[0x01, 0x00]).await.unwrap();
+
+            let mut associate = [0u8; 22];
+            stream.read_exact(&mut associate).await.unwrap();
+            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+
+            let mut response = vec![0x05, 0x00, 0x00, 0x01];
+            response.extend_from_slice(&match relay_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => unreachable!("relay is IPv4"),
+            });
+            response.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let _transport = UdpTransport::new_socks5(
+            DialTarget::new(
+                Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+                "dns.google".to_string(),
+                53,
+            ),
+            SocketOptions::default(),
+            Socks5Opt {
+                username: Some("user".to_string()),
+                password: Some("password".to_string()),
+                socket_addr: proxy_addr,
+            },
+        )
+        .await
+        .expect("authenticated SOCKS5 UDP association should be established");
+
+        proxy.await.expect("proxy task should complete");
+    }
 }
