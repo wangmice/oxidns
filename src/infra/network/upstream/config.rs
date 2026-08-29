@@ -495,7 +495,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
         };
         let socks5 = if let Some((socks5_opt, proxy_source)) = raw_socks5 {
             match connection_type {
-                ConnectionType::TCP | ConnectionType::DoT => Some(socks5_opt),
+                ConnectionType::UDP | ConnectionType::TCP | ConnectionType::DoT => Some(socks5_opt),
                 ConnectionType::DoH if !enable_http3 => Some(socks5_opt),
                 _ => {
                     info!(

@@ -16,6 +16,7 @@ use tracing::{debug, error, trace, warn};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
+use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::udp::UdpTransport;
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
@@ -192,11 +193,11 @@ impl UdpConnection {
     ///
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging
-    /// * `socket` - Pre-configured UDP socket connected to remote server
-    fn new(conn_id: u16, socket: UdpSocket, request_map_capacity: u16) -> UdpConnection {
+    /// * `transport` - Pre-configured direct or SOCKS5 UDP transport
+    fn new(conn_id: u16, transport: UdpTransport, request_map_capacity: u16) -> UdpConnection {
         Self {
             id: conn_id,
-            transport: UdpTransport::new(socket),
+            transport,
             close_notify: Notify::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
@@ -273,6 +274,7 @@ impl UdpConnection {
 pub struct UdpConnectionBuilder {
     target: DialTarget,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     request_map_capacity: u16,
 }
 
@@ -289,6 +291,7 @@ impl UdpConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             request_map_capacity,
         }
     }
@@ -311,23 +314,24 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
         conn_id: u16,
         _deadline: QueryDeadline,
     ) -> Result<Arc<UdpConnection>> {
-        let socket = connect_udp(UdpDialOptions::new(
-            self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
+        let transport = if let Some(socks5) = self.socks5.clone() {
+            UdpTransport::new_socks5(self.target.clone(), self.socket_options.clone(), socks5)
+                .await?
+        } else {
+            let socket = connect_udp(UdpDialOptions::new(
+                self.target.clone(),
+                self.socket_options.clone(),
+            ))?;
+            debug!(
+                conn_id,
+                local_addr = ?socket.local_addr(),
+                remote_addr = ?socket.peer_addr(),
+                "Established UDP connection to DNS server"
+            );
+            UdpTransport::new(UdpSocket::from_std(socket)?)
+        };
 
-        debug!(
-            conn_id,
-            local_addr = ?socket.local_addr(),
-            remote_addr = ?socket.peer_addr(),
-            "Established UDP connection to DNS server"
-        );
-
-        let connection = UdpConnection::new(
-            conn_id,
-            UdpSocket::from_std(socket)?,
-            self.request_map_capacity,
-        );
+        let connection = UdpConnection::new(conn_id, transport, self.request_map_capacity);
         let arc = Arc::new(connection);
 
         // Spawn background task for listening responses

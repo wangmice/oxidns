@@ -460,7 +460,24 @@ fn test_connection_info_uses_default_outbound_proxy_when_local_socks5_absent() {
 }
 
 #[test]
-fn test_connection_info_ignores_outbound_proxy_for_udp_upstream() {
+fn test_connection_info_preserves_local_socks5_for_udp_upstream() {
+    let mut cfg = make_upstream_config("udp://8.8.8.8:53");
+    cfg.socks5 = Some("127.0.0.1:1080".to_string());
+
+    let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
+
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("local proxy should be retained")
+            .socket_addr
+            .port(),
+        1080
+    );
+}
+
+#[test]
+fn test_connection_info_uses_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
         .expect("outbound test lock should not be poisoned");
@@ -470,12 +487,19 @@ fn test_connection_info_ignores_outbound_proxy_for_udp_upstream() {
     cfg.outbound = Some("remote".to_string());
     let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
 
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
 }
 
 #[test]
-fn test_connection_info_ignores_default_outbound_proxy_for_udp_upstream() {
+fn test_connection_info_uses_default_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
         .expect("outbound test lock should not be poisoned");
@@ -484,7 +508,14 @@ fn test_connection_info_ignores_default_outbound_proxy_for_udp_upstream() {
     let cfg = make_upstream_config("8.8.8.8");
     let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
 
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("default outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
 }
 
