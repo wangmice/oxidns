@@ -36,6 +36,25 @@ enum UdpTransportSocket {
     },
 }
 
+fn socks5_response_source_matches(expected: &TargetAddr, received: &TargetAddr) -> bool {
+    match (expected, received) {
+        (TargetAddr::Ip(expected), TargetAddr::Ip(received)) => expected == received,
+        (
+            TargetAddr::Domain(expected_domain, expected_port),
+            TargetAddr::Domain(received_domain, received_port),
+        ) => {
+            expected_port == received_port
+                && expected_domain
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(received_domain.trim_end_matches('.'))
+        }
+        (TargetAddr::Domain(_, expected_port), TargetAddr::Ip(received)) => {
+            *expected_port == received.port()
+        }
+        _ => false,
+    }
+}
+
 impl UdpTransport {
     pub fn new(socket: UdpSocket) -> Self {
         Self {
@@ -97,11 +116,18 @@ impl UdpTransport {
                 .recv(buf)
                 .await
                 .map_err(|e| DnsError::protocol(format!("UDP recv error: {e}")))?,
-            UdpTransportSocket::Socks5 { datagram, .. } => datagram
-                .recv_from(buf)
-                .await
-                .map(|(n, _)| n)
-                .map_err(|e| DnsError::protocol(format!("SOCKS5 UDP recv error: {e}")))?,
+            UdpTransportSocket::Socks5 { datagram, target } => {
+                let (n, source) = datagram
+                    .recv_from(buf)
+                    .await
+                    .map_err(|e| DnsError::protocol(format!("SOCKS5 UDP recv error: {e}")))?;
+                if !socks5_response_source_matches(target, &source) {
+                    return Err(DnsError::protocol(format!(
+                        "SOCKS5 UDP response source mismatch: expected {target}, received {source}"
+                    )));
+                }
+                n
+            }
         };
 
         Message::from_bytes(&buf[..n])
@@ -195,6 +221,28 @@ mod tests {
 
     use super::*;
     use crate::proto::{DNSClass, Name, Question, RecordType};
+
+    #[test]
+    fn socks5_response_source_rejects_wrong_upstream() {
+        let expected = TargetAddr::Ip("8.8.8.8:53".parse().unwrap());
+        let correct = TargetAddr::Ip("8.8.8.8:53".parse().unwrap());
+        let wrong_ip = TargetAddr::Ip("1.1.1.1:53".parse().unwrap());
+        let wrong_port = TargetAddr::Ip("8.8.8.8:5353".parse().unwrap());
+
+        assert!(socks5_response_source_matches(&expected, &correct));
+        assert!(!socks5_response_source_matches(&expected, &wrong_ip));
+        assert!(!socks5_response_source_matches(&expected, &wrong_port));
+
+        let expected_domain = TargetAddr::Domain("dns.example".to_string(), 53);
+        assert!(socks5_response_source_matches(
+            &expected_domain,
+            &TargetAddr::Ip("192.0.2.1:53".parse().unwrap())
+        ));
+        assert!(!socks5_response_source_matches(
+            &expected_domain,
+            &TargetAddr::Ip("192.0.2.1:5353".parse().unwrap())
+        ));
+    }
 
     #[tokio::test]
     async fn new_socks5_requests_udp_associate() {
