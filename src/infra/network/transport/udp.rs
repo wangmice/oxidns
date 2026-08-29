@@ -10,7 +10,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
-    DialTarget, SocketOptions, TcpDialOptions, connect_tcp as dial_connect_tcp,
+    DialTarget, SocketOptions, TcpDialOptions, bind_udp, connect_tcp as dial_connect_tcp,
 };
 use crate::infra::network::proxy::Socks5Opt;
 use crate::proto::Message;
@@ -49,19 +49,26 @@ impl UdpTransport {
         socks5: Socks5Opt,
     ) -> Result<Self> {
         let proxy_target = DialTarget::from_socket_addr(socks5.socket_addr);
-        let proxy_stream =
-            dial_connect_tcp(TcpDialOptions::new(proxy_target).with_socket_options(socket_options))
-                .await?;
+        let proxy_stream = dial_connect_tcp(
+            TcpDialOptions::new(proxy_target).with_socket_options(socket_options.clone()),
+        )
+        .await?;
         let bind_addr = match socks5.socket_addr {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
         };
+        let udp_socket = UdpSocket::from_std(bind_udp(bind_addr, &socket_options)?)?;
         let datagram = match (socks5.username.as_deref(), socks5.password.as_deref()) {
             (Some(username), Some(password)) => {
-                Socks5Datagram::bind_with_password(proxy_stream, bind_addr, username, password)
-                    .await?
+                Socks5Datagram::use_socket_with_password(
+                    proxy_stream,
+                    udp_socket,
+                    username,
+                    password,
+                )
+                .await?
             }
-            _ => Socks5Datagram::bind(proxy_stream, bind_addr).await?,
+            _ => Socks5Datagram::use_socket(proxy_stream, udp_socket).await?,
         };
         let target = if let Some(remote_ip) = target.remote_ip() {
             TargetAddr::Ip(SocketAddr::new(remote_ip, target.port()))
