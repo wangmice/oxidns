@@ -16,6 +16,7 @@ use tracing::{debug, error, trace, warn};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
+use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::udp::UdpTransport;
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
@@ -192,11 +193,11 @@ impl UdpConnection {
     ///
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging
-    /// * `socket` - Pre-configured UDP socket connected to remote server
-    fn new(conn_id: u16, socket: UdpSocket, request_map_capacity: u16) -> UdpConnection {
+    /// * `transport` - Pre-configured direct or SOCKS5 UDP transport
+    fn new(conn_id: u16, transport: UdpTransport, request_map_capacity: u16) -> UdpConnection {
         Self {
             id: conn_id,
-            transport: UdpTransport::new(socket),
+            transport,
             close_notify: Notify::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
@@ -212,10 +213,11 @@ impl UdpConnection {
     /// the connection closes.
     ///
     /// # Buffer Size
-    /// Uses 4KB buffer which is sufficient for most DNS responses.
-    /// Larger responses would typically use TCP (with TC bit set).
+    /// Direct UDP keeps the bounded DNS-sized buffer. SOCKS5 uses a full UDP
+    /// payload buffer because `fast-socks5` copies the decoded payload into the
+    /// caller-provided slice without a length check.
     async fn listen_dns_response(self: Arc<Self>) {
-        let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
+        let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
         let mut closing = false;
 
         debug!(
@@ -273,6 +275,7 @@ impl UdpConnection {
 pub struct UdpConnectionBuilder {
     target: DialTarget,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     request_map_capacity: u16,
 }
 
@@ -289,6 +292,7 @@ impl UdpConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             request_map_capacity,
         }
     }
@@ -311,23 +315,24 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
         conn_id: u16,
         _deadline: QueryDeadline,
     ) -> Result<Arc<UdpConnection>> {
-        let socket = connect_udp(UdpDialOptions::new(
-            self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
+        let transport = if let Some(socks5) = self.socks5.clone() {
+            UdpTransport::new_socks5(self.target.clone(), self.socket_options.clone(), socks5)
+                .await?
+        } else {
+            let socket = connect_udp(UdpDialOptions::new(
+                self.target.clone(),
+                self.socket_options.clone(),
+            ))?;
+            debug!(
+                conn_id,
+                local_addr = ?socket.local_addr(),
+                remote_addr = ?socket.peer_addr(),
+                "Established UDP connection to DNS server"
+            );
+            UdpTransport::new(UdpSocket::from_std(socket)?)
+        };
 
-        debug!(
-            conn_id,
-            local_addr = ?socket.local_addr(),
-            remote_addr = ?socket.peer_addr(),
-            "Established UDP connection to DNS server"
-        );
-
-        let connection = UdpConnection::new(
-            conn_id,
-            UdpSocket::from_std(socket)?,
-            self.request_map_capacity,
-        );
+        let connection = UdpConnection::new(conn_id, transport, self.request_map_capacity);
         let arc = Arc::new(connection);
 
         // Spawn background task for listening responses
@@ -339,8 +344,15 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
     use super::*;
     use crate::infra::network::upstream::ConnectionType;
+    use crate::proto::{DNSClass, Name, Question, RecordType};
 
     #[test]
     fn test_builder_new_copies_connection_info_fields() {
@@ -359,5 +371,77 @@ mod tests {
         assert_eq!(builder.target.host(), "1.1.1.1");
         assert_eq!(builder.socket_options.so_mark(), Some(100));
         assert_eq!(builder.socket_options.bind_to_device(), Some("en0"));
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_query_runs_through_connection_builder() {
+        AppClock::start();
+        let relay = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("UDP relay should bind");
+        let relay_addr = relay.local_addr().expect("relay should have an address");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("SOCKS5 listener should bind");
+        let proxy_addr = listener.local_addr().expect("proxy should have an address");
+        let (close_proxy, close_proxy_rx) = oneshot::channel();
+
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut associate = [0u8; 22];
+            stream.read_exact(&mut associate).await.unwrap();
+            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+
+            let mut response = vec![0x05, 0x00, 0x00, 0x01];
+            response.extend_from_slice(&match relay_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => unreachable!("relay is IPv4"),
+            });
+            response.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&response).await.unwrap();
+            let _ = close_proxy_rx.await;
+        });
+
+        let relay_task = tokio::spawn(async move {
+            let mut packet = [0u8; 1024];
+            let (len, client) = relay.recv_from(&mut packet).await.unwrap();
+            assert_eq!(&packet[..10], &[0, 0, 0, 1, 8, 8, 8, 8, 0, 53]);
+            relay.send_to(&packet[..len], client).await.unwrap();
+        });
+
+        let mut info = ConnectionInfo::with_addr("udp://8.8.8.8:53").unwrap();
+        info.socks5 = Some(Socks5Opt {
+            username: None,
+            password: None,
+            socket_addr: proxy_addr,
+        });
+        let builder = UdpConnectionBuilder::new(&info, DEFAULT_REQUEST_MAP_CAPACITY);
+        let connection = builder
+            .create_connection(1, QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("SOCKS5 UDP connection should be created");
+
+        let mut request = Message::new();
+        request.set_id(0xCAFE);
+        request.add_question(Question::new(
+            Name::from_ascii("example.com").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        let response = connection
+            .query(request, QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("SOCKS5 UDP query should complete");
+
+        assert_eq!(response.id(), 0xCAFE);
+        connection.close();
+        relay_task.await.unwrap();
+        let _ = close_proxy.send(());
+        proxy.await.unwrap();
     }
 }

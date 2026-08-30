@@ -17,6 +17,8 @@
 //! reduces duplication at transport boundaries.
 #[cfg(any(feature = "server-doq", feature = "_dns-client-doq"))]
 pub mod quic;
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+pub(crate) mod socks5_quic;
 pub mod tcp;
 pub mod udp;
 

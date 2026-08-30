@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::infra::error::{DnsError, Result};
@@ -49,12 +49,6 @@ impl ConnectionType {
             ConnectionType::DoH => vec!["doh", "https", "h3"],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProxySource {
-    Local,
-    Profile,
 }
 
 /// Configuration for building an upstream DNS server connection
@@ -480,34 +474,12 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             (None, None)
         };
 
-        let raw_socks5 = if let Some(socks5_str) = socks5.as_deref() {
-            Some((
-                parse_socks5_opt(socks5_str).ok_or_else(|| {
-                    DnsError::plugin(format!("upstream has invalid socks5 proxy '{socks5_str}'"))
-                })?,
-                ProxySource::Local,
-            ))
+        let socks5 = if let Some(socks5_str) = socks5.as_deref() {
+            Some(parse_socks5_opt(socks5_str).ok_or_else(|| {
+                DnsError::plugin(format!("upstream has invalid socks5 proxy '{socks5_str}'"))
+            })?)
         } else {
-            outbound_policy
-                .as_ref()
-                .and_then(|policy| policy.proxy())
-                .map(|socks5| (socks5, ProxySource::Profile))
-        };
-        let socks5 = if let Some((socks5_opt, proxy_source)) = raw_socks5 {
-            match connection_type {
-                ConnectionType::TCP | ConnectionType::DoT => Some(socks5_opt),
-                ConnectionType::DoH if !enable_http3 => Some(socks5_opt),
-                _ => {
-                    info!(
-                        ?connection_type,
-                        ?proxy_source,
-                        "upstream protocol does not use SOCKS5 proxy; ignoring proxy"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
+            outbound_policy.as_ref().and_then(|policy| policy.proxy())
         };
 
         Ok(ConnectionInfo {

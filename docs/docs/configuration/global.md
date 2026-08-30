@@ -226,7 +226,7 @@ network:
   - 含义：未显式配置 `outbound` 的 HTTP client 和 upstream 默认使用哪个 profile。
   - 默认：无；无默认 profile 时使用系统 DNS + 直连。
   - 限制：如果配置，必须引用 `profiles` 中存在的名称。
-  - 注意：默认 profile 的 proxy 会严格应用到 upstream；如果默认 SOCKS5 proxy 遇到 UDP、DoQ 或 DoH3 upstream，启动会失败，因为这些连接模型不支持 profile proxy。
+  - 注意：默认 profile 的 proxy 会严格应用到所有 upstream 协议；UDP、DoQ 和 DoH3 要求 SOCKS5 服务端支持 `UDP ASSOCIATE`。
 - `outbound.profiles.<name>.resolver`
   - `system`：使用系统 DNS。HTTP client 中该解析是异步执行，不会阻塞运行时工作线程。
   - `nameservers`：使用指定 DNS nameserver 解析目标域名。支持 `udp://`、`tcp://`、`tls://`、`https://`、`doh://`、`h3://`、`quic://`、`doq://`；未写协议时按 UDP 处理。

@@ -13,9 +13,12 @@ use super::{UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{
-    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
+    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
+    connect_quic_abstract, connect_udp,
 };
+use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::quic::QuicTransport;
+use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::pool::{ConnectionBuilder, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
@@ -162,6 +165,7 @@ impl Connection for QuicConnection {
 pub struct QuicConnectionBuilder {
     target: DialTarget,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
 }
@@ -178,6 +182,7 @@ impl QuicConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
         }
@@ -205,25 +210,27 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
         conn_id: u16,
         deadline: QueryDeadline,
     ) -> Result<Arc<QuicConnection>> {
-        let socket = connect_udp(UdpDialOptions::new(
+        let dial_options = QuicDialOptions::new(
             self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
-
-        // Establish QUIC connection (includes TLS 1.3 handshake)
-        let quic_conn = connect_quic(
-            socket,
-            QuicDialOptions::new(
+            self.insecure_skip_verify,
+            deadline
+                .remaining()
+                .ok_or_else(|| deadline.timeout_error())?,
+            quic_idle_timeout(self.timeout),
+            vec![b"doq".to_vec()],
+        );
+        let quic_conn = if let Some(socks5) = self.socks5.clone() {
+            let (socket, peer_addr) =
+                Socks5QuicSocket::connect(self.target.clone(), self.socket_options.clone(), socks5)
+                    .await?;
+            connect_quic_abstract(socket, peer_addr, dial_options).await?
+        } else {
+            let socket = connect_udp(UdpDialOptions::new(
                 self.target.clone(),
-                self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
-                quic_idle_timeout(self.timeout),
-                vec![b"doq".to_vec()],
-            ),
-        )
-        .await?;
+                self.socket_options.clone(),
+            ))?;
+            connect_quic(socket, dial_options).await?
+        };
 
         debug!(
             conn_id,

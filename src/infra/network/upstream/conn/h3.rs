@@ -19,8 +19,11 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
-    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
+    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
+    connect_quic_abstract, connect_udp,
 };
+use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
     build_dns_get_request, build_doh_request_uri, get_cap_buf_with_context_len,
 };
@@ -140,6 +143,7 @@ impl H3Connection {
 pub struct H3ConnectionBuilder {
     target: DialTarget,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     request_uri: String,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
@@ -157,6 +161,7 @@ impl H3ConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             request_uri: build_doh_request_uri(connection_info),
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
@@ -171,24 +176,27 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         conn_id: u16,
         deadline: QueryDeadline,
     ) -> Result<Arc<H3Connection>> {
-        let socket = connect_udp(UdpDialOptions::new(
+        let dial_options = QuicDialOptions::new(
             self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
-
-        let quic_conn = connect_quic(
-            socket,
-            QuicDialOptions::new(
+            self.insecure_skip_verify,
+            deadline
+                .remaining()
+                .ok_or_else(|| deadline.timeout_error())?,
+            quic_idle_timeout(self.timeout),
+            vec![b"h3".to_vec()],
+        );
+        let quic_conn = if let Some(socks5) = self.socks5.clone() {
+            let (socket, peer_addr) =
+                Socks5QuicSocket::connect(self.target.clone(), self.socket_options.clone(), socks5)
+                    .await?;
+            connect_quic_abstract(socket, peer_addr, dial_options).await?
+        } else {
+            let socket = connect_udp(UdpDialOptions::new(
                 self.target.clone(),
-                self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
-                quic_idle_timeout(self.timeout),
-                vec![b"h3".to_vec()],
-            ),
-        )
-        .await?;
+                self.socket_options.clone(),
+            ))?;
+            connect_quic(socket, dial_options).await?
+        };
 
         let h3_conn = h3_quinn::Connection::new(quic_conn);
 

@@ -178,7 +178,7 @@ pub struct ProbeUpstreamOptions {
     #[arg(long = "bootstrap-version")]
     pub bootstrap_version: Option<u8>,
 
-    /// SOCKS5 proxy for TCP-like upstream transports.
+    /// SOCKS5 proxy for upstream transports; UDP/QUIC requires UDP ASSOCIATE.
     #[arg(long = "socks5")]
     pub socks5: Option<String>,
 

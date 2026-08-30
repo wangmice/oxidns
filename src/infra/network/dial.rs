@@ -27,7 +27,9 @@ use std::time::Duration;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 use quinn::crypto::rustls::QuicClientConfig;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
-use quinn::{ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt};
+use quinn::{
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt,
+};
 #[cfg(feature = "_tls-client")]
 use rustls::pki_types::ServerName;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -293,13 +295,38 @@ pub(crate) async fn connect_quic(
     options: QuicDialOptions,
 ) -> Result<quinn::Connection> {
     let remote_addr = udp_socket.peer_addr()?;
-    let mut endpoint = Endpoint::new(
+    let endpoint = Endpoint::new(
         EndpointConfig::default(),
         None,
         udp_socket,
         Arc::new(TokioRuntime),
     )?;
 
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+pub(crate) async fn connect_quic_abstract(
+    socket: Arc<dyn AsyncUdpSocket>,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
+    let endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(TokioRuntime),
+    )?;
+
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+async fn connect_quic_endpoint(
+    mut endpoint: Endpoint,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
     let mut client_config = if options.skip_cert {
         insecure_client_config()
     } else {
@@ -400,13 +427,24 @@ pub fn try_lookup_server_name(server_name: &str) -> Result<IpAddr> {
 ///   send_to)
 pub(crate) fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
     let socket_addr = options.target.socket_addr()?;
+    let socket = create_udp_socket(socket_addr, &options.socket)?;
+    socket.connect(&socket_addr.into())?;
+    Ok(socket.into())
+}
+
+pub(crate) fn bind_udp(bind_addr: SocketAddr, options: &SocketOptions) -> Result<UdpSocket> {
+    let socket = create_udp_socket(bind_addr, options)?;
+    socket.bind(&bind_addr.into())?;
+    Ok(socket.into())
+}
+
+fn create_udp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result<Socket> {
     let socket = Socket::new(
         Domain::for_address(socket_addr),
         Type::DGRAM,
         Some(Protocol::UDP),
     )?;
-
-    configure_common_socket(&socket, &options.socket)?;
+    configure_common_socket(&socket, options)?;
     #[cfg(all(
         unix,
         not(any(
@@ -418,10 +456,7 @@ pub(crate) fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
     ))]
     let _ = socket.set_reuse_port(true);
     let _ = socket.set_recv_buffer_size(64 * 1024);
-
-    socket.connect(&socket_addr.into())?;
-
-    Ok(socket.into())
+    Ok(socket)
 }
 
 fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result<Socket> {
@@ -524,4 +559,25 @@ pub(crate) async fn connect_tcp(options: TcpDialOptions) -> Result<TcpStream> {
     let socket_addr = options.target.socket_addr()?;
     let socket = create_tcp_socket(socket_addr, &options.socket)?;
     connect_tcp_socket(socket, socket_addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use super::*;
+
+    #[test]
+    fn bind_udp_creates_bound_socket_with_common_options() {
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
+        let socket = bind_udp(bind_addr, &SocketOptions::default())
+            .expect("configured UDP socket should bind");
+
+        let local_addr = socket
+            .local_addr()
+            .expect("bound socket should have an address");
+        assert_eq!(local_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(local_addr.port(), 0);
+    }
 }
