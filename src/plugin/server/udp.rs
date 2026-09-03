@@ -8,6 +8,8 @@
 //! task spawning with automatic cleanup.
 
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -186,7 +188,10 @@ async fn run_server(
             }
             recv = transport.read_message_from(&mut buf) => {
                 match recv {
-                    Ok((msg, src_addr)) => {
+                    Ok(received) => {
+                        let msg = received.message;
+                        let src_addr = received.source;
+                        let destination = received.destination;
                         let max_payload = msg.max_payload();
                         let handler = handler.clone();
                         let transport = transport.clone();
@@ -194,9 +199,20 @@ async fn run_server(
                             let response = handler.handle_request(msg, src_addr, RequestMeta{server_name: None, url_path: None}).await;
                             // Use requester-advertised UDP payload limit (EDNS) when encoding
                             // response so oversize replies become TC=1 DNS messages, not raw truncation.
-                            if let Err(e) =
-                                transport.write_message_to(&response.response, src_addr, max_payload).await
-                            {
+                            #[cfg(target_os = "linux")]
+                            let result = transport
+                                .write_message_to_with_source(
+                                    &response.response,
+                                    src_addr,
+                                    destination,
+                                    max_payload,
+                                )
+                                .await;
+                            #[cfg(not(target_os = "linux"))]
+                            let result = transport
+                                .write_message_to(&response.response, src_addr, max_payload)
+                                .await;
+                            if let Err(e) = result {
                                 warn!("Failed to send response to {}: {}", src_addr, e);
                             }
                         });
@@ -218,10 +234,31 @@ async fn run_server(
 ///
 /// Creates a socket optimized for DNS server workloads with port reuse enabled.
 pub fn build_udp_socket(addr: SocketAddr) -> Result<StdUdpSocket> {
-    listen::build_udp_socket(addr, configure_udp_socket)
+    listen::build_udp_socket(addr, |sock| configure_udp_socket(sock, addr))
 }
 
-fn configure_udp_socket(sock: &Socket) {
+fn configure_udp_socket(sock: &Socket, addr: SocketAddr) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let enabled: libc::c_int = 1;
+        let (level, option) = if addr.is_ipv4() {
+            (libc::IPPROTO_IP, libc::IP_PKTINFO)
+        } else {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                level,
+                option,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(DnsError::Io(std::io::Error::last_os_error()));
+        }
+    }
     #[cfg(all(
         unix,
         not(any(
@@ -233,6 +270,7 @@ fn configure_udp_socket(sock: &Socket) {
     ))]
     let _ = sock.set_reuse_port(true);
     let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE);
+    Ok(())
 }
 
 /// Factory for creating UDP server plugin instances
@@ -271,7 +309,8 @@ impl PluginFactory for UdpServerFactory {
             ))
         })?;
 
-        // Resolve and type-check the entry executor using contextual diagnostics.
+        // Resolve and type-check the entry executor using contextual
+        // diagnostics.
         let entry_executor = init_context.executor("args.entry", &udp_config.entry)?;
 
         let metrics = Arc::new(ServerMetrics::new(plugin_config.tag.clone(), "udp"));

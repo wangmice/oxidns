@@ -69,10 +69,13 @@ pub fn build_tcp_listener(
 /// IPv6 sockets are explicitly configured with `IPV6_V6ONLY=false` before
 /// binding, so a wildcard listen address produced from `:port` can receive both
 /// IPv6 and IPv4-mapped datagrams on platforms that support dual-stack sockets.
-pub fn build_udp_socket(addr: SocketAddr, configure: impl FnOnce(&Socket)) -> Result<StdUdpSocket> {
+pub fn build_udp_socket(
+    addr: SocketAddr,
+    configure: impl FnOnce(&Socket) -> Result<()>,
+) -> Result<StdUdpSocket> {
     let sock = build_listen_socket(addr, Type::DGRAM, Some(Protocol::UDP))?;
 
-    configure(&sock);
+    configure(&sock)?;
     sock.bind(&addr.into())?;
 
     Ok(sock.into())

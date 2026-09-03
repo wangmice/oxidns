@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, RawFd};
 
 use fast_socks5::client::Socks5Datagram;
 use fast_socks5::util::target_addr::TargetAddr;
+#[cfg(target_os = "linux")]
+use socket2::SockAddr;
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::infra::error::{DnsError, Result};
@@ -25,6 +31,14 @@ use crate::proto::Message;
 #[derive(Debug)]
 pub struct UdpTransport {
     socket: UdpTransportSocket,
+}
+
+/// A received DNS datagram and the local address that received it.
+#[derive(Debug)]
+pub struct ReceivedUdpMessage {
+    pub message: Message,
+    pub source: SocketAddr,
+    pub destination: Option<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -137,21 +151,44 @@ impl UdpTransport {
     /// Receive one UDP datagram from any peer and decode it as a DNS message.
     #[inline]
     #[hotpath::measure]
-    pub async fn read_message_from(&self, buf: &mut [u8]) -> Result<(Message, SocketAddr)> {
+    pub async fn read_message_from(&self, buf: &mut [u8]) -> Result<ReceivedUdpMessage> {
         let UdpTransportSocket::Direct(socket) = &self.socket else {
             return Err(DnsError::protocol(
                 "SOCKS5 UDP transport does not support unconnected receive",
             ));
         };
-        let (n, addr) = socket
-            .recv_from(buf)
-            .await
-            .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {e}")))?;
+
+        #[cfg(target_os = "linux")]
+        let (n, addr, destination) = loop {
+            socket
+                .readable()
+                .await
+                .map_err(|e| DnsError::protocol(format!("Failed to poll UDP socket: {e}")))?;
+            match socket.try_io(Interest::READABLE, || {
+                recv_from_pktinfo(socket.as_raw_fd(), buf)
+            }) {
+                Ok(result) => break result,
+                Err(_) => continue,
+            }
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (n, addr, destination) = {
+            let (n, addr) = socket
+                .recv_from(buf)
+                .await
+                .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {e}")))?;
+            (n, addr, None)
+        };
 
         let msg = Message::from_bytes(&buf[..n]).map_err(|e| {
             DnsError::protocol(format!("Failed to parse DNS message from UDP: {e}"))
         })?;
-        Ok((msg, addr))
+        Ok(ReceivedUdpMessage {
+            message: msg,
+            source: addr,
+            destination,
+        })
     }
 
     /// Serialize and send a DNS message while overriding the wire ID.
@@ -208,6 +245,192 @@ impl UdpTransport {
             )));
         }
         Ok(())
+    }
+
+    /// Send a response while preserving the local IPv4 address that received
+    /// it.
+    #[cfg(target_os = "linux")]
+    pub async fn write_message_to_with_source(
+        &self,
+        msg: &Message,
+        to: SocketAddr,
+        source: Option<IpAddr>,
+        max_payload: u16,
+    ) -> Result<()> {
+        let UdpTransportSocket::Direct(socket) = &self.socket else {
+            return Err(DnsError::protocol(
+                "SOCKS5 UDP transport does not support unconnected send",
+            ));
+        };
+        let mut bytes = wire_buffer_pool().acquire();
+        msg.append_to_with_limit(usize::from(max_payload), &mut bytes)?;
+        let Some(source) = source else {
+            let n = socket
+                .send_to(&bytes, to)
+                .await
+                .map_err(|e| DnsError::protocol(format!("Failed to send_to UDP: {e}")))?;
+            return if n == bytes.len() {
+                Ok(())
+            } else {
+                Err(DnsError::protocol(format!(
+                    "Partial UDP send_to: sent {n} of {} bytes",
+                    bytes.len()
+                )))
+            };
+        };
+        let n = send_to_with_source(socket.as_raw_fd(), &bytes, to, source)
+            .map_err(|e| DnsError::protocol(format!("Failed to send UDP response: {e}")))?;
+        if n != bytes.len() {
+            return Err(DnsError::protocol(format!(
+                "Partial UDP send_to: sent {n} of {} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recv_from_pktinfo(
+    fd: RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+    use std::mem::zeroed;
+
+    let mut peer: libc::sockaddr_storage = unsafe { zeroed() };
+    let mut control = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { zeroed() };
+    msg.msg_name = (&mut peer as *mut libc::sockaddr_storage).cast();
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+
+    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let peer = unsafe {
+        match peer.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let addr = *(&peer as *const _ as *const libc::sockaddr_in);
+                SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+                    u16::from_be(addr.sin_port),
+                ))
+            }
+            libc::AF_INET6 => {
+                let addr = *(&peer as *const _ as *const libc::sockaddr_in6);
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                    u16::from_be(addr.sin6_port),
+                    addr.sin6_flowinfo,
+                    addr.sin6_scope_id,
+                ))
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid peer address",
+                ));
+            }
+        }
+    };
+    let destination = unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        let mut destination = None;
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
+                let info = libc::CMSG_DATA(cmsg).cast::<libc::in_pktinfo>();
+                destination = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    (*info).ipi_addr.s_addr,
+                ))));
+                break;
+            }
+            if (*cmsg).cmsg_level == libc::IPPROTO_IPV6 && (*cmsg).cmsg_type == libc::IPV6_PKTINFO {
+                let info = libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>();
+                destination = Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                    (*info).ipi6_addr.s6_addr,
+                )));
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+        destination
+    };
+    Ok((n as usize, peer, destination))
+}
+
+#[cfg(target_os = "linux")]
+fn send_to_with_source(
+    fd: RawFd,
+    buf: &[u8],
+    to: SocketAddr,
+    source: IpAddr,
+) -> std::io::Result<usize> {
+    use std::mem::zeroed;
+    let addr = SockAddr::from(to);
+    let info_len = match source {
+        IpAddr::V4(_) => std::mem::size_of::<libc::in_pktinfo>(),
+        IpAddr::V6(_) => std::mem::size_of::<libc::in6_pktinfo>(),
+    } as u32;
+    let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
+    let length = unsafe { libc::CMSG_LEN(info_len) } as usize;
+    let mut control = [0u8; 64];
+    debug_assert!(space <= control.len());
+    let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+    unsafe {
+        (*cmsg).cmsg_len = length as _;
+        match source {
+            IpAddr::V4(source) => {
+                let mut info: libc::in_pktinfo = zeroed();
+                info.ipi_spec_dst.s_addr = u32::from(source).to_be();
+                (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                (*cmsg).cmsg_type = libc::IP_PKTINFO;
+                std::ptr::copy_nonoverlapping(
+                    (&info as *const libc::in_pktinfo).cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    std::mem::size_of::<libc::in_pktinfo>(),
+                );
+            }
+            IpAddr::V6(source) => {
+                let info = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr {
+                        s6_addr: source.octets(),
+                    },
+                    ipi6_ifindex: 0,
+                };
+                (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+                (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+                std::ptr::copy_nonoverlapping(
+                    (&info as *const libc::in6_pktinfo).cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    std::mem::size_of::<libc::in6_pktinfo>(),
+                );
+            }
+        }
+    }
+    let mut iov = libc::iovec {
+        iov_base: buf.as_ptr().cast_mut().cast(),
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { zeroed() };
+    msg.msg_name = addr.as_ptr().cast_mut().cast();
+    msg.msg_namelen = addr.len();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
     }
 }
 
