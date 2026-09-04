@@ -89,7 +89,7 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
         return if has_any_answer_at_name(response, question.name(), question.qclass()) {
             ResponseDisposition::CompletePositive
         } else if response.answers().is_empty()
-            || has_negative_soa_for_class(response, question.qclass())
+            || has_negative_soa_for_name(response, question.name(), question.qclass())
         {
             ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
         } else {
@@ -105,7 +105,7 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
         }) {
             ResponseDisposition::CompletePositive
         } else if response.answers().is_empty()
-            || has_negative_soa_for_class(response, question.qclass())
+            || has_negative_soa_for_name(response, question.name(), question.qclass())
         {
             ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
         } else {
@@ -131,7 +131,9 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
         current = target;
     }
 
-    if response.answers().is_empty() || has_negative_soa_for_class(response, question.qclass()) {
+    if response.answers().is_empty()
+        || has_negative_soa_for_name(response, current, question.qclass())
+    {
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
     } else if saw_alias {
         ResponseDisposition::IncompleteAlias
@@ -197,11 +199,21 @@ fn has_any_answer_at_name(response: &Message, name: &Name, dns_class: DNSClass) 
 }
 
 #[inline]
-fn has_negative_soa_for_class(response: &Message, dns_class: DNSClass) -> bool {
-    response
-        .authorities()
-        .iter()
-        .any(|record| record.class() == dns_class && record.rr_type() == RecordType::SOA)
+fn has_negative_soa_for_name(response: &Message, name: &Name, dns_class: DNSClass) -> bool {
+    response.authorities().iter().any(|record| {
+        record.class() == dns_class
+            && record.rr_type() == RecordType::SOA
+            && is_name_or_subdomain(name, record.name())
+    })
+}
+
+/// Return whether `name` is equal to or below `ancestor` in the DNS tree.
+#[inline]
+fn is_name_or_subdomain(name: &Name, ancestor: &Name) -> bool {
+    let mut name_labels = name.iter_labels_rev();
+    ancestor
+        .iter_labels_rev()
+        .all(|ancestor_label| name_labels.next() == Some(ancestor_label))
 }
 
 #[cfg(test)]
@@ -288,6 +300,31 @@ mod tests {
         assert_eq!(
             classify_response(&response, Some(&request)),
             ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_soa_for_incomplete_alias() {
+        let request = question("www.example.com.", RecordType::A);
+        let mut response = response_with_question(request.clone());
+        add_cname(&mut response, "www.example.com.", "edge.other.net.");
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                2,
+                3,
+                4,
+                60,
+            )),
+        ));
+
+        assert_eq!(
+            classify_response(&response, Some(&request)),
+            ResponseDisposition::IncompleteAlias
         );
     }
 

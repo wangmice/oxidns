@@ -291,6 +291,10 @@ impl UdpTransport {
 }
 
 #[cfg(target_os = "linux")]
+#[repr(align(8))]
+struct AlignedControlBuffer([u8; 64]);
+
+#[cfg(target_os = "linux")]
 fn recv_from_pktinfo(
     fd: RawFd,
     buf: &mut [u8],
@@ -298,7 +302,7 @@ fn recv_from_pktinfo(
     use std::mem::zeroed;
 
     let mut peer: libc::sockaddr_storage = unsafe { zeroed() };
-    let mut control = [0u8; 64];
+    let mut control = AlignedControlBuffer([0u8; 64]);
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
@@ -308,8 +312,8 @@ fn recv_from_pktinfo(
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as _;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = control.0.len() as _;
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
     if n < 0 {
@@ -381,9 +385,9 @@ fn send_to_with_source(
     } as u32;
     let space = unsafe { libc::CMSG_SPACE(info_len) } as usize;
     let length = unsafe { libc::CMSG_LEN(info_len) } as usize;
-    let mut control = [0u8; 64];
-    debug_assert!(space <= control.len());
-    let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+    let mut control = AlignedControlBuffer([0u8; 64]);
+    debug_assert!(space <= control.0.len());
+    let cmsg = control.0.as_mut_ptr().cast::<libc::cmsghdr>();
     unsafe {
         (*cmsg).cmsg_len = length as _;
         match source {
@@ -424,7 +428,7 @@ fn send_to_with_source(
     msg.msg_namelen = addr.len();
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_control = control.0.as_mut_ptr().cast();
     msg.msg_controllen = space as _;
     let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
     if n < 0 {
