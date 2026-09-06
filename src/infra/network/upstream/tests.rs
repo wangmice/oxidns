@@ -319,7 +319,7 @@ fn test_connection_info_dial_addr_takes_precedence_over_bootstrap() {
 fn test_connection_info_uses_outbound_resolver_for_domain() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -343,7 +343,7 @@ fn test_connection_info_uses_outbound_resolver_for_domain() {
 fn test_connection_info_without_default_outbound_keeps_domain_resolution_deferred() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     outbound::clear_global();
 
     let cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -358,7 +358,7 @@ fn test_connection_info_without_default_outbound_keeps_domain_resolution_deferre
 fn test_connection_info_uses_default_outbound_resolver_for_domain() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_resolver_only_config();
 
     let cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -381,7 +381,7 @@ fn test_connection_info_uses_default_outbound_resolver_for_domain() {
 async fn test_udp_upstream_with_outbound_resolver_keeps_truncated_fallback() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("udp://dns.example.invalid:53");
@@ -400,7 +400,7 @@ async fn test_udp_upstream_with_outbound_resolver_keeps_truncated_fallback() {
 fn test_connection_info_dial_addr_takes_precedence_over_outbound_resolver() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -420,7 +420,7 @@ fn test_connection_info_dial_addr_takes_precedence_over_outbound_resolver() {
 fn test_connection_info_uses_outbound_proxy_when_local_socks5_absent() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -442,7 +442,7 @@ fn test_connection_info_uses_outbound_proxy_when_local_socks5_absent() {
 fn test_connection_info_uses_default_outbound_proxy_when_local_socks5_absent() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -480,7 +480,7 @@ fn test_connection_info_preserves_local_socks5_for_udp_upstream() {
 fn test_connection_info_uses_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("8.8.8.8");
@@ -502,7 +502,7 @@ fn test_connection_info_uses_outbound_proxy_for_udp_upstream() {
 fn test_connection_info_uses_default_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let cfg = make_upstream_config("8.8.8.8");
@@ -523,7 +523,7 @@ fn test_connection_info_uses_default_outbound_proxy_for_udp_upstream() {
 fn test_connection_info_uses_outbound_proxy_for_doh3_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("h3://dns.example/dns-query");
@@ -564,7 +564,7 @@ fn test_connection_info_preserves_local_socks5_for_doq_upstream() {
 fn test_connection_info_local_socks5_overrides_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -587,7 +587,7 @@ fn test_connection_info_local_socks5_overrides_outbound_proxy() {
 fn test_connection_info_local_socks5_overrides_default_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -609,7 +609,7 @@ fn test_connection_info_local_socks5_overrides_default_outbound_proxy() {
 fn test_connection_info_local_bootstrap_overrides_default_outbound_resolver() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -632,7 +632,7 @@ fn test_connection_info_local_bootstrap_overrides_default_outbound_resolver() {
 fn test_connection_info_rejects_invalid_local_socks5_with_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");

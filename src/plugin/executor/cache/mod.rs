@@ -7,7 +7,7 @@
 //! (qtype/qclass/DO/CD and optional ECS scope). Cache entries expire by TTL and
 //! are periodically cleaned up.
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -16,14 +16,23 @@ use dashmap::{DashMap, DashSet, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 use tokio::sync::{OnceCell, watch};
+#[cfg(feature = "api")]
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Level, debug, event_enabled, warn};
 
-use self::key::{CacheKey, build_cache_key as build_cache_key_internal};
+use self::key::{
+    CacheKey, build_cache_key as build_cache_key_internal, cache_key_for_response_ecs_scope,
+    cache_lookup_keys,
+};
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
 use crate::core::response::{ResponseDisposition, classify_response};
-use crate::infra::cache::ttl::{TtlCache, TtlCacheLookup};
+#[cfg(feature = "api")]
+use crate::infra::cache::ttl::TtlCacheRetiredState;
+use crate::infra::cache::ttl::{
+    TtlCache, TtlCacheInsertIfNotNewerResult, TtlCacheLookup, TtlCachePruneMode,
+};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::observability::metrics::{
@@ -33,7 +42,7 @@ use crate::infra::observability::metrics::{
 use crate::infra::task as task_center;
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::{Message, RData};
+use crate::proto::{ClientSubnet, Edns, EdnsCode, EdnsOption, Message, MessageType, Opcode, RData};
 use crate::{continue_next, plugin_factory};
 
 #[cfg(feature = "api")]
@@ -45,6 +54,7 @@ mod persistence;
 const DEFAULT_CACHE_SIZE: usize = 1024;
 // Default cleanup interval (seconds).
 const DEFAULT_CLEANUP_INTERVAL: u64 = 60;
+const PRESSURE_CHECK_INTERVAL: u64 = 1;
 // Default dump interval (seconds).
 const DEFAULT_DUMP_INTERVAL: u64 = 600;
 // Minimum key updates required to trigger periodic dump.
@@ -66,21 +76,109 @@ const MEDIUM_CACHE_TOUCH_SIZE: usize = 32_768;
 
 // Cleanup tuning.
 const MAX_INITIAL_CACHE_CAPACITY: usize = 16_384;
-const INLINE_MAINTENANCE_INTERVAL_MS: u64 = 1000;
-const INLINE_EXPIRED_SWEEP_BATCH: usize = 512;
-const INLINE_EVICTION_SAMPLE_SIZE: usize = 512;
-const INLINE_EVICTION_MAX_BATCH: usize = 512;
 const EVICT_HIGH_WATERMARK_PERCENT: usize = 95;
 const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
-const EXPIRED_SWEEP_BATCH: usize = 2048;
-const EXPIRED_SWEEP_ROUNDS: usize = 4;
-const EXPIRED_SWEEP_MIN_LIMIT: usize = EXPIRED_SWEEP_BATCH * EXPIRED_SWEEP_ROUNDS;
-const EXPIRED_SWEEP_MAX_LIMIT: usize = 65_536;
-const EVICTION_SAMPLE_SIZE: usize = 4096;
-const FULL_TRIM_CACHE_SIZE_LIMIT: usize = 100_000;
-const LARGE_CACHE_EVICTION_MAX_BATCH: usize = 65_536;
 const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIRTY_AGE_SECS: u64 = 120;
+const MAX_DIRTY_AGE_MS: u64 = MAX_DIRTY_AGE_SECS * 1000;
+#[cfg(feature = "api")]
+const MAX_PENDING_CACHE_RECLAIMS: usize = 1;
+
+#[inline]
+fn dirty_timestamp(now_ms: u64) -> u64 {
+    now_ms.max(1)
+}
+
+fn mark_dirty(
+    updated_keys: &AtomicU64,
+    dirty_since_ms: &AtomicU64,
+    dirty_generation: &AtomicU64,
+    changes: u64,
+) {
+    if changes == 0 {
+        return;
+    }
+    let _ = dirty_generation.try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+        Some(generation.saturating_add(1).max(1))
+    });
+    updated_keys.fetch_add(changes, Ordering::Relaxed);
+    // Preserve mutations that happen during the first millisecond of the
+    // process lifetime; zero remains the initial timestamp sentinel.
+    let now = dirty_timestamp(AppClock::elapsed_millis());
+    let _ = dirty_since_ms.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+#[inline]
+fn restore_dirty_since(dirty_since_ms: &AtomicU64, timestamp_ms: u64) {
+    if timestamp_ms == 0 {
+        return;
+    }
+
+    let _ = dirty_since_ms.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(if current == 0 {
+            timestamp_ms
+        } else {
+            current.min(timestamp_ms)
+        })
+    });
+}
+
+#[inline]
+fn begin_dump_watermark(dirty_generation: &AtomicU64, dirty_since_ms: &AtomicU64) -> (u64, u64) {
+    //   Capture the generation represented by this dump.
+    //
+    //   Mutations after this point belong to the next dirty generation and must
+    //   retain their own dirty_since watermark.
+    let dump_generation = dirty_generation.load(Ordering::Acquire);
+
+    //   Hand the existing dirty watermark to this dump.
+    //
+    //   From now on dirty_since_ms=0 means a concurrent/new mutation can
+    // install   a fresh watermark without being blocked by the old
+    // already-being-dumped   timestamp.
+    let previous_dirty_since = dirty_since_ms.swap(0, Ordering::AcqRel);
+
+    let current_generation = dirty_generation.load(Ordering::Acquire);
+    if current_generation == dump_generation {
+        return (dump_generation, previous_dirty_since);
+    }
+
+    let now = dirty_timestamp(AppClock::elapsed_millis());
+
+    let mut current_since = dirty_since_ms.load(Ordering::Acquire);
+    loop {
+        if current_since != 0 && current_since <= now {
+            break;
+        }
+        match dirty_since_ms.compare_exchange_weak(
+            current_since,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current_since = actual,
+        }
+    }
+    (dump_generation, previous_dirty_since)
+}
+
+fn finish_dump_if_unchanged(
+    dirty_generation: &AtomicU64,
+    persisted_generation: &AtomicU64,
+    dump_generation: u64,
+) -> bool {
+    persisted_generation.store(dump_generation, Ordering::Release);
+    dirty_generation.load(Ordering::Acquire) == dump_generation
+}
+
+#[inline]
+fn dump_age_due(now_ms: u64, dirty_since_ms: u64, check_interval_ms: u64) -> bool {
+    dirty_since_ms != 0
+        && now_ms.saturating_sub(dirty_since_ms)
+            >= MAX_DIRTY_AGE_MS.saturating_sub(check_interval_ms)
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
@@ -125,7 +223,141 @@ pub struct CacheConfig {
     ecs_in_key: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CacheLoadPolicy {
+    lazy_cache_ttl: Option<u32>,
+    cache_negative: bool,
+    max_negative_ttl: u32,
+    negative_ttl_without_soa: u32,
+    max_positive_ttl: Option<u32>,
+    min_positive_ttl: Option<u32>,
+}
+
+impl Default for CacheLoadPolicy {
+    fn default() -> Self {
+        Self {
+            lazy_cache_ttl: None,
+            cache_negative: true,
+            max_negative_ttl: DEFAULT_MAX_NEGATIVE_TTL,
+            negative_ttl_without_soa: DEFAULT_NEGATIVE_TTL_WITHOUT_SOA,
+            max_positive_ttl: None,
+            min_positive_ttl: None,
+        }
+    }
+}
+
 type CacheMap = TtlCache<CacheKey, Arc<CacheItem>>;
+
+#[cfg(feature = "api")]
+type CacheRetiredState = TtlCacheRetiredState<CacheKey, Arc<CacheItem>>;
+
+/// Dedicated retirement path for large cache states replaced by online API
+/// mutations. A single permit intentionally serializes destructive replacement
+/// work so prepared/current/retired cache generations cannot pile up in memory.
+#[cfg(feature = "api")]
+#[derive(Clone)]
+pub(super) struct CacheReclaimer {
+    sender: std::sync::mpsc::Sender<CacheReclaimJob>,
+    slots: Arc<Semaphore>,
+}
+
+#[cfg(feature = "api")]
+impl Debug for CacheReclaimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheReclaimer")
+            .field("max_pending", &MAX_PENDING_CACHE_RECLAIMS)
+            .field("available_permits", &self.slots.available_permits())
+            .finish()
+    }
+}
+
+#[cfg(feature = "api")]
+pub(super) type CacheReclaimPermit = OwnedSemaphorePermit;
+
+#[cfg(feature = "api")]
+struct CacheReclaimJob {
+    retired: CacheRetiredState,
+    permit: CacheReclaimPermit,
+}
+
+#[cfg(feature = "api")]
+impl CacheReclaimer {
+    pub(super) fn new(tag: &str) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<CacheReclaimJob>();
+        let thread_name = format!("cache-reclaimer:{tag}");
+
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    Self::reclaim_job(job);
+                }
+            })
+            .map_err(|err| {
+                DnsError::Runtime(format!("failed to start cache reclaimer thread: {err}"))
+            })?;
+
+        Ok(Self {
+            sender,
+            slots: Arc::new(Semaphore::new(MAX_PENDING_CACHE_RECLAIMS)),
+        })
+    }
+
+    /// Reserve the one outstanding retirement slot before preparing a new cache
+    /// generation. Waiting here is asynchronous and therefore provides memory
+    /// backpressure without blocking a Tokio worker.
+    pub(super) async fn reserve(&self) -> Result<CacheReclaimPermit> {
+        let permit = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DnsError::Runtime("cache reclaimer is closed".to_string()))?;
+        Ok(permit)
+    }
+
+    /// Transfer a retired cache generation to the dedicated reclaimer. Sending
+    /// on an unbounded std channel is non-blocking; the semaphore above bounds
+    /// the number of outstanding generations instead of the channel itself.
+    fn submit(&self, retired: CacheRetiredState, permit: CacheReclaimPermit) {
+        let job = CacheReclaimJob { retired, permit };
+        if let Err(err) = self.sender.send(job) {
+            warn!("cache reclaimer thread disconnected; using blocking-pool fallback");
+            let job = err.0;
+            drop(tokio::task::spawn_blocking(move || Self::reclaim_job(job)));
+        }
+    }
+
+    fn reclaim_job(job: CacheReclaimJob) {
+        let CacheReclaimJob { retired, permit } = job;
+
+        let reclaim_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut retired = retired;
+            loop {
+                match retired.try_reclaim() {
+                    Ok(()) => break,
+                    Err(still_retired) => {
+                        retired = still_retired;
+                        // Cache operations retain state guards only briefly. A
+                        // small sleep avoids spinning
+                        // if one was preempted across the swap.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }));
+
+        if reclaim_result.is_err() {
+            // Keep the reclaimer service alive even if an unexpected value
+            // destructor panics while a retired generation is being destroyed.
+            warn!("cache reclaimer caught a panic while dropping retired state");
+        }
+
+        // Releasing the permit only after reclamation (or a caught destructor
+        // panic) bounds retired-generation memory, not merely queue length.
+        drop(permit);
+    }
+}
 
 #[derive(Debug)]
 struct MissCoalescer {
@@ -536,8 +768,21 @@ pub struct Cache {
     /// Whether to include ECS scope in cache key.
     ecs_in_key: bool,
 
+    /// Set by rejected admissions; consumed by the background cleanup task.
+    pressure_requested: Arc<AtomicBool>,
+
     /// Number of cache entry updates since last dump.
     updated_keys: Arc<AtomicU64>,
+
+    /// Lower-bound timestamp of the oldest unsaved mutation. It is retained as
+    /// a conservative watermark; generation equality determines cleanliness.
+    dirty_since_ms: Arc<AtomicU64>,
+
+    /// Monotonic dirty generation used to protect dump completion from races.
+    dirty_generation: Arc<AtomicU64>,
+
+    /// Generation covered by the last successful dump.
+    persisted_generation: Arc<AtomicU64>,
 
     /// Low-overhead cache metrics.
     metrics: Arc<CacheMetrics>,
@@ -554,9 +799,6 @@ pub struct Cache {
     /// Coalesces concurrent upstream fetches for the same cache miss key.
     miss_coalescer: MissCoalescer,
 
-    /// Next timestamp when an inline write-side maintenance pass may run.
-    next_inline_maintenance_ms: AtomicU64,
-
     /// Cached hit-side last-access touch interval.
     touch_interval_ms: AtomicU64,
 
@@ -565,13 +807,25 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn spawn_dump_task(
-        &self,
-        cache_map: CacheMap,
-        dump_path: String,
-        dump_interval: u64,
-        updated_keys: Arc<AtomicU64>,
-    ) -> u64 {
+    #[inline]
+    fn cache_load_policy(&self) -> CacheLoadPolicy {
+        CacheLoadPolicy {
+            lazy_cache_ttl: self.config.lazy_cache_ttl,
+            cache_negative: self.cache_negative,
+            max_negative_ttl: self.max_negative_ttl,
+            negative_ttl_without_soa: self.negative_ttl_without_soa,
+            max_positive_ttl: self.config.max_positive_ttl,
+            min_positive_ttl: self.config.min_positive_ttl,
+        }
+    }
+
+    fn spawn_dump_task(&self, cache_map: CacheMap, dump_path: String, dump_interval: u64) -> u64 {
+        let dump_interval = dump_interval.clamp(1, MAX_DIRTY_AGE_SECS);
+        let check_interval_ms = dump_interval.saturating_mul(1000);
+        let updated_keys = self.updated_keys.clone();
+        let dirty_since_ms = self.dirty_since_ms.clone();
+        let dirty_generation = self.dirty_generation.clone();
+        let persisted_generation = self.persisted_generation.clone();
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
@@ -579,22 +833,50 @@ impl Cache {
                 let cache_map = cache_map.clone();
                 let dump_path = dump_path.clone();
                 let updated_keys = updated_keys.clone();
+                let dirty_since_ms = dirty_since_ms.clone();
+                let dirty_generation = dirty_generation.clone();
+                let persisted_generation = persisted_generation.clone();
                 async move {
-                    let changed = updated_keys.swap(0, Ordering::Relaxed);
-                    if changed < MINIMUM_CHANGES_TO_DUMP {
-                        // Keep sparse updates accumulated so low-write
-                        // workloads still persist
-                        // eventually without triggering dump every interval.
-                        if changed > 0 {
-                            updated_keys.fetch_add(changed, Ordering::Relaxed);
-                        }
+                    let changed = updated_keys.swap(0, Ordering::AcqRel);
+                    let now = AppClock::elapsed_millis();
+                    let dirty_since = dirty_since_ms.load(Ordering::Acquire);
+                    let dirty = dirty_generation.load(Ordering::Acquire)
+                        != persisted_generation.load(Ordering::Acquire);
+                    let age_due = dirty && dump_age_due(now, dirty_since, check_interval_ms);
+
+                    //   We consumed `changed` with swap(0), but no dump is
+                    // being attempted yet.
+                    //
+                    //   Put only the counter back.
+                    //
+                    //   IMPORTANT:
+                    //   Do not call mark_dirty() here. These are not new
+                    // mutations and therefore   must not
+                    // increment dirty_generation or change dirty_since_ms.
+                    if changed < MINIMUM_CHANGES_TO_DUMP && !age_due {
+                        updated_keys.fetch_add(changed, Ordering::Relaxed);
+
                         return;
                     }
+
+                    //  Hand the current dirty watermark to this dump.
+                    //
+                    //  Any mutation from this point onward gets a new
+                    // dirty_since value and belongs
+                    //  to a generation newer than dump_generation.
+                    let (dump_generation, previous_dirty_since) =
+                        begin_dump_watermark(&dirty_generation, &dirty_since_ms);
+
                     if let Err(e) = dump_cache_to_file(&cache_map, &dump_path).await {
-                        // Preserve the updates consumed by `swap` so a
-                        // transient filesystem failure is retried later.
                         updated_keys.fetch_add(changed, Ordering::Relaxed);
+                        restore_dirty_since(&dirty_since_ms, previous_dirty_since);
                         warn!("Failed to dump cache to {}: {}", dump_path, e);
+                    } else {
+                        let _ = finish_dump_if_unchanged(
+                            &dirty_generation,
+                            &persisted_generation,
+                            dump_generation,
+                        );
                     }
                 }
             },
@@ -602,29 +884,85 @@ impl Cache {
     }
 
     fn spawn_cleanup_task(&self, cache_map: CacheMap, cache_size: usize) -> u64 {
+        let updated_keys = self.updated_keys.clone();
+        let dirty_since_ms = self.dirty_since_ms.clone();
+        let dirty_generation = self.dirty_generation.clone();
+        let pressure_requested = self.pressure_requested.clone();
+        let last_cleanup_ms = Arc::new(AtomicU64::new(0));
+        let cleanup_in_progress = Arc::new(AtomicBool::new(false));
         task_center::spawn_fixed(
             format!("cache:{}:cleanup", self.tag),
-            Duration::from_secs(DEFAULT_CLEANUP_INTERVAL),
+            Duration::from_secs(PRESSURE_CHECK_INTERVAL),
             move || {
                 let cache_map = cache_map.clone();
+                let updated_keys = updated_keys.clone();
+                let dirty_since_ms = dirty_since_ms.clone();
+                let dirty_generation = dirty_generation.clone();
+                let pressure_requested = pressure_requested.clone();
+                let last_cleanup_ms = last_cleanup_ms.clone();
+                let cleanup_in_progress = cleanup_in_progress.clone();
                 async move {
-                    let stats = Cache::prune_cache_periodic(
-                        &cache_map,
-                        cache_size,
-                        AppClock::elapsed_millis(),
-                    );
-                    if stats.expired_removed > 0 {
-                        debug!("Cleaned {} expired cache entries", stats.expired_removed);
+                    let now = AppClock::elapsed_millis();
+                    let pressure = pressure_requested.swap(false, Ordering::AcqRel);
+                    let periodic_due = now.saturating_sub(last_cleanup_ms.load(Ordering::Acquire))
+                        >= DEFAULT_CLEANUP_INTERVAL.saturating_mul(1000);
+                    if !pressure && !periodic_due {
+                        return;
                     }
-                    if stats.evicted > 0 {
+                    if cleanup_in_progress
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_cleanup_ms.store(now, Ordering::Release);
+                    let prune = tokio::task::spawn_blocking(move || {
+                        cache_map.prune(
+                            TtlCachePruneMode::Periodic {
+                                max_size: cache_size,
+                                high_watermark_pct: EVICT_HIGH_WATERMARK_PERCENT,
+                                low_watermark_pct: EVICT_LOW_WATERMARK_PERCENT,
+                            },
+                            now,
+                        )
+                    })
+                    .await;
+                    let Ok((expired_removed, evicted, after_len)) = prune else {
+                        cleanup_in_progress.store(false, Ordering::Release);
+                        warn!("Cache cleanup worker failed");
+                        return;
+                    };
+                    let total_removed = expired_removed.saturating_add(evicted);
+                    mark_dirty(
+                        &updated_keys,
+                        &dirty_since_ms,
+                        &dirty_generation,
+                        total_removed as u64,
+                    );
+                    if expired_removed > 0 {
+                        debug!("Cleaned {} expired cache entries", expired_removed);
+                    }
+                    if evicted > 0 {
+                        let before_len = after_len.saturating_add(total_removed);
                         warn!(
                             "LRU eviction: removed {} items, cache size {} -> {}",
-                            stats.evicted, stats.before_len, stats.after_len
+                            evicted, before_len, after_len
                         );
                     }
+                    cleanup_in_progress.store(false, Ordering::Release);
                 }
             },
         )
+    }
+
+    #[inline]
+    fn mark_dirty(&self, changes: u64) {
+        mark_dirty(
+            &self.updated_keys,
+            &self.dirty_since_ms,
+            &self.dirty_generation,
+            changes,
+        );
     }
 
     #[inline]
@@ -692,210 +1030,55 @@ impl Cache {
     }
 
     #[inline]
-    fn periodic_expired_sweep_limit(cache_size: usize) -> usize {
-        cache_size.clamp(EXPIRED_SWEEP_MIN_LIMIT, EXPIRED_SWEEP_MAX_LIMIT)
-    }
-
-    #[inline]
-    fn periodic_eviction_limit(cache_size: usize, evict_target: usize) -> usize {
-        if cache_size <= FULL_TRIM_CACHE_SIZE_LIMIT {
-            evict_target
-        } else {
-            evict_target.min(LARGE_CACHE_EVICTION_MAX_BATCH)
-        }
-    }
-
-    fn remove_expired_with_limit(
-        cache_map: &CacheMap,
-        now: u64,
-        limit: usize,
-        batch: usize,
-    ) -> usize {
-        if limit == 0 || batch == 0 {
-            return 0;
-        }
-
-        let mut removed_total = 0usize;
-        while removed_total < limit {
-            let current_batch = (limit - removed_total).min(batch);
-            let removed = cache_map.remove_expired_batch(now, current_batch);
-            removed_total += removed;
-            if removed < current_batch {
-                break;
-            }
-        }
-        removed_total
-    }
-
-    fn evict_lru_sampled(cache_map: &CacheMap, evict_target: usize, sample_size: usize) -> usize {
-        if evict_target == 0 || sample_size == 0 {
-            return 0;
-        }
-
-        let mut evicted_total = 0usize;
-        while evicted_total < evict_target {
-            let mut sample = cache_map.sample_last_access(sample_size);
-            if sample.is_empty() {
-                break;
-            }
-
-            // Approximate LRU: sort sampled keys by last-access and evict
-            // oldest subset.
-            sample.sort_unstable_by_key(|(_, last)| *last);
-            let wanted = (evict_target - evicted_total).min(sample.len());
-            let mut evicted_batch = 0usize;
-            for (key, _) in sample.into_iter().take(wanted) {
-                if cache_map.remove(&key) {
-                    evicted_batch += 1;
-                }
-            }
-
-            if evicted_batch == 0 {
-                break;
-            }
-            evicted_total += evicted_batch;
-        }
-        evicted_total
-    }
-
-    fn prune_cache_periodic(cache_map: &CacheMap, cache_size: usize, now: u64) -> CachePruneStats {
-        let before_len = cache_map.len();
-        let expired_removed = Self::remove_expired_with_limit(
-            cache_map,
-            now,
-            Self::periodic_expired_sweep_limit(cache_size),
-            EXPIRED_SWEEP_BATCH,
-        );
-
-        let current_size = cache_map.len();
-        let high_watermark = cache_size
-            .saturating_mul(EVICT_HIGH_WATERMARK_PERCENT)
-            .saturating_div(100)
-            .max(1);
-
-        let evicted = if current_size > high_watermark {
-            let low_watermark = cache_size
-                .saturating_mul(EVICT_LOW_WATERMARK_PERCENT)
-                .saturating_div(100)
-                .max(1);
-            let target_size = low_watermark.min(current_size);
-            let evict_target = current_size.saturating_sub(target_size);
-            Self::evict_lru_sampled(
-                cache_map,
-                Self::periodic_eviction_limit(cache_size, evict_target),
-                EVICTION_SAMPLE_SIZE,
-            )
-        } else {
-            0
-        };
-
-        CachePruneStats {
-            before_len,
-            after_len: cache_map.len(),
-            expired_removed,
-            evicted,
-        }
-    }
-
-    fn prune_cache_after_load(
-        cache_map: &CacheMap,
-        cache_size: usize,
-        now: u64,
-    ) -> CachePruneStats {
-        let before_len = cache_map.len();
-        let expired_removed =
-            Self::remove_expired_with_limit(cache_map, now, before_len, EXPIRED_SWEEP_BATCH);
-
-        let current_size = cache_map.len();
-        let evicted = if current_size > cache_size {
-            Self::evict_lru_sampled(
-                cache_map,
-                current_size.saturating_sub(cache_size),
-                EVICTION_SAMPLE_SIZE,
-            )
-        } else {
-            0
-        };
-
-        CachePruneStats {
-            before_len,
-            after_len: cache_map.len(),
-            expired_removed,
-            evicted,
-        }
-    }
-
-    fn prune_cache_after_insert(
-        cache_map: &CacheMap,
-        cache_size: usize,
-        now: u64,
-    ) -> CachePruneStats {
-        let before_len = cache_map.len();
-        let expired_removed = Self::remove_expired_with_limit(
-            cache_map,
-            now,
-            INLINE_EXPIRED_SWEEP_BATCH,
-            INLINE_EXPIRED_SWEEP_BATCH,
-        );
-
-        let current_size = cache_map.len();
-        let evicted = if current_size > cache_size {
-            let evict_target = current_size
-                .saturating_sub(cache_size)
-                .min(INLINE_EVICTION_MAX_BATCH);
-            Self::evict_lru_sampled(cache_map, evict_target, INLINE_EVICTION_SAMPLE_SIZE)
-        } else {
-            0
-        };
-
-        CachePruneStats {
-            before_len,
-            after_len: cache_map.len(),
-            expired_removed,
-            evicted,
-        }
-    }
-
-    fn maybe_prune_after_insert(&self, cache_map: &CacheMap, now: u64) {
-        if cache_map.len() <= self.cache_size {
-            return;
-        }
-
-        let next_due = self.next_inline_maintenance_ms.load(Ordering::Relaxed);
-        if now < next_due {
-            return;
-        }
-
-        let new_next_due = now.saturating_add(INLINE_MAINTENANCE_INTERVAL_MS);
-        if self
-            .next_inline_maintenance_ms
-            .compare_exchange(next_due, new_next_due, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        let stats = Self::prune_cache_after_insert(cache_map, self.cache_size, now);
-        if stats.total_removed() > 0 {
-            debug!(
-                expired_removed = stats.expired_removed,
-                evicted = stats.evicted,
-                before = stats.before_len,
-                after = stats.after_len,
-                "Pruned cache after insert"
-            );
-        }
-    }
-
-    #[inline]
     fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Option<CacheKey> {
         build_cache_key_internal(context, ecs_in_key)
     }
 
     #[inline]
-    fn restore_cached_message(item: &CacheItem, request_id: u16, remaining_ttl: u32) -> Message {
-        item.resp
-            .clone_with_id_and_record_ttl(request_id, remaining_ttl)
+    fn restore_cached_message(item: &CacheItem, request: &Message, remaining_ttl: u32) -> Message {
+        let mut response = item
+            .resp
+            .clone_with_id_and_record_ttl(request.id(), remaining_ttl);
+        response.questions_mut().clear();
+        response.add_question(
+            request
+                .first_question()
+                .cloned()
+                .expect("cacheable request must contain one question"),
+        );
+        response.set_recursion_desired(request.recursion_desired());
+        response.set_checking_disabled(request.checking_disabled());
+        response.set_authentic_data(item.resp.authentic_data());
+        response.set_message_type(MessageType::Response);
+        response.set_opcode(Opcode::Query);
+        response.signature_mut().clear();
+        if let Some(request_edns) = request.edns().as_ref() {
+            let mut edns = Edns::new();
+            edns.set_udp_payload_size(request_edns.udp_payload_size());
+            edns.set_version(request_edns.version());
+            edns.flags_mut().z = request_edns.flags().z;
+            edns.set_dnssec_ok(request_edns.flags().dnssec_ok);
+            if let (
+                Some(EdnsOption::Subnet(request_subnet)),
+                Some(EdnsOption::Subnet(response_subnet)),
+            ) = (
+                request_edns.option(EdnsCode::Subnet),
+                item.resp
+                    .edns()
+                    .as_ref()
+                    .and_then(|response_edns| response_edns.option(EdnsCode::Subnet)),
+            ) {
+                edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+                    request_subnet.addr(),
+                    request_subnet.source_prefix(),
+                    response_subnet.scope_prefix(),
+                )));
+            }
+            response.set_edns(edns);
+        } else {
+            response.edns_mut().take();
+        }
+        response
     }
 
     #[inline]
@@ -922,31 +1105,58 @@ impl Cache {
     #[inline]
     #[hotpath::measure]
     fn try_cache_hit(&self, context: &mut DnsContext, cache_map: &CacheMap) -> Option<CacheLookup> {
-        let key = Self::build_cache_key(context, self.ecs_in_key)?;
+        let request_key = Self::build_cache_key(context, self.ecs_in_key)?;
         self.metrics.lookup_total.fetch_add(1, Ordering::Relaxed);
 
         let now = AppClock::elapsed_millis();
         let touch_interval_ms = self.current_touch_interval_ms(cache_map, now);
 
-        match cache_map.get_retained_cloned_status(&key, now, touch_interval_ms) {
-            Some(TtlCacheLookup::Hit(item)) => {
-                let invalid_disposition = if item.value.is_validated() {
-                    None
-                } else {
-                    let disposition = response_disposition_for_cache(&item.value.resp, &key);
-                    (!is_cache_disposition_valid(disposition)).then_some(disposition)
-                };
-                if let Some(disposition) = invalid_disposition {
-                    if cache_map.remove_if(&key, |existing| {
-                        existing.cache_time_ms == item.cache_time_ms
-                            && existing.expire_at_ms == item.expire_at_ms
-                            && Arc::ptr_eq(&existing.value, &item.value)
-                    }) {
-                        self.updated_keys.fetch_add(1, Ordering::Relaxed);
-                        self.metrics
-                            .record_skip(cache_skip_reason_for_disposition(disposition));
+        let mut expired = false;
+        for key in cache_lookup_keys(&request_key) {
+            let key = key.as_ref();
+            match cache_map.get_retained_cloned_status(key, now, touch_interval_ms) {
+                Some(TtlCacheLookup::Hit(item)) => {
+                    let invalid_disposition = if item.value.is_validated() {
+                        None
+                    } else {
+                        let disposition = response_disposition_for_cache(&item.value.resp, key);
+                        (!is_cache_disposition_valid(disposition)).then_some(disposition)
+                    };
+                    if let Some(disposition) = invalid_disposition {
+                        if cache_map.remove_if(key, |existing| {
+                            existing.cache_time_ms == item.cache_time_ms
+                                && existing.expire_at_ms == item.expire_at_ms
+                                && Arc::ptr_eq(&existing.value, &item.value)
+                        }) {
+                            self.mark_dirty(1);
+                            self.metrics
+                                .record_skip(cache_skip_reason_for_disposition(disposition));
+                            debug!(
+                                "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                                key.domain,
+                                key.record_type,
+                                key.dns_class,
+                                key.do_bit,
+                                key.cd_bit,
+                                key.ecs_scope.is_some()
+                            );
+                        }
+                    } else if now < item.value.fresh_until_ms {
+                        self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
+                        let remaining_ttl =
+                            item.value
+                                .fresh_until_ms
+                                .saturating_sub(now)
+                                .saturating_div(1000) as u32;
+                        let resp = Self::restore_cached_message(
+                            &item.value,
+                            &context.request,
+                            remaining_ttl,
+                        );
+                        context.set_response(resp);
+
                         debug!(
-                            "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=fresh",
                             key.domain,
                             key.record_type,
                             key.dns_class,
@@ -954,85 +1164,69 @@ impl Cache {
                             key.cd_bit,
                             key.ecs_scope.is_some()
                         );
+                        return Some(CacheLookup {
+                            key: key.clone(),
+                            hit_kind: Some(CacheHitKind::Fresh),
+                            refresh_entry: None,
+                        });
+                    } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms {
+                        let refresh_entry = CacheEntryIdentity {
+                            value: item.value.clone(),
+                            cache_time_ms: item.cache_time_ms,
+                            expire_at_ms: item.expire_at_ms,
+                        };
+                        self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
+                        let resp = Self::restore_cached_message(
+                            &item.value,
+                            &context.request,
+                            self.stale_reply_ttl(&item.value),
+                        );
+                        context.set_response(resp);
+
+                        debug!(
+                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=stale",
+                            key.domain,
+                            key.record_type,
+                            key.dns_class,
+                            key.do_bit,
+                            key.cd_bit,
+                            key.ecs_scope.is_some()
+                        );
+                        return Some(CacheLookup {
+                            key: key.clone(),
+                            hit_kind: Some(CacheHitKind::Stale),
+                            refresh_entry: Some(refresh_entry),
+                        });
                     }
-                } else if now < item.value.fresh_until_ms {
-                    self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
-                    let remaining_ttl = item
-                        .value
-                        .fresh_until_ms
-                        .saturating_sub(now)
-                        .saturating_div(1000) as u32;
-                    let resp = Self::restore_cached_message(
-                        &item.value,
-                        context.request.id(),
-                        remaining_ttl,
-                    );
-                    context.set_response(resp);
-
-                    debug!(
-                        "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=fresh",
-                        key.domain,
-                        key.record_type,
-                        key.dns_class,
-                        key.do_bit,
-                        key.cd_bit,
-                        key.ecs_scope.is_some()
-                    );
-                    return Some(CacheLookup {
-                        key,
-                        hit_kind: Some(CacheHitKind::Fresh),
-                        refresh_entry: None,
-                    });
-                } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms {
-                    let refresh_entry = CacheEntryIdentity {
-                        value: item.value.clone(),
-                        cache_time_ms: item.cache_time_ms,
-                        expire_at_ms: item.expire_at_ms,
-                    };
-                    self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
-                    let resp = Self::restore_cached_message(
-                        &item.value,
-                        context.request.id(),
-                        self.stale_reply_ttl(&item.value),
-                    );
-                    context.set_response(resp);
-
-                    debug!(
-                        "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=stale",
-                        key.domain,
-                        key.record_type,
-                        key.dns_class,
-                        key.do_bit,
-                        key.cd_bit,
-                        key.ecs_scope.is_some()
-                    );
-                    return Some(CacheLookup {
-                        key,
-                        hit_kind: Some(CacheHitKind::Stale),
-                        refresh_entry: Some(refresh_entry),
-                    });
                 }
+                Some(TtlCacheLookup::Expired) => {
+                    self.mark_dirty(1);
+                    self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
+                    expired = true;
+                    debug!(
+                        "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                        key.domain,
+                        key.record_type,
+                        key.dns_class,
+                        key.do_bit,
+                        key.cd_bit,
+                        key.ecs_scope.is_some()
+                    );
+                    continue;
+                }
+                None => {}
             }
-            Some(TtlCacheLookup::Expired) => {
-                self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
-                    key.domain,
-                    key.record_type,
-                    key.dns_class,
-                    key.do_bit,
-                    key.cd_bit,
-                    key.ecs_scope.is_some()
-                );
-                return Some(CacheLookup {
-                    key,
-                    hit_kind: None,
-                    refresh_entry: None,
-                });
-            }
-            None => {}
         }
 
+        if expired {
+            return Some(CacheLookup {
+                key: request_key,
+                hit_kind: None,
+                refresh_entry: None,
+            });
+        }
+
+        let key = request_key;
         if cache_map.remove_if_expired(&key, now) {
             self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
             debug!(
@@ -1179,8 +1373,11 @@ impl Cache {
         response: Message,
         ttl: u32,
         disposition: ResponseDisposition,
-    ) {
+    ) -> bool {
         let now = AppClock::elapsed_millis();
+        let Some(key) = cache_key_for_response_ecs_scope(&key, &response) else {
+            return false;
+        };
         let fresh_until_ms = Self::compute_fresh_until_ms(now, ttl);
         let enable_lazy =
             self.config.lazy_cache_ttl.is_some() && disposition.is_complete_positive();
@@ -1190,15 +1387,27 @@ impl Cache {
             "cached: domain={}, type={:?}, class={:?}, ttl={}",
             key.domain, key.record_type, key.dns_class, ttl
         );
-        cache_map.insert_or_update(key, Arc::new(item), now, expire_time);
-        self.updated_keys.fetch_add(1, Ordering::Relaxed);
-        self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
-        self.maybe_prune_after_insert(cache_map, now);
+        let inserted = cache_map.try_insert_or_update_with_limit(
+            key,
+            Arc::new(item),
+            now,
+            expire_time,
+            now,
+            self.cache_size,
+        );
+        if inserted {
+            self.mark_dirty(1);
+            self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pressure_requested.store(true, Ordering::Release);
+        }
+        inserted
     }
 
     fn try_start_lazy_refresh(
         &self,
-        key: &CacheKey,
+        cache_key: &CacheKey,
+        request_key: &CacheKey,
         refresh_entry: &CacheEntryIdentity,
         cache_map: &CacheMap,
         context: &DnsContext,
@@ -1208,7 +1417,7 @@ impl Cache {
             return;
         };
 
-        if !self.lazy_refresh_inflight.insert(key.clone()) {
+        if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
             return;
         }
         self.metrics
@@ -1217,9 +1426,10 @@ impl Cache {
 
         let refresh_guard = LazyRefreshGuard {
             inflight: self.lazy_refresh_inflight.clone(),
-            key: key.clone(),
+            key: cache_key.clone(),
         };
-        let key = key.clone();
+        let cache_key = cache_key.clone();
+        let request_key = request_key.clone();
         let refresh_entry = refresh_entry.clone();
         let cache_map = cache_map.clone();
         let mut sub_ctx = context.copy_for_subquery();
@@ -1231,7 +1441,10 @@ impl Cache {
         let max_negative_ttl = self.max_negative_ttl;
         let negative_ttl_without_soa = self.negative_ttl_without_soa;
         let updated_keys = self.updated_keys.clone();
+        let dirty_since_ms = self.dirty_since_ms.clone();
+        let dirty_generation = self.dirty_generation.clone();
         let metrics = self.metrics.clone();
+        let cache_size = self.cache_size;
 
         tokio::spawn(async move {
             let _refresh_guard = refresh_guard;
@@ -1245,7 +1458,7 @@ impl Cache {
                 Ok(Ok(Some(response))) if !response.truncated() => {
                     let (ttl, disposition) = compute_cache_ttl_with_policy(
                         &response,
-                        &key,
+                        &request_key,
                         max_positive_ttl,
                         min_positive_ttl,
                         cache_negative,
@@ -1253,6 +1466,18 @@ impl Cache {
                         negative_ttl_without_soa,
                     );
                     if let CacheTtlDecision::Cache(ttl) = ttl {
+                        let Some(response_key) =
+                            cache_key_for_response_ecs_scope(&request_key, &response)
+                        else {
+                            metrics
+                                .lazy_refresh_failed_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "lazy cache refresh response has incompatible ECS for {}",
+                                request_key.domain
+                            );
+                            return;
+                        };
                         let now = AppClock::elapsed_millis();
                         let fresh_until_ms = Cache::compute_fresh_until_ms(now, ttl);
                         let enable_lazy =
@@ -1264,30 +1489,88 @@ impl Cache {
                         } else {
                             fresh_until_ms
                         };
-                        cache_map.insert_or_update(
-                            key.clone(),
-                            Arc::new(CacheItem::new_validated(response, ttl, fresh_until_ms)),
-                            now,
-                            expire_at_ms,
-                        );
-                        updated_keys.fetch_add(1, Ordering::Relaxed);
-                        metrics.insert_total.fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .lazy_refresh_success_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        let new_item =
+                            Arc::new(CacheItem::new_validated(response, ttl, fresh_until_ms));
+                        let matches_stale =
+                            |existing: &crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>| {
+                                existing.cache_time_ms == refresh_entry.cache_time_ms
+                                    && existing.expire_at_ms == refresh_entry.expire_at_ms
+                                    && Arc::ptr_eq(&existing.value, &refresh_entry.value)
+                            };
+                        let mut stale_removed_at_capacity = false;
+                        let inserted = if response_key == cache_key {
+                            cache_map.replace_if(
+                                cache_key.clone(),
+                                new_item,
+                                now,
+                                expire_at_ms,
+                                now,
+                                matches_stale,
+                            )
+                        } else if cache_map.remove_if(&cache_key, matches_stale) {
+                            let inserted = cache_map.try_insert_or_update_with_limit(
+                                response_key,
+                                new_item,
+                                now,
+                                expire_at_ms,
+                                now,
+                                cache_size,
+                            );
+                            if !inserted {
+                                match cache_map.try_insert_if_not_newer_with_limit(
+                                    cache_key,
+                                    refresh_entry.value.clone(),
+                                    refresh_entry.cache_time_ms,
+                                    refresh_entry.expire_at_ms,
+                                    now,
+                                    cache_size,
+                                ) {
+                                    TtlCacheInsertIfNotNewerResult::Inserted
+                                    | TtlCacheInsertIfNotNewerResult::NewerPresent => {}
+                                    TtlCacheInsertIfNotNewerResult::AtCapacity => {
+                                        // Another insertion consumed the slot
+                                        // released by removing the stale ECS
+                                        // key.
+                                        // Do not bypass the hard capacity limit
+                                        // to
+                                        // restore it; record the resulting
+                                        // removal
+                                        // as a real cache mutation instead.
+                                        stale_removed_at_capacity = true;
+                                    }
+                                }
+                            }
+                            inserted
+                        } else {
+                            false
+                        };
+                        if inserted {
+                            mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
+                            metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .lazy_refresh_success_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            if stale_removed_at_capacity {
+                                mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
+                            }
+                            metrics
+                                .lazy_refresh_failed_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     } else {
                         if let CacheTtlDecision::Skip(reason) = ttl {
                             if reason == CacheSkipReason::LowPositiveTtl
-                                && cache_map.remove_if(&key, |existing| {
+                                && cache_map.remove_if(&cache_key, |existing| {
                                     existing.cache_time_ms == refresh_entry.cache_time_ms
                                         && existing.expire_at_ms == refresh_entry.expire_at_ms
                                         && Arc::ptr_eq(&existing.value, &refresh_entry.value)
                                 })
                             {
-                                updated_keys.fetch_add(1, Ordering::Relaxed);
+                                mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
                                 debug!(
                                     "evicted stale lazy cache entry after low positive TTL refresh: domain={}, type={:?}, class={:?}",
-                                    key.domain, key.record_type, key.dns_class
+                                    cache_key.domain, cache_key.record_type, cache_key.dns_class
                                 );
                             }
                             metrics.record_skip(reason);
@@ -1306,13 +1589,16 @@ impl Cache {
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!("lazy cache refresh failed for {}: {}", key.domain, err);
+                    warn!(
+                        "lazy cache refresh failed for {}: {}",
+                        request_key.domain, err
+                    );
                 }
                 Err(_) => {
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!("lazy cache refresh timed out for {}", key.domain);
+                    warn!("lazy cache refresh timed out for {}", request_key.domain);
                 }
             }
         });
@@ -1332,43 +1618,73 @@ impl Plugin for Cache {
         self.metrics.set_cache_map(cache_map.clone());
 
         if let Some(dump_file) = &self.config.dump_file {
-            if let Err(e) = load_cache_from_file(&cache_map, dump_file, self.ecs_in_key).await {
+            if let Err(e) = load_cache_from_file(
+                &cache_map,
+                dump_file,
+                self.ecs_in_key,
+                self.cache_load_policy(),
+            )
+            .await
+            {
                 warn!("Failed to load cache from {}: {}", dump_file, e);
             } else {
-                let stats = Cache::prune_cache_after_load(
-                    &cache_map,
-                    self.cache_size,
-                    AppClock::elapsed_millis(),
-                );
-                if stats.total_removed() > 0 {
-                    debug!(
-                        expired_removed = stats.expired_removed,
-                        evicted = stats.evicted,
-                        before = stats.before_len,
-                        after = stats.after_len,
-                        "Pruned cache after loading dump"
-                    );
+                let cache_map_for_prune = cache_map.clone();
+                let cache_size = self.cache_size;
+                match tokio::task::spawn_blocking(move || {
+                    cache_map_for_prune.prune(
+                        TtlCachePruneMode::Exact {
+                            max_size: cache_size,
+                        },
+                        AppClock::elapsed_millis(),
+                    )
+                })
+                .await
+                {
+                    // 通过模式匹配解构提取出统计三元组
+                    Ok((expired_removed, evicted, after_len)) => {
+                        let total_removed = expired_removed.saturating_add(evicted);
+                        if total_removed > 0 {
+                            self.mark_dirty(total_removed as u64);
+
+                            // 纯算术反向推导清理前的长度，
+                            // 省去调用底层读锁的开销
+                            let before_len = after_len.saturating_add(total_removed);
+                            debug!(
+                                expired_removed = expired_removed,
+                                evicted = evicted,
+                                before = before_len,
+                                after = after_len,
+                                "Pruned cache after loading dump"
+                            );
+                        }
+                    }
+                    Err(err) => warn!("Cache load prune worker failed: {}", err),
                 }
             }
         }
 
         #[cfg(feature = "api")]
-        api::register(
-            &self.tag,
-            cache_map.clone(),
-            self.ecs_in_key,
-            self.cache_size,
-        )?;
+        {
+            let cache_reclaimer = CacheReclaimer::new(&self.tag)?;
+            api::register(
+                &self.tag,
+                cache_map.clone(),
+                self.ecs_in_key,
+                self.cache_size,
+                self.cache_load_policy(),
+                cache_reclaimer,
+                api::CacheMutationState {
+                    updated_keys: self.updated_keys.clone(),
+                    dirty_since_ms: self.dirty_since_ms.clone(),
+                    dirty_generation: self.dirty_generation.clone(),
+                },
+            )?;
+        }
         register_metric_source(self.metrics.clone())?;
 
         if let Some(dump_file) = &self.config.dump_file {
             let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
-            let task_id = self.spawn_dump_task(
-                cache_map.clone(),
-                dump_file.clone(),
-                dump_interval,
-                self.updated_keys.clone(),
-            );
+            let task_id = self.spawn_dump_task(cache_map.clone(), dump_file.clone(), dump_interval);
             *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
         }
 
@@ -1439,9 +1755,11 @@ impl Executor for Cache {
         if let Some(lookup) = cache_lookup.as_ref()
             && lookup.hit_kind == Some(CacheHitKind::Stale)
             && let Some(refresh_entry) = lookup.refresh_entry.as_ref()
+            && let Some(request_key) = Self::build_cache_key(context, self.ecs_in_key)
         {
             self.try_start_lazy_refresh(
                 &lookup.key,
+                &request_key,
                 refresh_entry,
                 cache_map,
                 context,
@@ -1478,21 +1796,10 @@ impl Executor for Cache {
                 }
 
                 if ready.borrow().to_owned()
-                    && let Some(entry) = cache_map.get_retained_cloned(
-                        &key,
-                        AppClock::elapsed_millis(),
-                        self.current_touch_interval_ms(cache_map, AppClock::elapsed_millis()),
-                    )
+                    && self
+                        .try_cache_hit(context, cache_map)
+                        .is_some_and(|lookup| lookup.hit_kind.is_some())
                 {
-                    let remaining_ttl = entry
-                        .expire_at_ms
-                        .saturating_sub(AppClock::elapsed_millis())
-                        .saturating_div(1000) as u32;
-                    context.set_response(Self::restore_cached_message(
-                        &entry.value,
-                        context.request.id(),
-                        remaining_ttl,
-                    ));
                     if self.should_short_circuit(true) {
                         return Ok(ExecStep::Stop);
                     }
@@ -1514,16 +1821,13 @@ impl Executor for Cache {
                     } else {
                         let disposition = response_disposition_for_cache(response, &key);
                         match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
-                            CacheTtlDecision::Cache(ttl) => {
-                                self.update_cache_entry(
-                                    cache_map,
-                                    key,
-                                    response.clone(),
-                                    ttl,
-                                    disposition,
-                                );
-                                true
-                            }
+                            CacheTtlDecision::Cache(ttl) => self.update_cache_entry(
+                                cache_map,
+                                key,
+                                response.clone(),
+                                ttl,
+                                disposition,
+                            ),
                             CacheTtlDecision::Skip(reason) => {
                                 self.metrics.record_skip(reason);
                                 false
@@ -1620,7 +1924,7 @@ fn compute_cache_ttl_with_policy(
 #[inline]
 fn response_disposition_for_cache(response: &Message, key: &CacheKey) -> ResponseDisposition {
     if let Some(question) = response.first_question() {
-        if question.name().normalized() != key.domain
+        if question.name().normalized() != key.domain.as_ref()
             || question.qtype() != key.record_type
             || question.qclass() != key.dns_class
         {
@@ -1678,28 +1982,70 @@ fn clamp_persisted_cache_ttl(
     response: &Message,
     key: &CacheKey,
     disposition: ResponseDisposition,
-    ttl: u32,
+    persisted_ttl: u32,
     remaining_ttl_ms: u64,
     cache_age_ms: u64,
-) -> (u32, u64) {
-    if !matches!(disposition, ResponseDisposition::DefinitiveNegative(_)) {
-        return (ttl, remaining_ttl_ms);
+    policy: CacheLoadPolicy,
+) -> (u32, u64, u64) {
+    let ttl = match disposition {
+        ResponseDisposition::CompletePositive => {
+            let Some(answer_ttl) = min_answer_ttl_for_key(response, key) else {
+                return (0, 0, 0);
+            };
+            let ttl = policy
+                .max_positive_ttl
+                .map_or(answer_ttl, |max| answer_ttl.min(max));
+            if ttl == 0 || policy.min_positive_ttl.is_some_and(|min| ttl < min) {
+                return (0, 0, 0);
+            }
+            ttl
+        }
+        ResponseDisposition::DefinitiveNegative(_) => {
+            if !policy.cache_negative {
+                return (0, 0, 0);
+            }
+            let mut ttl = negative_ttl_from_soa_for_key(response, key)
+                .unwrap_or(policy.negative_ttl_without_soa);
+            if let Some(answer_ttl) = min_answer_ttl_for_key(response, key) {
+                ttl = ttl.min(answer_ttl);
+            }
+            let ttl = ttl.min(policy.max_negative_ttl);
+            if ttl == 0 {
+                return (0, 0, 0);
+            }
+            ttl
+        }
+        _ => return (0, 0, 0),
+    };
+
+    // Never widen freshness beyond the effective TTL persisted in the dump.
+    let ttl = ttl.min(persisted_ttl);
+    if ttl == 0 {
+        return (0, 0, 0);
     }
 
-    let protocol_cap = [
-        negative_ttl_from_soa_for_key(response, key),
-        min_answer_ttl_for_key(response, key),
-    ]
-    .into_iter()
-    .flatten()
-    .min();
-    let ttl = protocol_cap.map_or(ttl, |cap| ttl.min(cap));
-    let remaining_ttl_ms = remaining_ttl_ms.min(
+    let fresh_remaining_ms = remaining_ttl_ms.min(
         u64::from(ttl)
             .saturating_mul(1000)
             .saturating_sub(cache_age_ms),
     );
-    (ttl, remaining_ttl_ms)
+    let retention_limit_ms = policy
+        .lazy_cache_ttl
+        .map_or(u64::from(ttl), |lazy_ttl| u64::from(ttl.max(lazy_ttl)));
+    let retention_remaining_ms = remaining_ttl_ms.min(
+        retention_limit_ms
+            .saturating_mul(1000)
+            .saturating_sub(cache_age_ms),
+    );
+    let retention_remaining_ms = if matches!(disposition, ResponseDisposition::CompletePositive)
+        && policy.lazy_cache_ttl.is_some()
+    {
+        retention_remaining_ms
+    } else {
+        fresh_remaining_ms
+    };
+
+    (ttl, fresh_remaining_ms, retention_remaining_ms)
 }
 
 fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
@@ -1820,33 +2166,21 @@ impl CacheFactory {
                 .unwrap_or(DEFAULT_NEGATIVE_TTL_WITHOUT_SOA),
             short_circuit: cache_config.short_circuit.unwrap_or(false),
             ecs_in_key: cache_config.ecs_in_key.unwrap_or(false),
+            pressure_requested: Arc::new(AtomicBool::new(false)),
             cache_size: cache_config.size.unwrap_or(DEFAULT_CACHE_SIZE),
             config: cache_config,
             updated_keys: Arc::new(AtomicU64::new(0)),
+            dirty_since_ms: Arc::new(AtomicU64::new(0)),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
+            persisted_generation: Arc::new(AtomicU64::new(0)),
             metrics,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             miss_coalescer: MissCoalescer::new(),
-            next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
         })))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct CachePruneStats {
-    before_len: usize,
-    after_len: usize,
-    expired_removed: usize,
-    evicted: usize,
-}
-
-impl CachePruneStats {
-    #[inline]
-    fn total_removed(self) -> usize {
-        self.expired_removed + self.evicted
     }
 }
 
@@ -1895,7 +2229,7 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
@@ -1905,7 +2239,8 @@ mod tests {
     use crate::plugin::executor::sequence::chain::ChainProgram;
     use crate::proto::rdata::{CNAME, SOA};
     use crate::proto::{
-        DNSClass, Edns, EdnsOption, Message, Name, Question, RData, Rcode, Record, RecordType,
+        ClientSubnet, DNSClass, Edns, EdnsCode, EdnsOption, Message, Name, Question, RData, Rcode,
+        Record, RecordType,
     };
 
     async fn wait_until<F>(description: &str, condition: F)
@@ -1939,15 +2274,18 @@ mod tests {
             negative_ttl_without_soa,
             short_circuit,
             ecs_in_key,
+            pressure_requested: Arc::new(AtomicBool::new(false)),
             config,
             updated_keys: Arc::new(AtomicU64::new(0)),
+            dirty_since_ms: Arc::new(AtomicU64::new(0)),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
+            persisted_generation: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(CacheMetrics::new("cache_test".to_string())),
             cache_size,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             miss_coalescer: MissCoalescer::new(),
-            next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
         }
@@ -2077,6 +2415,104 @@ mod tests {
         DnsContext::new("127.0.0.1:5300".parse::<SocketAddr>().unwrap(), request)
     }
 
+    #[test]
+    fn dump_age_due_accounts_for_the_next_scheduler_tick() {
+        assert!(dump_age_due(1, 1, 120_000));
+        assert!(dump_age_due(120_000, 1, 120_000));
+        assert!(!dump_age_due(60_000, 1, 60_000));
+        assert!(dump_age_due(60_001, 1, 60_000));
+    }
+
+    #[test]
+    fn dirty_timestamp_reserves_zero_for_clean_state() {
+        assert_eq!(dirty_timestamp(0), 1);
+        assert_eq!(dirty_timestamp(1), 1);
+        assert_eq!(dirty_timestamp(42), 42);
+    }
+
+    #[test]
+    fn successful_dump_handoff_clears_old_dirty_watermark() {
+        AppClock::start();
+
+        let dirty_since_ms = AtomicU64::new(10);
+
+        let dirty_generation = AtomicU64::new(7);
+
+        let persisted_generation = AtomicU64::new(0);
+
+        let (dump_generation, previous_dirty_since) =
+            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
+
+        assert_eq!(dump_generation, 7);
+        assert_eq!(previous_dirty_since, 10);
+
+        // Old watermark now belongs to the in-progress dump.
+        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
+
+        assert!(finish_dump_if_unchanged(
+            &dirty_generation,
+            &persisted_generation,
+            dump_generation,
+        ));
+
+        assert_eq!(persisted_generation.load(Ordering::Acquire), 7);
+
+        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dump_handoff_preserves_new_mutation_watermark() {
+        AppClock::start();
+
+        let dirty_since_ms = AtomicU64::new(10);
+
+        let dirty_generation = AtomicU64::new(7);
+
+        let persisted_generation = AtomicU64::new(0);
+
+        let (dump_generation, previous_dirty_since) =
+            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
+
+        assert_eq!(previous_dirty_since, 10);
+        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
+
+        mark_dirty(&AtomicU64::new(0), &dirty_since_ms, &dirty_generation, 1);
+
+        assert_eq!(dirty_generation.load(Ordering::Acquire), 8);
+
+        assert!(dirty_since_ms.load(Ordering::Acquire) != 0);
+
+        assert!(!finish_dump_if_unchanged(
+            &dirty_generation,
+            &persisted_generation,
+            dump_generation,
+        ));
+        assert_eq!(persisted_generation.load(Ordering::Acquire), 7);
+        assert!(dirty_since_ms.load(Ordering::Acquire) != 0);
+    }
+
+    #[test]
+    fn failed_dump_restores_previous_dirty_watermark() {
+        let dirty_since_ms = AtomicU64::new(100);
+
+        let dirty_generation = AtomicU64::new(5);
+
+        let (_dump_generation, previous_dirty_since) =
+            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
+
+        assert_eq!(previous_dirty_since, 100);
+        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
+
+        //  Simulate a newer mutation during failed dump.
+        dirty_since_ms.store(200, Ordering::Release);
+
+        restore_dirty_since(&dirty_since_ms, previous_dirty_since);
+
+        //  The failed dump means the mutation from t=100 is still unsaved,
+        //  therefore it remains the oldest watermark.
+        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 100);
+    }
+
     fn make_request_with_query(name: &str, do_bit: bool, cd_bit: bool) -> Message {
         make_request_with_qtype(name, RecordType::A, do_bit, cd_bit)
     }
@@ -2111,7 +2547,7 @@ mod tests {
         record_type: RecordType,
     ) -> CacheKey {
         CacheKey {
-            domain: domain.into(),
+            domain: Arc::from(domain.into()),
             record_type,
             dns_class: DNSClass::IN,
             do_bit: false,
@@ -2184,7 +2620,7 @@ mod tests {
     fn periodic_prune_removes_large_expired_backlog() {
         let cache_map = CacheMap::with_capacity(16);
         let now = 10_000u64;
-        let expired_count = EXPIRED_SWEEP_MIN_LIMIT + 512;
+        let expired_count = 8_704; // 8704
         for idx in 0..expired_count {
             insert_test_cache_entry(
                 &cache_map,
@@ -2194,10 +2630,19 @@ mod tests {
             );
         }
 
-        let stats = Cache::prune_cache_periodic(&cache_map, expired_count, now);
+        // 执行清理
+        let (expired_removed, evicted, after_len) = cache_map.prune(
+            TtlCachePruneMode::Periodic {
+                max_size: expired_count,
+                high_watermark_pct: EVICT_HIGH_WATERMARK_PERCENT,
+                low_watermark_pct: EVICT_LOW_WATERMARK_PERCENT,
+            },
+            now,
+        );
 
-        assert_eq!(stats.expired_removed, expired_count);
-        assert_eq!(stats.evicted, 0);
+        assert_eq!(expired_removed, expired_count); // 8704 == 8704
+        assert_eq!(evicted, 0);
+        assert_eq!(after_len, 0);
         assert!(cache_map.is_empty());
     }
 
@@ -2214,17 +2659,51 @@ mod tests {
             );
         }
 
-        let stats = Cache::prune_cache_periodic(&cache_map, 8, now);
+        let (expired_removed, evicted, after_len) = cache_map.prune(
+            TtlCachePruneMode::Periodic {
+                max_size: 8,
+                high_watermark_pct: EVICT_HIGH_WATERMARK_PERCENT,
+                low_watermark_pct: EVICT_LOW_WATERMARK_PERCENT,
+            },
+            now,
+        );
 
-        assert_eq!(stats.expired_removed, 0);
-        assert_eq!(stats.evicted, 26);
+        assert_eq!(expired_removed, 0);
+        assert_eq!(evicted, 26);
+        assert_eq!(after_len, 6);
         assert_eq!(cache_map.len(), 6);
     }
 
     #[test]
+    fn periodic_prune_releases_slot_for_single_entry_cache() {
+        let cache_map = CacheMap::with_capacity(1);
+        let now = 10_000u64;
+        insert_test_cache_entry(
+            &cache_map,
+            "live.example".to_string(),
+            now.saturating_add(60_000),
+            1,
+        );
+
+        let (expired_removed, evicted, after_len) = cache_map.prune(
+            TtlCachePruneMode::Periodic {
+                max_size: 1,
+                high_watermark_pct: EVICT_HIGH_WATERMARK_PERCENT,
+                low_watermark_pct: EVICT_LOW_WATERMARK_PERCENT,
+            },
+            now,
+        );
+
+        assert_eq!(expired_removed, 0);
+        assert_eq!(evicted, 1);
+        assert_eq!(after_len, 0);
+        assert!(cache_map.is_empty());
+    }
+
+    #[test]
     fn load_prune_trims_large_cache_to_configured_limit() {
-        let cache_size = FULL_TRIM_CACHE_SIZE_LIMIT + 1;
-        let excess = LARGE_CACHE_EVICTION_MAX_BATCH + 17;
+        let cache_size = 100_001;
+        let excess = 65_553;
         let live_count = cache_size + excess;
         let cache_map = CacheMap::with_capacity(Cache::initial_cache_capacity(cache_size));
         let now = 10_000u64;
@@ -2237,10 +2716,16 @@ mod tests {
             );
         }
 
-        let stats = Cache::prune_cache_after_load(&cache_map, cache_size, now);
+        let (expired_removed, evicted, after_len) = cache_map.prune(
+            TtlCachePruneMode::Exact {
+                max_size: cache_size,
+            },
+            now,
+        );
 
-        assert_eq!(stats.expired_removed, 0);
-        assert_eq!(stats.evicted, excess);
+        assert_eq!(expired_removed, 0);
+        assert_eq!(evicted, excess);
+        assert_eq!(after_len, cache_size);
         assert_eq!(cache_map.len(), cache_size);
     }
 
@@ -2298,6 +2783,20 @@ mod tests {
                 55,
                 RData::A(crate::proto::rdata::A(Ipv4Addr::new(9, 9, 9, 9))),
             ));
+            if let Some(EdnsOption::Subnet(request_subnet)) = context
+                .request
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+            {
+                let mut edns = Edns::new();
+                edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+                    request_subnet.addr(),
+                    request_subnet.source_prefix(),
+                    16,
+                )));
+                response.set_edns(edns);
+            }
             context.set_response(response);
             continue_next!(next, context)
         }
@@ -2409,7 +2908,7 @@ mod tests {
         let key_upper = Cache::build_cache_key(&mut ctx_upper, true).unwrap();
         let key_lower = Cache::build_cache_key(&mut ctx_lower, true).unwrap();
 
-        assert_eq!(key_upper.domain, "example.com");
+        assert_eq!(key_upper.domain.as_ref(), "example.com");
         assert_eq!(key_upper, key_lower);
     }
 
@@ -2439,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_ignores_ecs_when_disabled() {
+    fn cache_key_rejects_ecs_when_disabled() {
         let mut req_ecs_a = make_request_with_query("example.com.", false, false);
         add_ecs(&mut req_ecs_a, "192.0.2.0/24");
 
@@ -2449,12 +2948,95 @@ mod tests {
         let mut ctx_ecs_a = make_context(req_ecs_a);
         let mut ctx_ecs_b = make_context(req_ecs_b);
 
-        let key_ecs_a = Cache::build_cache_key(&mut ctx_ecs_a, false).unwrap();
-        let key_ecs_b = Cache::build_cache_key(&mut ctx_ecs_b, false).unwrap();
+        assert!(Cache::build_cache_key(&mut ctx_ecs_a, false).is_none());
+        assert!(Cache::build_cache_key(&mut ctx_ecs_b, false).is_none());
+    }
 
-        assert_eq!(key_ecs_a, key_ecs_b);
-        assert!(key_ecs_a.ecs_scope.is_none());
-        assert!(key_ecs_b.ecs_scope.is_none());
+    #[tokio::test]
+    async fn cache_hit_reuses_response_ecs_scope_for_matching_client_prefix() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let mut first_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut first_request, "203.0.113.199/24");
+        let mut first_context = make_context(first_request);
+        let first_key = Cache::build_cache_key(&mut first_context, true).unwrap();
+
+        let mut response = cacheable_response_for_domain("example.com.", 120);
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        response.set_edns(response_edns);
+        let disposition = response_disposition_for_cache(&response, &first_key);
+        assert!(cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            first_key,
+            response,
+            120,
+            disposition,
+        ));
+
+        let mut second_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut second_request, "203.0.127.1/24");
+        let mut second_context = make_context(second_request);
+
+        let lookup = cache
+            .try_cache_hit(&mut second_context, cache.cache_map.get().unwrap())
+            .expect("cache lookup should exist");
+        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
+        let response = second_context
+            .response()
+            .expect("cache hit should set response");
+        assert_eq!(
+            response
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet)),
+            Some(&EdnsOption::Subnet(ClientSubnet::new(
+                IpAddr::from([203, 0, 127, 1]),
+                24,
+                20,
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_rejects_response_with_mismatched_ecs_address() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let mut request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut request, "203.0.113.199/24");
+        let mut context = make_context(request);
+        let key = Cache::build_cache_key(&mut context, true).expect("cache key should exist");
+
+        let mut response = cacheable_response_for_domain("example.com.", 120);
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 114, 0]),
+            24,
+            20,
+        )));
+        response.set_edns(response_edns);
+        let disposition = response_disposition_for_cache(&response, &key);
+
+        assert!(!cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            key,
+            response,
+            120,
+            disposition,
+        ));
+        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
     }
 
     #[test]
@@ -2962,8 +3544,17 @@ mod tests {
         let mut cache = test_cache(default_test_config());
         let _ = cache.init_for_test().await;
 
-        let mut request = make_request_with_query("example.com.", false, false);
+        let mut request = make_request_with_query("example.com.", true, true);
         request.set_id(7);
+        request.set_recursion_desired(true);
+        request
+            .first_question_mut()
+            .unwrap()
+            .set_name(Name::from_ascii("WWW.Example.COM.").unwrap());
+        let mut request_edns = Edns::new();
+        request_edns.set_udp_payload_size(4096);
+        request_edns.set_dnssec_ok(true);
+        request.set_edns(request_edns);
         let mut context = make_context(request.clone());
         let key = Cache::build_cache_key(&mut context, false).unwrap();
 
@@ -2998,7 +3589,12 @@ mod tests {
         }));
         let response = context.response().expect("cache hit should set response");
         assert_eq!(response.id(), 7);
-        assert_eq!(response.answers().len(), 1);
+        assert_eq!(response.first_question(), request.first_question());
+        assert!(response.recursion_desired());
+        assert!(response.checking_disabled());
+        assert!(response.edns().as_ref().unwrap().flags().dnssec_ok);
+        assert_eq!(response.edns().as_ref().unwrap().udp_payload_size(), 4096);
+        assert!(response.edns().as_ref().unwrap().options().is_empty());
         assert!(
             (119..=120).contains(&response.answers()[0].ttl()),
             "fresh cache hit should preserve the original TTL or decrement by at most one second"
@@ -3009,6 +3605,49 @@ mod tests {
             1
         );
         assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn restore_cached_message_preserves_response_ecs_scope_only() {
+        let mut request = make_request_with_query("example.com.", false, false);
+        let mut request_edns = Edns::new();
+        request_edns.set_udp_payload_size(4096);
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 99]),
+            24,
+            0,
+        )));
+        request.set_edns(request_edns);
+
+        let mut cached_response = cacheable_response_for_domain("example.com.", 120);
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        response_edns.insert(EdnsOption::Cookie(crate::proto::EdnsCookie::new(vec![
+            1, 2,
+        ])));
+        cached_response.set_edns(response_edns);
+        let item = CacheItem::new(cached_response, 120, 120_000);
+
+        let restored = Cache::restore_cached_message(&item, &request, 60);
+        let edns = restored
+            .edns()
+            .as_ref()
+            .expect("response should retain EDNS");
+
+        assert_eq!(edns.udp_payload_size(), 4096);
+        assert_eq!(
+            edns.option(EdnsCode::Subnet),
+            Some(&EdnsOption::Subnet(ClientSubnet::new(
+                IpAddr::from([203, 0, 113, 99]),
+                24,
+                20,
+            )))
+        );
+        assert_eq!(edns.options().len(), 1);
     }
 
     #[tokio::test]
@@ -3059,6 +3698,81 @@ mod tests {
         assert_eq!(
             cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn ecs_lazy_cache_hit_returns_stale_response() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(3_600);
+        cfg.ecs_in_key = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let mut request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut request, "203.0.113.199/24");
+        let mut context = make_context(request);
+        let key = Cache::build_cache_key(&mut context, true).unwrap();
+        let mut response = cacheable_response_for_domain("example.com.", 120);
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        response.set_edns(response_edns);
+        let stored_key = cache_key_for_response_ecs_scope(&key, &response)
+            .expect("initial ECS response should produce a scoped cache key");
+        let now = AppClock::elapsed_millis();
+
+        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+            stored_key.clone(),
+            Arc::new(CacheItem::new_validated(
+                response,
+                120,
+                now.saturating_sub(1),
+            )),
+            now.saturating_sub(121_000),
+            now.saturating_add(3_000_000),
+            now,
+        );
+
+        let lookup = cache
+            .try_cache_hit(&mut context, cache.cache_map.get().unwrap())
+            .expect("cache lookup should exist");
+        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Stale));
+        assert_eq!(
+            cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
+            1
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+                calls: calls.clone(),
+            }));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("stale ECS refresh should succeed");
+        wait_until("ECS lazy refresh should complete", || {
+            cache
+                .metrics
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+        assert!(
+            cache
+                .cache_map
+                .get()
+                .unwrap()
+                .get_retained_cloned(&stored_key, AppClock::elapsed_millis(), 0)
+                .is_none()
         );
     }
 

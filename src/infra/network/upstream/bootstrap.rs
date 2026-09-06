@@ -475,8 +475,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bootstrap_upstream_pool_refresh_metrics_record_reasons() {
+    async fn assert_bootstrap_upstream_pool_refresh_metrics_record_reasons() {
         AppClock::start();
         let before = network_metrics::snapshot_for_profile_for_tests(OUTBOUND_PROFILE_LOCAL);
         let (bootstrap, _count) = spawn_bootstrap_server(vec![
@@ -525,6 +524,21 @@ mod tests {
                 ),
             "expected ip_changed pool refresh metric to increase: before={before:?}, after={after:?}"
         );
+    }
+
+    #[test]
+    fn bootstrap_upstream_pool_refresh_metrics_record_reasons() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("bootstrap metrics test runtime should build");
+        runtime.block_on(async {
+            tokio::spawn(assert_bootstrap_upstream_pool_refresh_metrics_record_reasons())
+                .await
+                .expect("bootstrap metrics test task should complete");
+        });
     }
 
     #[tokio::test]

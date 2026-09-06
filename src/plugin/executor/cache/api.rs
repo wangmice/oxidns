@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -10,13 +13,19 @@ use bytes::Bytes;
 use http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::key::{CacheKey, EcsScopeDigest, normalize_domain_key};
-use super::persistence::{dump_cache_to_bytes, load_cache_from_bytes};
-use super::{Cache, CacheItem, CacheMap};
+use super::key::{CacheKey, canonical_ecs_key_digest, normalize_domain_key};
+#[cfg(test)]
+use super::persistence::dump_cache_to_bytes;
+use super::persistence::{
+    CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes,
+};
+use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer, mark_dirty};
 use crate::api::query::{optional_text, parse_usize_param, visit_query_params};
 use crate::api::{ApiHandler, json_error, json_ok, simple_response};
+use crate::infra::cache::ttl::TtlCachePruneMode;
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
 use crate::plugin::executor::rdata_json::{RDataPayloadMode, rdata_payload};
@@ -25,12 +34,33 @@ use crate::register_plugin_api;
 
 const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
+pub(super) struct CacheMutationState {
+    pub(super) updated_keys: Arc<AtomicU64>,
+    pub(super) dirty_since_ms: Arc<AtomicU64>,
+    pub(super) dirty_generation: Arc<AtomicU64>,
+}
+
 pub(super) fn register(
     tag: &str,
     cache_map: CacheMap,
     ecs_in_key: bool,
     cache_size: usize,
+    policy: CacheLoadPolicy,
+    cache_reclaimer: CacheReclaimer,
+    state: CacheMutationState,
 ) -> Result<()> {
+    let CacheMutationState {
+        updated_keys,
+        dirty_since_ms,
+        dirty_generation,
+    } = state;
+    // The gate is an API-internal implementation detail. All destructive cache
+    // management handlers share this same mutex, while callers of register()
+    // keep the registration call focused on cache configuration and shared
+    // state.
+    let mutation_gate = Arc::new(Mutex::new(()));
+
     register_plugin_api!(
         tag,
         |plugin_api|
@@ -39,10 +69,20 @@ pub(super) fn register(
         },
         DELETE_PREFIX "/entries/" => CacheEntryDeleteHandler {
             cache_map: cache_map.clone(),
+            updated_keys: updated_keys.clone(),
+            dirty_since_ms: dirty_since_ms.clone(),
+            dirty_generation: dirty_generation.clone(),
+            mutation_gate: mutation_gate.clone(),
             path_prefix: plugin_api.path("/entries/")?,
         },
         GET "/flush" => CacheFlushHandler {
             cache_map: cache_map.clone(),
+            cache_size,
+            cache_reclaimer: cache_reclaimer.clone(),
+            updated_keys: updated_keys.clone(),
+            dirty_since_ms: dirty_since_ms.clone(),
+            dirty_generation: dirty_generation.clone(),
+            mutation_gate: mutation_gate.clone(),
         },
         GET "/dump" => CacheDumpHandler {
             cache_map: cache_map.clone(),
@@ -52,6 +92,12 @@ pub(super) fn register(
             cache_map,
             ecs_in_key,
             cache_size,
+            policy,
+            cache_reclaimer,
+            updated_keys,
+            dirty_since_ms,
+            dirty_generation,
+            mutation_gate,
         },
     )?;
     Ok(())
@@ -60,6 +106,12 @@ pub(super) fn register(
 #[derive(Debug)]
 struct CacheFlushHandler {
     cache_map: CacheMap,
+    cache_size: usize,
+    cache_reclaimer: CacheReclaimer,
+    updated_keys: Arc<AtomicU64>,
+    dirty_since_ms: Arc<AtomicU64>,
+    dirty_generation: Arc<AtomicU64>,
+    mutation_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,8 +123,54 @@ struct CacheFlushResponse {
 #[async_trait]
 impl ApiHandler for CacheFlushHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
-        let cleared_entries = self.cache_map.len();
-        self.cache_map.clear();
+        // Reserve the only outstanding retirement slot before allocating the
+        // replacement. This provides async backpressure when a previous large
+        // generation is still being reclaimed.
+        let reclaim_permit = match self.cache_reclaimer.reserve().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                warn!("Cache reclaimer reservation failed: {}", err);
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cache_reclaimer_unavailable",
+                    "cache reclaimer unavailable",
+                );
+            }
+        };
+
+        // Preparing a replacement DashMap can allocate. Keep that work off the
+        // async worker just like dump parsing/pruning.
+        let initial_capacity = Cache::initial_cache_capacity(self.cache_size);
+        let replacement =
+            match tokio::task::spawn_blocking(move || CacheMap::with_capacity(initial_capacity))
+                .await
+            {
+                Ok(replacement) => replacement,
+                Err(err) => {
+                    warn!("Cache flush preparation worker failed: {}", err);
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "cache_worker_failed",
+                        "cache flush preparation worker failed",
+                    );
+                }
+            };
+
+        let mutation_guard = self.mutation_gate.lock().await;
+        let retired = self.cache_map.swap_retired(&replacement);
+        let cleared_entries = retired.entry_count();
+        mark_dirty(
+            &self.updated_keys,
+            &self.dirty_since_ms,
+            &self.dirty_generation,
+            cleared_entries as u64,
+        );
+        drop(mutation_guard);
+
+        // The commit is complete. Transfer the retired generation to the
+        // dedicated reclaimer; no large map is dropped on this Tokio worker.
+        self.cache_reclaimer.submit(retired, reclaim_permit);
+
         info!("cache flushed, cleared entries {}", cleared_entries);
         json_ok(
             StatusCode::OK,
@@ -93,8 +191,13 @@ struct CacheDumpHandler {
 #[async_trait]
 impl ApiHandler for CacheDumpHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
-        match dump_cache_to_bytes(&self.cache_map) {
-            Ok(bytes) => {
+        let cache_map = self.cache_map.clone();
+        match tokio::task::spawn_blocking(move || {
+            dump_cache_to_bytes_with_limit(&cache_map, MAX_CACHE_DUMP_BODY)
+        })
+        .await
+        {
+            Ok(Ok(CacheDumpOutcome::Complete(bytes))) => {
                 let mut response = simple_response(StatusCode::OK, Bytes::from(bytes));
                 response.headers_mut().insert(
                     http::header::CONTENT_TYPE,
@@ -110,11 +213,32 @@ impl ApiHandler for CacheDumpHandler {
                 }
                 response
             }
-            Err(err) => {
+            Ok(Ok(CacheDumpOutcome::TooLarge {
+                limit,
+                minimum_size,
+            })) => {
+                warn!(
+                    minimum_size,
+                    limit, "Cache dump exceeds API size limit; stopped before full serialization"
+                );
+                json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "cache_dump_too_large",
+                    "cache dump exceeds API size limit",
+                )
+            }
+            Ok(Err(err)) => {
                 warn!("Failed to dump cache via API: {}", err);
                 simple_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Bytes::from("failed to dump cache"),
+                )
+            }
+            Err(err) => {
+                warn!("Cache dump worker failed: {}", err);
+                simple_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from("cache dump worker failed"),
                 )
             }
         }
@@ -126,6 +250,12 @@ struct CacheLoadDumpHandler {
     cache_map: CacheMap,
     ecs_in_key: bool,
     cache_size: usize,
+    policy: CacheLoadPolicy,
+    cache_reclaimer: CacheReclaimer,
+    updated_keys: Arc<AtomicU64>,
+    dirty_since_ms: Arc<AtomicU64>,
+    dirty_generation: Arc<AtomicU64>,
+    mutation_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,19 +271,100 @@ impl ApiHandler for CacheLoadDumpHandler {
     }
 
     async fn handle(&self, request: Request<Bytes>) -> crate::api::ApiResponse {
-        match load_cache_from_bytes(&self.cache_map, request.body(), self.ecs_in_key, true) {
-            Ok(loaded_entries) => {
-                let stats = Cache::prune_cache_after_load(
-                    &self.cache_map,
-                    self.cache_size,
-                    AppClock::elapsed_millis(),
+        // Serialize large replacement generations before parsing/building a new
+        // cache. This bounds current + staged + retired memory under repeated
+        // load/flush requests without blocking a Tokio worker thread.
+        let reclaim_permit = match self.cache_reclaimer.reserve().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                warn!("Cache reclaimer reservation failed: {}", err);
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cache_reclaimer_unavailable",
+                    "cache reclaimer unavailable",
                 );
-                if stats.total_removed() > 0 {
+            }
+        };
+
+        // Acquire the destructive-mutation gate before the staged cache exists.
+        // Use an owned guard so the guard can move into spawn_blocking together
+        // with the reclaim permit. Once the blocking transaction starts there
+        // is no async cancellation point between building the staged
+        // cache and committing it, so a cancelled handler cannot drop a
+        // large staged map on a Tokio worker while waiting for this
+        // mutex.
+        let mutation_guard = self.mutation_gate.clone().lock_owned().await;
+
+        let body = request.into_body();
+        let ecs_in_key = self.ecs_in_key;
+        let cache_size = self.cache_size;
+        let policy = self.policy;
+        let cache_map = self.cache_map.clone();
+        let cache_reclaimer = self.cache_reclaimer.clone();
+        let updated_keys = self.updated_keys.clone();
+        let dirty_since_ms = self.dirty_since_ms.clone();
+        let dirty_generation = self.dirty_generation.clone();
+
+        // Keep both the mutation guard and reclaim permit owned by the blocking
+        // transaction for its entire lifetime. If the async request is
+        // cancelled, an already-started spawn_blocking task continues
+        // to completion while retaining both: no second destructive
+        // mutation can interleave and no second large staged generation
+        // can bypass the memory backpressure.
+        let result = tokio::task::spawn_blocking(move || {
+            let _mutation_guard = mutation_guard;
+
+            let (staged_cache, loaded_entries) = stage_cache_from_bytes(
+                &body,
+                ecs_in_key,
+                policy,
+                Cache::initial_cache_capacity(cache_size),
+            )?;
+            let (expired_removed, evicted, after_len) = staged_cache.prune(
+                TtlCachePruneMode::Exact {
+                    max_size: cache_size,
+                },
+                AppClock::elapsed_millis(),
+            );
+
+            // Commit while still inside the blocking transaction. The staged
+            // cache never crosses back to the async worker, and there is no
+            // await/cancellation point between staging and this atomic swap.
+            let retired = cache_map.swap_retired(&staged_cache);
+            let had_entries = retired.entry_count();
+            let total_removed = expired_removed.saturating_add(evicted);
+            // A replacement load clears all previous entries, inserts the
+            // prepared entries and can then prune some of those inserts. Count
+            // all of those mutations instead of only the surviving inserts.
+            let changed = (had_entries as u64)
+                .saturating_add(loaded_entries as u64)
+                .saturating_add(total_removed as u64);
+            mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, changed);
+
+            // Transfer ownership of the old generation before leaving the
+            // blocking transaction. Its final destruction is handled by the
+            // dedicated reclaimer after pre-swap readers are gone.
+            cache_reclaimer.submit(retired, reclaim_permit);
+
+            Ok::<_, crate::infra::error::DnsError>((
+                loaded_entries,
+                expired_removed,
+                evicted,
+                after_len,
+            ))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((loaded_entries, expired_removed, evicted, after_len))) => {
+                let total_removed = expired_removed.saturating_add(evicted);
+                if total_removed > 0 {
+                    let before_len = after_len.saturating_add(total_removed);
                     info!(
-                        expired_removed = stats.expired_removed,
-                        evicted = stats.evicted,
-                        before = stats.before_len,
-                        after = stats.after_len,
+                        expired_removed = expired_removed,
+                        evicted = evicted,
+                        before = before_len,
+                        after = after_len,
                         "cache dump load pruned entries"
                     );
                 }
@@ -165,12 +376,20 @@ impl ApiHandler for CacheLoadDumpHandler {
                     },
                 )
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 warn!("Failed to load cache dump via API: {}", err);
                 json_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_cache_dump",
                     "failed to load cache dump",
+                )
+            }
+            Err(err) => {
+                warn!("Cache load worker failed: {}", err);
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cache_worker_failed",
+                    "cache load worker failed",
                 )
             }
         }
@@ -185,6 +404,10 @@ struct CacheEntriesListHandler {
 #[derive(Debug)]
 struct CacheEntryDeleteHandler {
     cache_map: CacheMap,
+    updated_keys: Arc<AtomicU64>,
+    dirty_since_ms: Arc<AtomicU64>,
+    dirty_generation: Arc<AtomicU64>,
+    mutation_gate: Arc<Mutex<()>>,
     path_prefix: String,
 }
 
@@ -269,61 +492,158 @@ struct CacheEntryEcsRow {
     network_hex: String,
 }
 
+struct CacheEntryPageCandidate {
+    key: CacheKey,
+    entry: crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>,
+}
+
+impl PartialEq for CacheEntryPageCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_cache_keys(&self.key, &other.key) == Ordering::Equal
+    }
+}
+
+impl Eq for CacheEntryPageCandidate {}
+
+impl PartialOrd for CacheEntryPageCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CacheEntryPageCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_cache_keys(&self.key, &other.key)
+    }
+}
+
 #[async_trait]
 impl ApiHandler for CacheEntriesListHandler {
     async fn handle(&self, request: Request<Bytes>) -> crate::api::ApiResponse {
         let query = match parse_cache_entries_query(request.uri().query()) {
             Ok(query) => query,
-            Err(err) => return json_error(StatusCode::BAD_REQUEST, "invalid_query", err),
+
+            Err(err) => {
+                return json_error(StatusCode::BAD_REQUEST, "invalid_query", err);
+            }
         };
+
         let now = AppClock::elapsed_millis();
         let now_unix_ms = AppClock::now_timestamp();
-        let mut entries = self
-            .cache_map
-            .iter_entries_cloned()
-            .into_iter()
-            .filter(|(_, entry)| entry.expire_at_ms > now)
-            .filter(|(key, _)| cache_entry_matches_query(key, &query))
-            .collect::<Vec<_>>();
-        entries.sort_by(|(left_key, left_entry), (right_key, right_entry)| {
-            right_entry
-                .last_access_ms
-                .cmp(&left_entry.last_access_ms)
-                .then_with(|| left_key.domain.cmp(&right_key.domain))
-                .then_with(|| {
-                    u16::from(left_key.record_type).cmp(&u16::from(right_key.record_type))
+        let cache_map = self.cache_map.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            // Keep only the smallest `limit + 1` keys after the cursor. This
+            // preserves stable keyset pagination without cloning/sorting the
+            // whole cache or retaining every cached response Arc.
+            let candidate_limit = query.limit.saturating_add(1);
+            let mut candidates = BinaryHeap::with_capacity(candidate_limit);
+            let mut total_entries = 0usize;
+
+            cache_map.visit_entries(|key, entry| {
+                if entry.expire_at_ms <= now || !cache_entry_matches_query(key, &query) {
+                    return true;
+                }
+
+                total_entries = total_entries.saturating_add(1);
+
+                if query
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cmp_cache_keys(key, cursor) != Ordering::Greater)
+                {
+                    return true;
+                }
+
+                let should_keep = candidates.len() < candidate_limit
+                    || candidates
+                        .peek()
+                        .is_some_and(|largest: &CacheEntryPageCandidate| {
+                            cmp_cache_keys(key, &largest.key) == Ordering::Less
+                        });
+
+                if should_keep {
+                    if candidates.len() == candidate_limit {
+                        candidates.pop();
+                    }
+                    candidates.push(CacheEntryPageCandidate {
+                        key: key.clone(),
+                        entry: entry.clone(),
+                    });
+                }
+
+                true
+            });
+
+            let mut entries = candidates.into_vec();
+            entries.sort_unstable_by(|left, right| cmp_cache_keys(&left.key, &right.key));
+
+            let has_more = entries.len() > query.limit;
+            if has_more {
+                entries.truncate(query.limit);
+            }
+
+            // Cursor identifies the last key in this page rather than an
+            // offset into a mutable collection.
+            let next_cursor = if has_more {
+                match entries
+                    .last()
+                    .map(|candidate| encode_cache_entry_id(&candidate.key))
+                {
+                    Some(Ok(cursor)) => Some(cursor),
+                    Some(Err(err)) => {
+                        warn!("Failed to encode cache entries cursor: {}", err);
+
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "cache_cursor_encode_failed",
+                            "failed to encode cache entries cursor",
+                        );
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let rows = entries
+                .iter()
+                .filter_map(|candidate| {
+                    cache_entry_row(&candidate.key, &candidate.entry, now, now_unix_ms).ok()
                 })
-                .then_with(|| u16::from(left_key.dns_class).cmp(&u16::from(right_key.dns_class)))
-        });
+                .collect::<Vec<_>>();
 
-        let total_entries = entries.len();
-        let start = query.cursor.min(total_entries);
-        let end = start.saturating_add(query.limit).min(total_entries);
-        let next_cursor = if end < total_entries {
-            Some(end.to_string())
-        } else {
-            None
-        };
-        let rows = entries[start..end]
-            .iter()
-            .filter_map(|(key, entry)| cache_entry_row(key, entry, now, now_unix_ms).ok())
-            .collect::<Vec<_>>();
+            json_ok(
+                StatusCode::OK,
+                &CacheEntriesResponse {
+                    ok: true,
+                    entries: rows,
+                    next_cursor,
+                    total_entries,
+                },
+            )
+        })
+        .await
+        {
+            Ok(response) => response,
 
-        json_ok(
-            StatusCode::OK,
-            &CacheEntriesResponse {
-                ok: true,
-                entries: rows,
-                next_cursor,
-                total_entries,
-            },
-        )
+            Err(err) => {
+                warn!("Cache entries list worker failed: {}", err);
+
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cache_worker_failed",
+                    "cache entries list failed",
+                )
+            }
+        }
     }
 }
 
 #[async_trait]
 impl ApiHandler for CacheEntryDeleteHandler {
     async fn handle(&self, request: Request<Bytes>) -> crate::api::ApiResponse {
+        let _mutation_guard = self.mutation_gate.lock().await;
         let Some(raw_id) = request.uri().path().strip_prefix(self.path_prefix.as_str()) else {
             return simple_response(StatusCode::NOT_FOUND, Bytes::from("404 Not Found"));
         };
@@ -347,6 +667,12 @@ impl ApiHandler for CacheEntryDeleteHandler {
                 "cache entry does not exist",
             );
         }
+        mark_dirty(
+            &self.updated_keys,
+            &self.dirty_since_ms,
+            &self.dirty_generation,
+            1,
+        );
         json_ok(
             StatusCode::OK,
             &CacheEntryDeleteResponse {
@@ -360,7 +686,10 @@ impl ApiHandler for CacheEntryDeleteHandler {
 #[derive(Debug, Clone)]
 struct CacheEntriesQuery {
     limit: usize,
-    cursor: usize,
+
+    /// Opaque keyset cursor. It is the immutable CacheKey of the last entry
+    /// returned by the previous page.
+    cursor: Option<CacheKey>,
     qname: Option<String>,
 }
 
@@ -368,8 +697,9 @@ fn parse_cache_entries_query(
     query: Option<&str>,
 ) -> std::result::Result<CacheEntriesQuery, String> {
     let mut limit = 100usize;
-    let mut cursor = 0usize;
+    let mut cursor = None;
     let mut qname = None;
+
     visit_query_params(query, |key, value| {
         match key {
             "limit" => {
@@ -377,18 +707,26 @@ fn parse_cache_entries_query(
                     parse_usize_param(value, |_| "limit must be a positive integer".to_string())?
                         .clamp(1, 500);
             }
+
             "cursor" => {
-                cursor = parse_usize_param(value, |_| {
-                    "cursor must be a non-negative integer".to_string()
-                })?;
+                cursor = optional_text(value)
+                    .map(|raw| {
+                        decode_cache_entry_id(raw.as_str())
+                            .map_err(|err| format!("invalid cursor: {err}"))
+                    })
+                    .transpose()?;
             }
+
             "qname" => {
                 qname = optional_text(value).map(|value| normalize_domain_key(value.as_str()));
             }
+
             _ => {}
         }
+
         Ok(())
     })?;
+
     Ok(CacheEntriesQuery {
         limit,
         cursor,
@@ -396,11 +734,63 @@ fn parse_cache_entries_query(
     })
 }
 
+#[inline]
+fn cmp_cache_keys(left: &CacheKey, right: &CacheKey) -> Ordering {
+    left.domain
+        .as_ref()
+        .cmp(right.domain.as_ref())
+        .then_with(|| u16::from(left.record_type).cmp(&u16::from(right.record_type)))
+        .then_with(|| u16::from(left.dns_class).cmp(&u16::from(right.dns_class)))
+        .then_with(|| left.do_bit.cmp(&right.do_bit))
+        .then_with(|| left.cd_bit.cmp(&right.cd_bit))
+        .then_with(|| {
+            match (&left.ecs_scope, &right.ecs_scope) {
+                (None, None) => Ordering::Equal,
+
+                // Non-ECS variant sorts before ECS variants.
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+
+                (Some(left_ecs), Some(right_ecs)) => left_ecs
+                    .family
+                    .cmp(&right_ecs.family)
+                    .then_with(|| left_ecs.source_prefix.cmp(&right_ecs.source_prefix))
+                    .then_with(|| left_ecs.scope_prefix.cmp(&right_ecs.scope_prefix))
+                    .then_with(|| left_ecs.network_len.cmp(&right_ecs.network_len))
+                    .then_with(|| left_ecs.network.cmp(&right_ecs.network)),
+            }
+        })
+}
+
+#[cfg(test)]
+fn cache_entries_cursor_start<T>(entries: &[(CacheKey, T)], cursor: Option<&CacheKey>) -> usize {
+    let Some(cursor) = cursor else {
+        return 0;
+    };
+
+    match entries.binary_search_by(|(key, _)| cmp_cache_keys(key, cursor)) {
+        Ok(index) => index.saturating_add(1),
+        Err(index) => index,
+    }
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn cache_entry_matches_query(key: &CacheKey, query: &CacheEntriesQuery) -> bool {
     query
         .qname
         .as_deref()
-        .is_none_or(|qname| key.domain.to_ascii_lowercase().contains(qname))
+        .is_none_or(|qname| contains_ascii_case_insensitive(key.domain.as_ref(), qname))
 }
 
 fn cache_entry_row(
@@ -412,9 +802,28 @@ fn cache_entry_row(
     let item = entry.value.as_ref();
     let fresh = now < item.fresh_until_ms;
     let stale = !fresh && now < entry.expire_at_ms;
+    let ecs_scope = match key.ecs_scope.as_ref() {
+        Some(ecs) => {
+            let network_len = usize::from(ecs.network_len);
+            if network_len > ecs.network.len() {
+                return Err("cache entry contains invalid ECS network length".to_string());
+            }
+            Some(CacheEntryEcsRow {
+                family: ecs.family,
+                source_prefix: ecs.source_prefix,
+                scope_prefix: ecs.scope_prefix,
+                network_hex: ecs.network[..network_len]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            })
+        }
+        None => None,
+    };
+
     Ok(CacheEntryRow {
         id: encode_cache_entry_id(key)?,
-        domain: key.domain.clone(),
+        domain: key.domain.to_string(),
         record_type: key.record_type.to_string(),
         dns_class: key.dns_class.to_string(),
         rcode: item.resp.rcode().to_string(),
@@ -452,15 +861,7 @@ fn cache_entry_row(
             .iter()
             .map(cache_record_json)
             .collect(),
-        ecs_scope: key.ecs_scope.as_ref().map(|ecs| CacheEntryEcsRow {
-            family: ecs.family,
-            source_prefix: ecs.source_prefix,
-            scope_prefix: ecs.scope_prefix,
-            network_hex: ecs.network[..usize::from(ecs.network_len)]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        }),
+        ecs_scope,
     })
 }
 
@@ -503,7 +904,7 @@ fn record_type_name(record_type: RecordType) -> String {
 
 fn encode_cache_entry_id(key: &CacheKey) -> std::result::Result<String, String> {
     let id = CacheEntryId {
-        domain: key.domain.clone(),
+        domain: key.domain.to_string(),
         record_type: u16::from(key.record_type),
         dns_class: u16::from(key.dns_class),
         do_bit: key.do_bit,
@@ -527,32 +928,55 @@ fn decode_cache_entry_id(raw: &str) -> std::result::Result<CacheKey, String> {
         .map_err(|_| "cache entry id is not valid base64url".to_string())?;
     let id: CacheEntryId = serde_json::from_slice(&bytes)
         .map_err(|_| "cache entry id is not valid json".to_string())?;
-    if id.domain.trim().is_empty() {
+
+    let domain = normalize_domain_key(&id.domain);
+    if domain.is_empty() {
         return Err("cache entry id domain is empty".to_string());
     }
+
+    let ecs_scope = match id.ecs_scope {
+        Some(ecs) => {
+            let network_len = usize::from(ecs.network_len);
+            if network_len > ecs.network.len() {
+                return Err("cache entry id has invalid ECS network length".to_string());
+            }
+            canonical_ecs_key_digest(
+                ecs.family,
+                ecs.source_prefix,
+                ecs.scope_prefix,
+                &ecs.network[..network_len],
+            )
+            .ok_or_else(|| "cache entry id has noncanonical ECS metadata".to_string())
+            .map(Some)?
+        }
+        None => None,
+    };
+
     Ok(CacheKey {
-        domain: id.domain,
+        domain: domain.into(),
         record_type: id.record_type.into(),
         dns_class: id.dns_class.into(),
         do_bit: id.do_bit,
         cd_bit: id.cd_bit,
-        ecs_scope: id.ecs_scope.map(|ecs| EcsScopeDigest {
-            family: ecs.family,
-            source_prefix: ecs.source_prefix,
-            scope_prefix: ecs.scope_prefix,
-            network_len: ecs.network_len,
-            network: ecs.network,
-        }),
+        ecs_scope,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::Mutex;
+
     use super::*;
+
+    fn test_cache_reclaimer() -> CacheReclaimer {
+        CacheReclaimer::new("api-test").expect("cache reclaimer should start")
+    }
 
     fn test_cache_key(domain: &str) -> CacheKey {
         CacheKey {
-            domain: domain.to_string(),
+            domain: domain.into(),
             record_type: RecordType::A,
             dns_class: DNSClass::IN,
             do_bit: false,
@@ -562,27 +986,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_cache_entries_query_accepts_qname_filter() {
-        let query = parse_cache_entries_query(Some("limit=20&cursor=5&qname=%20EXAMPLE.COM.%20"))
-            .expect("query should parse");
+    fn parse_cache_entries_query_accepts_keyset_cursor_and_qname_filter() {
+        let cursor_key = test_cache_key("cursor.example.com");
+
+        let encoded_cursor = encode_cache_entry_id(&cursor_key).expect("cursor should encode");
+
+        let raw_query = format!("limit=20&cursor={encoded_cursor}&qname=%20EXAMPLE.COM.%20");
+
+        let query = parse_cache_entries_query(Some(&raw_query)).expect("query should parse");
 
         assert_eq!(query.limit, 20);
-        assert_eq!(query.cursor, 5);
+
+        assert_eq!(query.cursor.as_ref(), Some(&cursor_key));
+
         assert_eq!(query.qname.as_deref(), Some("example.com"));
-    }
-
-    #[test]
-    fn parse_cache_entries_query_ignores_empty_qname_filter() {
-        let query = parse_cache_entries_query(Some("qname=%20%20")).expect("query should parse");
-
-        assert_eq!(query.qname, None);
     }
 
     #[test]
     fn cache_entry_matches_query_filters_qname_case_insensitively() {
         let query = CacheEntriesQuery {
             limit: 100,
-            cursor: 0,
+            cursor: None,
             qname: Some("example.com".to_string()),
         };
 
@@ -594,5 +1018,234 @@ mod tests {
             &test_cache_key("www.example.net"),
             &query
         ));
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_avoids_case_sensitive_qname_regression() {
+        assert!(contains_ascii_case_insensitive(
+            "WWW.Example.COM",
+            "example.com"
+        ));
+        assert!(!contains_ascii_case_insensitive(
+            "www.example.net",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn decode_cache_entry_id_rejects_oversized_ecs_network_len() {
+        let id = CacheEntryId {
+            domain: "example.com".to_string(),
+            record_type: u16::from(RecordType::A),
+            dns_class: u16::from(DNSClass::IN),
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: Some(CacheEntryEcsId {
+                family: 2,
+                source_prefix: 56,
+                scope_prefix: 64,
+                network_len: 17,
+                network: [0; 16],
+            }),
+        };
+        let raw = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id).unwrap());
+        assert!(decode_cache_entry_id(&raw).is_err());
+    }
+
+    #[test]
+    fn decode_cache_entry_id_rejects_noncanonical_ecs_metadata() {
+        let mut id = CacheEntryId {
+            domain: "example.com".to_string(),
+            record_type: u16::from(RecordType::A),
+            dns_class: u16::from(DNSClass::IN),
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: Some(CacheEntryEcsId {
+                family: 1,
+                source_prefix: 20,
+                scope_prefix: 20,
+                network_len: 3,
+                network: [192, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }),
+        };
+
+        id.ecs_scope.as_mut().unwrap().network[2] = 0x21;
+        let raw = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id).unwrap());
+        assert!(decode_cache_entry_id(&raw).is_err());
+
+        id.ecs_scope.as_mut().unwrap().network[2] = 0;
+        id.ecs_scope.as_mut().unwrap().scope_prefix = 16;
+        let raw = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id).unwrap());
+        assert!(decode_cache_entry_id(&raw).is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_reclaimer_reservation_applies_async_backpressure() {
+        let reclaimer = test_cache_reclaimer();
+        let first = reclaimer
+            .reserve()
+            .await
+            .expect("first reclaim permit should be available");
+
+        let waiter = tokio::spawn({
+            let reclaimer = reclaimer.clone();
+            async move { reclaimer.reserve().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("second reservation should wake after permit release")
+            .expect("reservation task should not fail")
+            .expect("cache reclaimer should remain available");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn invalid_load_dump_returns_bad_request() {
+        let cache_map = CacheMap::with_capacity(1);
+        let handler = CacheLoadDumpHandler {
+            cache_map,
+            ecs_in_key: false,
+            cache_size: 1,
+            policy: CacheLoadPolicy::default(),
+            cache_reclaimer: test_cache_reclaimer(),
+            updated_keys: Arc::new(AtomicU64::new(0)),
+            dirty_since_ms: Arc::new(AtomicU64::new(0)),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
+            mutation_gate: Arc::new(Mutex::new(())),
+        };
+
+        let response = handler
+            .handle(Request::new(Bytes::from_static(b"not a cache dump")))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cache_mutation_handlers_serialize_load_and_flush() {
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(1);
+        let mutation_gate = Arc::new(Mutex::new(()));
+        let updated_keys = Arc::new(AtomicU64::new(0));
+        let dirty_since_ms = Arc::new(AtomicU64::new(0));
+        let dirty_generation = Arc::new(AtomicU64::new(0));
+        let reclaimer = test_cache_reclaimer();
+        let flush = Arc::new(CacheFlushHandler {
+            cache_map: cache_map.clone(),
+            cache_size: 1,
+            cache_reclaimer: reclaimer.clone(),
+            updated_keys: updated_keys.clone(),
+            dirty_since_ms: dirty_since_ms.clone(),
+            dirty_generation: dirty_generation.clone(),
+            mutation_gate: mutation_gate.clone(),
+        });
+        let load = Arc::new(CacheLoadDumpHandler {
+            cache_map: cache_map.clone(),
+            ecs_in_key: false,
+            cache_size: 1,
+            policy: CacheLoadPolicy::default(),
+            cache_reclaimer: reclaimer,
+            updated_keys,
+            dirty_since_ms,
+            dirty_generation,
+            mutation_gate: mutation_gate.clone(),
+        });
+        let dump = dump_cache_to_bytes(&cache_map).expect("empty dump should serialize");
+
+        let gate_guard = mutation_gate.lock().await;
+        let load_task = tokio::spawn({
+            let load = load.clone();
+            async move { load.handle(Request::new(Bytes::from(dump))).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!load_task.is_finished());
+        drop(gate_guard);
+        let _ = tokio::time::timeout(Duration::from_secs(1), load_task)
+            .await
+            .expect("load should run after the mutation gate is released");
+
+        let gate_guard = mutation_gate.lock().await;
+        let flush_task =
+            tokio::spawn(async move { flush.handle(Request::new(Bytes::new())).await });
+        tokio::task::yield_now().await;
+        assert!(!flush_task.is_finished());
+        drop(gate_guard);
+        let _ = tokio::time::timeout(Duration::from_secs(1), flush_task)
+            .await
+            .expect("flush should run after the mutation gate is released");
+    }
+
+    #[test]
+    fn parse_cache_entries_query_rejects_invalid_cursor() {
+        let result = parse_cache_entries_query(Some("limit=20&cursor=not-a-valid-cursor"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cache_entries_keyset_pagination_is_independent_of_last_access() {
+        let key_a = test_cache_key("a.example.com");
+        let key_b = test_cache_key("b.example.com");
+        let key_c = test_cache_key("c.example.com");
+        let key_d = test_cache_key("d.example.com");
+
+        let mut entries = vec![
+            (key_a.clone(), 400u64),
+            (key_b.clone(), 300u64),
+            (key_c.clone(), 200u64),
+            (key_d.clone(), 100u64),
+        ];
+
+        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
+
+        let page1 = &entries[..2];
+
+        assert_eq!(page1[0].0, key_a);
+        assert_eq!(page1[1].0, key_b);
+
+        let cursor = key_b.clone();
+
+        //  D is heavily accessed between page requests.
+        //
+        //  Under the old last_access ordering this would move D to the front
+        // and  shift the offset, causing duplicates/missing rows.
+        for (key, last_access) in &mut entries {
+            if *key == key_d {
+                *last_access = 10_000;
+            }
+        }
+
+        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
+
+        let start = cache_entries_cursor_start(&entries, Some(&cursor));
+
+        assert_eq!(start, 2);
+
+        assert_eq!(entries[start].0, key_c);
+        assert_eq!(entries[start + 1].0, key_d);
+    }
+
+    #[test]
+    fn cache_entries_keyset_cursor_survives_deleted_boundary_key() {
+        let key_a = test_cache_key("a.example.com");
+        let key_b = test_cache_key("b.example.com");
+        let key_c = test_cache_key("c.example.com");
+        let key_d = test_cache_key("d.example.com");
+
+        // Previous page ended at B, but B disappeared before the next request.
+        let cursor = key_b;
+
+        let mut entries = vec![(key_a, ()), (key_c.clone(), ()), (key_d.clone(), ())];
+
+        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
+
+        let start = cache_entries_cursor_start(&entries, Some(&cursor));
+
+        assert_eq!(start, 1);
+        assert_eq!(entries[start].0, key_c);
+        assert_eq!(entries[start + 1].0, key_d);
     }
 }
