@@ -195,7 +195,7 @@ impl ApiHandler for CacheDumpHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
         let cache_map = self.cache_map.clone();
         match tokio::task::spawn_blocking(move || {
-            dump_cache_to_bytes_with_limit(&cache_map, MAX_CACHE_DUMP_BODY)
+            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(&cache_map, MAX_CACHE_DUMP_BODY)
         })
         .await
         {
@@ -337,14 +337,12 @@ impl ApiHandler for CacheLoadDumpHandler {
             // await/cancellation point between staging and this atomic swap.
             let retired = cache_map.swap_retired(&staged_cache);
             let had_entries = retired.entry_count();
-
             // Dirty accounting describes changes published to the live cache,
             // not transient work performed while building the isolated staged
             // generation. Entries inserted into the staged cache and pruned
             // before this swap were never visible, so count only the observed
             // retired entries plus the entries that actually became live.
             let changed = (had_entries as u64).saturating_add(after_len as u64);
-
             mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, changed);
 
             // Transfer ownership of the old generation before leaving the

@@ -158,17 +158,21 @@ fn serialized_size_to_usize(size: u64) -> Result<usize> {
         .map_err(|_| DnsError::Runtime("cache dump serialized size exceeds usize".to_string()))
 }
 
-fn persisted_dump_serialized_size(dump: &PersistedCacheDump) -> Result<usize> {
+fn persisted_dump_serialized_size<const PREALLOCATION_LIMIT: usize>(
+    dump: &PersistedCacheDump,
+) -> Result<usize> {
     serialized_size_to_usize(wincode::config::serialized_size(
         dump,
-        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        cache_wincode_config::<PREALLOCATION_LIMIT>(),
     )?)
 }
 
-fn persisted_entry_serialized_size(entry: &PersistedCacheEntry) -> Result<usize> {
+fn persisted_entry_serialized_size<const PREALLOCATION_LIMIT: usize>(
+    entry: &PersistedCacheEntry,
+) -> Result<usize> {
     serialized_size_to_usize(wincode::config::serialized_size(
         entry,
-        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        cache_wincode_config::<PREALLOCATION_LIMIT>(),
     )?)
 }
 
@@ -264,7 +268,11 @@ fn prepare_persisted_entry(
     })
 }
 
-pub(super) fn dump_cache_to_bytes_with_limit(
+/// Serialize a cache dump under both a wire-size limit and the wincode
+/// preallocation budget that the corresponding reader will use. Keeping the
+/// writer and reader on the same `PREALLOCATION_LIMIT` prevents the API from
+/// emitting a dump that its own bounded loader would reject.
+pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
     cache_map: &CacheMap,
     max_bytes: usize,
 ) -> Result<CacheDumpOutcome> {
@@ -282,7 +290,7 @@ pub(super) fn dump_cache_to_bytes_with_limit(
         dumped_at_unix_ms,
         entries: Vec::new(),
     };
-    let mut encoded_size = persisted_dump_serialized_size(&empty_dump)?;
+    let mut encoded_size = persisted_dump_serialized_size::<PREALLOCATION_LIMIT>(&empty_dump)?;
     if encoded_size > max_bytes {
         return Ok(CacheDumpOutcome::TooLarge {
             limit: max_bytes,
@@ -303,7 +311,7 @@ pub(super) fn dump_cache_to_bytes_with_limit(
                 continue;
             };
 
-            let entry_size = match persisted_entry_serialized_size(&entry) {
+            let entry_size = match persisted_entry_serialized_size::<PREALLOCATION_LIMIT>(&entry) {
                 Ok(size) => size,
                 Err(err) => {
                     build_error = Some(err);
@@ -343,7 +351,7 @@ pub(super) fn dump_cache_to_bytes_with_limit(
     // Defensive exact check before allocating the final byte buffer. This is
     // linear in the retained entries but allocates nothing proportional to the
     // encoded output and protects us if wincode's length encoding changes.
-    let exact_size = persisted_dump_serialized_size(&dump)?;
+    let exact_size = persisted_dump_serialized_size::<PREALLOCATION_LIMIT>(&dump)?;
     if exact_size > max_bytes {
         return Ok(CacheDumpOutcome::TooLarge {
             limit: max_bytes,
@@ -351,16 +359,16 @@ pub(super) fn dump_cache_to_bytes_with_limit(
         });
     }
 
-    let encoded = wincode::config::serialize(
-        &dump,
-        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
-    )?;
+    let encoded = wincode::config::serialize(&dump, cache_wincode_config::<PREALLOCATION_LIMIT>())?;
     debug_assert_eq!(encoded.len(), exact_size);
     Ok(CacheDumpOutcome::Complete(encoded))
 }
 
 pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
-    match dump_cache_to_bytes_with_limit(cache_map, MAX_PERSISTED_CACHE_DUMP_BYTES)? {
+    match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        cache_map,
+        MAX_PERSISTED_CACHE_DUMP_BYTES,
+    )? {
         CacheDumpOutcome::Complete(bytes) => Ok(bytes),
         CacheDumpOutcome::TooLarge {
             limit,
@@ -800,6 +808,78 @@ mod tests {
         assert!(bytes.len() < API_BUDGET);
         assert!(parse_persisted_dump_with_limit::<FOUR_MIB>(&bytes).is_err());
         assert!(parse_persisted_dump_with_limit::<API_BUDGET>(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_dump_and_load_use_the_same_preallocation_budget() {
+        const TEST_BUDGET: usize = 64 * 1024;
+        const ENTRY_COUNT: usize = 128;
+
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(256);
+        let now = AppClock::elapsed_millis();
+
+        for index in 0..ENTRY_COUNT {
+            let domain = Arc::<str>::from(format!("n{index}.example.com"));
+            let mut response = Message::new();
+            response.set_rcode(crate::proto::Rcode::NoError);
+            response.add_question(Question::new(
+                Name::from_ascii(domain.as_ref()).expect("test domain should parse"),
+                RecordType::A,
+                DNSClass::IN,
+            ));
+            response.add_answer(Record::from_rdata(
+                Name::from_ascii(domain.as_ref()).expect("test domain should parse"),
+                120,
+                RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                    192,
+                    0,
+                    2,
+                    ((index % 250) + 1) as u8,
+                ))),
+            ));
+
+            cache_map.insert_if_not_newer(
+                CacheKey {
+                    domain,
+                    record_type: RecordType::A,
+                    dns_class: DNSClass::IN,
+                    do_bit: false,
+                    cd_bit: false,
+                    ecs_scope: None,
+                },
+                Arc::new(CacheItem::new_validated(
+                    response,
+                    120,
+                    now.saturating_add(120_000),
+                )),
+                now,
+                now.saturating_add(120_000),
+                now,
+            );
+        }
+
+        let bytes = match dump_cache_to_bytes_with_limit::<TEST_BUDGET>(&cache_map, TEST_BUDGET)
+            .expect("bounded dump should succeed")
+        {
+            CacheDumpOutcome::Complete(bytes) => bytes,
+            CacheDumpOutcome::TooLarge { .. } => panic!("test dump should fit its budget"),
+        };
+
+        let restored = CacheMap::with_capacity(256);
+        let hints = EcsPrefixHints::new();
+        let loaded = load_cache_from_bytes_with_hints::<TEST_BUDGET>(
+            &restored,
+            &bytes,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+            &hints,
+        )
+        .expect("a dump emitted with a budget must load with the same budget");
+
+        assert_eq!(loaded, ENTRY_COUNT);
+        assert_eq!(restored.len(), ENTRY_COUNT);
     }
 
     fn cname_only_response_bytes() -> Vec<u8> {
@@ -1528,15 +1608,21 @@ mod tests {
         let full = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
         let exact_limit = full.len();
 
-        match dump_cache_to_bytes_with_limit(&cache_map, exact_limit)
-            .expect("exact-limit dump should succeed")
+        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            exact_limit,
+        )
+        .expect("exact-limit dump should succeed")
         {
             CacheDumpOutcome::Complete(bytes) => assert_eq!(bytes.len(), exact_limit),
             CacheDumpOutcome::TooLarge { .. } => panic!("exact limit must be accepted"),
         }
 
-        match dump_cache_to_bytes_with_limit(&cache_map, exact_limit - 1)
-            .expect("bounded dump should report size overflow")
+        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            exact_limit - 1,
+        )
+        .expect("bounded dump should report size overflow")
         {
             CacheDumpOutcome::Complete(_) => panic!("one-byte-short limit must be rejected"),
             CacheDumpOutcome::TooLarge {
