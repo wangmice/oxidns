@@ -12,10 +12,13 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use fast_socks5::client::{Config, Socks5Stream};
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{AuthenticationMethod, Socks5Command};
+use futures::task::AtomicWaker;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,7 @@ pub(crate) struct Socks5UdpAssociation {
     socket: UdpSocket,
     control_closed: CancellationToken,
     control_shutdown: CancellationToken,
+    control_recv_waker: Arc<AtomicWaker>,
 }
 
 impl Socks5UdpAssociation {
@@ -78,16 +82,19 @@ impl Socks5UdpAssociation {
 
         let control_closed = CancellationToken::new();
         let control_shutdown = CancellationToken::new();
+        let control_recv_waker = Arc::new(AtomicWaker::new());
         tokio::spawn(monitor_control_channel(
             control,
             control_closed.clone(),
             control_shutdown.clone(),
+            control_recv_waker.clone(),
         ));
 
         Ok(Self {
             socket: udp_socket,
             control_closed,
             control_shutdown,
+            control_recv_waker,
         })
     }
 
@@ -108,6 +115,20 @@ impl Socks5UdpAssociation {
     #[inline]
     pub(crate) fn is_control_closed(&self) -> bool {
         self.control_closed.is_cancelled()
+    }
+
+    #[inline]
+    pub(crate) fn check_control_open(&self) -> io::Result<()> {
+        self.ensure_control_open()
+    }
+
+    pub(crate) fn poll_control_closed_recv(&self, cx: &mut Context<'_>) -> Poll<()> {
+        poll_control_closed(&self.control_closed, &self.control_recv_waker, cx)
+    }
+
+    #[inline]
+    pub(crate) fn control_closed_token(&self) -> CancellationToken {
+        self.control_closed.clone()
     }
 
     pub(crate) async fn send_to(&self, data: &[u8], target: &TargetAddr) -> io::Result<usize> {
@@ -180,6 +201,7 @@ async fn monitor_control_channel(
     mut control: Socks5Stream<TcpStream>,
     control_closed: CancellationToken,
     shutdown: CancellationToken,
+    control_recv_waker: Arc<AtomicWaker>,
 ) {
     let mut byte = [0u8; 1];
     tokio::select! {
@@ -188,14 +210,36 @@ async fn monitor_control_channel(
         _ = control.read(&mut byte) => {
             // A UDP ASSOCIATE control connection is a lifetime signal after the
             // handshake. EOF, a read error, or unexpected data all invalidate
-            // the association.
+            // the association. The cancellation token wakes every Quinn
+            // writable poller; the explicit waker covers the socket-level
+            // receive poll.
             control_closed.cancel();
+            control_recv_waker.wake();
         }
     }
 }
 
+fn poll_control_closed(
+    control_closed: &CancellationToken,
+    waker: &AtomicWaker,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    if control_closed.is_cancelled() {
+        return Poll::Ready(());
+    }
+
+    // Register before the second state check so a control-channel close cannot
+    // land between the check and waiter registration and get lost.
+    waker.register(cx.waker());
+    if control_closed.is_cancelled() {
+        Poll::Ready(())
+    } else {
+        Poll::Pending
+    }
+}
+
 #[inline]
-fn control_closed_error() -> io::Error {
+pub(crate) fn control_closed_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "SOCKS5 UDP control connection closed",

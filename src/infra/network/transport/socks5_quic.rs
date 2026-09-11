@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -12,13 +13,14 @@ use fast_socks5::util::target_addr::TargetAddr;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::io::ReadBuf;
+use tokio_util::sync::WaitForCancellationFutureOwned;
 
 use crate::infra::error::Result;
 use crate::infra::network::dial::{DialTarget, SocketOptions};
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::socks5_udp::{
-    SOCKS5_UDP_HEADER_MAX_SIZE, Socks5UdpAssociation, parse_socks5_udp_packet,
-    response_source_matches, write_socks5_udp_header,
+    SOCKS5_UDP_HEADER_MAX_SIZE, Socks5UdpAssociation, control_closed_error,
+    parse_socks5_udp_packet, response_source_matches, write_socks5_udp_header,
 };
 
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
@@ -62,7 +64,11 @@ impl Socks5QuicSocket {
 
 impl AsyncUdpSocket for Socks5QuicSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(Socks5QuicPoller { socket: self })
+        let control_closed = self.association.control_closed_token().cancelled_owned();
+        Box::pin(Socks5QuicPoller {
+            socket: self,
+            control_closed,
+        })
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
@@ -78,6 +84,8 @@ impl AsyncUdpSocket for Socks5QuicSocket {
                 "QUIC transmit destination does not match SOCKS5 upstream",
             ));
         }
+        self.association.check_control_open()?;
+
         let mut header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
         let header_len = write_socks5_udp_header(&mut header, &self.target)?;
 
@@ -113,6 +121,10 @@ impl AsyncUdpSocket for Socks5QuicSocket {
                 "QUIC receive metadata is empty",
             )));
         };
+        if self.association.poll_control_closed_recv(cx).is_ready() {
+            return Poll::Ready(Err(control_closed_error()));
+        }
+
         RECV_BUF.with(|raw| {
             let Ok(mut raw) = raw.try_borrow_mut() else {
                 return Poll::Ready(Err(io::Error::other(
@@ -132,6 +144,9 @@ impl AsyncUdpSocket for Socks5QuicSocket {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Ready(Ok(())) => {
+                        if self.association.is_control_closed() {
+                            return Poll::Ready(Err(control_closed_error()));
+                        }
                         let packet = read_buf.filled();
                         let Ok((source, payload_offset)) = parse_socks5_udp_packet(packet) else {
                             continue;
@@ -183,11 +198,21 @@ impl AsyncUdpSocket for Socks5QuicSocket {
 #[derive(Debug)]
 struct Socks5QuicPoller {
     socket: Arc<Socks5QuicSocket>,
+    control_closed: WaitForCancellationFutureOwned,
 }
 
 impl UdpPoller for Socks5QuicPoller {
-    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.socket.association.get_ref().poll_send_ready(cx)
+    fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if Pin::new(&mut self.control_closed).poll(cx).is_ready() {
+            return Poll::Ready(Err(control_closed_error()));
+        }
+
+        match self.socket.association.get_ref().poll_send_ready(cx) {
+            Poll::Ready(Ok(())) if self.socket.association.is_control_closed() => {
+                Poll::Ready(Err(control_closed_error()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -208,12 +233,14 @@ fn send_complete(socket: &Socks5QuicSocket, buf: &[u8]) -> io::Result<()> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::pin::Pin;
+    use std::time::Duration;
 
     use futures::future::poll_fn;
     use quinn::udp::Transmit;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::infra::network::proxy::Socks5Opt;
@@ -636,6 +663,109 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
 
         let _ = close_proxy.send(());
+        proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_close_wakes_pending_quic_io() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (close_proxy, close_proxy_rx) = oneshot::channel();
+
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut associate = [0u8; 10];
+            stream.read_exact(&mut associate).await.unwrap();
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+            let mut response = vec![0x05, 0x00, 0x00, 0x01];
+            response.extend_from_slice(&match relay_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => unreachable!("relay is IPv4"),
+            });
+            response.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&response).await.unwrap();
+
+            let _ = close_proxy_rx.await;
+            // Dropping the control stream invalidates the UDP association.
+        });
+
+        let upstream = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 853);
+        let (socket, peer_addr) = Socks5QuicSocket::connect(
+            DialTarget::new(Some(upstream.ip()), "dns.google".to_string(), 853),
+            SocketOptions::default(),
+            Socks5Opt {
+                username: None,
+                password: None,
+                socket_addr: proxy_addr,
+            },
+        )
+        .await
+        .unwrap();
+
+        let recv_socket = socket.clone();
+        let (poll_started, poll_started_rx) = oneshot::channel();
+        let recv_task = tokio::spawn(async move {
+            let mut output = [0u8; 64];
+            let mut meta = [RecvMeta {
+                addr: peer_addr,
+                len: 0,
+                stride: 0,
+                ecn: None,
+                dst_ip: None,
+            }];
+            let mut poll_started = Some(poll_started);
+
+            poll_fn(|cx| {
+                let mut bufs = [IoSliceMut::new(&mut output)];
+                let poll = Pin::new(&recv_socket).poll_recv(cx, &mut bufs, &mut meta);
+                if poll.is_pending() {
+                    if let Some(started) = poll_started.take() {
+                        let _ = started.send(());
+                    }
+                }
+                poll
+            })
+            .await
+        });
+
+        poll_started_rx
+            .await
+            .expect("QUIC receive should register before control close");
+        close_proxy
+            .send(())
+            .expect("proxy close signal should be delivered");
+
+        let recv_err = timeout(Duration::from_secs(1), recv_task)
+            .await
+            .expect("control close should wake pending QUIC receive")
+            .expect("receive task should not panic")
+            .expect_err("closed SOCKS5 control channel should fail receive");
+        assert_eq!(recv_err.kind(), io::ErrorKind::ConnectionAborted);
+
+        let send_err = socket
+            .try_send(&Transmit {
+                destination: peer_addr,
+                contents: b"after-close",
+                segment_size: None,
+                src_ip: None,
+                ecn: None,
+            })
+            .expect_err("closed control channel should reject QUIC sends");
+        assert_eq!(send_err.kind(), io::ErrorKind::ConnectionAborted);
+
+        let mut poller = socket.clone().create_io_poller();
+        let writable_err = poll_fn(|cx| poller.as_mut().poll_writable(cx))
+            .await
+            .expect_err("closed control channel should fail writable polling");
+        assert_eq!(writable_err.kind(), io::ErrorKind::ConnectionAborted);
+
         proxy.await.unwrap();
     }
 
