@@ -87,12 +87,33 @@ impl DialTarget {
         self.port
     }
 
-    fn socket_addr(&self) -> Result<SocketAddr> {
-        let ip = match self.remote_ip {
-            Some(ip) => ip,
-            None => try_lookup_server_name(&self.host)?,
-        };
-        Ok(SocketAddr::new(ip, self.port))
+    async fn socket_addr_async(&self) -> Result<SocketAddr> {
+        if let Some(ip) = self.remote_ip {
+            return Ok(SocketAddr::new(ip, self.port));
+        }
+
+        let mut addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| {
+                DnsError::protocol(format!(
+                    "System DNS resolution failed for '{}': {}",
+                    self.host, e
+                ))
+            })?;
+        let addr = addrs.next().ok_or_else(|| {
+            DnsError::protocol(format!(
+                "System DNS returned no addresses for '{}'",
+                self.host
+            ))
+        })?;
+
+        info!(
+            server_name = %self.host,
+            resolved_ip = %addr.ip(),
+            ip_version = if addr.is_ipv4() { "IPv4" } else { "IPv6" },
+            "Resolved hostname using async system DNS"
+        );
+        Ok(addr)
     }
 
     #[cfg(any(
@@ -368,10 +389,11 @@ async fn connect_quic_endpoint(
 /// - `Err(DnsError)` if resolution fails or returns no results
 ///
 /// # Notes
-/// - This is used at connection time when no literal IP, `dial_addr`, or
-///   bootstrap-resolved address is available
+/// - This is used by synchronous configuration/probe paths that explicitly need
+///   the system resolver
 /// - For dynamic resolution with TTL support, use Bootstrap instead
-/// - Blocks the current task - consider using bootstrap for async resolution
+/// - This function is synchronous; async connection paths use
+///   `tokio::net::lookup_host`
 /// - Returns the first address from the system resolver (maybe IPv4 or IPv6)
 ///
 /// # Platform Behavior
@@ -425,8 +447,8 @@ pub fn try_lookup_server_name(server_name: &str) -> Result<IpAddr> {
 /// - SO_REUSEADDR is enabled to allow rapid reconnection
 /// - connect() is called to set the default destination (allows using send vs
 ///   send_to)
-pub(crate) fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
-    let socket_addr = options.target.socket_addr()?;
+pub(crate) async fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
+    let socket_addr = options.target.socket_addr_async().await?;
     let socket = create_udp_socket(socket_addr, &options.socket)?;
     socket.connect(&socket_addr.into())?;
     Ok(socket.into())
@@ -556,7 +578,7 @@ fn is_connect_in_progress(err: &std::io::Error) -> bool {
 /// TCP_NODELAY keeps small request frames from waiting for more data before
 /// being sent.
 pub(crate) async fn connect_tcp(options: TcpDialOptions) -> Result<TcpStream> {
-    let socket_addr = options.target.socket_addr()?;
+    let socket_addr = options.target.socket_addr_async().await?;
     let socket = create_tcp_socket(socket_addr, &options.socket)?;
     connect_tcp_socket(socket, socket_addr).await
 }
@@ -566,6 +588,18 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use super::*;
+
+    #[tokio::test]
+    async fn dial_target_resolves_hostname_asynchronously() {
+        let target = DialTarget::new(None, "localhost".to_string(), 53);
+        let addr = target
+            .socket_addr_async()
+            .await
+            .expect("localhost should resolve through Tokio");
+
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 53);
+    }
 
     #[test]
     fn bind_udp_creates_bound_socket_with_common_options() {

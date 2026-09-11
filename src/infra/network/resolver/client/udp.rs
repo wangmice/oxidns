@@ -54,7 +54,8 @@ async fn query_udp_config(
     let socket = connect_udp(UdpDialOptions::new(
         config.target(),
         SocketOptions::default(),
-    ))?;
+    ))
+    .await?;
     let socket = UdpSocket::from_std(socket)?;
     let transport = UdpTransport::new(socket);
     let query_id = request.id();

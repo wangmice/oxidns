@@ -339,7 +339,7 @@ mod tests {
         let mut client_builder = h2::client::Builder::new();
         client_builder.initial_window_size(16);
         let (mut sender, connection) = client_builder
-            .handshake(client_io)
+            .handshake::<_, Bytes>(client_io)
             .await
             .expect("client handshake should succeed");
         let client_task = tokio::spawn(async move {
@@ -353,7 +353,7 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("https://dns.example.test/dns-query")
-            .body(Bytes::new())
+            .body(())
             .expect("request should build");
         let (response_future, _send_stream) = sender
             .send_request(request, true)

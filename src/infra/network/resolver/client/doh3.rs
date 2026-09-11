@@ -61,7 +61,8 @@ async fn query_doh3_config(
     let socket = connect_udp(UdpDialOptions::new(
         config.target(),
         SocketOptions::default(),
-    ))?;
+    ))
+    .await?;
     let quic_conn = connect_quic(
         socket,
         QuicDialOptions::new(

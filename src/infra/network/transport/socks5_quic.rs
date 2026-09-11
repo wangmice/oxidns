@@ -64,7 +64,8 @@ impl Socks5QuicSocket {
 
 impl AsyncUdpSocket for Socks5QuicSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        let control_closed = self.association.control_closed_token().cancelled_owned();
+        let control_closed = Box::pin(self.association.control_closed_token().cancelled_owned());
+
         Box::pin(Socks5QuicPoller {
             socket: self,
             control_closed,
@@ -198,12 +199,12 @@ impl AsyncUdpSocket for Socks5QuicSocket {
 #[derive(Debug)]
 struct Socks5QuicPoller {
     socket: Arc<Socks5QuicSocket>,
-    control_closed: WaitForCancellationFutureOwned,
+    control_closed: Pin<Box<WaitForCancellationFutureOwned>>,
 }
 
 impl UdpPoller for Socks5QuicPoller {
     fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if Pin::new(&mut self.control_closed).poll(cx).is_ready() {
+        if self.control_closed.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(control_closed_error()));
         }
 
