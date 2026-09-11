@@ -96,17 +96,19 @@ impl H2Connection {
         )?;
         drop(body_bytes);
 
-        let (response_future, _send_stream) = self
-            .sender
-            .clone()
-            // DoH GET carries the DNS payload in the URI, so the request body is empty.
-            // Mark the stream as finished when sending headers, otherwise some servers
-            // will wait for an end-of-stream signal and never produce a response.
-            .send_request(request, true)
-            .map_err(|e| {
-                self.close();
-                DnsError::protocol(format!("H2 send_request error: {e}"))
-            })?;
+        let mut sender = self.sender.clone().ready().await.map_err(|e| {
+            self.close();
+            DnsError::protocol(format!("H2 sender readiness error: {e}"))
+        })?;
+
+        // DoH GET carries the DNS payload in the URI, so the request body is
+        // empty. Mark the stream as finished when sending headers,
+        // otherwise some servers will wait for an end-of-stream signal
+        // and never produce a response.
+        let (response_future, _send_stream) = sender.send_request(request, true).map_err(|e| {
+            self.close();
+            DnsError::protocol(format!("H2 send_request error: {e}"))
+        })?;
 
         match recv(response_future).await {
             Ok(bytes) => {
