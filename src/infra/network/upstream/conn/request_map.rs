@@ -58,6 +58,8 @@ use crate::proto::{Message, MessageType};
 const ID_SPACE_SIZE: u32 = u16::MAX as u32 + 1;
 const MIN_SLOT_COUNT: usize = 8;
 const SLOT_FACTOR: usize = 4;
+const ID_HASH_DOMAIN: u64 = u64::from_be_bytes(*b"IDPERMUT");
+const ID_PERMUTATION_ROUNDS: usize = 4;
 
 /// Slot has never been used or has been fully reset.
 const STATE_EMPTY: u32 = 0;
@@ -156,9 +158,10 @@ enum StoreResult {
 pub struct RequestMap {
     slots: Box<[Slot]>,
     mask: usize,
-    next_id: AtomicU16,
+    id_sequence: AtomicU16,
+    id_rounds: [[u8; 256]; ID_PERMUTATION_ROUNDS],
     size: AtomicU16,
-    fingerprint_state: RandomState,
+    hash_state: RandomState,
 }
 
 impl std::fmt::Debug for RequestMap {
@@ -166,7 +169,7 @@ impl std::fmt::Debug for RequestMap {
         f.debug_struct("RequestMap")
             .field("slot_count", &self.slots.len())
             .field("mask", &self.mask)
-            .field("next_id", &self.next_id)
+            .field("id_sequence", &self.id_sequence)
             .field("size", &self.size)
             .finish_non_exhaustive()
     }
@@ -185,12 +188,21 @@ impl RequestMap {
         for _ in 0..slot_count {
             slots.push(Slot::empty());
         }
+        let hash_state = RandomState::new();
+        let mut id_rounds = [[0u8; 256]; ID_PERMUTATION_ROUNDS];
+        for (round, table) in id_rounds.iter_mut().enumerate() {
+            for half in u8::MIN..=u8::MAX {
+                table[usize::from(half)] = hash_state.hash_one((ID_HASH_DOMAIN, round, half)) as u8;
+            }
+        }
+
         Self {
             slots: slots.into_boxed_slice(),
             mask: slot_count - 1,
-            next_id: AtomicU16::new(0),
+            id_sequence: AtomicU16::new(0),
+            id_rounds,
             size: AtomicU16::new(0),
-            fingerprint_state: RandomState::new(),
+            hash_state,
         }
     }
 
@@ -220,11 +232,10 @@ impl RequestMap {
 
     #[inline(always)]
     fn store_inner(&self, tx: Sender<Message>, fingerprint: u64) -> Result<RequestGuard<'_>> {
-        let start = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut tx = Some(tx);
 
-        for offset in 0..ID_SPACE_SIZE {
-            let id = start.wrapping_add(offset as u16);
+        for _ in 0..ID_SPACE_SIZE {
+            let id = self.next_start_id();
             match self.try_store_candidate(id, fingerprint, &mut tx) {
                 StoreResult::Stored(id) => {
                     return Ok(RequestGuard {
@@ -348,12 +359,7 @@ impl RequestMap {
                     // We can stop probing at the first EMPTY slot. If we saw an
                     // earlier TOMBSTONE, reuse it; otherwise insert here.
                     let target = tombstone.unwrap_or(idx);
-                    return if self.claim_slot(
-                        target,
-                        id,
-                        fingerprint,
-                        tx.take().expect("sender present"),
-                    ) {
+                    return if self.claim_slot(target, id, fingerprint, tx) {
                         StoreResult::Stored(id)
                     } else {
                         StoreResult::Retry
@@ -377,7 +383,7 @@ impl RequestMap {
         }
 
         if let Some(target) = tombstone {
-            if self.claim_slot(target, id, fingerprint, tx.take().expect("sender present")) {
+            if self.claim_slot(target, id, fingerprint, tx) {
                 StoreResult::Stored(id)
             } else {
                 StoreResult::Retry
@@ -388,7 +394,13 @@ impl RequestMap {
     }
 
     #[inline(always)]
-    fn claim_slot(&self, idx: usize, id: u16, fingerprint: u64, tx: Sender<Message>) -> bool {
+    fn claim_slot(
+        &self,
+        idx: usize,
+        id: u16,
+        fingerprint: u64,
+        tx: &mut Option<Sender<Message>>,
+    ) -> bool {
         let slot = &self.slots[idx];
 
         loop {
@@ -411,6 +423,7 @@ impl RequestMap {
                         continue;
                     }
 
+                    let tx = tx.take().expect("sender present after slot claim");
                     unsafe {
                         (*slot.sender.get()).write(tx);
                     }
@@ -544,8 +557,30 @@ impl RequestMap {
     }
 
     #[inline(always)]
+    fn next_start_id(&self) -> u16 {
+        let sequence = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        self.permute_id(sequence)
+    }
+
+    /// Map the sequential allocation counter onto a keyed permutation of the
+    /// entire 16-bit DNS transaction-ID space. Unlike truncating a wider hash,
+    /// this cannot repeat an ID within one complete 65536-allocation cycle.
+    #[inline(always)]
+    fn permute_id(&self, input: u16) -> u16 {
+        let mut left = (input >> 8) as u8;
+        let mut right = input as u8;
+
+        for table in &self.id_rounds {
+            let mixed = table[usize::from(right)];
+            (left, right) = (right, left ^ mixed);
+        }
+
+        (u16::from(left) << 8) | u16::from(right)
+    }
+
+    #[inline(always)]
     fn fingerprint(&self, message: &Message) -> u64 {
-        let mut hasher = self.fingerprint_state.build_hasher();
+        let mut hasher = self.hash_state.build_hasher();
         message.opcode().hash(&mut hasher);
         message.questions().len().hash(&mut hasher);
         for question in message.questions() {
@@ -776,9 +811,39 @@ mod tests {
     }
 
     #[test]
-    fn test_wraparound_ids_remain_reusable() {
+    fn test_failed_slot_claim_preserves_sender_for_retry() {
+        let map = RequestMap::with_capacity(1);
+        let (first_tx, _first_rx) = oneshot::channel::<Message>();
+        let mut first_tx = Some(first_tx);
+        assert!(map.claim_slot(0, 1, 0, &mut first_tx));
+        assert!(first_tx.is_none());
+
+        let (retry_tx, _retry_rx) = oneshot::channel::<Message>();
+        let mut retry_tx = Some(retry_tx);
+        assert!(!map.claim_slot(0, 2, 0, &mut retry_tx));
+        assert!(retry_tx.is_some(), "failed claim must preserve sender");
+
+        assert_eq!(map.clear(), 1);
+    }
+
+    #[test]
+    fn test_id_permutation_covers_full_space_without_reuse() {
         let map = RequestMap::with_capacity(8);
-        map.next_id.store(u16::MAX - 1, Ordering::Relaxed);
+        let mut seen = vec![false; ID_SPACE_SIZE as usize];
+
+        for input in 0..=u16::MAX {
+            let id = map.permute_id(input);
+            assert!(!seen[usize::from(id)], "duplicate permuted DNS ID: {id}");
+            seen[usize::from(id)] = true;
+        }
+
+        assert!(seen.into_iter().all(|used| used));
+    }
+
+    #[test]
+    fn test_id_sequence_wraparound_remains_usable() {
+        let map = RequestMap::with_capacity(8);
+        map.id_sequence.store(u16::MAX - 1, Ordering::Relaxed);
 
         let (tx1, _rx1) = oneshot::channel();
         let mut first = map.store(tx1).expect("store should succeed");
@@ -787,9 +852,10 @@ mod tests {
         let (tx3, _rx3) = oneshot::channel();
         let mut third = map.store(tx3).expect("store should succeed");
 
-        assert_eq!(first.query_id(), u16::MAX - 1);
-        assert_eq!(second.query_id(), u16::MAX);
-        assert_eq!(third.query_id(), 0);
+        assert_eq!(map.id_sequence.load(Ordering::Relaxed), 1);
+        assert_ne!(first.query_id(), second.query_id());
+        assert_ne!(first.query_id(), third.query_id());
+        assert_ne!(second.query_id(), third.query_id());
         assert!(first.remove());
         assert!(second.remove());
         assert!(third.remove());
