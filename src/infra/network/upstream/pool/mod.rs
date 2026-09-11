@@ -81,7 +81,7 @@ pub trait Connection: Send + Sized + Debug + Sync + 'static {
     /// Get the number of queries currently in flight on this connection
     ///
     /// Used by pipeline pools to balance load across connections
-    fn using_count(&self) -> u16;
+    fn using_count(&self) -> u32;
 
     /// Check if the connection is available for use
     ///

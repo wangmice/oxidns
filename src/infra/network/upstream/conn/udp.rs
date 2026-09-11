@@ -171,8 +171,8 @@ impl Connection for UdpConnection {
 
     /// Return the number of active queries currently tracked by this
     /// connection.
-    fn using_count(&self) -> u16 {
-        self.request_map.size()
+    fn using_count(&self) -> u32 {
+        u32::from(self.request_map.size())
     }
 
     /// Check if the UDP connection is available for new queries

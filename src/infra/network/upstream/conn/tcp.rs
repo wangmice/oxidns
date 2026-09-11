@@ -166,8 +166,8 @@ impl Connection for TcpConnection {
         }
     }
 
-    fn using_count(&self) -> u16 {
-        self.request_map.size()
+    fn using_count(&self) -> u32 {
+        u32::from(self.request_map.size())
     }
 
     fn available(&self) -> bool {

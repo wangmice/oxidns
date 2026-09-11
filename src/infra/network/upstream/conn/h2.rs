@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
@@ -36,7 +36,7 @@ enum H2RecvError {
 pub struct H2Connection {
     id: u16,
     sender: SendRequest<Bytes>,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
@@ -67,7 +67,7 @@ impl Connection for H2Connection {
         self.query_inner(request).await
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -201,7 +201,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             sender,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });

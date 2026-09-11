@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
@@ -41,7 +41,7 @@ enum H3RecvError {
 pub struct H3Connection {
     id: u16,
     sender: SendRequest<OpenStreams, Bytes>,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
@@ -77,7 +77,7 @@ impl Connection for H3Connection {
         self.query_inner(request).await
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -216,7 +216,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             sender: send_request,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });
