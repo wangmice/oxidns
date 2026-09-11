@@ -81,6 +81,15 @@ impl UdpTransport {
         }
     }
 
+    /// Completes when an underlying SOCKS5 UDP control connection dies. Direct
+    /// UDP has no persistent control channel and therefore never resolves here.
+    pub(crate) async fn control_closed(&self) {
+        match &self.socket {
+            UdpTransportSocket::Direct(_) => std::future::pending::<()>().await,
+            UdpTransportSocket::Socks5 { association, .. } => association.control_closed().await,
+        }
+    }
+
     /// Receive one UDP datagram and decode it as a DNS message.
     /// Blocks until a datagram arrives or the socket errors.
     #[inline]

@@ -233,6 +233,16 @@ impl UdpConnection {
             }
 
             select! {
+                biased;
+                _ = self.transport.control_closed(), if !closing => {
+                    warn!(
+                        conn_id = self.id,
+                        "SOCKS5 UDP control connection closed; retiring UDP connection"
+                    );
+                    self.close();
+                    closing = true;
+                    continue;
+                }
                 recv = self.transport.read_message(&mut buf) => {
                     match recv {
                         Ok(msg) => {
@@ -448,5 +458,63 @@ mod tests {
         relay_task.await.unwrap();
         let _ = close_proxy.send(());
         proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_control_close_marks_udp_connection_unavailable() {
+        AppClock::start();
+        let relay = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("UDP relay should bind");
+        let relay_addr = relay.local_addr().expect("relay should have an address");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("SOCKS5 listener should bind");
+        let proxy_addr = listener.local_addr().expect("proxy should have an address");
+
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut associate = [0u8; 10];
+            stream.read_exact(&mut associate).await.unwrap();
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+            let mut response = vec![0x05, 0x00, 0x00, 0x01];
+            response.extend_from_slice(&match relay_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => unreachable!("relay is IPv4"),
+            });
+            response.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&response).await.unwrap();
+            // Dropping the TCP stream invalidates the UDP association per RFC
+            // 1928.
+        });
+
+        let mut info = ConnectionInfo::with_addr("udp://8.8.8.8:53").unwrap();
+        info.socks5 = Some(Socks5Opt {
+            username: None,
+            password: None,
+            socket_addr: proxy_addr,
+        });
+        let builder = UdpConnectionBuilder::new(&info, DEFAULT_REQUEST_MAP_CAPACITY);
+        let connection = builder
+            .create_connection(2, QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("SOCKS5 UDP connection should be created");
+
+        proxy.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while connection.available() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control-channel close should retire the UDP connection promptly");
+
+        assert!(!connection.available());
     }
 }
