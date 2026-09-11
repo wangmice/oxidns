@@ -3,7 +3,7 @@
 
 //! Protocol-specific upstream connection implementations.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(feature = "upstream-doq", feature = "upstream-doh3"))]
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ pub(crate) use udp::{UdpConnection, UdpConnectionBuilder};
 /// cancelled by an outer timeout, preventing the pool from permanently
 /// deadlocking due to a leaked counter.
 #[allow(dead_code)]
-pub(crate) struct UsingCountGuard<'a>(pub(crate) &'a AtomicU16);
+pub(crate) struct UsingCountGuard<'a>(pub(crate) &'a AtomicU32);
 
 impl Drop for UsingCountGuard<'_> {
     fn drop(&mut self) {
@@ -49,4 +49,22 @@ pub(crate) fn quic_idle_timeout(query_timeout: Duration) -> Duration {
     // the QUIC driver eventually closes and the upstream pool can replace the
     // dead connection instead of reusing it indefinitely.
     query_timeout.checked_mul(3).unwrap_or(Duration::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn using_count_guard_does_not_wrap_at_u16_boundary() {
+        let count = AtomicU32::new(u32::from(u16::MAX));
+        count.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(count.load(Ordering::Relaxed), u32::from(u16::MAX) + 1);
+
+        {
+            let _guard = UsingCountGuard(&count);
+        }
+
+        assert_eq!(count.load(Ordering::Relaxed), u32::from(u16::MAX));
+    }
 }

@@ -67,8 +67,11 @@ where
         msg.append_to(&mut self.write_buf)?;
 
         let body_len = self.write_buf.len() - 2;
+        let body_len = u16::try_from(body_len).map_err(|_| {
+            DnsError::protocol("DNS message exceeds the 65535-byte TCP framing limit")
+        })?;
 
-        self.write_buf[..2].copy_from_slice(&(body_len as u16).to_be_bytes());
+        self.write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
 
         self.writer
             .write_all(&self.write_buf)
@@ -87,10 +90,11 @@ where
             .map_err(|e| DnsError::protocol(format!("Failed to serialize DNS message: {}", e)))?;
 
         let body_len = self.write_buf.len() - 2;
+        let body_len = u16::try_from(body_len).map_err(|_| {
+            DnsError::protocol("DNS message exceeds the 65535-byte TCP framing limit")
+        })?;
 
-        debug_assert!(body_len < u16::MAX as usize);
-
-        self.write_buf[..2].copy_from_slice(&(body_len as u16).to_be_bytes());
+        self.write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
 
         self.writer
             .write_all(&self.write_buf)

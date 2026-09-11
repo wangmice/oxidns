@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::select;
@@ -17,16 +17,52 @@ use crate::infra::network::dial::{
     connect_quic_abstract, connect_udp,
 };
 use crate::infra::network::proxy::Socks5Opt;
-use crate::infra::network::transport::quic::QuicTransport;
+use crate::infra::network::transport::quic::{
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter,
+};
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::pool::{ConnectionBuilder, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
+const DOQ_NO_ERROR: u32 = 0x0;
+const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
+
+struct DoqQueryStream {
+    reader: QuicTransportReader,
+    writer: QuicTransportWriter,
+    send_finished: bool,
+    completed: bool,
+}
+
+impl DoqQueryStream {
+    fn new(reader: QuicTransportReader, writer: QuicTransportWriter) -> Self {
+        Self {
+            reader,
+            writer,
+            send_finished: false,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for DoqQueryStream {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if !self.send_finished {
+            self.writer.reset(DOQ_REQUEST_CANCELLED);
+        }
+        self.reader.stop(DOQ_REQUEST_CANCELLED);
+    }
+}
+
 pub struct QuicConnection {
     id: u16,
     transport: QuicTransport,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     close_notify: Notify,
@@ -38,6 +74,17 @@ impl Debug for QuicConnection {
     }
 }
 
+impl QuicConnection {
+    fn close_with_code(&self, code: u32, reason: &[u8]) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.transport.close_with_code(code, reason);
+        self.close_notify.notify_waiters();
+        true
+    }
+}
+
 #[async_trait]
 impl Connection for QuicConnection {
     /// Gracefully close the QUIC connection
@@ -45,17 +92,12 @@ impl Connection for QuicConnection {
     /// Sends QUIC CONNECTION_CLOSE frame to peer and notifies background tasks.
     /// This is idempotent - multiple calls are safe.
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return; // Already closed
+        if self.close_with_code(DOQ_NO_ERROR, b"closing") {
+            debug!(
+                conn_id = self.id,
+                "Closing QUIC connection, sending CONNECTION_CLOSE frame"
+            );
         }
-        debug!(
-            conn_id = self.id,
-            "Closing QUIC connection, sending CONNECTION_CLOSE frame"
-        );
-        // Gracefully close the underlying QUIC connection with error code 0 (no
-        // error)
-        self.transport.close(b"closing");
-        self.close_notify.notify_waiters();
     }
 
     /// Send a DNS query over QUIC (DoQ - DNS over QUIC, RFC 9250)
@@ -89,7 +131,7 @@ impl Connection for QuicConnection {
 
         // Open a new bidirectional stream (reader/writer) via connection
         // wrapper
-        let (mut reader, mut writer) = match self.transport.open_bi().await {
+        let (reader, writer) = match self.transport.open_bi().await {
             Ok((reader, writer)) => (reader, writer),
             Err(e) => {
                 self.close();
@@ -99,16 +141,17 @@ impl Connection for QuicConnection {
                 )));
             }
         };
+        let mut stream = DoqQueryStream::new(reader, writer);
 
         let raw_id = request.id();
-        if let Err(e) = writer.write_message(&request).await {
+        if let Err(e) = stream.writer.write_message(&request).await {
             self.close();
             return Err(DnsError::protocol(format!(
                 "Failed to write DNS query to QUIC stream: {}",
                 e
             )));
         }
-        if let Err(e) = writer.finish() {
+        if let Err(e) = stream.writer.finish() {
             self.close();
             warn!(
                 conn_id = self.id,
@@ -120,9 +163,11 @@ impl Connection for QuicConnection {
                 e
             )));
         }
+        stream.send_finished = true;
 
-        match reader.read_message().await {
+        match stream.reader.read_message_doq().await {
             Ok(mut resp) => {
+                stream.completed = true;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
@@ -133,23 +178,51 @@ impl Connection for QuicConnection {
                 );
                 Ok(resp)
             }
-            Err(e) => {
+            Err(QuicReadError::StreamReset(code)) => {
+                warn!(
+                    conn_id = self.id,
+                    query_id = raw_id,
+                    %code,
+                    "DoQ transaction reset by server"
+                );
+                Err(DnsError::protocol(format!(
+                    "DoQ transaction reset by server with code {code}"
+                )))
+            }
+            Err(QuicReadError::Protocol(message)) => {
+                self.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
+                warn!(
+                    conn_id = self.id,
+                    query_id = raw_id,
+                    error = %message,
+                    "Fatal DoQ protocol error"
+                );
+                Err(DnsError::protocol(message))
+            }
+            Err(QuicReadError::ConnectionLost(e)) => {
                 self.close();
                 warn!(
                     conn_id = self.id,
                     query_id = raw_id,
                     error = ?e,
-                    "Failed to read DNS response from QUIC stream"
+                    "QUIC connection lost while reading DoQ response"
                 );
-                Err(DnsError::protocol(format!(
-                    "Failed to read QUIC DNS response: {}",
-                    e
-                )))
+                Err(DnsError::protocol(format!("QUIC connection lost: {e}")))
+            }
+            Err(QuicReadError::Stream(message)) => {
+                self.close();
+                warn!(
+                    conn_id = self.id,
+                    query_id = raw_id,
+                    error = %message,
+                    "Unexpected DoQ stream read error"
+                );
+                Err(DnsError::protocol(message))
             }
         }
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -246,7 +319,7 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
             transport: QuicTransport::new(quic_conn),
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             close_notify: Notify::new(),
         });
 

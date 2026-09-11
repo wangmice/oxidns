@@ -504,7 +504,7 @@ impl<C: Connection> Drop for ReusePool<C> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
     use super::*;
     use crate::infra::error::{DnsError, Result};
@@ -513,7 +513,7 @@ mod tests {
     #[derive(Debug)]
     struct MockConnection {
         available: AtomicBool,
-        using_count: AtomicU16,
+        using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
         query_calls: AtomicUsize,
@@ -521,10 +521,10 @@ mod tests {
     }
 
     impl MockConnection {
-        fn new(available: bool, using_count: u16, last_used: u64) -> Self {
+        fn new(available: bool, using_count: u32, last_used: u64) -> Self {
             Self {
                 available: AtomicBool::new(available),
-                using_count: AtomicU16::new(using_count),
+                using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
                 query_calls: AtomicUsize::new(0),
@@ -561,7 +561,7 @@ mod tests {
             Ok(request)
         }
 
-        fn using_count(&self) -> u16 {
+        fn using_count(&self) -> u32 {
             self.using_count.load(Ordering::Relaxed)
         }
 

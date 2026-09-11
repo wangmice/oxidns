@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
@@ -19,7 +19,8 @@ use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::upstream::conn::doh::{
-    build_dns_get_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
+    get_cap_buf_with_context_len,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -28,13 +29,14 @@ use crate::proto::Message;
 enum H2RecvError {
     Transport(DnsError),
     HttpStatus(DnsError),
+    InvalidResponse(DnsError),
 }
 
 #[derive(Debug)]
 pub struct H2Connection {
     id: u16,
     sender: SendRequest<Bytes>,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
@@ -65,7 +67,7 @@ impl Connection for H2Connection {
         self.query_inner(request).await
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -85,10 +87,11 @@ impl H2Connection {
         request.append_to_with_id(0, &mut body_bytes)?;
 
         let request = build_dns_get_request(
-            self.request_uri.clone(),
+            self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_2,
         );
+        drop(body_bytes);
 
         let (response_future, _send_stream) = self
             .sender
@@ -116,7 +119,7 @@ impl H2Connection {
                 warn!(conn_id = self.id, raw_id, ?e, "H2 request error");
                 Err(e)
             }
-            Err(H2RecvError::HttpStatus(e)) => Err(e),
+            Err(H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
         }
     }
 }
@@ -198,7 +201,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             sender,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });
@@ -224,26 +227,44 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 }
 
 async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2RecvError> {
-    let mut response = response_future.await.map_err(|e| {
+    let response = response_future.await.map_err(|e| {
         H2RecvError::Transport(DnsError::protocol(format!("H2 response error: {}", e)))
     })?;
 
     let status_code = response.status();
-    let mut response_bytes = get_cap_buf_with_context_len(&mut response);
+    let body_limit = if status_code.is_success() {
+        MAX_DOH_DNS_BODY_SIZE
+    } else {
+        MAX_DOH_ERROR_BODY_SIZE
+    };
+    let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
     let mut body = response.into_body();
+    let mut truncated = false;
 
     while let Some(partial_bytes) = body.data().await {
         let partial_bytes = partial_bytes.map_err(|e| {
             H2RecvError::Transport(DnsError::protocol(format!("H2 body error: {}", e)))
         })?;
+        let remaining = body_limit.saturating_sub(response_bytes.len());
+        if partial_bytes.len() > remaining {
+            if status_code.is_success() {
+                return Err(H2RecvError::InvalidResponse(DnsError::protocol(
+                    "DoH response body exceeds the 65535-byte DNS message limit",
+                )));
+            }
+            response_bytes.put_slice(&partial_bytes[..remaining]);
+            truncated = true;
+            break;
+        }
         response_bytes.put_slice(&partial_bytes);
     }
 
     if !status_code.is_success() {
         let error_string = String::from_utf8_lossy(response_bytes.as_ref());
+        let suffix = if truncated { " (truncated)" } else { "" };
         Err(H2RecvError::HttpStatus(DnsError::protocol(format!(
-            "http unsuccessful code: {}, message: {}",
-            status_code, error_string
+            "http unsuccessful code: {}, message: {}{}",
+            status_code, error_string, suffix
         ))))
     } else {
         Ok(response_bytes.freeze())

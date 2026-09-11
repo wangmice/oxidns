@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use futures::future::poll_fn;
 use h3::client::{RequestStream, SendRequest};
 use h3_quinn::{BidiStream, OpenStreams};
@@ -25,7 +25,8 @@ use crate::infra::network::dial::{
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
-    build_dns_get_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
+    get_cap_buf_with_context_len,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -34,12 +35,13 @@ use crate::proto::Message;
 enum H3RecvError {
     Transport(DnsError),
     HttpStatus(DnsError),
+    InvalidResponse(DnsError),
 }
 
 pub struct H3Connection {
     id: u16,
     sender: SendRequest<OpenStreams, Bytes>,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
@@ -58,7 +60,7 @@ impl Connection for H3Connection {
             return;
         }
         debug!(conn_id = self.id, "Closing H3 connection");
-        self.close_notify.notify_waiters();
+        self.close_notify.notify_one();
     }
 
     async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
@@ -75,7 +77,7 @@ impl Connection for H3Connection {
         self.query_inner(request).await
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -95,10 +97,11 @@ impl H3Connection {
         request.append_to_with_id(0, &mut body_bytes)?;
 
         let http_request = build_dns_get_request(
-            self.request_uri.clone(),
+            self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_3,
         );
+        drop(body_bytes);
 
         self.do_request(http_request, raw_id).await
     }
@@ -133,7 +136,7 @@ impl H3Connection {
                 warn!(conn_id = self.id, raw_id, ?e, "H3 request error");
                 Err(e)
             }
-            Err(H3RecvError::HttpStatus(e)) => Err(e),
+            Err(H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
         }
     }
 }
@@ -213,7 +216,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             sender: send_request,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });
@@ -223,14 +226,17 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         let _driver_handle = tokio::spawn(async move {
             select! {
                 _ = poll_fn(|cx| driver.poll_close(cx)) => {
-                    _conn.close();
+                    _conn.closed.store(true, Ordering::Release);
                     debug!(conn_id, "H3 connection poll closed");
                 }
-                _ = _conn.close_notify.notified()=>{
-                    debug!(conn_id, "H3 connection closed by notify");
+                _ = _conn.close_notify.notified() => {
+                    debug!(conn_id, "H3 connection shutdown requested");
+                    if let Err(e) = driver.shutdown(0).await {
+                        warn!(conn_id, error = ?e, "H3 graceful shutdown failed");
+                    }
+                    let _ = poll_fn(|cx| driver.poll_close(cx)).await;
                 }
             }
-            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         Ok(h3_conn)
@@ -240,26 +246,43 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
 async fn recv(
     mut request_stream: RequestStream<BidiStream<Bytes>, Bytes>,
 ) -> std::result::Result<Bytes, H3RecvError> {
-    let mut response = request_stream.recv_response().await.map_err(|e| {
+    let response = request_stream.recv_response().await.map_err(|e| {
         H3RecvError::Transport(DnsError::protocol(format!("H3 response error: {}", e)))
     })?;
 
-    let mut response_bytes = get_cap_buf_with_context_len(&mut response);
+    let status_code = response.status();
+    let body_limit = if status_code.is_success() {
+        MAX_DOH_DNS_BODY_SIZE
+    } else {
+        MAX_DOH_ERROR_BODY_SIZE
+    };
+    let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
+    let mut truncated = false;
 
     while let Some(partial_bytes) = request_stream.recv_data().await.map_err(|e| {
         H3RecvError::Transport(DnsError::protocol(format!("h3 recv_data error: {e}")))
     })? {
+        let remaining = body_limit.saturating_sub(response_bytes.len());
+        if partial_bytes.remaining() > remaining {
+            if status_code.is_success() {
+                return Err(H3RecvError::InvalidResponse(DnsError::protocol(
+                    "DoH response body exceeds the 65535-byte DNS message limit",
+                )));
+            }
+            response_bytes.put(partial_bytes.take(remaining));
+            truncated = true;
+            break;
+        }
         response_bytes.put(partial_bytes);
     }
 
-    // Was it a successful request?
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         let error_string = String::from_utf8_lossy(response_bytes.as_ref());
+        let suffix = if truncated { " (truncated)" } else { "" };
 
         Err(H3RecvError::HttpStatus(DnsError::protocol(format!(
-            "http unsuccessful code: {}, message: {}",
-            response.status(),
-            error_string
+            "http unsuccessful code: {}, message: {}{}",
+            status_code, error_string, suffix
         ))))
     } else {
         Ok(response_bytes.freeze())

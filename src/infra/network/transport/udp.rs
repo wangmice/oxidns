@@ -5,20 +5,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 
-use fast_socks5::client::Socks5Datagram;
 use fast_socks5::util::target_addr::TargetAddr;
 #[cfg(target_os = "linux")]
 use socket2::SockAddr;
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
-use crate::infra::network::dial::{
-    DialTarget, SocketOptions, TcpDialOptions, bind_udp, connect_tcp as dial_connect_tcp,
-};
+use crate::infra::network::dial::{DialTarget, SocketOptions};
 use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::transport::socks5_udp::{Socks5UdpAssociation, response_source_matches};
 use crate::proto::Message;
 
 /// UDP transport wrapper for DNS messages.
@@ -45,28 +43,9 @@ pub struct ReceivedUdpMessage {
 enum UdpTransportSocket {
     Direct(UdpSocket),
     Socks5 {
-        datagram: Socks5Datagram<TcpStream>,
+        association: Socks5UdpAssociation,
         target: TargetAddr,
     },
-}
-
-fn socks5_response_source_matches(expected: &TargetAddr, received: &TargetAddr) -> bool {
-    match (expected, received) {
-        (TargetAddr::Ip(expected), TargetAddr::Ip(received)) => expected == received,
-        (
-            TargetAddr::Domain(expected_domain, expected_port),
-            TargetAddr::Domain(received_domain, received_port),
-        ) => {
-            expected_port == received_port
-                && expected_domain
-                    .trim_end_matches('.')
-                    .eq_ignore_ascii_case(received_domain.trim_end_matches('.'))
-        }
-        (TargetAddr::Domain(_, expected_port), TargetAddr::Ip(received)) => {
-            *expected_port == received.port()
-        }
-        _ => false,
-    }
 }
 
 impl UdpTransport {
@@ -81,35 +60,17 @@ impl UdpTransport {
         socket_options: SocketOptions,
         socks5: Socks5Opt,
     ) -> Result<Self> {
-        let proxy_target = DialTarget::from_socket_addr(socks5.socket_addr);
-        let proxy_stream = dial_connect_tcp(
-            TcpDialOptions::new(proxy_target).with_socket_options(socket_options.clone()),
-        )
-        .await?;
-        let bind_addr = match socks5.socket_addr {
-            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
-        };
-        let udp_socket = UdpSocket::from_std(bind_udp(bind_addr, &socket_options)?)?;
-        let datagram = match (socks5.username.as_deref(), socks5.password.as_deref()) {
-            (Some(username), Some(password)) => {
-                Socks5Datagram::use_socket_with_password(
-                    proxy_stream,
-                    udp_socket,
-                    username,
-                    password,
-                )
-                .await?
-            }
-            _ => Socks5Datagram::use_socket(proxy_stream, udp_socket).await?,
-        };
+        let association = Socks5UdpAssociation::connect(socket_options, socks5).await?;
         let target = if let Some(remote_ip) = target.remote_ip() {
             TargetAddr::Ip(SocketAddr::new(remote_ip, target.port()))
         } else {
             TargetAddr::Domain(target.host().to_string(), target.port())
         };
         Ok(Self {
-            socket: UdpTransportSocket::Socks5 { datagram, target },
+            socket: UdpTransportSocket::Socks5 {
+                association,
+                target,
+            },
         })
     }
 
@@ -130,12 +91,15 @@ impl UdpTransport {
                 .recv(buf)
                 .await
                 .map_err(|e| DnsError::protocol(format!("UDP recv error: {e}")))?,
-            UdpTransportSocket::Socks5 { datagram, target } => {
-                let (n, source) = datagram
+            UdpTransportSocket::Socks5 {
+                association,
+                target,
+            } => {
+                let (n, source) = association
                     .recv_from(buf)
                     .await
                     .map_err(|e| DnsError::protocol(format!("SOCKS5 UDP recv error: {e}")))?;
-                if !socks5_response_source_matches(target, &source) {
+                if !response_source_matches(target, &source) {
                     return Err(DnsError::protocol(format!(
                         "SOCKS5 UDP response source mismatch: expected {target}, received {source}"
                     )));
@@ -168,7 +132,12 @@ impl UdpTransport {
                 recv_from_pktinfo(socket.as_raw_fd(), buf)
             }) {
                 Ok(result) => break result,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    return Err(DnsError::protocol(format!(
+                        "Failed to recv_from UDP with pktinfo: {e}"
+                    )));
+                }
             }
         };
 
@@ -203,8 +172,11 @@ impl UdpTransport {
                 .send(&bytes)
                 .await
                 .map_err(|e| DnsError::protocol(format!("UDP send error: {e}")))?,
-            UdpTransportSocket::Socks5 { datagram, target } => datagram
-                .send_to(&bytes, target.clone())
+            UdpTransportSocket::Socks5 {
+                association,
+                target,
+            } => association
+                .send_to(&bytes, target)
                 .await
                 .map_err(|e| DnsError::protocol(format!("SOCKS5 UDP send error: {e}")))?,
         };
@@ -278,7 +250,8 @@ impl UdpTransport {
                 )))
             };
         };
-        let n = send_to_with_source(socket.as_raw_fd(), &bytes, to, source)
+        let n = send_to_with_source_async(socket, &bytes, to, source)
+            .await
             .map_err(|e| DnsError::protocol(format!("Failed to send UDP response: {e}")))?;
         if n != bytes.len() {
             return Err(DnsError::protocol(format!(
@@ -371,6 +344,25 @@ fn recv_from_pktinfo(
 }
 
 #[cfg(target_os = "linux")]
+async fn send_to_with_source_async(
+    socket: &UdpSocket,
+    buf: &[u8],
+    to: SocketAddr,
+    source: IpAddr,
+) -> std::io::Result<usize> {
+    loop {
+        socket.writable().await?;
+        match socket.try_io(Interest::WRITABLE, || {
+            send_to_with_source(socket.as_raw_fd(), buf, to, source)
+        }) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn send_to_with_source(
     fd: RawFd,
     buf: &[u8],
@@ -456,16 +448,16 @@ mod tests {
         let wrong_ip = TargetAddr::Ip("1.1.1.1:53".parse().unwrap());
         let wrong_port = TargetAddr::Ip("8.8.8.8:5353".parse().unwrap());
 
-        assert!(socks5_response_source_matches(&expected, &correct));
-        assert!(!socks5_response_source_matches(&expected, &wrong_ip));
-        assert!(!socks5_response_source_matches(&expected, &wrong_port));
+        assert!(response_source_matches(&expected, &correct));
+        assert!(!response_source_matches(&expected, &wrong_ip));
+        assert!(!response_source_matches(&expected, &wrong_port));
 
         let expected_domain = TargetAddr::Domain("dns.example".to_string(), 53);
-        assert!(socks5_response_source_matches(
+        assert!(response_source_matches(
             &expected_domain,
             &TargetAddr::Ip("192.0.2.1:53".parse().unwrap())
         ));
-        assert!(!socks5_response_source_matches(
+        assert!(!response_source_matches(
             &expected_domain,
             &TargetAddr::Ip("192.0.2.1:5353".parse().unwrap())
         ));

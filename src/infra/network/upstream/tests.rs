@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,7 +50,7 @@ impl Upstream for SlowUpstream {
 #[derive(Debug)]
 struct NoopConnection {
     available: AtomicBool,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     last_used: AtomicU64,
 }
 
@@ -64,7 +64,7 @@ impl Connection for NoopConnection {
         Ok(request)
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -89,7 +89,7 @@ impl ConnectionBuilder<NoopConnection> for NoopConnectionBuilder {
     ) -> Result<Arc<NoopConnection>> {
         Ok(Arc::new(NoopConnection {
             available: AtomicBool::new(true),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             last_used: AtomicU64::new(crate::infra::clock::AppClock::elapsed_millis()),
         }))
     }

@@ -6,12 +6,8 @@
 use async_trait::async_trait;
 
 use super::super::endpoint::NameserverConfig;
-#[cfg(feature = "resolver-doq")]
-use super::super::query::validate_response_id;
 use super::{NameserverClient, effective_deadline};
-#[cfg(not(feature = "resolver-doq"))]
-use crate::infra::error::DnsError;
-use crate::infra::error::Result;
+use crate::infra::error::{DnsError, Result};
 #[cfg(feature = "resolver-doq")]
 use crate::infra::network::deadline::DeadlineOutcome;
 use crate::infra::network::deadline::QueryDeadline;
@@ -20,8 +16,48 @@ use crate::infra::network::dial::{
     QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
 };
 #[cfg(feature = "resolver-doq")]
-use crate::infra::network::transport::quic::QuicTransport;
+use crate::infra::network::transport::quic::{
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter,
+};
 use crate::proto::Message;
+
+#[cfg(feature = "resolver-doq")]
+const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+#[cfg(feature = "resolver-doq")]
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
+
+#[cfg(feature = "resolver-doq")]
+struct DoqQueryStream {
+    reader: QuicTransportReader,
+    writer: QuicTransportWriter,
+    send_finished: bool,
+    completed: bool,
+}
+
+#[cfg(feature = "resolver-doq")]
+impl DoqQueryStream {
+    fn new(reader: QuicTransportReader, writer: QuicTransportWriter) -> Self {
+        Self {
+            reader,
+            writer,
+            send_finished: false,
+            completed: false,
+        }
+    }
+}
+
+#[cfg(feature = "resolver-doq")]
+impl Drop for DoqQueryStream {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if !self.send_finished {
+            self.writer.reset(DOQ_REQUEST_CANCELLED);
+        }
+        self.reader.stop(DOQ_REQUEST_CANCELLED);
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct DoqNameserverClient {
@@ -74,21 +110,32 @@ async fn query_doq_config(
     )
     .await?;
     let transport = QuicTransport::new(quic_conn);
-    let (mut reader, mut writer) = match deadline.run(transport.open_bi()).await {
+    let (reader, writer) = match deadline.run(transport.open_bi()).await {
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
+    let mut stream = DoqQueryStream::new(reader, writer);
     let query_id = request.id();
-    match deadline.run(writer.write_message(&request)).await {
+    match deadline.run(stream.writer.write_message(&request)).await {
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     }
-    writer.finish()?;
-    let response = match deadline.run(reader.read_message()).await {
-        DeadlineOutcome::Completed(result) => result?,
+    stream.writer.finish()?;
+    stream.send_finished = true;
+
+    let mut response = match deadline.run(stream.reader.read_message_doq()).await {
+        DeadlineOutcome::Completed(Ok(response)) => response,
+        DeadlineOutcome::Completed(Err(QuicReadError::Protocol(message))) => {
+            transport.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
+            return Err(DnsError::protocol(message));
+        }
+        DeadlineOutcome::Completed(Err(e)) => {
+            return Err(DnsError::protocol(e.to_string()));
+        }
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
-    validate_response_id(&response, query_id)?;
+    stream.completed = true;
+    response.set_id(query_id);
     transport.close(b"resolver query complete");
     Ok(response)
 }
