@@ -58,7 +58,7 @@ impl Connection for H3Connection {
             return;
         }
         debug!(conn_id = self.id, "Closing H3 connection");
-        self.close_notify.notify_waiters();
+        self.close_notify.notify_one();
     }
 
     async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
@@ -223,14 +223,17 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         let _driver_handle = tokio::spawn(async move {
             select! {
                 _ = poll_fn(|cx| driver.poll_close(cx)) => {
-                    _conn.close();
+                    _conn.closed.store(true, Ordering::Release);
                     debug!(conn_id, "H3 connection poll closed");
                 }
-                _ = _conn.close_notify.notified()=>{
-                    debug!(conn_id, "H3 connection closed by notify");
+                _ = _conn.close_notify.notified() => {
+                    debug!(conn_id, "H3 connection shutdown requested");
+                    if let Err(e) = driver.shutdown(0).await {
+                        warn!(conn_id, error = ?e, "H3 graceful shutdown failed");
+                    }
+                    let _ = poll_fn(|cx| driver.poll_close(cx)).await;
                 }
             }
-            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         Ok(h3_conn)

@@ -73,7 +73,7 @@ impl Connection for UdpConnection {
             canceled_queries = cleared,
             "Closing UDP connection and signaling listener task"
         );
-        self.close_notify.notify_waiters();
+        self.close_notify.notify_one();
     }
 
     /// Send a DNS query and wait asynchronously for its response
@@ -227,7 +227,7 @@ impl UdpConnection {
         );
 
         loop {
-            if closing && self.request_map.is_empty() {
+            if (closing || self.closed.load(Ordering::Acquire)) && self.request_map.is_empty() {
                 debug!(conn_id = self.id, "Listener exiting (connection dropped)");
                 break;
             }
