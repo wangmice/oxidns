@@ -93,7 +93,7 @@ impl H2Connection {
             self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_2,
-        );
+        )?;
         drop(body_bytes);
 
         let (response_future, _send_stream) = self
