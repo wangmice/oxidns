@@ -287,8 +287,16 @@ impl RequestMap {
 
     /// Remove and drop every pending sender currently tracked by this map.
     pub fn clear(&self) -> u16 {
+        self.clear_inner(|_| {})
+    }
+
+    #[inline]
+    fn clear_inner<F>(&self, mut after_slot: F) -> u16
+    where
+        F: FnMut(usize),
+    {
         let mut removed = 0u16;
-        for slot in &self.slots {
+        for (idx, slot) in self.slots.iter().enumerate() {
             loop {
                 let meta = slot.meta.load(Ordering::Acquire);
                 match meta_state(meta) {
@@ -322,6 +330,14 @@ impl RequestMap {
                         unsafe {
                             (*slot.sender.get()).assume_init_drop();
                         }
+                        // Every published FULL slot has already incremented
+                        // `size` before becoming observable. Decrement exactly
+                        // the entry we successfully claimed instead of
+                        // resetting the whole counter
+                        // after the scan: a concurrent insert
+                        // into an earlier slot may legitimately survive this
+                        // clear pass.
+                        self.size.fetch_sub(1, Ordering::Relaxed);
                         removed = removed.saturating_add(1);
                         slot.meta.store(META_EMPTY, Ordering::Release);
                         break;
@@ -329,8 +345,8 @@ impl RequestMap {
                     _ => unreachable!("invalid request map slot state"),
                 }
             }
+            after_slot(idx);
         }
-        self.size.store(0, Ordering::Relaxed);
         removed
     }
 
@@ -428,9 +444,14 @@ impl RequestMap {
                         (*slot.sender.get()).write(tx);
                     }
                     slot.fingerprint.store(fingerprint, Ordering::Relaxed);
+                    // Account for the live request before publishing FULL. A
+                    // concurrent clear() treats RESERVED as in-flight and waits
+                    // until publication completes, so any thread that observes
+                    // FULL is guaranteed that the slot is already included in
+                    // `size`.
+                    self.size.fetch_add(1, Ordering::Relaxed);
                     slot.meta
                         .store(pack_meta(STATE_FULL, id), Ordering::Release);
-                    self.size.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
                 STATE_RESERVED | STATE_FULL => return false,
@@ -808,6 +829,51 @@ mod tests {
         drop(guard2);
         assert!(rx1.blocking_recv().is_err());
         assert!(rx2.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn test_clear_preserves_count_for_insert_after_scanned_slot() {
+        use std::sync::{Arc, Barrier};
+
+        let map = Arc::new(RequestMap::with_capacity(1));
+        let after_first_slot = Arc::new(Barrier::new(2));
+        let resume_clear = Arc::new(Barrier::new(2));
+
+        let clear_map = Arc::clone(&map);
+        let clear_after_first = Arc::clone(&after_first_slot);
+        let clear_resume = Arc::clone(&resume_clear);
+        let clear_thread = std::thread::spawn(move || {
+            clear_map.clear_inner(|idx| {
+                if idx == 0 {
+                    clear_after_first.wait();
+                    clear_resume.wait();
+                }
+            })
+        });
+
+        // Wait until clear() has observed slot 0 as EMPTY, then publish a live
+        // entry into exactly that already-scanned slot. This is the shutdown
+        // race that used to be corrupted by the final `size.store(0)`.
+        after_first_slot.wait();
+        let id = (u16::MIN..=u16::MAX)
+            .find(|id| map.probe_index(*id, 0) == 0)
+            .expect("an ID must hash to slot 0");
+        let (tx, _rx) = oneshot::channel::<Message>();
+        let mut tx = Some(tx);
+        assert!(map.claim_slot(0, id, 0, &mut tx));
+        assert_eq!(map.size(), 1);
+
+        resume_clear.wait();
+        assert_eq!(clear_thread.join().expect("clear thread should finish"), 0);
+        assert_eq!(
+            map.size(),
+            1,
+            "clear must not erase the count of an insert into an already-scanned slot"
+        );
+
+        assert!(map.remove(id));
+        assert_eq!(map.size(), 0);
+        assert!(map.is_empty());
     }
 
     #[test]
