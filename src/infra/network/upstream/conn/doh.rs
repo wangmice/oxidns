@@ -13,6 +13,8 @@ use http::header::CONTENT_LENGTH;
 use http::{HeaderValue, Method, Request, Response, Version, header};
 
 #[cfg(feature = "_http-client")]
+use crate::infra::error::{DnsError, Result};
+#[cfg(feature = "_http-client")]
 use crate::infra::network::upstream::{ConnectionInfo, ConnectionType};
 
 /// Content type header for DNS-over-HTTPS (RFC 8484 Section 6)
@@ -39,7 +41,7 @@ const DNS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/dns-
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 #[inline]
-pub fn build_dns_get_request(uri: &str, buf: &[u8], version: Version) -> Request<()> {
+pub fn build_dns_get_request(uri: &str, buf: &[u8], version: Version) -> Result<Request<()>> {
     // Reserve the complete GET URI once and append Base64 directly into it.
     // For unpadded Base64, every complete 3-byte group emits 4 bytes and the
     // remainder emits either 2 or 3 bytes. DNS wire messages are <= 65535
@@ -61,7 +63,7 @@ pub fn build_dns_get_request(uri: &str, buf: &[u8], version: Version) -> Request
         .method(Method::GET)
         .uri(request_uri)
         .body(())
-        .expect("Failed to build HTTP request (should never fail with static headers)")
+        .map_err(|e| DnsError::protocol(format!("invalid DoH request URI: {e}")))
 }
 
 /// Extract and pre-allocate response buffer from HTTP response
@@ -124,18 +126,27 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
+    let host = doh_uri_host(&connection_info.server_name);
     if connection_info.port != ConnectionType::DoH.default_port() {
-        // Include port in URI for non-standard ports
+        // Include port in URI for non-standard ports. IPv6 literals must be
+        // enclosed in brackets when used as an URI authority.
         format!(
             "https://{}:{}{}?dns=",
-            connection_info.server_name, connection_info.port, connection_info.path
+            host, connection_info.port, connection_info.path
         )
     } else {
-        // Omit port 443 (standard HTTPS port) from URI
-        format!(
-            "https://{}{}?dns=",
-            connection_info.server_name, connection_info.path
-        )
+        // Omit port 443 (standard HTTPS port) from URI.
+        format!("https://{}{}?dns=", host, connection_info.path)
+    }
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+fn doh_uri_host(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
     }
 }
 
@@ -149,7 +160,8 @@ mod tests {
             "https://dns.example.test/dns-query?dns=",
             &[0, 1, 2, 3],
             Version::HTTP_2,
-        );
+        )
+        .expect("valid DoH request should build");
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.version(), Version::HTTP_2);
@@ -213,5 +225,32 @@ mod tests {
         let uri = build_doh_request_uri(&connection_info);
 
         assert_eq!(uri, "https://dns.example.test:8443/dns-query?dns=");
+    }
+
+    #[test]
+    fn test_build_doh_request_uri_brackets_ipv6_literal() {
+        let connection_info = ConnectionInfo::with_addr("https://[2001:db8::1]/dns-query")
+            .expect("IPv6 connection info should parse");
+
+        let uri = build_doh_request_uri(&connection_info);
+
+        assert_eq!(uri, "https://[2001:db8::1]/dns-query?dns=");
+    }
+
+    #[test]
+    fn test_build_doh_request_uri_brackets_ipv6_literal_with_custom_port() {
+        let connection_info = ConnectionInfo::with_addr("https://[2001:db8::1]:8443/dns-query")
+            .expect("IPv6 connection info should parse");
+
+        let uri = build_doh_request_uri(&connection_info);
+
+        assert_eq!(uri, "https://[2001:db8::1]:8443/dns-query?dns=");
+    }
+
+    #[test]
+    fn test_build_dns_get_request_returns_error_for_invalid_uri() {
+        let result = build_dns_get_request("https://[?dns=", &[0, 1, 2, 3], Version::HTTP_2);
+
+        assert!(result.is_err());
     }
 }

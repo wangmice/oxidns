@@ -16,7 +16,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use fast_socks5::client::{Config, Socks5Stream};
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{AuthenticationMethod, Socks5Command};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_util::sync::CancellationToken;
 
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{
@@ -34,8 +36,8 @@ const SMALL_SEND_BUFFER_SIZE: usize = 2_048;
 #[derive(Debug)]
 pub(crate) struct Socks5UdpAssociation {
     socket: UdpSocket,
-    #[allow(dead_code)]
-    control: Socks5Stream<TcpStream>,
+    control_closed: CancellationToken,
+    control_shutdown: CancellationToken,
 }
 
 impl Socks5UdpAssociation {
@@ -46,6 +48,7 @@ impl Socks5UdpAssociation {
         )
         .await?;
         let proxy_peer = proxy_stream.peer_addr()?;
+        let proxy_local = proxy_stream.local_addr()?;
 
         let auth = match (socks5.username.as_ref(), socks5.password.as_ref()) {
             (Some(username), Some(password)) => Some(AuthenticationMethod::Password {
@@ -57,11 +60,13 @@ impl Socks5UdpAssociation {
 
         let mut control = Socks5Stream::use_stream(proxy_stream, auth, Config::default()).await?;
 
-        // Preserve the request shape used by fast-socks5: when the client does
-        // not yet know its externally visible UDP endpoint, advertise an
-        // all-zero address and port. The proxy's reply decides the
-        // relay family.
-        let client_src = TargetAddr::Ip("[::]:0".parse().expect("valid unspecified IPv6 address"));
+        // When the client does not yet know its externally visible UDP
+        // endpoint, advertise an all-zero address and port using the
+        // address family of the SOCKS5 control connection. Some
+        // IPv4-only proxies reject an IPv6 ATYP here even though the
+        // relay returned by UDP ASSOCIATE may use either
+        // address family.
+        let client_src = TargetAddr::Ip(unspecified_for(proxy_local));
         let relay = control
             .request(Socks5Command::UDPAssociate, client_src)
             .await?;
@@ -71,9 +76,18 @@ impl Socks5UdpAssociation {
         let udp_socket = UdpSocket::from_std(bind_udp(bind_addr, &socket_options)?)?;
         udp_socket.connect(relay_addr).await?;
 
+        let control_closed = CancellationToken::new();
+        let control_shutdown = CancellationToken::new();
+        tokio::spawn(monitor_control_channel(
+            control,
+            control_closed.clone(),
+            control_shutdown.clone(),
+        ));
+
         Ok(Self {
             socket: udp_socket,
-            control,
+            control_closed,
+            control_shutdown,
         })
     }
 
@@ -82,7 +96,22 @@ impl Socks5UdpAssociation {
         &self.socket
     }
 
+    /// Completes when the SOCKS5 TCP control channel closes or becomes invalid.
+    ///
+    /// RFC 1928 ties the UDP association lifetime to this TCP connection. The
+    /// cancellation token is latched, so callers cannot miss a close that
+    /// happens before they start waiting.
+    pub(crate) async fn control_closed(&self) {
+        self.control_closed.cancelled().await;
+    }
+
+    #[inline]
+    pub(crate) fn is_control_closed(&self) -> bool {
+        self.control_closed.is_cancelled()
+    }
+
     pub(crate) async fn send_to(&self, data: &[u8], target: &TargetAddr) -> io::Result<usize> {
+        self.ensure_control_open()?;
         let mut header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
         let header_len = write_socks5_udp_header(&mut header, target)?;
         let total_len = header_len.checked_add(data.len()).ok_or_else(|| {
@@ -111,7 +140,12 @@ impl Socks5UdpAssociation {
     }
 
     pub(crate) async fn recv_from(&self, data_store: &mut [u8]) -> io::Result<(usize, TargetAddr)> {
-        let size = self.socket.recv(data_store).await?;
+        self.ensure_control_open()?;
+        let size = tokio::select! {
+            biased;
+            _ = self.control_closed() => return Err(control_closed_error()),
+            result = self.socket.recv(data_store) => result?,
+        };
         let packet = data_store.get(..size).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -123,6 +157,49 @@ impl Socks5UdpAssociation {
         data_store.copy_within(payload_offset..size, 0);
         Ok((payload_len, source))
     }
+
+    #[inline]
+    fn ensure_control_open(&self) -> io::Result<()> {
+        if self.is_control_closed() {
+            Err(control_closed_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Socks5UdpAssociation {
+    fn drop(&mut self) {
+        // Wake the detached monitor so it promptly drops the TCP control stream
+        // when the UDP association itself is no longer needed.
+        self.control_shutdown.cancel();
+    }
+}
+
+async fn monitor_control_channel(
+    mut control: Socks5Stream<TcpStream>,
+    control_closed: CancellationToken,
+    shutdown: CancellationToken,
+) {
+    let mut byte = [0u8; 1];
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {}
+        _ = control.read(&mut byte) => {
+            // A UDP ASSOCIATE control connection is a lifetime signal after the
+            // handshake. EOF, a read error, or unexpected data all invalidate
+            // the association.
+            control_closed.cancel();
+        }
+    }
+}
+
+#[inline]
+fn control_closed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "SOCKS5 UDP control connection closed",
+    )
 }
 
 fn resolve_relay_addr(relay: &TargetAddr, proxy_peer: SocketAddr) -> Result<SocketAddr> {
@@ -305,10 +382,16 @@ mod tests {
             assert_eq!(greeting, [0x05, 0x01, 0x00]);
             stream.write_all(&[0x05, 0x00]).await.unwrap();
 
-            let mut associate = [0u8; 22];
-            stream.read_exact(&mut associate).await.unwrap();
-            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
-            assert_eq!(&associate[4..], &[0u8; 18]);
+            if proxy_addr.is_ipv4() {
+                let mut associate = [0u8; 10];
+                stream.read_exact(&mut associate).await.unwrap();
+                assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            } else {
+                let mut associate = [0u8; 22];
+                stream.read_exact(&mut associate).await.unwrap();
+                assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+                assert_eq!(&associate[4..], &[0u8; 18]);
+            }
 
             let mut response = vec![0x05, 0x00, 0x00];
             match relay_addr {

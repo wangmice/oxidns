@@ -100,7 +100,7 @@ impl H3Connection {
             self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_3,
-        );
+        )?;
         drop(body_bytes);
 
         self.do_request(http_request, raw_id).await

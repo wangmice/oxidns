@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
 use crate::infra::clock::AppClock;
@@ -38,8 +39,8 @@ pub struct TcpConnection {
     id: u16,
     /// Sender for the unbounded outgoing TCP message channel.
     sender: UnboundedSender<QueuedQuery>,
-    /// Notifier that signals connection closure to background tasks.
-    close_notify: Notify,
+    /// Latched cancellation signal for background read/write tasks.
+    close_token: CancellationToken,
     /// Map of active DNS queries (query_id → response channel sender).
     request_map: RequestMap,
     /// Whether the connection is marked as closed.
@@ -79,7 +80,7 @@ impl Connection for TcpConnection {
             canceled_queries = cleared,
             "Initiating TCP connection close sequence"
         );
-        self.close_notify.notify_waiters();
+        self.close_token.cancel();
     }
 
     /// Sends a DNS query and waits asynchronously for its corresponding
@@ -193,7 +194,7 @@ impl TcpConnection {
         Self {
             id: conn_id,
             sender,
-            close_notify: Notify::new(),
+            close_token: CancellationToken::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
             closed: AtomicBool::new(false),
             writeable: AtomicBool::new(true),
@@ -204,7 +205,8 @@ impl TcpConnection {
     /// Background task: sends queued DNS requests through the TCP writer
     ///
     /// Continuously drains the outbound message queue and writes to the TCP
-    /// stream. Terminates gracefully when close notification is received.
+    /// stream. Connection cancellation interrupts both queue waits and an
+    /// in-flight socket write.
     ///
     /// # Error Handling
     /// Write errors trigger connection closure and notify waiting queries
@@ -213,35 +215,48 @@ impl TcpConnection {
         mut writer: TcpTransportWriter<S>,
         mut receiver: UnboundedReceiver<QueuedQuery>,
     ) {
-        let mut closing = false;
         debug!(
             conn_id = self.id,
             "TCP sender task started, ready to transmit queued messages"
         );
 
-        while !closing {
-            select! {
-                Some(queued) = receiver.recv() => {
-                    if let Err(e) = writer
-                        .write_message_with_id(&queued.message, queued.query_id)
-                        .await
-                    {
-                        error!(
-                            conn_id = self.id,
-                            error = ?e,
-                            "TCP write failed, marking connection as non-writable"
-                        );
-                        self.writeable.store(false, Ordering::Release);
-                        self.close();
-                    }
-                }
-                _ = self.close_notify.notified() => {
+        loop {
+            let queued = select! {
+                biased;
+                _ = self.close_token.cancelled() => {
                     debug!(
                         conn_id = self.id,
-                        "TCP sender received close notification, shutting down stream"
+                        "TCP sender observed connection cancellation"
                     );
-                    closing = true;
+                    break;
                 }
+                queued = receiver.recv() => match queued {
+                    Some(queued) => queued,
+                    None => break,
+                },
+            };
+
+            let write_result = select! {
+                biased;
+                _ = self.close_token.cancelled() => {
+                    debug!(
+                        conn_id = self.id,
+                        "TCP sender canceled an in-flight write during close"
+                    );
+                    break;
+                }
+                result = writer.write_message_with_id(&queued.message, queued.query_id) => result,
+            };
+
+            if let Err(e) = write_result {
+                error!(
+                    conn_id = self.id,
+                    error = ?e,
+                    "TCP write failed, marking connection as non-writable"
+                );
+                self.writeable.store(false, Ordering::Release);
+                self.close();
+                break;
             }
         }
 
@@ -263,62 +278,53 @@ impl TcpConnection {
         self: Arc<Self>,
         mut reader: TcpTransportReader<S>,
     ) {
-        let mut closing = false;
         debug!(
             conn_id = self.id,
             "TCP listener task started, waiting for DNS responses"
         );
 
         loop {
-            if closing && self.request_map.is_empty() {
-                debug!(conn_id = self.id, "TCP listener exiting (no more requests)");
-                break;
-            }
-            if self.closed.load(Ordering::Acquire) {
-                debug!(conn_id = self.id, "TCP listener detected closed connection");
-                break;
-            }
-
-            select! {
-                res = reader.read_message() => {
-                    match res {
-                        Ok(msg) => {
-                            let id = msg.id();
-                            if let Some(sender) = self.request_map.take_for_response(id, &msg) {
-                                let _ = sender.send(msg);
-                                self.last_used.store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                                trace!(
-                                    conn_id = self.id,
-                                    query_id = id,
-                                    "Matched and delivered DNS response to waiting query"
-                                );
-                            } else {
-                                trace!(
-                                    conn_id = self.id,
-                                    query_id = id,
-                                    "Discarded DNS response (no matching query or fingerprint mismatch)"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
-                                conn_id = self.id,
-                                error = ?e,
-                                "TCP read error or EOF, closing connection"
-                            );
-                            self.close();
-                            break;
-                        }
-                    }
-                }
-                _ = self.close_notify.notified() => {
-                    closing = true;
+            let result = select! {
+                biased;
+                _ = self.close_token.cancelled() => {
                     debug!(
                         conn_id = self.id,
                         pending_queries = self.request_map.size(),
-                        "TCP listener received close notification, draining remaining responses"
+                        "TCP listener observed connection cancellation"
                     );
-                    continue;
+                    break;
+                }
+                result = reader.read_message() => result,
+            };
+
+            match result {
+                Ok(msg) => {
+                    let id = msg.id();
+                    if let Some(sender) = self.request_map.take_for_response(id, &msg) {
+                        let _ = sender.send(msg);
+                        self.last_used
+                            .store(AppClock::elapsed_millis(), Ordering::Relaxed);
+                        trace!(
+                            conn_id = self.id,
+                            query_id = id,
+                            "Matched and delivered DNS response to waiting query"
+                        );
+                    } else {
+                        trace!(
+                            conn_id = self.id,
+                            query_id = id,
+                            "Discarded DNS response (no matching query or fingerprint mismatch)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        conn_id = self.id,
+                        error = ?e,
+                        "TCP read error or EOF, closing connection"
+                    );
+                    self.close();
+                    break;
                 }
             }
         }
@@ -498,6 +504,64 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(connection.using_count(), 0);
         assert!(!connection.available());
+    }
+
+    #[tokio::test]
+    async fn test_close_before_listener_start_is_latched() {
+        AppClock::start();
+        let (sender, _receiver) = unbounded_channel();
+        let connection = Arc::new(TcpConnection::new(9, sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        connection.close();
+
+        let (client, _server) = tokio::io::duplex(64);
+        let reader = TcpTransportReader::new(client);
+        let task = tokio::spawn(TcpConnection::listen_dns_response(
+            Arc::clone(&connection),
+            reader,
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("latched close must stop a listener started after close")
+            .expect("listener task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_close_cancels_blocked_tcp_write() {
+        use tokio::io::AsyncReadExt;
+
+        AppClock::start();
+        let (sender, receiver) = unbounded_channel();
+        let queue = sender.clone();
+        let connection = Arc::new(TcpConnection::new(10, sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        let (client, mut server) = tokio::io::duplex(1);
+        let writer = TcpTransportWriter::new(client);
+        let task = tokio::spawn(TcpConnection::send_dns_request(
+            Arc::clone(&connection),
+            writer,
+            receiver,
+        ));
+
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 1,
+            })
+            .expect("sender task should still own the receiver");
+
+        // Observe one byte to prove write_all() has started. With a one-byte
+        // duplex buffer and no further reads, the remaining frame is blocked.
+        let mut first = [0u8; 1];
+        tokio::time::timeout(Duration::from_millis(100), server.read_exact(&mut first))
+            .await
+            .expect("writer should start writing")
+            .expect("first byte should be readable");
+
+        connection.close();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("close must cancel an in-flight blocked write")
+            .expect("sender task should not panic");
     }
 
     #[tokio::test]

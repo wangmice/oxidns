@@ -81,6 +81,15 @@ impl UdpTransport {
         }
     }
 
+    /// Completes when an underlying SOCKS5 UDP control connection dies. Direct
+    /// UDP has no persistent control channel and therefore never resolves here.
+    pub(crate) async fn control_closed(&self) {
+        match &self.socket {
+            UdpTransportSocket::Direct(_) => std::future::pending::<()>().await,
+            UdpTransportSocket::Socks5 { association, .. } => association.control_closed().await,
+        }
+    }
+
     /// Receive one UDP datagram and decode it as a DNS message.
     /// Blocks until a datagram arrives or the socket errors.
     #[inline]
@@ -492,18 +501,12 @@ mod tests {
                 .await
                 .expect("proxy should select no-auth");
 
-            let mut request = [0u8; 4];
+            let mut associate = [0u8; 10];
             stream
-                .read_exact(&mut request)
+                .read_exact(&mut associate)
                 .await
                 .expect("proxy should read UDP associate request");
-            assert_eq!(request, [0x05, 0x03, 0x00, 0x04]);
-            let mut client_addr = [0u8; 18];
-            stream
-                .read_exact(&mut client_addr)
-                .await
-                .expect("proxy should read UDP associate client address");
-            assert_eq!(client_addr, [0; 18]);
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
             let mut response = vec![0x05, 0x00, 0x00, 0x01];
             response.extend_from_slice(&match relay_addr.ip() {
@@ -598,9 +601,9 @@ mod tests {
             assert_eq!(auth, *b"\x01\x04user\x08password");
             stream.write_all(&[0x01, 0x00]).await.unwrap();
 
-            let mut associate = [0u8; 22];
+            let mut associate = [0u8; 10];
             stream.read_exact(&mut associate).await.unwrap();
-            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
             let mut response = vec![0x05, 0x00, 0x00, 0x01];
             response.extend_from_slice(&match relay_addr.ip() {
