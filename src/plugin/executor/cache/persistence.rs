@@ -15,7 +15,8 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{
-    CacheKey, canonical_ecs_key_digest, normalize_domain_key, persisted_ecs_key_matches_response,
+    CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_domain_key,
+    persisted_ecs_key_matches_response,
 };
 use super::{
     CacheItem, CacheLoadPolicy, CacheMap, clamp_persisted_cache_ttl, is_cache_disposition_valid,
@@ -547,6 +548,7 @@ pub(super) async fn load_cache_from_file(
     cache_map: &CacheMap,
     dump_path: &str,
     ecs_in_key: bool,
+    ecs_prefix_hints: Arc<EcsPrefixHints>,
     policy: CacheLoadPolicy,
 ) -> Result<()> {
     let Some(file_len) = file_len_if_exists(dump_path).await? else {
@@ -567,7 +569,14 @@ pub(super) async fn load_cache_from_file(
     let cache_map = cache_map.clone();
 
     let loaded = match tokio::task::spawn_blocking(move || {
-        load_cache_from_bytes(&cache_map, &data, ecs_in_key, policy, false)
+        load_cache_from_bytes_with_hints(
+            &cache_map,
+            &data,
+            ecs_in_key,
+            policy,
+            false,
+            &ecs_prefix_hints,
+        )
     })
     .await
     {
@@ -598,12 +607,28 @@ pub(super) async fn load_cache_from_file(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn load_cache_from_bytes(
     cache_map: &CacheMap,
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
     replace: bool,
+) -> Result<usize> {
+    // Keep the test/utility entry point self-contained. Runtime startup and API
+    // staging use `load_cache_from_bytes_with_hints` so their plugin-level
+    // advisory prefix bitmap is populated before entries become visible.
+    let hints = EcsPrefixHints::new();
+    load_cache_from_bytes_with_hints(cache_map, data, ecs_in_key, policy, replace, &hints)
+}
+
+fn load_cache_from_bytes_with_hints(
+    cache_map: &CacheMap,
+    data: &[u8],
+    ecs_in_key: bool,
+    policy: CacheLoadPolicy,
+    replace: bool,
+    ecs_prefix_hints: &EcsPrefixHints,
 ) -> Result<usize> {
     // Transaction boundary: deserialize, validate, age and build every entry
     // before touching the live cache. If any structural validation fails, the
@@ -617,6 +642,10 @@ pub(super) fn load_cache_from_bytes(
 
     let mut loaded = 0usize;
     for entry in prepared {
+        // Set the advisory bit before publishing a reusable ECS key. Bits are
+        // intentionally monotonic, so an insert rejected as older can only
+        // leave a harmless false-positive hint.
+        ecs_prefix_hints.observe_cache_key(&entry.key);
         let inserted = cache_map.insert_if_not_newer(
             entry.key,
             entry.value,
@@ -641,10 +670,18 @@ pub(super) fn stage_cache_from_bytes(
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
+    ecs_prefix_hints: &EcsPrefixHints,
     capacity: usize,
 ) -> Result<(CacheMap, usize)> {
     let staged = CacheMap::with_capacity(capacity);
-    let loaded = load_cache_from_bytes(&staged, data, ecs_in_key, policy, false)?;
+    let loaded = load_cache_from_bytes_with_hints(
+        &staged,
+        data,
+        ecs_in_key,
+        policy,
+        false,
+        ecs_prefix_hints,
+    )?;
     Ok((staged, loaded))
 }
 
@@ -1360,13 +1397,21 @@ mod tests {
         let dump = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
 
         let restored = CacheMap::with_capacity(4);
+        let hints = EcsPrefixHints::new();
 
-        let loaded =
-            load_cache_from_bytes(&restored, &dump, true, CacheLoadPolicy::default(), false)
-                .expect("SCOPE=0 dump should load");
+        let loaded = load_cache_from_bytes_with_hints(
+            &restored,
+            &dump,
+            true,
+            CacheLoadPolicy::default(),
+            false,
+            &hints,
+        )
+        .expect("SCOPE=0 dump should load");
 
         assert_eq!(loaded, 1);
         assert_eq!(restored.len(), 1);
+        assert_eq!(hints.observed_ipv4_prefixes(), 1);
     }
 
     #[test]

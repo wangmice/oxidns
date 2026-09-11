@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::context::DnsContext;
 use crate::proto::{
@@ -430,25 +431,150 @@ fn ecs_network_prefix_matches(left: &EcsScopeDigest, right: &EcsScopeDigest, pre
             == (right.network[full_bytes] & (0xFFu8 << (8 - remaining_bits)))
 }
 
+/// Monotonic advisory index of reusable ECS scope prefixes observed by this
+/// cache plugin instance.
+///
+/// The main cache map remains authoritative. Bits are set before a reusable ECS
+/// key is published and are intentionally never cleared, so stale bits can only
+/// cause harmless extra lookups; eviction/expiration/flush never risks hiding a
+/// still-live cache entry by clearing a shared prefix bit.
+#[derive(Debug)]
+pub(super) struct EcsPrefixHints {
+    ipv4: AtomicU64,
+    ipv6: [AtomicU64; 3],
+}
+
+impl Default for EcsPrefixHints {
+    fn default() -> Self {
+        Self {
+            ipv4: AtomicU64::new(0),
+            ipv6: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl EcsPrefixHints {
+    #[inline]
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn observe_prefix(&self, family: u16, prefix: u8) {
+        match family {
+            1 if prefix <= 32 => {
+                self.ipv4.fetch_or(1u64 << prefix, Ordering::Release);
+            }
+            2 if prefix <= 128 => {
+                let word = usize::from(prefix / 64);
+                let bit = prefix % 64;
+                self.ipv6[word].fetch_or(1u64 << bit, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record a key only when it is reusable by ECS scope.
+    ///
+    /// Request-specific keys have `scope_prefix == 0` while
+    /// `source_prefix > 0`, so they intentionally do not create lookup hints.
+    #[inline]
+    pub(super) fn observe_cache_key(&self, key: &CacheKey) {
+        let Some(ecs) = &key.ecs_scope else {
+            return;
+        };
+        if ecs.source_prefix == ecs.scope_prefix {
+            self.observe_prefix(ecs.family, ecs.scope_prefix);
+        }
+    }
+
+    #[inline]
+    fn snapshot_for(&self, family: u16, max_prefix: u8) -> EcsPrefixMask {
+        let mut words = match family {
+            1 => [self.ipv4.load(Ordering::Acquire), 0, 0],
+            2 => [
+                self.ipv6[0].load(Ordering::Acquire),
+                self.ipv6[1].load(Ordering::Acquire),
+                self.ipv6[2].load(Ordering::Acquire),
+            ],
+            _ => [0; 3],
+        };
+
+        let max_prefix = match family {
+            1 => max_prefix.min(32),
+            2 => max_prefix.min(128),
+            _ => return EcsPrefixMask { words: [0; 3] },
+        };
+        let max_word = usize::from(max_prefix / 64);
+        for word in words.iter_mut().skip(max_word + 1) {
+            *word = 0;
+        }
+        let max_bit = max_prefix % 64;
+        if max_bit < 63 {
+            words[max_word] &= (1u64 << (max_bit + 1)) - 1;
+        }
+
+        EcsPrefixMask { words }
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv4_prefixes(&self) -> u32 {
+        self.ipv4.load(Ordering::Relaxed).count_ones()
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv6_prefixes(&self) -> u32 {
+        self.ipv6
+            .iter()
+            .map(|word| word.load(Ordering::Relaxed).count_ones())
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EcsPrefixMask {
+    words: [u64; 3],
+}
+
+impl EcsPrefixMask {
+    #[inline]
+    fn pop_highest(&mut self) -> Option<u8> {
+        for word_index in (0..self.words.len()).rev() {
+            let word = self.words[word_index];
+            if word == 0 {
+                continue;
+            }
+            let bit = 63u32.saturating_sub(word.leading_zeros()) as u8;
+            self.words[word_index] &= !(1u64 << bit);
+            return Some((word_index as u8).saturating_mul(64).saturating_add(bit));
+        }
+        None
+    }
+}
+
 /// Lazily return cache lookup candidates in RFC 7871 order.
 ///
-/// For ECS requests, reusable covering entries are checked first from the
-/// longest prefix to the shortest. Only if none of those entries hits should
-/// the caller fall back to the exact-SOURCE request-specific key.
-///
-/// For non-ECS requests, only the ordinary request key is returned.
+/// For ECS requests, only reusable scope prefixes present in the advisory hint
+/// bitmap are materialized, longest-prefix first. The exact-SOURCE
+/// request-specific key is always yielded last. For non-ECS requests, only the
+/// ordinary request key is returned.
 pub(super) struct CacheLookupKeys<'a> {
     key: &'a CacheKey,
-    next_scope_prefix: Option<u8>,
+    reusable_prefixes: EcsPrefixMask,
     exact_pending: bool,
 }
 
 impl<'a> CacheLookupKeys<'a> {
     #[inline]
-    fn new(key: &'a CacheKey) -> Self {
+    fn new(key: &'a CacheKey, hints: &EcsPrefixHints) -> Self {
+        let reusable_prefixes = key
+            .ecs_scope
+            .as_ref()
+            .map(|ecs| hints.snapshot_for(ecs.family, ecs.source_prefix))
+            .unwrap_or(EcsPrefixMask { words: [0; 3] });
         Self {
             key,
-            next_scope_prefix: key.ecs_scope.as_ref().map(|ecs| ecs.source_prefix),
+            reusable_prefixes,
             exact_pending: true,
         }
     }
@@ -459,14 +585,11 @@ impl<'a> Iterator for CacheLookupKeys<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(scope_prefix) = self.next_scope_prefix {
-            self.next_scope_prefix = scope_prefix.checked_sub(1);
-
+        if let Some(scope_prefix) = self.reusable_prefixes.pop_highest() {
             let candidate = self.key.with_ecs_scope_prefix(scope_prefix);
 
             // SOURCE=/0 has the same concrete key shape as reusable SCOPE=/0.
-            // Runtime admission rejects the ambiguous exact SOURCE=/0 +
-            // SCOPE>0 case, so yield this key once as the covering /0 entry.
+            // Yield the concrete key only once.
             if candidate == *self.key {
                 self.exact_pending = false;
                 return Some(Cow::Borrowed(self.key));
@@ -485,8 +608,11 @@ impl<'a> Iterator for CacheLookupKeys<'a> {
 }
 
 #[inline]
-pub(super) fn cache_lookup_keys<'a>(key: &'a CacheKey) -> CacheLookupKeys<'a> {
-    CacheLookupKeys::new(key)
+pub(super) fn cache_lookup_keys<'a>(
+    key: &'a CacheKey,
+    hints: &EcsPrefixHints,
+) -> CacheLookupKeys<'a> {
+    CacheLookupKeys::new(key, hints)
 }
 
 /// Only cache ordinary unsigned single-question DNS queries.
@@ -508,6 +634,16 @@ pub(super) fn is_cacheable_request(request: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+
+    fn exhaustive_hints_for(key: &CacheKey) -> EcsPrefixHints {
+        let hints = EcsPrefixHints::new();
+        if let Some(ecs) = &key.ecs_scope {
+            for prefix in 0..=ecs.source_prefix {
+                hints.observe_prefix(ecs.family, prefix);
+            }
+        }
+        hints
+    }
 
     use super::*;
     use crate::proto::{DNSClass, Edns, EdnsOption, Message, Name, Question, RecordType};
@@ -637,7 +773,7 @@ mod tests {
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
-        let candidates = cache_lookup_keys(&request_key)
+        let candidates = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
 
@@ -650,10 +786,66 @@ mod tests {
     }
 
     #[test]
+    fn test_ecs_lookup_uses_only_observed_scope_prefixes() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 1]),
+            128,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let hints = EcsPrefixHints::new();
+        let family = request_key.ecs_scope.as_ref().expect("ECS key").family;
+        for prefix in [0, 32, 48, 56, 64] {
+            hints.observe_prefix(family, prefix);
+        }
+
+        let prefixes = cache_lookup_keys(&request_key, &hints)
+            .filter_map(|candidate| {
+                if candidate.as_ref() == &request_key {
+                    None
+                } else {
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .map(|ecs| ecs.scope_prefix)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(prefixes, vec![64, 56, 48, 32, 0]);
+    }
+
+    #[test]
+    fn test_request_specific_ecs_key_does_not_create_hint() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let hints = EcsPrefixHints::new();
+        hints.observe_cache_key(&request_key);
+
+        let candidates = cache_lookup_keys(&request_key, &hints)
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates, vec![request_key]);
+    }
+
+    #[test]
     fn test_non_ecs_lookup_borrows_request_key_without_candidates() {
         let mut request = make_context("example.com.");
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
-        let mut lookup_keys = cache_lookup_keys(&request_key);
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
 
         assert!(matches!(lookup_keys.next(), Some(Cow::Borrowed(key)) if key == &request_key));
         assert!(lookup_keys.next().is_none());
@@ -670,7 +862,7 @@ mod tests {
         )));
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
-        let mut lookup_keys = cache_lookup_keys(&request_key);
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
 
         assert!(matches!(lookup_keys.next(), Some(Cow::Owned(_))));
 
@@ -699,7 +891,7 @@ mod tests {
         // Both a reusable covering /20 entry and an exact-SOURCE fallback
         // entry exist. RFC 7871 longest-prefix matching must choose /20 first.
         let cached = [request_key.clone(), scoped_key.clone()];
-        let first_hit = cache_lookup_keys(&request_key)
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
             .find(|candidate| cached.contains(candidate.as_ref()))
             .map(Cow::into_owned);
 
@@ -719,7 +911,7 @@ mod tests {
 
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
         let cached = [request_key.clone()];
-        let first_hit = cache_lookup_keys(&request_key)
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
             .find(|candidate| cached.contains(candidate.as_ref()))
             .map(Cow::into_owned);
 
@@ -739,7 +931,7 @@ mod tests {
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
         assert_eq!(
-            cache_lookup_keys(&request_key)
+            cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
                 .map(Cow::into_owned)
                 .collect::<Vec<_>>(),
             vec![request_key]
@@ -788,7 +980,10 @@ mod tests {
         let other_key =
             build_cache_key(&mut other_request, true).expect("request key should exist");
 
-        assert!(cache_lookup_keys(&other_key).any(|candidate| candidate.as_ref() == &scoped_key));
+        assert!(
+            cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+                .any(|candidate| candidate.as_ref() == &scoped_key)
+        );
     }
 
     #[test]
@@ -900,7 +1095,10 @@ mod tests {
         let other_key =
             build_cache_key(&mut other_request, true).expect("other request key should exist");
 
-        assert!(!cache_lookup_keys(&other_key).any(|candidate| candidate.as_ref() == &scoped_key));
+        assert!(
+            !cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+                .any(|candidate| candidate.as_ref() == &scoped_key)
+        );
     }
 
     #[test]

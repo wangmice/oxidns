@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::key::{CacheKey, canonical_ecs_key_digest, normalize_domain_key};
+use super::key::{CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_domain_key};
 #[cfg(test)]
 use super::persistence::dump_cache_to_bytes;
 use super::persistence::{
@@ -45,6 +45,7 @@ pub(super) fn register(
     tag: &str,
     cache_map: CacheMap,
     ecs_in_key: bool,
+    ecs_prefix_hints: Arc<EcsPrefixHints>,
     cache_size: usize,
     policy: CacheLoadPolicy,
     cache_reclaimer: CacheReclaimer,
@@ -91,6 +92,7 @@ pub(super) fn register(
         POST "/load_dump" => CacheLoadDumpHandler {
             cache_map,
             ecs_in_key,
+            ecs_prefix_hints,
             cache_size,
             policy,
             cache_reclaimer,
@@ -249,6 +251,7 @@ impl ApiHandler for CacheDumpHandler {
 struct CacheLoadDumpHandler {
     cache_map: CacheMap,
     ecs_in_key: bool,
+    ecs_prefix_hints: Arc<EcsPrefixHints>,
     cache_size: usize,
     policy: CacheLoadPolicy,
     cache_reclaimer: CacheReclaimer,
@@ -297,6 +300,7 @@ impl ApiHandler for CacheLoadDumpHandler {
 
         let body = request.into_body();
         let ecs_in_key = self.ecs_in_key;
+        let ecs_prefix_hints = self.ecs_prefix_hints.clone();
         let cache_size = self.cache_size;
         let policy = self.policy;
         let cache_map = self.cache_map.clone();
@@ -318,6 +322,7 @@ impl ApiHandler for CacheLoadDumpHandler {
                 &body,
                 ecs_in_key,
                 policy,
+                &ecs_prefix_hints,
                 Cache::initial_cache_capacity(cache_size),
             )?;
             let (expired_removed, evicted, after_len) = staged_cache.prune(
@@ -1109,6 +1114,7 @@ mod tests {
         let handler = CacheLoadDumpHandler {
             cache_map,
             ecs_in_key: false,
+            ecs_prefix_hints: Arc::new(EcsPrefixHints::new()),
             cache_size: 1,
             policy: CacheLoadPolicy::default(),
             cache_reclaimer: test_cache_reclaimer(),
@@ -1145,6 +1151,7 @@ mod tests {
         let load = Arc::new(CacheLoadDumpHandler {
             cache_map: cache_map.clone(),
             ecs_in_key: false,
+            ecs_prefix_hints: Arc::new(EcsPrefixHints::new()),
             cache_size: 1,
             policy: CacheLoadPolicy::default(),
             cache_reclaimer: reclaimer,

@@ -21,8 +21,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{
-    CacheKey, build_cache_key as build_cache_key_internal, cache_key_for_response_ecs_scope,
-    cache_lookup_keys,
+    CacheKey, EcsPrefixHints, build_cache_key as build_cache_key_internal,
+    cache_key_for_response_ecs_scope, cache_lookup_keys,
 };
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
 use crate::config::types::PluginConfig;
@@ -333,6 +333,7 @@ impl CacheReclaimer {
 
         let reclaim_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             const MAX_RECLAIM_BACKOFF_MS: u64 = 32;
+
             let mut retired = retired;
             let mut backoff_ms = 1u64;
             loop {
@@ -533,7 +534,11 @@ struct CacheEntryIdentity {
 struct CacheMetrics {
     tag: String,
     cache_map: OnceLock<CacheMap>,
+    ecs_prefix_hints: Arc<EcsPrefixHints>,
     lookup_total: AtomicU64,
+    ecs_lookup_requests_total: AtomicU64,
+    ecs_lookup_candidates_total: AtomicU64,
+    ecs_lookup_exact_fallback_total: AtomicU64,
     fresh_hit_total: AtomicU64,
     stale_hit_total: AtomicU64,
     miss_total: AtomicU64,
@@ -551,11 +556,15 @@ struct CacheMetrics {
 }
 
 impl CacheMetrics {
-    fn new(tag: String) -> Self {
+    fn new(tag: String, ecs_prefix_hints: Arc<EcsPrefixHints>) -> Self {
         Self {
             tag,
             cache_map: OnceLock::new(),
+            ecs_prefix_hints,
             lookup_total: AtomicU64::new(0),
+            ecs_lookup_requests_total: AtomicU64::new(0),
+            ecs_lookup_candidates_total: AtomicU64::new(0),
+            ecs_lookup_exact_fallback_total: AtomicU64::new(0),
             fresh_hit_total: AtomicU64::new(0),
             stale_hit_total: AtomicU64::new(0),
             miss_total: AtomicU64::new(0),
@@ -610,6 +619,44 @@ impl MetricSource for CacheMetrics {
             "Total cache lookups with a cacheable request key.",
             &base,
             self.lookup_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_ecs_lookup_requests_total",
+            "Total cache lookups carrying an ECS request key.",
+            &base,
+            self.ecs_lookup_requests_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_ecs_lookup_candidates_total",
+            "Total ECS cache key candidates probed after prefix-hint filtering.",
+            &base,
+            self.ecs_lookup_candidates_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_ecs_lookup_exact_fallback_total",
+            "Total ECS lookups that reached the exact-SOURCE fallback key.",
+            &base,
+            self.ecs_lookup_exact_fallback_total.load(Ordering::Relaxed),
+        ));
+        let ecs_v4 = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("family", "ipv4"),
+        ];
+        sink.emit(MetricSample::gauge(
+            "cache_ecs_prefix_hint_count",
+            "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
+            &ecs_v4,
+            u64::from(self.ecs_prefix_hints.observed_ipv4_prefixes()),
+        ));
+        let ecs_v6 = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("family", "ipv6"),
+        ];
+        sink.emit(MetricSample::gauge(
+            "cache_ecs_prefix_hint_count",
+            "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
+            &ecs_v6,
+            u64::from(self.ecs_prefix_hints.observed_ipv6_prefixes()),
         ));
         let fresh = [
             MetricLabel::new("plugin_tag", self.tag.as_str()),
@@ -774,6 +821,10 @@ pub struct Cache {
 
     /// Whether to include ECS scope in cache key.
     ecs_in_key: bool,
+
+    /// Monotonic advisory bitmap of reusable ECS scope prefixes. The main
+    /// cache map remains authoritative; stale bits only add harmless lookups.
+    ecs_prefix_hints: Arc<EcsPrefixHints>,
 
     /// Set by rejected admissions; consumed by the background cleanup task.
     pressure_requested: Arc<AtomicBool>,
@@ -1118,9 +1169,27 @@ impl Cache {
         let now = AppClock::elapsed_millis();
         let touch_interval_ms = self.current_touch_interval_ms(cache_map, now);
 
+        let ecs_lookup = request_key.ecs_scope.is_some();
+        if ecs_lookup {
+            self.metrics
+                .ecs_lookup_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let mut expired = false;
-        for key in cache_lookup_keys(&request_key) {
-            let key = key.as_ref();
+        for candidate in cache_lookup_keys(&request_key, &self.ecs_prefix_hints) {
+            if ecs_lookup {
+                self.metrics
+                    .ecs_lookup_candidates_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if candidate.as_ref() == &request_key {
+                    self.metrics
+                        .ecs_lookup_exact_fallback_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let key = candidate.as_ref();
             match cache_map.get_retained_cloned_status(key, now, touch_interval_ms) {
                 Some(TtlCacheLookup::Hit(item)) => {
                     let invalid_disposition = if item.value.is_validated() {
@@ -1394,6 +1463,10 @@ impl Cache {
             "cached: domain={}, type={:?}, class={:?}, ttl={}",
             key.domain, key.record_type, key.dns_class, ttl
         );
+        // Publish the advisory prefix bit before the reusable cache key. The
+        // hint is monotonic, so failed admission can only leave a harmless
+        // false-positive bit.
+        self.ecs_prefix_hints.observe_cache_key(&key);
         let inserted = cache_map.try_insert_or_update_with_limit(
             key,
             Arc::new(item),
@@ -1452,6 +1525,7 @@ impl Cache {
         let dirty_generation = self.dirty_generation.clone();
         let metrics = self.metrics.clone();
         let cache_size = self.cache_size;
+        let ecs_prefix_hints = self.ecs_prefix_hints.clone();
 
         tokio::spawn(async move {
             let _refresh_guard = refresh_guard;
@@ -1498,6 +1572,9 @@ impl Cache {
                         };
                         let new_item =
                             Arc::new(CacheItem::new_validated(response, ttl, fresh_until_ms));
+                        // Set-before-publish keeps the hint advisory-only:
+                        // failed writes leave at most a false-positive bit.
+                        ecs_prefix_hints.observe_cache_key(&response_key);
                         let matches_stale =
                             |existing: &crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>| {
                                 existing.cache_time_ms == refresh_entry.cache_time_ms
@@ -1629,6 +1706,7 @@ impl Plugin for Cache {
                 &cache_map,
                 dump_file,
                 self.ecs_in_key,
+                self.ecs_prefix_hints.clone(),
                 self.cache_load_policy(),
             )
             .await
@@ -1677,6 +1755,7 @@ impl Plugin for Cache {
                 &self.tag,
                 cache_map.clone(),
                 self.ecs_in_key,
+                self.ecs_prefix_hints.clone(),
                 self.cache_size,
                 self.cache_load_policy(),
                 cache_reclaimer,
@@ -2160,7 +2239,8 @@ impl PluginFactory for CacheFactory {
 
 impl CacheFactory {
     fn build_cache(&self, tag: String, cache_config: CacheConfig) -> Result<UninitializedPlugin> {
-        let metrics = Arc::new(CacheMetrics::new(tag.clone()));
+        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
+        let metrics = Arc::new(CacheMetrics::new(tag.clone(), ecs_prefix_hints.clone()));
         Ok(UninitializedPlugin::Executor(Box::new(Cache {
             cache_map: OnceCell::new(),
             tag,
@@ -2173,6 +2253,7 @@ impl CacheFactory {
                 .unwrap_or(DEFAULT_NEGATIVE_TTL_WITHOUT_SOA),
             short_circuit: cache_config.short_circuit.unwrap_or(false),
             ecs_in_key: cache_config.ecs_in_key.unwrap_or(false),
+            ecs_prefix_hints,
             pressure_requested: Arc::new(AtomicBool::new(false)),
             cache_size: cache_config.size.unwrap_or(DEFAULT_CACHE_SIZE),
             config: cache_config,
@@ -2272,6 +2353,7 @@ mod tests {
         let cache_size = config.size.unwrap_or(DEFAULT_CACHE_SIZE);
         let ecs_in_key = config.ecs_in_key.unwrap_or(false);
         let short_circuit = config.short_circuit.unwrap_or(false);
+        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
 
         Cache {
             cache_map: OnceCell::new(),
@@ -2281,13 +2363,17 @@ mod tests {
             negative_ttl_without_soa,
             short_circuit,
             ecs_in_key,
+            ecs_prefix_hints: ecs_prefix_hints.clone(),
             pressure_requested: Arc::new(AtomicBool::new(false)),
             config,
             updated_keys: Arc::new(AtomicU64::new(0)),
             dirty_since_ms: Arc::new(AtomicU64::new(0)),
             dirty_generation: Arc::new(AtomicU64::new(0)),
             persisted_generation: Arc::new(AtomicU64::new(0)),
-            metrics: Arc::new(CacheMetrics::new("cache_test".to_string())),
+            metrics: Arc::new(CacheMetrics::new(
+                "cache_test".to_string(),
+                ecs_prefix_hints,
+            )),
             cache_size,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
@@ -3733,6 +3819,7 @@ mod tests {
             .expect("initial ECS response should produce a scoped cache key");
         let now = AppClock::elapsed_millis();
 
+        cache.ecs_prefix_hints.observe_cache_key(&stored_key);
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             stored_key.clone(),
             Arc::new(CacheItem::new_validated(
