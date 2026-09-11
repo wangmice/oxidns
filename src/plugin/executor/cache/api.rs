@@ -76,7 +76,7 @@ pub(super) fn register(
             mutation_gate: mutation_gate.clone(),
             path_prefix: plugin_api.path("/entries/")?,
         },
-        GET "/flush" => CacheFlushHandler {
+        POST "/flush" => CacheFlushHandler {
             cache_map: cache_map.clone(),
             cache_size,
             cache_reclaimer: cache_reclaimer.clone(),
