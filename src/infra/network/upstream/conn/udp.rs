@@ -394,9 +394,9 @@ mod tests {
             assert_eq!(greeting, [0x05, 0x01, 0x00]);
             stream.write_all(&[0x05, 0x00]).await.unwrap();
 
-            let mut associate = [0u8; 22];
+            let mut associate = [0u8; 10];
             stream.read_exact(&mut associate).await.unwrap();
-            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
             let mut response = vec![0x05, 0x00, 0x00, 0x01];
             response.extend_from_slice(&match relay_addr.ip() {

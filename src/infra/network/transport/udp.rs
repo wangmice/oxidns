@@ -492,18 +492,12 @@ mod tests {
                 .await
                 .expect("proxy should select no-auth");
 
-            let mut request = [0u8; 4];
+            let mut associate = [0u8; 10];
             stream
-                .read_exact(&mut request)
+                .read_exact(&mut associate)
                 .await
                 .expect("proxy should read UDP associate request");
-            assert_eq!(request, [0x05, 0x03, 0x00, 0x04]);
-            let mut client_addr = [0u8; 18];
-            stream
-                .read_exact(&mut client_addr)
-                .await
-                .expect("proxy should read UDP associate client address");
-            assert_eq!(client_addr, [0; 18]);
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
             let mut response = vec![0x05, 0x00, 0x00, 0x01];
             response.extend_from_slice(&match relay_addr.ip() {
@@ -598,9 +592,9 @@ mod tests {
             assert_eq!(auth, *b"\x01\x04user\x08password");
             stream.write_all(&[0x01, 0x00]).await.unwrap();
 
-            let mut associate = [0u8; 22];
+            let mut associate = [0u8; 10];
             stream.read_exact(&mut associate).await.unwrap();
-            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
             let mut response = vec![0x05, 0x00, 0x00, 0x01];
             response.extend_from_slice(&match relay_addr.ip() {

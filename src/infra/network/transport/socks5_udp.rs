@@ -46,6 +46,7 @@ impl Socks5UdpAssociation {
         )
         .await?;
         let proxy_peer = proxy_stream.peer_addr()?;
+        let proxy_local = proxy_stream.local_addr()?;
 
         let auth = match (socks5.username.as_ref(), socks5.password.as_ref()) {
             (Some(username), Some(password)) => Some(AuthenticationMethod::Password {
@@ -57,11 +58,13 @@ impl Socks5UdpAssociation {
 
         let mut control = Socks5Stream::use_stream(proxy_stream, auth, Config::default()).await?;
 
-        // Preserve the request shape used by fast-socks5: when the client does
-        // not yet know its externally visible UDP endpoint, advertise an
-        // all-zero address and port. The proxy's reply decides the
-        // relay family.
-        let client_src = TargetAddr::Ip("[::]:0".parse().expect("valid unspecified IPv6 address"));
+        // When the client does not yet know its externally visible UDP
+        // endpoint, advertise an all-zero address and port using the
+        // address family of the SOCKS5 control connection. Some
+        // IPv4-only proxies reject an IPv6 ATYP here even though the
+        // relay returned by UDP ASSOCIATE may use either
+        // address family.
+        let client_src = TargetAddr::Ip(unspecified_for(proxy_local));
         let relay = control
             .request(Socks5Command::UDPAssociate, client_src)
             .await?;
@@ -305,10 +308,16 @@ mod tests {
             assert_eq!(greeting, [0x05, 0x01, 0x00]);
             stream.write_all(&[0x05, 0x00]).await.unwrap();
 
-            let mut associate = [0u8; 22];
-            stream.read_exact(&mut associate).await.unwrap();
-            assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
-            assert_eq!(&associate[4..], &[0u8; 18]);
+            if proxy_addr.is_ipv4() {
+                let mut associate = [0u8; 10];
+                stream.read_exact(&mut associate).await.unwrap();
+                assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            } else {
+                let mut associate = [0u8; 22];
+                stream.read_exact(&mut associate).await.unwrap();
+                assert_eq!(&associate[..4], &[0x05, 0x03, 0x00, 0x04]);
+                assert_eq!(&associate[4..], &[0u8; 18]);
+            }
 
             let mut response = vec![0x05, 0x00, 0x00];
             match relay_addr {
