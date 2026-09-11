@@ -134,7 +134,11 @@ impl<K, V> TtlCacheRetiredState<K, V>
 where
     K: Eq + Hash,
 {
-    /// Number of entries observed in the state at the time it was retired.
+    /// Number of entries observed immediately after the state was retired.
+    ///
+    /// This is intentionally an observational statistic: operations that
+    /// captured the old state before retirement can still complete against it,
+    /// so the value need not equal the state's eventual quiescent entry count.
     #[inline]
     pub fn entry_count(&self) -> usize {
         self.entry_count
@@ -592,8 +596,10 @@ where
     /// retired state without reclaiming it on the caller thread.
     ///
     /// The returned wrapper can be sent to a dedicated reclaimer. Its
-    /// `entry_count()` is captured from the exact state removed by this swap,
-    /// so callers do not need a separate `len()` pass before committing.
+    /// `entry_count()` is an observation taken immediately after the old state
+    /// is detached. Operations that obtained the old state before the swap may
+    /// still finish against it, so this value is suitable for telemetry and
+    /// mutation accounting but is not a quiescent/final entry count.
     #[inline]
     pub fn swap_retired(&self, replacement: &Self) -> TtlCacheRetiredState<K, V> {
         let retired = self.state.swap(replacement.state.load_full());

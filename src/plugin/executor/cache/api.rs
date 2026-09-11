@@ -337,13 +337,14 @@ impl ApiHandler for CacheLoadDumpHandler {
             // await/cancellation point between staging and this atomic swap.
             let retired = cache_map.swap_retired(&staged_cache);
             let had_entries = retired.entry_count();
-            let total_removed = expired_removed.saturating_add(evicted);
-            // A replacement load clears all previous entries, inserts the
-            // prepared entries and can then prune some of those inserts. Count
-            // all of those mutations instead of only the surviving inserts.
-            let changed = (had_entries as u64)
-                .saturating_add(loaded_entries as u64)
-                .saturating_add(total_removed as u64);
+
+            // Dirty accounting describes changes published to the live cache,
+            // not transient work performed while building the isolated staged
+            // generation. Entries inserted into the staged cache and pruned
+            // before this swap were never visible, so count only the observed
+            // retired entries plus the entries that actually became live.
+            let changed = (had_entries as u64).saturating_add(after_len as u64);
+
             mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, changed);
 
             // Transfer ownership of the old generation before leaving the
