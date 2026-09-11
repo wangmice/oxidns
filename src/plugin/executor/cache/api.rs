@@ -318,7 +318,7 @@ impl ApiHandler for CacheLoadDumpHandler {
         let result = tokio::task::spawn_blocking(move || {
             let _mutation_guard = mutation_guard;
 
-            let (staged_cache, loaded_entries) = stage_cache_from_bytes(
+            let (staged_cache, loaded_entries) = stage_cache_from_bytes::<MAX_CACHE_DUMP_BODY>(
                 &body,
                 ecs_in_key,
                 policy,

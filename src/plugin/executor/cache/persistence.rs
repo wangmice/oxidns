@@ -39,6 +39,16 @@ const CACHE_DUMP_VERSION: u32 = 1;
 /// cannot cause an unbounded allocation during startup.
 pub(super) const MAX_PERSISTED_CACHE_DUMP_BYTES: usize = 64 * 1024 * 1024;
 
+/// Build the cache-persistence wincode configuration with an explicit
+/// deserialization preallocation budget. This keeps the existing wire format
+/// (little-endian, fixed-width integers and bincode-compatible lengths) while
+/// replacing wincode's default 4 MiB sequence-allocation limit with the
+/// caller's already-enforced dump-size budget.
+#[inline]
+fn cache_wincode_config<const PREALLOCATION_LIMIT: usize>() -> impl wincode::config::Config {
+    wincode::config::Configuration::default().with_preallocation_size_limit::<PREALLOCATION_LIMIT>()
+}
+
 #[derive(Debug)]
 pub(super) enum CacheDumpOutcome {
     Complete(Vec<u8>),
@@ -149,11 +159,17 @@ fn serialized_size_to_usize(size: u64) -> Result<usize> {
 }
 
 fn persisted_dump_serialized_size(dump: &PersistedCacheDump) -> Result<usize> {
-    serialized_size_to_usize(wincode::serialized_size(dump)?)
+    serialized_size_to_usize(wincode::config::serialized_size(
+        dump,
+        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+    )?)
 }
 
 fn persisted_entry_serialized_size(entry: &PersistedCacheEntry) -> Result<usize> {
-    serialized_size_to_usize(wincode::serialized_size(entry)?)
+    serialized_size_to_usize(wincode::config::serialized_size(
+        entry,
+        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+    )?)
 }
 
 fn prepare_persisted_entry(
@@ -335,7 +351,10 @@ pub(super) fn dump_cache_to_bytes_with_limit(
         });
     }
 
-    let encoded = wincode::serialize(&dump)?;
+    let encoded = wincode::config::serialize(
+        &dump,
+        cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+    )?;
     debug_assert_eq!(encoded.len(), exact_size);
     Ok(CacheDumpOutcome::Complete(encoded))
 }
@@ -352,9 +371,14 @@ pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
     }
 }
 
-fn parse_persisted_dump(data: &[u8]) -> Result<PersistedCacheDump> {
-    let dump = wincode::deserialize_exact::<PersistedCacheDump>(data)
-        .map_err(|err| invalid_dump(format!("failed to deserialize: {err}")))?;
+fn parse_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDump> {
+    let dump = wincode::config::deserialize_exact::<PersistedCacheDump, _>(
+        data,
+        cache_wincode_config::<PREALLOCATION_LIMIT>(),
+    )
+    .map_err(|err| invalid_dump(format!("failed to deserialize: {err}")))?;
 
     if dump.magic != CACHE_DUMP_MAGIC {
         return Err(invalid_dump("bad magic or legacy unversioned format"));
@@ -367,6 +391,11 @@ fn parse_persisted_dump(data: &[u8]) -> Result<PersistedCacheDump> {
     }
 
     Ok(dump)
+}
+
+#[cfg(test)]
+fn parse_persisted_dump(data: &[u8]) -> Result<PersistedCacheDump> {
+    parse_persisted_dump_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(data)
 }
 
 /// Convert persisted key material into a runtime key.
@@ -569,7 +598,7 @@ pub(super) async fn load_cache_from_file(
     let cache_map = cache_map.clone();
 
     let loaded = match tokio::task::spawn_blocking(move || {
-        load_cache_from_bytes_with_hints(
+        load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
             ecs_in_key,
@@ -619,10 +648,12 @@ pub(super) fn load_cache_from_bytes(
     // staging use `load_cache_from_bytes_with_hints` so their plugin-level
     // advisory prefix bitmap is populated before entries become visible.
     let hints = EcsPrefixHints::new();
-    load_cache_from_bytes_with_hints(cache_map, data, ecs_in_key, policy, replace, &hints)
+    load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        cache_map, data, ecs_in_key, policy, replace, &hints,
+    )
 }
 
-fn load_cache_from_bytes_with_hints(
+fn load_cache_from_bytes_with_hints<const PREALLOCATION_LIMIT: usize>(
     cache_map: &CacheMap,
     data: &[u8],
     ecs_in_key: bool,
@@ -633,7 +664,7 @@ fn load_cache_from_bytes_with_hints(
     // Transaction boundary: deserialize, validate, age and build every entry
     // before touching the live cache. If any structural validation fails, the
     // caller gets Err and the existing cache remains unchanged.
-    let dump = parse_persisted_dump(data)?;
+    let dump = parse_persisted_dump_with_limit::<PREALLOCATION_LIMIT>(data)?;
     let prepared = prepare_persisted_entries(dump, ecs_in_key, policy)?;
 
     if replace {
@@ -666,7 +697,7 @@ fn load_cache_from_bytes_with_hints(
 /// The returned cache has never been visible to request handling, so a dropped
 /// caller or cancelled blocking task cannot mutate the live cache.
 #[cfg(feature = "api")]
-pub(super) fn stage_cache_from_bytes(
+pub(super) fn stage_cache_from_bytes<const PREALLOCATION_LIMIT: usize>(
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
@@ -674,7 +705,7 @@ pub(super) fn stage_cache_from_bytes(
     capacity: usize,
 ) -> Result<(CacheMap, usize)> {
     let staged = CacheMap::with_capacity(capacity);
-    let loaded = load_cache_from_bytes_with_hints(
+    let loaded = load_cache_from_bytes_with_hints::<PREALLOCATION_LIMIT>(
         &staged,
         data,
         ecs_in_key,
@@ -711,17 +742,64 @@ mod tests {
     }
 
     fn serialize_dump_at(entries: Vec<PersistedCacheEntry>, dumped_at_unix_ms: u64) -> Vec<u8> {
-        wincode::serialize(&PersistedCacheDump {
-            magic: CACHE_DUMP_MAGIC,
-            version: CACHE_DUMP_VERSION,
-            dumped_at_unix_ms,
-            entries,
-        })
+        wincode::config::serialize(
+            &PersistedCacheDump {
+                magic: CACHE_DUMP_MAGIC,
+                version: CACHE_DUMP_VERSION,
+                dumped_at_unix_ms,
+                entries,
+            },
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
         .expect("dump should serialize")
     }
 
     fn serialize_current_dump(entries: Vec<PersistedCacheEntry>) -> Vec<u8> {
         serialize_dump_at(entries, AppClock::now_timestamp())
+    }
+
+    #[test]
+    fn test_explicit_wincode_config_preserves_v1_wire_format() {
+        let dump = PersistedCacheDump {
+            magic: CACHE_DUMP_MAGIC,
+            version: CACHE_DUMP_VERSION,
+            dumped_at_unix_ms: 123_456,
+            entries: vec![make_entry()],
+        };
+
+        let legacy_bytes = wincode::serialize(&dump).expect("default config should serialize");
+        let configured_bytes = wincode::config::serialize(
+            &dump,
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("explicit config should serialize");
+
+        assert_eq!(configured_bytes, legacy_bytes);
+    }
+
+    #[test]
+    fn test_explicit_preallocation_budget_allows_dump_above_default_four_mib() {
+        const FOUR_MIB: usize = 4 * 1024 * 1024;
+        const API_BUDGET: usize = 16 * 1024 * 1024;
+
+        let mut entry = make_entry();
+        entry.resp_bytes = vec![0xA5; 5 * 1024 * 1024];
+
+        let dump = PersistedCacheDump {
+            magic: CACHE_DUMP_MAGIC,
+            version: CACHE_DUMP_VERSION,
+            dumped_at_unix_ms: 123_456,
+            entries: vec![entry],
+        };
+        let bytes = wincode::config::serialize(
+            &dump,
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("large dump should serialize");
+
+        assert!(bytes.len() < API_BUDGET);
+        assert!(parse_persisted_dump_with_limit::<FOUR_MIB>(&bytes).is_err());
+        assert!(parse_persisted_dump_with_limit::<API_BUDGET>(&bytes).is_ok());
     }
 
     fn cname_only_response_bytes() -> Vec<u8> {
@@ -829,19 +907,26 @@ mod tests {
     #[test]
     fn test_parse_persisted_dump_rejects_unsupported_version() {
         AppClock::start();
-        let data = wincode::serialize(&PersistedCacheDump {
-            magic: CACHE_DUMP_MAGIC,
-            version: CACHE_DUMP_VERSION + 1,
-            dumped_at_unix_ms: AppClock::now_timestamp(),
-            entries: Vec::new(),
-        })
+        let data = wincode::config::serialize(
+            &PersistedCacheDump {
+                magic: CACHE_DUMP_MAGIC,
+                version: CACHE_DUMP_VERSION + 1,
+                dumped_at_unix_ms: AppClock::now_timestamp(),
+                entries: Vec::new(),
+            },
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
         .expect("dump should serialize");
         assert!(parse_persisted_dump(&data).is_err());
     }
 
     #[test]
     fn test_parse_persisted_dump_rejects_legacy_unversioned_dump() {
-        let legacy = wincode::serialize(&vec![make_entry()]).expect("legacy dump should serialize");
+        let legacy = wincode::config::serialize(
+            &vec![make_entry()],
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("legacy dump should serialize");
         assert!(parse_persisted_dump(&legacy).is_err());
     }
 
@@ -1399,7 +1484,7 @@ mod tests {
         let restored = CacheMap::with_capacity(4);
         let hints = EcsPrefixHints::new();
 
-        let loaded = load_cache_from_bytes_with_hints(
+        let loaded = load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &restored,
             &dump,
             true,
