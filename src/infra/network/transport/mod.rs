@@ -19,6 +19,7 @@
 pub mod quic;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 pub(crate) mod socks5_quic;
+pub(crate) mod socks5_udp;
 pub mod tcp;
 pub mod udp;
 

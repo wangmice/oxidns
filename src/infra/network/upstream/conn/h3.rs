@@ -258,7 +258,7 @@ async fn recv(
     let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
     let mut truncated = false;
 
-    while let Some(mut partial_bytes) = request_stream.recv_data().await.map_err(|e| {
+    while let Some(partial_bytes) = request_stream.recv_data().await.map_err(|e| {
         H3RecvError::Transport(DnsError::protocol(format!("h3 recv_data error: {e}")))
     })? {
         let remaining = body_limit.saturating_sub(response_bytes.len());

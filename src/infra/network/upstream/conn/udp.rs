@@ -215,8 +215,8 @@ impl UdpConnection {
     ///
     /// # Buffer Size
     /// Direct UDP keeps the bounded DNS-sized buffer. SOCKS5 uses a full UDP
-    /// payload buffer because `fast-socks5` copies the decoded payload into the
-    /// caller-provided slice without a length check.
+    /// datagram buffer so the SOCKS5 header and the maximum DNS payload can be
+    /// received and decoded in place without a separate temporary allocation.
     async fn listen_dns_response(self: Arc<Self>) {
         let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
         let mut closing = false;
