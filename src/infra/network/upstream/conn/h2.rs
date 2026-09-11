@@ -50,7 +50,10 @@ impl Connection for H2Connection {
             return;
         }
         debug!(conn_id = self.id, "Closing DoH connection");
-        self.close_notify.notify_waiters();
+        // A single background driver waits for this signal. `notify_one()`
+        // stores a permit when the waiter has not registered yet,
+        // avoiding a lost close wakeup.
+        self.close_notify.notify_one();
     }
 
     async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
