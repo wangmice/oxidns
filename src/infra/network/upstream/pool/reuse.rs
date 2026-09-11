@@ -118,22 +118,27 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         for _ in 0..check_count {
             if let Some(conn) = self.connections.pop() {
                 if conn.available() {
-                    let idle = now - conn.last_used();
+                    let idle = now.saturating_sub(conn.last_used());
                     if idle < self.max_idle.as_millis() as u64 || conn.using_count() > 0 {
                         // still valid
                         if let Err(conn) = self.connections.push(conn) {
                             drop_vec.push(conn);
                             self.active_count.fetch_sub(1, Ordering::Relaxed);
+                            self.release_notified.notify_waiters();
+                        } else {
+                            self.release_notified.notify_one();
                         }
                     } else {
                         // idle timeout
                         drop_vec.push(conn);
                         self.active_count.fetch_sub(1, Ordering::Relaxed);
+                        self.release_notified.notify_waiters();
                     }
                 } else {
                     debug!("Dropping invalid connection");
                     invalid_vec.push(conn);
                     self.active_count.fetch_sub(1, Ordering::Relaxed);
+                    self.release_notified.notify_waiters();
                 }
             } else {
                 break;
@@ -142,16 +147,19 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
 
         // Maintain minimum connection count
         while self.active_count.load(Ordering::Relaxed) < self.min_size {
-            if !drop_vec.is_empty() {
-                if let Err(conn) = self.connections.push(drop_vec.pop().unwrap()) {
-                    drop_vec.push(conn);
-                    break;
-                } else {
-                    self.active_count.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
+            let Some(conn) = drop_vec.pop() else {
+                break;
+            };
+            let Some(reservation) = self.try_reserve_active() else {
+                drop_vec.push(conn);
+                break;
+            };
+            if let Err(conn) = self.connections.push(conn) {
+                drop_vec.push(conn);
                 break;
             }
+            reservation.commit();
+            self.release_notified.notify_one();
         }
 
         // Close dropped/invalid connections
@@ -813,6 +821,67 @@ mod tests {
         assert_eq!(conn.query_calls(), 1);
         assert_eq!(conn.close_calls(), 1);
         assert_eq!(pool.connections.len(), 0);
+        assert_eq!(pool.active_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_maintain_saturates_idle_age_when_last_used_advances_past_snapshot() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let future_last_used = AppClock::elapsed_millis().saturating_add(1_000);
+        let conn = Arc::new(MockConnection::new(true, 0, future_last_used));
+        pool.connections
+            .push(conn.clone())
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        pool.maintain().await;
+
+        assert_eq!(conn.close_calls(), 0);
+        assert_eq!(pool.connections.len(), 1);
+        assert_eq!(pool.active_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_maintain_notifies_waiter_when_connection_is_requeued() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let conn = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.connections
+            .push(conn)
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        pool.maintain().await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified.as_mut())
+            .await
+            .expect("maintenance should wake a waiter when a connection is requeued");
+    }
+
+    #[tokio::test]
+    async fn test_maintain_notifies_waiter_when_capacity_is_freed() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let conn = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.connections
+            .push(conn)
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        pool.maintain().await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified.as_mut())
+            .await
+            .expect("maintenance should wake waiters when connection capacity is freed");
         assert_eq!(pool.active_count.load(Ordering::Relaxed), 0);
     }
 

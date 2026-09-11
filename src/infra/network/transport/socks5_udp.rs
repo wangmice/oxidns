@@ -11,11 +11,14 @@
 //! relay's actual address family.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use fast_socks5::client::{Config, Socks5Stream};
 use fast_socks5::util::target_addr::TargetAddr;
 use fast_socks5::{AuthenticationMethod, Socks5Command};
+use futures::task::AtomicWaker;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,7 @@ pub(crate) struct Socks5UdpAssociation {
     socket: UdpSocket,
     control_closed: CancellationToken,
     control_shutdown: CancellationToken,
+    control_recv_waker: Arc<AtomicWaker>,
 }
 
 impl Socks5UdpAssociation {
@@ -70,7 +74,7 @@ impl Socks5UdpAssociation {
         let relay = control
             .request(Socks5Command::UDPAssociate, client_src)
             .await?;
-        let relay_addr = resolve_relay_addr(&relay, proxy_peer)?;
+        let relay_addr = resolve_relay_addr(&relay, proxy_peer).await?;
 
         let bind_addr = unspecified_for(relay_addr);
         let udp_socket = UdpSocket::from_std(bind_udp(bind_addr, &socket_options)?)?;
@@ -78,16 +82,19 @@ impl Socks5UdpAssociation {
 
         let control_closed = CancellationToken::new();
         let control_shutdown = CancellationToken::new();
+        let control_recv_waker = Arc::new(AtomicWaker::new());
         tokio::spawn(monitor_control_channel(
             control,
             control_closed.clone(),
             control_shutdown.clone(),
+            control_recv_waker.clone(),
         ));
 
         Ok(Self {
             socket: udp_socket,
             control_closed,
             control_shutdown,
+            control_recv_waker,
         })
     }
 
@@ -108,6 +115,20 @@ impl Socks5UdpAssociation {
     #[inline]
     pub(crate) fn is_control_closed(&self) -> bool {
         self.control_closed.is_cancelled()
+    }
+
+    #[inline]
+    pub(crate) fn check_control_open(&self) -> io::Result<()> {
+        self.ensure_control_open()
+    }
+
+    pub(crate) fn poll_control_closed_recv(&self, cx: &mut Context<'_>) -> Poll<()> {
+        poll_control_closed(&self.control_closed, &self.control_recv_waker, cx)
+    }
+
+    #[inline]
+    pub(crate) fn control_closed_token(&self) -> CancellationToken {
+        self.control_closed.clone()
     }
 
     pub(crate) async fn send_to(&self, data: &[u8], target: &TargetAddr) -> io::Result<usize> {
@@ -180,6 +201,7 @@ async fn monitor_control_channel(
     mut control: Socks5Stream<TcpStream>,
     control_closed: CancellationToken,
     shutdown: CancellationToken,
+    control_recv_waker: Arc<AtomicWaker>,
 ) {
     let mut byte = [0u8; 1];
     tokio::select! {
@@ -188,27 +210,56 @@ async fn monitor_control_channel(
         _ = control.read(&mut byte) => {
             // A UDP ASSOCIATE control connection is a lifetime signal after the
             // handshake. EOF, a read error, or unexpected data all invalidate
-            // the association.
+            // the association. The cancellation token wakes every Quinn
+            // writable poller; the explicit waker covers the socket-level
+            // receive poll.
             control_closed.cancel();
+            control_recv_waker.wake();
         }
     }
 }
 
+fn poll_control_closed(
+    control_closed: &CancellationToken,
+    waker: &AtomicWaker,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    if control_closed.is_cancelled() {
+        return Poll::Ready(());
+    }
+
+    // Register before the second state check so a control-channel close cannot
+    // land between the check and waiter registration and get lost.
+    waker.register(cx.waker());
+    if control_closed.is_cancelled() {
+        Poll::Ready(())
+    } else {
+        Poll::Pending
+    }
+}
+
 #[inline]
-fn control_closed_error() -> io::Error {
+pub(crate) fn control_closed_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "SOCKS5 UDP control connection closed",
     )
 }
 
-fn resolve_relay_addr(relay: &TargetAddr, proxy_peer: SocketAddr) -> Result<SocketAddr> {
-    let mut addrs = relay.to_socket_addrs().map_err(|e| {
-        DnsError::protocol(format!("Failed to resolve SOCKS5 UDP relay {relay}: {e}"))
-    })?;
-    let mut relay_addr = addrs
-        .next()
-        .ok_or_else(|| DnsError::protocol("SOCKS5 UDP relay resolved to no addresses"))?;
+async fn resolve_relay_addr(relay: &TargetAddr, proxy_peer: SocketAddr) -> Result<SocketAddr> {
+    let mut relay_addr = match relay {
+        TargetAddr::Ip(addr) => *addr,
+        TargetAddr::Domain(host, port) => {
+            let mut addrs = tokio::net::lookup_host((host.as_str(), *port))
+                .await
+                .map_err(|e| {
+                    DnsError::protocol(format!("Failed to resolve SOCKS5 UDP relay {relay}: {e}"))
+                })?;
+            addrs
+                .next()
+                .ok_or_else(|| DnsError::protocol("SOCKS5 UDP relay resolved to no addresses"))?
+        }
+    };
 
     // Some SOCKS5 servers report an unspecified BND.ADDR and expect the client
     // to use the address of the TCP control peer with the returned UDP port.
@@ -369,6 +420,20 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[tokio::test]
+    async fn resolve_domain_relay_asynchronously() {
+        let relay = TargetAddr::Domain("localhost".to_string(), 5300);
+        let addr = resolve_relay_addr(
+            &relay,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080),
+        )
+        .await
+        .expect("localhost SOCKS5 relay should resolve through Tokio");
+
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 5300);
+    }
 
     async fn run_cross_family_association_test(listener: TcpListener, relay: UdpSocket) {
         let relay_addr = relay.local_addr().expect("relay should have an address");

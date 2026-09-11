@@ -39,9 +39,9 @@
 //!   the inline sender, then publishes the final `FULL` state with `Release`.
 //! - `take()` and `remove()` first move a `FULL` slot back to `RESERVED`, then
 //!   move the inline sender out, then leave a `TOMBSTONE`.
-//! - `clear()` is the shutdown path. It forcibly drops every sender and
-//!   rewrites all slots back to `EMPTY` so connection close can promptly
-//!   unblock waiters.
+//! - `clear()` is the shutdown path. It excludes concurrent insertions before
+//!   dropping senders and rewriting slots to `EMPTY`; ordinary empty-map
+//!   tombstone reset runs only when no insertion can depend on a probe chain.
 
 use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
@@ -60,6 +60,11 @@ const MIN_SLOT_COUNT: usize = 8;
 const SLOT_FACTOR: usize = 4;
 const ID_HASH_DOMAIN: u64 = u64::from_be_bytes(*b"IDPERMUT");
 const ID_PERMUTATION_ROUNDS: usize = 4;
+
+// High bit reserves exclusive access for tombstone reset / clear. The lower
+// bits count active store operations that may be probing through tombstones.
+const INSERT_STATE_EXCLUSIVE: u32 = 1 << 31;
+const INSERT_STATE_COUNT_MASK: u32 = INSERT_STATE_EXCLUSIVE - 1;
 
 /// Slot has never been used or has been fully reset.
 const STATE_EMPTY: u32 = 0;
@@ -150,6 +155,30 @@ enum StoreResult {
     Exhausted,
 }
 
+struct InsertGuard<'a> {
+    state: &'a AtomicU32,
+}
+
+impl Drop for InsertGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let previous = self.state.fetch_sub(1, Ordering::Release);
+        debug_assert_ne!(previous & INSERT_STATE_COUNT_MASK, 0);
+    }
+}
+
+struct ExclusiveGuard<'a> {
+    state: &'a AtomicU32,
+}
+
+impl Drop for ExclusiveGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), INSERT_STATE_EXCLUSIVE);
+        self.state.store(0, Ordering::Release);
+    }
+}
+
 /// Lock-free request correlation map with bounded sparse storage.
 ///
 /// The table is deliberately overprovisioned relative to `max_inflight` so the
@@ -161,6 +190,7 @@ pub struct RequestMap {
     id_sequence: AtomicU16,
     id_rounds: [[u8; 256]; ID_PERMUTATION_ROUNDS],
     size: AtomicU16,
+    insert_state: AtomicU32,
     hash_state: RandomState,
 }
 
@@ -171,6 +201,7 @@ impl std::fmt::Debug for RequestMap {
             .field("mask", &self.mask)
             .field("id_sequence", &self.id_sequence)
             .field("size", &self.size)
+            .field("insert_state", &self.insert_state)
             .finish_non_exhaustive()
     }
 }
@@ -202,6 +233,7 @@ impl RequestMap {
             id_sequence: AtomicU16::new(0),
             id_rounds,
             size: AtomicU16::new(0),
+            insert_state: AtomicU32::new(0),
             hash_state,
         }
     }
@@ -232,6 +264,10 @@ impl RequestMap {
 
     #[inline(always)]
     fn store_inner(&self, tx: Sender<Message>, fingerprint: u64) -> Result<RequestGuard<'_>> {
+        // Keep tombstone reset from turning a probe-chain predecessor into
+        // EMPTY while this insertion is still probing/publishing a later slot.
+        // This is one atomic increment/decrement per store, not per probe.
+        let _insert_guard = self.enter_insert();
         let mut tx = Some(tx);
 
         for _ in 0..ID_SPACE_SIZE {
@@ -295,6 +331,10 @@ impl RequestMap {
     where
         F: FnMut(usize),
     {
+        // `clear()` may run while a query that passed the connection's closed
+        // check is still publishing into this map. Block new stores and wait
+        // for already-active stores before rewriting TOMBSTONEs to EMPTY.
+        let _exclusive = self.enter_exclusive();
         let mut removed = 0u16;
         for (idx, slot) in self.slots.iter().enumerate() {
             loop {
@@ -553,7 +593,98 @@ impl RequestMap {
         None
     }
 
+    #[inline]
+    fn enter_insert(&self) -> InsertGuard<'_> {
+        loop {
+            let state = self.insert_state.load(Ordering::Acquire);
+            if state & INSERT_STATE_EXCLUSIVE != 0 {
+                spin_loop();
+                continue;
+            }
+
+            let count = state & INSERT_STATE_COUNT_MASK;
+            if count == INSERT_STATE_COUNT_MASK {
+                // Impossible under the u16 DNS inflight bound, but avoid
+                // carrying into the exclusive bit even under misuse.
+                spin_loop();
+                continue;
+            }
+
+            if self
+                .insert_state
+                .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return InsertGuard {
+                    state: &self.insert_state,
+                };
+            }
+        }
+    }
+
+    fn enter_exclusive(&self) -> ExclusiveGuard<'_> {
+        loop {
+            let state = self.insert_state.load(Ordering::Acquire);
+            if state & INSERT_STATE_EXCLUSIVE != 0 {
+                spin_loop();
+                continue;
+            }
+
+            if self
+                .insert_state
+                .compare_exchange_weak(
+                    state,
+                    state | INSERT_STATE_EXCLUSIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            // New stores are now blocked by the exclusive bit. Existing stores
+            // can finish publication and drop their read-side guards.
+            while self.insert_state.load(Ordering::Acquire) & INSERT_STATE_COUNT_MASK != 0 {
+                spin_loop();
+            }
+
+            return ExclusiveGuard {
+                state: &self.insert_state,
+            };
+        }
+    }
+
+    #[inline]
+    fn try_enter_exclusive(&self) -> Option<ExclusiveGuard<'_>> {
+        self.insert_state
+            .compare_exchange(
+                0,
+                INSERT_STATE_EXCLUSIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(ExclusiveGuard {
+            state: &self.insert_state,
+        })
+    }
+
     fn reset_tombstones(&self) {
+        if !self.is_empty() {
+            return;
+        }
+
+        // Never rewrite probe-chain history while an insertion may have
+        // observed it. If a store is active, leave the tombstones in place;
+        // they remain correct and will be reset on a later empty transition.
+        let Some(_exclusive) = self.try_enter_exclusive() else {
+            return;
+        };
+
+        // A store could have published between the first size check and our
+        // exclusive CAS. Once exclusive, all pre-existing stores are absent and
+        // new ones are blocked, so this second check is stable.
         if !self.is_empty() {
             return;
         }
@@ -832,48 +963,69 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_preserves_count_for_insert_after_scanned_slot() {
-        use std::sync::{Arc, Barrier};
+    fn test_tombstone_reset_skips_while_insert_is_active() {
+        let map = RequestMap::with_capacity(1);
 
-        let map = Arc::new(RequestMap::with_capacity(1));
-        let after_first_slot = Arc::new(Barrier::new(2));
-        let resume_clear = Arc::new(Barrier::new(2));
+        // Model the critical window directly: an insertion has started probing
+        // while the map is otherwise empty and an older probe-chain tombstone
+        // still exists. Reset must not turn that predecessor into EMPTY until
+        // the insertion guard is gone.
+        map.slots[0].meta.store(META_TOMBSTONE, Ordering::Release);
+        assert!(map.is_empty());
 
-        let clear_map = Arc::clone(&map);
-        let clear_after_first = Arc::clone(&after_first_slot);
-        let clear_resume = Arc::clone(&resume_clear);
-        let clear_thread = std::thread::spawn(move || {
-            clear_map.clear_inner(|idx| {
-                if idx == 0 {
-                    clear_after_first.wait();
-                    clear_resume.wait();
-                }
-            })
-        });
-
-        // Wait until clear() has observed slot 0 as EMPTY, then publish a live
-        // entry into exactly that already-scanned slot. This is the shutdown
-        // race that used to be corrupted by the final `size.store(0)`.
-        after_first_slot.wait();
-        let id = (u16::MIN..=u16::MAX)
-            .find(|id| map.probe_index(*id, 0) == 0)
-            .expect("an ID must hash to slot 0");
-        let (tx, _rx) = oneshot::channel::<Message>();
-        let mut tx = Some(tx);
-        assert!(map.claim_slot(0, id, 0, &mut tx));
-        assert_eq!(map.size(), 1);
-
-        resume_clear.wait();
-        assert_eq!(clear_thread.join().expect("clear thread should finish"), 0);
+        let insert_guard = map.enter_insert();
+        map.reset_tombstones();
         assert_eq!(
-            map.size(),
-            1,
-            "clear must not erase the count of an insert into an already-scanned slot"
+            meta_state(map.slots[0].meta.load(Ordering::Acquire)),
+            STATE_TOMBSTONE,
+            "active insertion must preserve probe-chain tombstones"
         );
 
-        assert!(map.remove(id));
-        assert_eq!(map.size(), 0);
-        assert!(map.is_empty());
+        drop(insert_guard);
+        map.reset_tombstones();
+        assert_eq!(
+            meta_state(map.slots[0].meta.load(Ordering::Acquire)),
+            STATE_EMPTY,
+            "tombstone may reset once no insertion can depend on it"
+        );
+    }
+
+    #[test]
+    fn test_exclusive_gate_waits_for_active_insert() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let map = Arc::new(RequestMap::with_capacity(1));
+        let insert_guard = map.enter_insert();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let exclusive_map = Arc::clone(&map);
+        let exclusive_thread = std::thread::spawn(move || {
+            let _exclusive = exclusive_map.enter_exclusive();
+            acquired_tx
+                .send(())
+                .expect("test receiver should remain alive");
+        });
+
+        // Wait until the writer-preference bit is visible. At this point new
+        // stores are blocked, but the exclusive caller must still be waiting on
+        // our active insertion count.
+        while map.insert_state.load(Ordering::Acquire) & INSERT_STATE_EXCLUSIVE == 0 {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(insert_guard);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exclusive gate should acquire after insert drains");
+        exclusive_thread
+            .join()
+            .expect("exclusive gate thread should finish");
+        assert_eq!(map.insert_state.load(Ordering::Acquire), 0);
     }
 
     #[test]

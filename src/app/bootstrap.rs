@@ -115,9 +115,11 @@ mod tests {
     };
     use crate::config::types::{ApiConfig, ApiHttpConfig, LogConfig, NetworkConfig, RuntimeConfig};
     use crate::infra::clock::AppClock;
+    use crate::infra::network::outbound::TestGlobalGuard;
 
     #[tokio::test]
     async fn assemble_without_api_config_does_not_register_api() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let _guard = global_api_test_guard().await;
         AppClock::start();
         let stale_hub = ApiHub::from_config(&ApiConfig {
@@ -153,12 +155,14 @@ mod tests {
     use super::*;
     use crate::config::types::{ApiConfig, ApiHttpConfig, LogConfig, NetworkConfig, RuntimeConfig};
     use crate::infra::clock::AppClock;
+    use crate::infra::network::outbound::TestGlobalGuard;
 
     /// Without the `api` feature, a config that still sets `api.http` is a
     /// version/feature mismatch that does not prevent the server from running:
     /// `assemble` should warn and succeed (no management listener), not error.
     #[tokio::test]
     async fn assemble_warns_but_succeeds_when_api_http_set_without_feature() {
+        let _outbound_guard = TestGlobalGuard::clean();
         AppClock::start();
         let assembly = assemble(
             &Config {

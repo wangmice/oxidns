@@ -325,7 +325,7 @@ async fn test_query_recorder_execute_enqueues_record() {
     .unwrap();
 
     let mut plugin = QueryRecorder::new("rec".to_string(), config.clone());
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
 
     let mut ctx = DnsContext::new(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
@@ -378,7 +378,7 @@ async fn test_query_recorder_list_cursor_only_when_more_records_exist() {
     .unwrap();
 
     let mut plugin = QueryRecorder::new("rec".to_string(), config.clone());
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
 
     for request_id in 1..=3 {
         let mut request = Message::new();
@@ -445,7 +445,7 @@ async fn test_query_recorder_clear_history_removes_records_and_tail() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_demo_records(&backend).await;
@@ -474,7 +474,7 @@ async fn test_query_recorder_clear_history_does_not_wait_for_reader_permits() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_demo_records(&backend).await;
@@ -515,7 +515,7 @@ async fn test_query_recorder_periodic_cleanup_reclaims_database_and_wal_space() 
     )))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_bulk_records(&backend, 2_000).await;
@@ -548,7 +548,7 @@ async fn test_query_recorder_manual_clear_reclaims_database_and_wal_space() {
     )))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_bulk_records(&backend, 2_000).await;
@@ -580,7 +580,7 @@ async fn test_query_recorder_periodic_cleanup_migrates_legacy_database() {
     )))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_bulk_records(&backend, 1_000).await;
@@ -612,7 +612,7 @@ async fn test_query_recorder_manual_clear_migrates_legacy_database() {
     )))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     seed_bulk_records(&backend, 1_000).await;
@@ -638,7 +638,7 @@ async fn test_query_recorder_clear_waits_for_active_database_reader() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -680,8 +680,8 @@ async fn test_query_recorder_shared_database_clear_preserves_other_recorder() {
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin_a = QueryRecorder::new("rec-a".to_string(), config.clone());
     let mut plugin_b = QueryRecorder::new("rec-b".to_string(), config);
-    plugin_a.init_for_test().await.unwrap();
-    plugin_b.init_for_test().await.unwrap();
+    plugin_a.init_without_api_for_test().await.unwrap();
+    plugin_b.init_without_api_for_test().await.unwrap();
     let backend_a = plugin_a.backend.as_ref().unwrap().clone();
     let backend_b = plugin_b.backend.as_ref().unwrap().clone();
 
@@ -737,7 +737,7 @@ async fn test_query_recorder_cleanup_failure_does_not_stop_writer() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -790,7 +790,7 @@ async fn test_query_recorder_cleanup_is_not_skipped_when_record_queue_is_full() 
     ))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -895,7 +895,7 @@ async fn test_query_recorder_query_records_support_common_filters() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     backend.enqueue(pending_record(
@@ -1063,7 +1063,7 @@ async fn test_query_recorder_matcher_stats_use_record_filters() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     backend.enqueue(pending_record(
@@ -1139,7 +1139,7 @@ async fn test_query_recorder_tracks_fixed_values_and_effective_match_results() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     backend.enqueue(pending_record(
@@ -1220,7 +1220,7 @@ async fn test_query_recorder_plugin_stats_preserve_total_without_steps() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     backend.enqueue(pending_record(
@@ -1324,7 +1324,7 @@ async fn test_load_top_clients_ranks_by_count() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -1364,7 +1364,7 @@ async fn test_load_top_clients_allows_limit_above_200() {
     ))
     .unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
     for index in 0..250u16 {
@@ -1404,7 +1404,7 @@ async fn test_load_top_qnames_unwinds_questions() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -1434,7 +1434,7 @@ async fn test_qtype_and_rcode_distribution_counts() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -1494,7 +1494,7 @@ async fn test_latency_summary_returns_percentiles_and_histogram() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     seed_demo_records(&backend).await;
 
@@ -1522,7 +1522,7 @@ async fn test_timeseries_buckets_records_by_minute() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
     let mut plugin = QueryRecorder::new("rec".to_string(), config);
-    plugin.init_for_test().await.unwrap();
+    plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
     let minute_ms: i64 = 60_000;
     backend.enqueue(pending_record(

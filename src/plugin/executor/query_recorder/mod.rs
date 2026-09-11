@@ -71,30 +71,7 @@ impl Plugin for QueryRecorder {
     }
 
     async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
-        let backend = RecorderBackend::run(self.tag.clone(), self.config.clone())?;
-        api::register(&backend)?;
-
-        let recorder_backend = backend.clone();
-        let retention_ms = self.config.retention_days.saturating_mul(ONE_DAY_MS) as i64;
-        self.cleanup_task_id = Some(task_center::spawn_fixed(
-            format!("query_recorder:{}:cleanup", self.tag),
-            Duration::from_secs(self.config.cleanup_interval_hours * 60 * 60),
-            move || {
-                let recorder_backend = recorder_backend.clone();
-                async move {
-                    let cutoff_ms = Timestamp::now().as_millisecond() - retention_ms;
-                    match tokio::task::spawn_blocking(move || recorder_backend.cleanup(cutoff_ms))
-                        .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => warn!("query_recorder cleanup failed: {}", err),
-                        Err(err) => warn!("query_recorder cleanup task failed: {}", err),
-                    }
-                }
-            },
-        ));
-        self.backend.replace(backend);
-        Ok(())
+        self.init_inner(true).await
     }
 
     async fn destroy(&self) -> Result<()> {
@@ -171,6 +148,40 @@ impl QueryRecorder {
             backend: None,
             cleanup_task_id: None,
         }
+    }
+
+    async fn init_inner(&mut self, register_api: bool) -> Result<()> {
+        let backend = RecorderBackend::run(self.tag.clone(), self.config.clone())?;
+        if register_api {
+            api::register(&backend)?;
+        }
+
+        let recorder_backend = backend.clone();
+        let retention_ms = self.config.retention_days.saturating_mul(ONE_DAY_MS) as i64;
+        self.cleanup_task_id = Some(task_center::spawn_fixed(
+            format!("query_recorder:{}:cleanup", self.tag),
+            Duration::from_secs(self.config.cleanup_interval_hours * 60 * 60),
+            move || {
+                let recorder_backend = recorder_backend.clone();
+                async move {
+                    let cutoff_ms = Timestamp::now().as_millisecond() - retention_ms;
+                    match tokio::task::spawn_blocking(move || recorder_backend.cleanup(cutoff_ms))
+                        .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => warn!("query_recorder cleanup failed: {}", err),
+                        Err(err) => warn!("query_recorder cleanup task failed: {}", err),
+                    }
+                }
+            },
+        ));
+        self.backend.replace(backend);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn init_without_api_for_test(&mut self) -> Result<()> {
+        self.init_inner(false).await
     }
 }
 

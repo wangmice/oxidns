@@ -58,10 +58,16 @@ async fn query_doh3_config(
     request: Message,
     deadline: QueryDeadline,
 ) -> Result<Message> {
-    let socket = connect_udp(UdpDialOptions::new(
-        config.target(),
-        SocketOptions::default(),
-    ))?;
+    let socket = match deadline
+        .run(connect_udp(UdpDialOptions::new(
+            config.target(),
+            SocketOptions::default(),
+        )))
+        .await
+    {
+        DeadlineOutcome::Completed(result) => result?,
+        DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+    };
     let quic_conn = connect_quic(
         socket,
         QuicDialOptions::new(
@@ -95,6 +101,9 @@ async fn query_doh3_config(
         body_bytes.as_slice(),
         Version::HTTP_3,
     );
+    // The DNS payload has been encoded into the request URI, so return the
+    // pooled wire buffer before waiting on the HTTP/3 transport.
+    drop(body_bytes);
     let mut stream = match deadline.run(send_request.send_request(http_request)).await {
         DeadlineOutcome::Completed(Ok(value)) => value,
         DeadlineOutcome::Completed(Err(err)) => {
