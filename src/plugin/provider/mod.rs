@@ -177,6 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_control_api_controls_matcher_and_reloads_provider() -> DnsResult<()> {
+        let _outbound_guard = crate::infra::network::outbound::TestGlobalGuard::clean();
         let _guard = global_api_test_guard().await;
         clear_global_api();
         plugin::reset_runtime_for_test().await;

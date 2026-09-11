@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_restore_global_reinstalls_previous_runtime() {
-        clear_global();
+        let _guard = TestGlobalGuard::clean();
         let first = NetworkOutboundConfig {
             default: Some("first".to_string()),
             profiles: HashMap::from([(
@@ -456,6 +456,5 @@ mod tests {
 
         assert!(global().resolve_policy(Some("first"), None).is_ok());
         assert!(global().resolve_policy(Some("second"), None).is_err());
-        clear_global();
     }
 }

@@ -11,6 +11,7 @@ use super::*;
 #[cfg(feature = "api")]
 use crate::api::{clear_global_api, global_api_test_guard};
 use crate::config::types::{Config, PluginConfig};
+use crate::infra::network::outbound::TestGlobalGuard;
 use crate::plugin::dependency::{
     DependencyGraphEdge, DependencyGraphNode, DependencyGraphReport, DependencySpec,
 };
@@ -68,6 +69,7 @@ async fn matcher_runtime_control_is_not_attached_when_api_is_not_running() {
 
 #[tokio::test]
 async fn test_init_runtime_failure_leaves_runtime_stopped() {
+    let _outbound_guard = TestGlobalGuard::clean();
     let manager = Arc::new(PluginRuntimeManager::new());
     manager
         .init_runtime(test_config(Vec::new()))
@@ -91,6 +93,7 @@ async fn test_init_runtime_failure_leaves_runtime_stopped() {
 
 #[tokio::test]
 async fn test_runtime_manager_recovers_poisoned_current_lock() {
+    let _outbound_guard = TestGlobalGuard::clean();
     let manager = Arc::new(PluginRuntimeManager::new());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = manager
