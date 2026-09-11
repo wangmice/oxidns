@@ -58,11 +58,16 @@ async fn query_doh3_config(
     request: Message,
     deadline: QueryDeadline,
 ) -> Result<Message> {
-    let socket = connect_udp(UdpDialOptions::new(
-        config.target(),
-        SocketOptions::default(),
-    ))
-    .await?;
+    let socket = match deadline
+        .run(connect_udp(UdpDialOptions::new(
+            config.target(),
+            SocketOptions::default(),
+        )))
+        .await
+    {
+        DeadlineOutcome::Completed(result) => result?,
+        DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+    };
     let quic_conn = connect_quic(
         socket,
         QuicDialOptions::new(

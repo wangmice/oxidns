@@ -51,11 +51,16 @@ async fn query_udp_config(
     request: Message,
     deadline: QueryDeadline,
 ) -> Result<Message> {
-    let socket = connect_udp(UdpDialOptions::new(
-        config.target(),
-        SocketOptions::default(),
-    ))
-    .await?;
+    let socket = match deadline
+        .run(connect_udp(UdpDialOptions::new(
+            config.target(),
+            SocketOptions::default(),
+        )))
+        .await
+    {
+        DeadlineOutcome::Completed(result) => result?,
+        DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+    };
     let socket = UdpSocket::from_std(socket)?;
     let transport = UdpTransport::new(socket);
     let query_id = request.id();

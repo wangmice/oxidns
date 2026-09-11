@@ -90,7 +90,7 @@ async fn query_doh_config(
         ),
     )
     .await?;
-    let (mut sender, connection) = match deadline
+    let (sender, connection) = match deadline
         .run(client::Builder::new().handshake::<_, Bytes>(tls_stream))
         .await
     {
@@ -112,6 +112,15 @@ async fn query_doh_config(
         body_bytes.as_slice(),
         Version::HTTP_2,
     );
+    let mut sender = match deadline.run(sender.ready()).await {
+        DeadlineOutcome::Completed(Ok(sender)) => sender,
+        DeadlineOutcome::Completed(Err(err)) => {
+            return Err(DnsError::protocol(format!(
+                "H2 sender readiness error: {err}"
+            )));
+        }
+        DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+    };
     let (response_future, _send_stream) = sender
         .send_request(http_request, true)
         .map_err(|err| DnsError::protocol(format!("H2 send_request error: {err}")))?;
