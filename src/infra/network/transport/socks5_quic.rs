@@ -30,7 +30,7 @@ const MAX_DROPPED_DATAGRAMS_PER_POLL: usize = 16;
 pub(crate) struct Socks5QuicSocket {
     association: Socks5UdpAssociation,
     target: TargetAddr,
-    peer_addr: SocketAddr,
+    quic_peer_addr: SocketAddr,
 }
 
 thread_local! {
@@ -43,22 +43,26 @@ impl Socks5QuicSocket {
         socket_options: SocketOptions,
         socks5: Socks5Opt,
     ) -> Result<(Arc<dyn AsyncUdpSocket>, SocketAddr)> {
-        let association = Socks5UdpAssociation::connect(socket_options, socks5.clone()).await?;
+        let association = Socks5UdpAssociation::connect(socket_options, socks5).await?;
         let target_addr = if let Some(remote_ip) = target.remote_ip() {
             TargetAddr::Ip(SocketAddr::new(remote_ip, target.port()))
         } else {
             TargetAddr::Domain(target.host().to_string(), target.port())
         };
-        let peer_addr = target
-            .remote_ip()
-            .map(|ip| SocketAddr::new(ip, target.port()))
-            .unwrap_or_else(|| SocketAddr::new(socks5.socket_addr.ip(), target.port()));
+
+        // Quinn derives its endpoint address family from local_addr(), so
+        // expose the connected SOCKS5 UDP relay as the logical QUIC
+        // peer. The actual upstream target is carried independently in
+        // the SOCKS5 UDP header. Keeping both logical addresses on the
+        // same connected UDP socket avoids Quinn rejecting or
+        // IPv4-mapping a cross-family upstream address.
+        let quic_peer_addr = association.get_ref().peer_addr()?;
         let socket = Arc::new(Self {
             association,
             target: target_addr,
-            peer_addr,
+            quic_peer_addr,
         });
-        Ok((socket, peer_addr))
+        Ok((socket, quic_peer_addr))
     }
 }
 
@@ -79,10 +83,10 @@ impl AsyncUdpSocket for Socks5QuicSocket {
                 "SOCKS5 QUIC socket does not support UDP segmentation",
             ));
         }
-        if transmit.destination != self.peer_addr {
+        if transmit.destination != self.quic_peer_addr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "QUIC transmit destination does not match SOCKS5 upstream",
+                "QUIC transmit destination does not match SOCKS5 relay peer",
             ));
         }
         self.association.check_control_open()?;
@@ -163,7 +167,7 @@ impl AsyncUdpSocket for Socks5QuicSocket {
 
                         output[..payload.len()].copy_from_slice(payload);
                         *output_meta = RecvMeta {
-                            addr: self.peer_addr,
+                            addr: self.quic_peer_addr,
                             len: payload.len(),
                             stride: payload.len(),
                             ecn: None,
@@ -232,7 +236,7 @@ fn send_complete(socket: &Socks5QuicSocket, buf: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::pin::Pin;
     use std::time::Duration;
 
@@ -347,7 +351,7 @@ mod tests {
             .local_addr()
             .expect("SOCKS5 listener should have an address");
         let upstream_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        let expected_peer = SocketAddr::new(upstream_ip, 853);
+        let expected_peer = relay_addr;
         let (close_proxy, close_proxy_rx) = oneshot::channel();
 
         let proxy = tokio::spawn(async move {
@@ -504,10 +508,7 @@ mod tests {
         .await
         .expect("authenticated SOCKS5 QUIC socket should connect");
 
-        assert_eq!(
-            peer_addr,
-            SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 853)
-        );
+        assert_eq!(peer_addr, relay_addr);
         proxy.await.expect("proxy task should complete");
     }
 
@@ -549,7 +550,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(peer_addr, SocketAddr::new(proxy_addr.ip(), 853));
+        assert_eq!(peer_addr, relay_addr);
 
         let relay_task = tokio::spawn(async move {
             let mut packet = [0u8; 1024];
@@ -577,6 +578,141 @@ mod tests {
         relay_task.await.unwrap();
         let _ = close_proxy.send(());
         proxy.await.unwrap();
+    }
+
+    async fn run_cross_family_quic_peer_test(relay: UdpSocket, upstream_ip: IpAddr) {
+        let relay_addr = relay.local_addr().expect("relay should have an address");
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("IPv4 SOCKS5 listener should bind");
+        let proxy_addr = listener
+            .local_addr()
+            .expect("SOCKS5 listener should have an address");
+        let (close_proxy, close_proxy_rx) = oneshot::channel();
+
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut associate = [0u8; 10];
+            stream.read_exact(&mut associate).await.unwrap();
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+            let mut response = vec![0x05, 0x00, 0x00];
+            match relay_addr {
+                SocketAddr::V4(addr) => {
+                    response.push(0x01);
+                    response.extend_from_slice(&addr.ip().octets());
+                    response.extend_from_slice(&addr.port().to_be_bytes());
+                }
+                SocketAddr::V6(addr) => {
+                    response.push(0x04);
+                    response.extend_from_slice(&addr.ip().octets());
+                    response.extend_from_slice(&addr.port().to_be_bytes());
+                }
+            }
+            stream.write_all(&response).await.unwrap();
+            let _ = close_proxy_rx.await;
+        });
+
+        let (socket, quic_peer_addr) = timeout(
+            Duration::from_secs(2),
+            Socks5QuicSocket::connect(
+                DialTarget::new(Some(upstream_ip), "dns.example".to_string(), 853),
+                SocketOptions::default(),
+                Socks5Opt {
+                    username: None,
+                    password: None,
+                    socket_addr: proxy_addr,
+                },
+            ),
+        )
+        .await
+        .expect("cross-family SOCKS5 QUIC connect should not time out")
+        .expect("cross-family SOCKS5 QUIC socket should connect");
+
+        assert_eq!(quic_peer_addr, relay_addr);
+        assert_eq!(
+            socket.local_addr().unwrap().is_ipv4(),
+            quic_peer_addr.is_ipv4(),
+            "Quinn local and logical peer addresses must use the same family"
+        );
+
+        let expected_target = TargetAddr::Ip(SocketAddr::new(upstream_ip, 853));
+        let relay_task = tokio::spawn(async move {
+            let mut packet = [0u8; 1024];
+            let (len, client) = relay.recv_from(&mut packet).await.unwrap();
+            let (target, payload_offset) = parse_socks5_udp_packet(&packet[..len]).unwrap();
+            assert_eq!(target, expected_target);
+            assert_eq!(&packet[payload_offset..len], b"cross-family");
+            relay.send_to(&packet[..len], client).await.unwrap();
+        });
+
+        timeout(
+            Duration::from_secs(2),
+            send_when_writable(
+                &socket,
+                &Transmit {
+                    destination: quic_peer_addr,
+                    contents: b"cross-family",
+                    segment_size: None,
+                    src_ip: None,
+                    ecn: None,
+                },
+            ),
+        )
+        .await
+        .expect("cross-family QUIC send should not time out")
+        .expect("cross-family QUIC send should succeed");
+
+        let mut output = [0u8; 64];
+        let mut meta = [RecvMeta {
+            addr: quic_peer_addr,
+            len: 0,
+            stride: 0,
+            ecn: None,
+            dst_ip: None,
+        }];
+        let received = timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| {
+                Pin::new(&socket).poll_recv(cx, &mut [IoSliceMut::new(&mut output)], &mut meta)
+            }),
+        )
+        .await
+        .expect("cross-family QUIC receive should not time out")
+        .expect("cross-family QUIC receive should succeed");
+        assert_eq!(received, 1);
+        assert_eq!(meta[0].addr, quic_peer_addr);
+        assert_eq!(&output[..meta[0].len], b"cross-family");
+
+        relay_task.await.unwrap();
+        let _ = close_proxy.send(());
+        proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_relay_is_quic_peer_for_ipv6_upstream() {
+        let relay = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("IPv4 relay should bind");
+        run_cross_family_quic_peer_test(
+            relay,
+            IpAddr::V6("2001:db8::53".parse::<Ipv6Addr>().unwrap()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_relay_is_quic_peer_for_ipv4_upstream() {
+        let Ok(relay) = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await
+        else {
+            return;
+        };
+        run_cross_family_quic_peer_test(relay, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))).await;
     }
 
     #[tokio::test]
@@ -617,7 +753,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(peer_addr, upstream);
+        assert_eq!(peer_addr, relay_addr);
 
         let wrong_destination = SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 853);
         let err = socket
