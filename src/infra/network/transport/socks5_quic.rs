@@ -22,6 +22,7 @@ use crate::infra::network::dial::{
 use crate::infra::network::proxy::Socks5Opt;
 
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
+const MAX_DROPPED_DATAGRAMS_PER_POLL: usize = 16;
 
 #[derive(Debug)]
 pub(crate) struct Socks5QuicSocket {
@@ -139,41 +140,44 @@ impl AsyncUdpSocket for Socks5QuicSocket {
                     "SOCKS5 QUIC receive buffer is already in use",
                 )));
             };
-            let mut read_buf = ReadBuf::new(raw.as_mut_slice());
-            match self.datagram.get_ref().poll_recv(cx, &mut read_buf) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Ready(Ok(())) => {
-                    let (source, payload) = match parse_socks5_udp_packet(read_buf.filled()) {
-                        Ok(parsed) => parsed,
-                        Err(err) => return Poll::Ready(Err(err)),
-                    };
-                    if !response_source_matches(&self.target, &source) {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "SOCKS5 QUIC response source mismatch: expected {}, received {}",
-                                self.target, source
-                            ),
-                        )));
+
+            // Malformed, fragmented, spoofed, or oversized SOCKS5 UDP datagrams
+            // are packet-level failures. Drop them instead of surfacing a
+            // socket error to Quinn, which would otherwise tear
+            // down the whole QUIC connection. Bound the drain loop
+            // so a flood of bad datagrams cannot monopolize one
+            // executor poll.
+            for _ in 0..MAX_DROPPED_DATAGRAMS_PER_POLL {
+                let mut read_buf = ReadBuf::new(raw.as_mut_slice());
+                match self.datagram.get_ref().poll_recv(cx, &mut read_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) => {
+                        let Ok((source, payload)) = parse_socks5_udp_packet(read_buf.filled())
+                        else {
+                            continue;
+                        };
+                        if !response_source_matches(&self.target, &source) {
+                            continue;
+                        }
+                        if payload.len() > output.len() {
+                            continue;
+                        }
+                        output[..payload.len()].copy_from_slice(payload);
+                        *output_meta = RecvMeta {
+                            addr: self.peer_addr,
+                            len: payload.len(),
+                            stride: payload.len(),
+                            ecn: None,
+                            dst_ip: None,
+                        };
+                        return Poll::Ready(Ok(1));
                     }
-                    if payload.len() > output.len() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "SOCKS5 QUIC packet exceeds receive buffer",
-                        )));
-                    }
-                    output[..payload.len()].copy_from_slice(payload);
-                    *output_meta = RecvMeta {
-                        addr: self.peer_addr,
-                        len: payload.len(),
-                        stride: payload.len(),
-                        ecn: None,
-                        dst_ip: None,
-                    };
-                    Poll::Ready(Ok(1))
                 }
             }
+
+            cx.waker().wake_by_ref();
+            Poll::Pending
         })
     }
 
@@ -786,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_recv_rejects_response_source_mismatch() {
+    async fn poll_recv_drops_invalid_datagrams_before_valid_response() {
         let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay.local_addr().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -829,8 +833,12 @@ mod tests {
         let relay_task = tokio::spawn(async move {
             let mut packet = [0u8; 1024];
             let (_len, client) = relay.recv_from(&mut packet).await.unwrap();
-            let wrong = [0, 0, 0, 1, 1, 1, 1, 1, 0, 53, 1, 2, 3];
+            let wrong = [0, 0, 0, 1, 1, 1, 1, 1, 0x03, 0x55, 1, 2, 3];
             relay.send_to(&wrong, client).await.unwrap();
+            let fragmented = [0, 0, 1, 1, 8, 8, 8, 8, 0x03, 0x55, 4, 5, 6];
+            relay.send_to(&fragmented, client).await.unwrap();
+            let valid = [0, 0, 0, 1, 8, 8, 8, 8, 0x03, 0x55, 7, 8, 9];
+            relay.send_to(&valid, client).await.unwrap();
         });
 
         socket
@@ -851,12 +859,14 @@ mod tests {
             ecn: None,
             dst_ip: None,
         }];
-        let err = poll_fn(|cx| {
+        let received = poll_fn(|cx| {
             Pin::new(&socket).poll_recv(cx, &mut [IoSliceMut::new(&mut output)], &mut meta)
         })
         .await
-        .expect_err("wrong SOCKS5 source should be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        .expect("invalid SOCKS5 datagrams should be dropped");
+        assert_eq!(received, 1);
+        assert_eq!(meta[0].len, 3);
+        assert_eq!(&output[..3], &[7, 8, 9]);
 
         relay_task.await.unwrap();
         let _ = close_proxy.send(());

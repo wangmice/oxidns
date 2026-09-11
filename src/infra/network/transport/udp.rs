@@ -168,7 +168,12 @@ impl UdpTransport {
                 recv_from_pktinfo(socket.as_raw_fd(), buf)
             }) {
                 Ok(result) => break result,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    return Err(DnsError::protocol(format!(
+                        "Failed to recv_from UDP with pktinfo: {e}"
+                    )));
+                }
             }
         };
 
@@ -278,7 +283,8 @@ impl UdpTransport {
                 )))
             };
         };
-        let n = send_to_with_source(socket.as_raw_fd(), &bytes, to, source)
+        let n = send_to_with_source_async(socket, &bytes, to, source)
+            .await
             .map_err(|e| DnsError::protocol(format!("Failed to send UDP response: {e}")))?;
         if n != bytes.len() {
             return Err(DnsError::protocol(format!(
@@ -368,6 +374,25 @@ fn recv_from_pktinfo(
         destination
     };
     Ok((n as usize, peer, destination))
+}
+
+#[cfg(target_os = "linux")]
+async fn send_to_with_source_async(
+    socket: &UdpSocket,
+    buf: &[u8],
+    to: SocketAddr,
+    source: IpAddr,
+) -> std::io::Result<usize> {
+    loop {
+        socket.writable().await?;
+        match socket.try_io(Interest::WRITABLE, || {
+            send_to_with_source(socket.as_raw_fd(), buf, to, source)
+        }) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

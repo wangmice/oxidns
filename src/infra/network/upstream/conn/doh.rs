@@ -60,9 +60,11 @@ pub fn build_dns_get_request(mut uri: String, buf: &[u8], version: Version) -> R
 ///
 /// # Arguments
 /// * `response` - HTTP response with headers
+/// * `body_limit` - Maximum capacity trusted from Content-Length
 ///
 /// # Returns
-/// BytesMut buffer pre-allocated to Content-Length size (or 4KB default)
+/// BytesMut buffer pre-allocated to Content-Length size (or 4KB default),
+/// capped by the caller-provided body limit.
 ///
 /// # Performance
 /// Pre-allocating based on Content-Length avoids:
@@ -72,16 +74,22 @@ pub fn build_dns_get_request(mut uri: String, buf: &[u8], version: Version) -> R
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 #[inline]
-pub fn get_cap_buf_with_context_len<T>(response: &mut Response<T>) -> BytesMut {
+pub fn get_cap_buf_with_context_len<T>(response: &Response<T>, body_limit: usize) -> BytesMut {
     let capacity = response
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4096); // Default 4KB for typical DNS responses
+        .unwrap_or(4096)
+        .min(body_limit);
 
     BytesMut::with_capacity(capacity)
 }
+
+/// Maximum wire-format DNS message size carried by DoH.
+pub const MAX_DOH_DNS_BODY_SIZE: usize = u16::MAX as usize;
+/// Error bodies are diagnostics only; keep them bounded independently.
+pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 
 /// Build DoH request URI template from connection info
 ///
@@ -149,23 +157,35 @@ mod tests {
 
     #[test]
     fn test_get_cap_buf_with_context_len_uses_content_length_header() {
-        let mut response = Response::builder()
+        let response = Response::builder()
             .header(CONTENT_LENGTH, "128")
             .body(())
             .expect("response should build");
 
-        let buf = get_cap_buf_with_context_len(&mut response);
+        let buf = get_cap_buf_with_context_len(&response, MAX_DOH_DNS_BODY_SIZE);
 
         assert_eq!(buf.capacity(), 128);
     }
 
     #[test]
     fn test_get_cap_buf_with_context_len_uses_default_capacity_without_header() {
-        let mut response = Response::builder().body(()).expect("response should build");
+        let response = Response::builder().body(()).expect("response should build");
 
-        let buf = get_cap_buf_with_context_len(&mut response);
+        let buf = get_cap_buf_with_context_len(&response, MAX_DOH_DNS_BODY_SIZE);
 
         assert_eq!(buf.capacity(), 4096);
+    }
+
+    #[test]
+    fn test_get_cap_buf_with_context_len_caps_untrusted_content_length() {
+        let response = Response::builder()
+            .header(CONTENT_LENGTH, "1000000")
+            .body(())
+            .expect("response should build");
+
+        let buf = get_cap_buf_with_context_len(&response, 8192);
+
+        assert_eq!(buf.capacity(), 8192);
     }
 
     #[test]

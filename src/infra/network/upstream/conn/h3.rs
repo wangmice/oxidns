@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use futures::future::poll_fn;
 use h3::client::{RequestStream, SendRequest};
 use h3_quinn::{BidiStream, OpenStreams};
@@ -25,7 +25,8 @@ use crate::infra::network::dial::{
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
-    build_dns_get_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
+    get_cap_buf_with_context_len,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -34,6 +35,7 @@ use crate::proto::Message;
 enum H3RecvError {
     Transport(DnsError),
     HttpStatus(DnsError),
+    InvalidResponse(DnsError),
 }
 
 pub struct H3Connection {
@@ -133,7 +135,7 @@ impl H3Connection {
                 warn!(conn_id = self.id, raw_id, ?e, "H3 request error");
                 Err(e)
             }
-            Err(H3RecvError::HttpStatus(e)) => Err(e),
+            Err(H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
         }
     }
 }
@@ -243,26 +245,43 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
 async fn recv(
     mut request_stream: RequestStream<BidiStream<Bytes>, Bytes>,
 ) -> std::result::Result<Bytes, H3RecvError> {
-    let mut response = request_stream.recv_response().await.map_err(|e| {
+    let response = request_stream.recv_response().await.map_err(|e| {
         H3RecvError::Transport(DnsError::protocol(format!("H3 response error: {}", e)))
     })?;
 
-    let mut response_bytes = get_cap_buf_with_context_len(&mut response);
+    let status_code = response.status();
+    let body_limit = if status_code.is_success() {
+        MAX_DOH_DNS_BODY_SIZE
+    } else {
+        MAX_DOH_ERROR_BODY_SIZE
+    };
+    let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
+    let mut truncated = false;
 
-    while let Some(partial_bytes) = request_stream.recv_data().await.map_err(|e| {
+    while let Some(mut partial_bytes) = request_stream.recv_data().await.map_err(|e| {
         H3RecvError::Transport(DnsError::protocol(format!("h3 recv_data error: {e}")))
     })? {
+        let remaining = body_limit.saturating_sub(response_bytes.len());
+        if partial_bytes.remaining() > remaining {
+            if status_code.is_success() {
+                return Err(H3RecvError::InvalidResponse(DnsError::protocol(
+                    "DoH response body exceeds the 65535-byte DNS message limit",
+                )));
+            }
+            response_bytes.put(partial_bytes.take(remaining));
+            truncated = true;
+            break;
+        }
         response_bytes.put(partial_bytes);
     }
 
-    // Was it a successful request?
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         let error_string = String::from_utf8_lossy(response_bytes.as_ref());
+        let suffix = if truncated { " (truncated)" } else { "" };
 
         Err(H3RecvError::HttpStatus(DnsError::protocol(format!(
-            "http unsuccessful code: {}, message: {}",
-            response.status(),
-            error_string
+            "http unsuccessful code: {}, message: {}{}",
+            status_code, error_string, suffix
         ))))
     } else {
         Ok(response_bytes.freeze())
