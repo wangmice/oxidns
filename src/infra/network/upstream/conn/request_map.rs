@@ -44,14 +44,16 @@
 //!   unblock waiters.
 
 use std::cell::UnsafeCell;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::hint::spin_loop;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::oneshot::Sender;
 
 use crate::infra::error::{DnsError, Result};
-use crate::proto::Message;
+use crate::proto::{Message, MessageType};
 
 const ID_SPACE_SIZE: u32 = u16::MAX as u32 + 1;
 const MIN_SLOT_COUNT: usize = 8;
@@ -85,6 +87,7 @@ const fn meta_id(meta: u32) -> u16 {
 #[derive(Debug)]
 struct Slot {
     meta: AtomicU32,
+    fingerprint: AtomicU64,
     sender: UnsafeCell<MaybeUninit<Sender<Message>>>,
 }
 
@@ -92,6 +95,7 @@ impl Slot {
     fn empty() -> Self {
         Self {
             meta: AtomicU32::new(META_EMPTY),
+            fingerprint: AtomicU64::new(0),
             sender: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
@@ -149,12 +153,23 @@ enum StoreResult {
 /// The table is deliberately overprovisioned relative to `max_inflight` so the
 /// average probe chain stays short while the per-connection memory footprint
 /// remains in the KB range instead of scaling with all 65536 DNS IDs.
-#[derive(Debug)]
 pub struct RequestMap {
     slots: Box<[Slot]>,
     mask: usize,
     next_id: AtomicU16,
     size: AtomicU16,
+    fingerprint_state: RandomState,
+}
+
+impl std::fmt::Debug for RequestMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestMap")
+            .field("slot_count", &self.slots.len())
+            .field("mask", &self.mask)
+            .field("next_id", &self.next_id)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestMap {
@@ -175,17 +190,42 @@ impl RequestMap {
             mask: slot_count - 1,
             next_id: AtomicU16::new(0),
             size: AtomicU16::new(0),
+            fingerprint_state: RandomState::new(),
         }
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn store(&self, tx: Sender<Message>) -> Result<RequestGuard<'_>> {
+        self.store_inner(tx, 0)
+    }
+
+    /// Store a DNS request together with a compact fingerprint of the request
+    /// opcode and question section.
+    ///
+    /// The fingerprint lets the receive path reject a delayed or malformed
+    /// response for a different question that happens to reuse the same 16-bit
+    /// DNS ID without removing the live request from the map. `RandomState`
+    /// keeps hash-collision behavior unpredictable. This is correlation, not
+    /// authentication: a response carrying the same ID and question still
+    /// matches. The common single-question case adds no heap allocation.
+    #[inline(always)]
+    pub fn store_for_request(
+        &self,
+        tx: Sender<Message>,
+        request: &Message,
+    ) -> Result<RequestGuard<'_>> {
+        self.store_inner(tx, self.fingerprint(request))
+    }
+
+    #[inline(always)]
+    fn store_inner(&self, tx: Sender<Message>, fingerprint: u64) -> Result<RequestGuard<'_>> {
         let start = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut tx = Some(tx);
 
         for offset in 0..ID_SPACE_SIZE {
             let id = start.wrapping_add(offset as u16);
-            match self.try_store_candidate(id, &mut tx) {
+            match self.try_store_candidate(id, fingerprint, &mut tx) {
                 StoreResult::Stored(id) => {
                     return Ok(RequestGuard {
                         request_map: self,
@@ -205,9 +245,24 @@ impl RequestMap {
         )))
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn take(&self, id: u16) -> Option<Sender<Message>> {
         self.detach(id)
+    }
+
+    /// Remove and return a pending request only when the DNS response matches
+    /// the request fingerprint stored for this ID.
+    ///
+    /// A mismatch deliberately leaves the slot untouched so the real response
+    /// may still arrive later. This must be paired with
+    /// [`Self::store_for_request`].
+    #[inline(always)]
+    pub fn take_for_response(&self, id: u16, response: &Message) -> Option<Sender<Message>> {
+        if response.message_type() != MessageType::Response {
+            return None;
+        }
+        self.detach_matching(id, self.fingerprint(response))
     }
 
     #[inline(always)]
@@ -277,7 +332,12 @@ impl RequestMap {
     }
 
     #[inline(always)]
-    fn try_store_candidate(&self, id: u16, tx: &mut Option<Sender<Message>>) -> StoreResult {
+    fn try_store_candidate(
+        &self,
+        id: u16,
+        fingerprint: u64,
+        tx: &mut Option<Sender<Message>>,
+    ) -> StoreResult {
         let mut tombstone = None;
 
         for step in 0..self.slots.len() {
@@ -288,7 +348,12 @@ impl RequestMap {
                     // We can stop probing at the first EMPTY slot. If we saw an
                     // earlier TOMBSTONE, reuse it; otherwise insert here.
                     let target = tombstone.unwrap_or(idx);
-                    return if self.claim_slot(target, id, tx.take().expect("sender present")) {
+                    return if self.claim_slot(
+                        target,
+                        id,
+                        fingerprint,
+                        tx.take().expect("sender present"),
+                    ) {
                         StoreResult::Stored(id)
                     } else {
                         StoreResult::Retry
@@ -312,7 +377,7 @@ impl RequestMap {
         }
 
         if let Some(target) = tombstone {
-            if self.claim_slot(target, id, tx.take().expect("sender present")) {
+            if self.claim_slot(target, id, fingerprint, tx.take().expect("sender present")) {
                 StoreResult::Stored(id)
             } else {
                 StoreResult::Retry
@@ -323,7 +388,7 @@ impl RequestMap {
     }
 
     #[inline(always)]
-    fn claim_slot(&self, idx: usize, id: u16, tx: Sender<Message>) -> bool {
+    fn claim_slot(&self, idx: usize, id: u16, fingerprint: u64, tx: Sender<Message>) -> bool {
         let slot = &self.slots[idx];
 
         loop {
@@ -349,6 +414,7 @@ impl RequestMap {
                     unsafe {
                         (*slot.sender.get()).write(tx);
                     }
+                    slot.fingerprint.store(fingerprint, Ordering::Relaxed);
                     slot.meta
                         .store(pack_meta(STATE_FULL, id), Ordering::Release);
                     self.size.fetch_add(1, Ordering::Relaxed);
@@ -358,6 +424,51 @@ impl RequestMap {
                 _ => unreachable!("invalid request map slot state"),
             }
         }
+    }
+
+    #[inline(always)]
+    fn detach_matching(&self, id: u16, fingerprint: u64) -> Option<Sender<Message>> {
+        for step in 0..self.slots.len() {
+            let idx = self.probe_index(id, step);
+            let slot = &self.slots[idx];
+            let meta = slot.meta.load(Ordering::Acquire);
+            match meta_state(meta) {
+                STATE_EMPTY => return None,
+                STATE_RESERVED | STATE_TOMBSTONE => continue,
+                STATE_FULL => {
+                    if meta_id(meta) != id {
+                        continue;
+                    }
+
+                    if slot.fingerprint.load(Ordering::Relaxed) != fingerprint {
+                        return None;
+                    }
+
+                    if slot
+                        .meta
+                        .compare_exchange(
+                            meta,
+                            pack_meta(STATE_RESERVED, id),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let sender = unsafe { (*slot.sender.get()).assume_init_read() };
+                    slot.meta.store(META_TOMBSTONE, Ordering::Release);
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    if self.is_empty() {
+                        self.reset_tombstones();
+                    }
+                    return Some(sender);
+                }
+                _ => unreachable!("invalid request map slot state"),
+            }
+        }
+        None
     }
 
     #[inline(always)]
@@ -431,6 +542,19 @@ impl RequestMap {
         let hash = usize::from(id).wrapping_mul(0x9E37_79B1usize);
         (hash.wrapping_add(step)) & self.mask
     }
+
+    #[inline(always)]
+    fn fingerprint(&self, message: &Message) -> u64 {
+        let mut hasher = self.fingerprint_state.build_hasher();
+        message.opcode().hash(&mut hasher);
+        message.questions().len().hash(&mut hasher);
+        for question in message.questions() {
+            question.name().hash(&mut hasher);
+            question.qtype().hash(&mut hasher);
+            question.qclass().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
 }
 
 impl Drop for RequestMap {
@@ -444,11 +568,29 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::proto::{DNSClass, Name, Question, RecordType};
 
     fn make_message(id: u16) -> Message {
         let mut message = Message::new();
         message.set_id(id);
         message
+    }
+
+    fn make_query(name: &str, qtype: RecordType) -> Message {
+        let mut message = Message::new();
+        message.add_question(Question::new(
+            Name::from_ascii(name).expect("test qname should parse"),
+            qtype,
+            DNSClass::IN,
+        ));
+        message
+    }
+
+    fn make_response(request: &Message, id: u16) -> Message {
+        let mut response = request.clone();
+        response.set_id(id);
+        response.set_message_type(MessageType::Response);
+        response
     }
 
     #[test]
@@ -496,6 +638,64 @@ mod tests {
         guard.disarm();
         assert!(map.take(id).is_none());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_take_for_response_accepts_matching_question_fingerprint() {
+        let map = RequestMap::with_capacity(8);
+        let request = make_query("example.com", RecordType::A);
+        let (tx, rx) = oneshot::channel();
+        let mut guard = map
+            .store_for_request(tx, &request)
+            .expect("store should succeed");
+        let id = guard.query_id();
+        let response = make_response(&request, id);
+
+        let sender = map
+            .take_for_response(id, &response)
+            .expect("matching response should detach sender");
+        guard.disarm();
+        assert!(sender.send(response).is_ok());
+        assert!(rx.blocking_recv().is_ok());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_take_for_response_rejects_mismatch_without_removing_request() {
+        let map = RequestMap::with_capacity(8);
+        let request = make_query("example.com", RecordType::A);
+        let (tx, _rx) = oneshot::channel();
+        let mut guard = map
+            .store_for_request(tx, &request)
+            .expect("store should succeed");
+        let id = guard.query_id();
+
+        let wrong_request = make_query("example.com", RecordType::AAAA);
+        let wrong_response = make_response(&wrong_request, id);
+        assert!(map.take_for_response(id, &wrong_response).is_none());
+        assert_eq!(map.size(), 1, "mismatch must leave request pending");
+
+        let response = make_response(&request, id);
+        assert!(map.take_for_response(id, &response).is_some());
+        guard.disarm();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_take_for_response_rejects_query_packet() {
+        let map = RequestMap::with_capacity(8);
+        let request = make_query("example.com", RecordType::A);
+        let (tx, _rx) = oneshot::channel();
+        let mut guard = map
+            .store_for_request(tx, &request)
+            .expect("store should succeed");
+        let id = guard.query_id();
+        let mut query_packet = request.clone();
+        query_packet.set_id(id);
+
+        assert!(map.take_for_response(id, &query_packet).is_none());
+        assert_eq!(map.size(), 1, "query packet must leave request pending");
+        assert!(guard.remove());
     }
 
     #[test]

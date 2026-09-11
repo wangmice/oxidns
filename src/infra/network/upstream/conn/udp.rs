@@ -109,7 +109,7 @@ impl Connection for UdpConnection {
             };
 
             let (tx, rx) = oneshot::channel();
-            let mut query_guard = self.request_map.store(tx)?;
+            let mut query_guard = self.request_map.store_for_request(tx, &request)?;
             let query_id = query_guard.query_id();
             if self.closed.load(Ordering::Acquire) {
                 return Err(DnsError::protocol("UDP connection is closed"));
@@ -237,7 +237,7 @@ impl UdpConnection {
                     match recv {
                         Ok(msg) => {
                             let id = msg.id();
-                            if let Some(sender) = self.request_map.take(id) {
+                            if let Some(sender) = self.request_map.take_for_response(id, &msg) {
                                 let _ = sender.send(msg);
                                 self.last_used.store(AppClock::elapsed_millis(), Ordering::Relaxed);
                                 trace!(
@@ -412,6 +412,10 @@ mod tests {
             let mut packet = [0u8; 1024];
             let (len, client) = relay.recv_from(&mut packet).await.unwrap();
             assert_eq!(&packet[..10], &[0, 0, 0, 1, 8, 8, 8, 8, 0, 53]);
+            // Convert the echoed DNS query into a response. Fingerprint
+            // matching deliberately rejects packets with QR=0 even when the
+            // DNS ID and question section match.
+            packet[12] |= 0x80;
             relay.send_to(&packet[..len], client).await.unwrap();
         });
 
