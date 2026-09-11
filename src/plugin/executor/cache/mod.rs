@@ -332,16 +332,23 @@ impl CacheReclaimer {
         let CacheReclaimJob { retired, permit } = job;
 
         let reclaim_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            const MAX_RECLAIM_BACKOFF_MS: u64 = 32;
             let mut retired = retired;
+            let mut backoff_ms = 1u64;
             loop {
                 match retired.try_reclaim() {
                     Ok(()) => break,
                     Err(still_retired) => {
                         retired = still_retired;
-                        // Cache operations retain state guards only briefly. A
-                        // small sleep avoids spinning
-                        // if one was preempted across the swap.
-                        std::thread::sleep(Duration::from_millis(1));
+
+                        // Cache operations normally retain state guards only
+                        // briefly, so retry quickly at first. If a pre-swap
+                        // reader holds the old generation for longer, back off
+                        // exponentially to avoid waking this dedicated thread
+                        // roughly 1000 times per second. The cap keeps reclaim
+                        // latency bounded once the final reader releases.
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                        backoff_ms = backoff_ms.saturating_mul(2).min(MAX_RECLAIM_BACKOFF_MS);
                     }
                 }
             }
