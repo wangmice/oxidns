@@ -244,24 +244,48 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
     };
     let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
     let mut body = response.into_body();
+    let mut flow_control = body.flow_control().clone();
     let mut truncated = false;
 
     while let Some(partial_bytes) = body.data().await {
         let partial_bytes = partial_bytes.map_err(|e| {
             H2RecvError::Transport(DnsError::protocol(format!("H2 body error: {}", e)))
         })?;
+        let chunk_len = partial_bytes.len();
         let remaining = body_limit.saturating_sub(response_bytes.len());
-        if partial_bytes.len() > remaining {
+        let exceeds_limit = chunk_len > remaining;
+
+        if exceeds_limit {
+            if !status_code.is_success() {
+                response_bytes.put_slice(&partial_bytes[..remaining]);
+                truncated = true;
+            }
+        } else {
+            response_bytes.put_slice(&partial_bytes);
+        }
+
+        // `h2` does not automatically return receive-window capacity after a
+        // DATA frame is yielded. We have finished consuming (or
+        // deliberately discarding) the entire chunk at this point, so
+        // release the full frame length before waiting for the next
+        // one. Otherwise a response larger than the current
+        // stream window can stall indefinitely.
+        if chunk_len != 0 {
+            flow_control.release_capacity(chunk_len).map_err(|e| {
+                H2RecvError::Transport(DnsError::protocol(format!(
+                    "H2 flow-control release error: {e}"
+                )))
+            })?;
+        }
+
+        if exceeds_limit {
             if status_code.is_success() {
                 return Err(H2RecvError::InvalidResponse(DnsError::protocol(
                     "DoH response body exceeds the 65535-byte DNS message limit",
                 )));
             }
-            response_bytes.put_slice(&partial_bytes[..remaining]);
-            truncated = true;
             break;
         }
-        response_bytes.put_slice(&partial_bytes);
     }
 
     if !status_code.is_success() {
@@ -279,6 +303,78 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recv_releases_flow_control_capacity_between_data_frames() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let Some(Ok((_request, mut respond))) = connection.accept().await else {
+                panic!("server should receive one request");
+            };
+
+            let response = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("response should build");
+            let mut send_stream = respond
+                .send_response(response, false)
+                .expect("response headers should send");
+            send_stream
+                .send_data(Bytes::from(vec![0x5A; 128]), true)
+                .expect("response body should queue");
+
+            // Keep driving the server connection so WINDOW_UPDATE frames from
+            // the client can release additional stream capacity.
+            while let Some(result) = connection.accept().await {
+                if let Err(error) = result {
+                    panic!("server connection failed: {error}");
+                }
+            }
+        });
+
+        let mut client_builder = h2::client::Builder::new();
+        client_builder.initial_window_size(16);
+        let (mut sender, connection) = client_builder
+            .handshake(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        sender = sender
+            .ready()
+            .await
+            .expect("client sender should become ready");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://dns.example.test/dns-query")
+            .body(Bytes::new())
+            .expect("request should build");
+        let (response_future, _send_stream) = sender
+            .send_request(request, true)
+            .expect("request should send");
+
+        let response_bytes =
+            tokio::time::timeout(std::time::Duration::from_secs(2), recv(response_future))
+                .await
+                .expect("response should not stall on the 16-byte H2 receive window");
+        let response_bytes = match response_bytes {
+            Ok(bytes) => bytes,
+            Err(_) => panic!("response body should be received successfully"),
+        };
+
+        assert_eq!(response_bytes.len(), 128);
+        assert!(response_bytes.iter().all(|byte| *byte == 0x5A));
+
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
+    }
 
     #[test]
     fn test_builder_new_uses_https_request_uri_and_flags() {
