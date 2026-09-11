@@ -5,6 +5,7 @@ use quinn::{
 };
 
 use crate::infra::error::{DnsError, Result};
+use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::proto::Message;
 
 /// QUIC connection transport that can accept or open bidirectional streams
@@ -23,16 +24,7 @@ impl QuicTransport {
     #[inline]
     pub async fn accept_bi(&self) -> Result<(QuicTransportReader, QuicTransportWriter)> {
         match self.conn.accept_bi().await {
-            Ok((send, recv)) => Ok((
-                QuicTransportReader {
-                    recv,
-                    read_buf: Vec::with_capacity(2048),
-                },
-                QuicTransportWriter {
-                    send,
-                    write_buf: Vec::with_capacity(2048),
-                },
-            )),
+            Ok((send, recv)) => Ok((QuicTransportReader { recv }, QuicTransportWriter { send })),
             Err(e) => Err(DnsError::protocol(format!(
                 "Failed to accept QUIC bidirectional stream: {}",
                 e
@@ -45,16 +37,7 @@ impl QuicTransport {
     #[inline]
     pub async fn open_bi(&self) -> Result<(QuicTransportReader, QuicTransportWriter)> {
         match self.conn.open_bi().await {
-            Ok((send, recv)) => Ok((
-                QuicTransportReader {
-                    recv,
-                    read_buf: Vec::with_capacity(2048),
-                },
-                QuicTransportWriter {
-                    send,
-                    write_buf: Vec::with_capacity(2048),
-                },
-            )),
+            Ok((send, recv)) => Ok((QuicTransportReader { recv }, QuicTransportWriter { send })),
             Err(e) => Err(DnsError::protocol(format!(
                 "Failed to open QUIC bidirectional stream: {}",
                 e
@@ -83,7 +66,6 @@ impl QuicTransport {
 /// with 2-byte big-endian length prefix before writing.
 pub struct QuicTransportWriter {
     send: SendStream,
-    write_buf: Vec<u8>,
 }
 
 impl QuicTransportWriter {
@@ -91,21 +73,21 @@ impl QuicTransportWriter {
     #[inline]
     #[hotpath::measure]
     pub async fn write_message(&mut self, msg: &Message) -> Result<()> {
-        self.write_buf.clear();
-        self.write_buf.extend_from_slice(&[0, 0]);
+        let mut write_buf = wire_buffer_pool().acquire();
+        write_buf.extend_from_slice(&[0, 0]);
 
         // RFC 9250: the DNS Message ID of every DoQ message MUST be 0
-        msg.append_to_with_id(0, &mut self.write_buf)?;
+        msg.append_to_with_id(0, &mut write_buf)?;
 
-        let body_len = self.write_buf.len() - 2;
+        let body_len = write_buf.len() - 2;
         let body_len = u16::try_from(body_len).map_err(|_| {
             DnsError::protocol("DNS message exceeds the 65535-byte QUIC framing limit")
         })?;
 
-        self.write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
+        write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
 
         self.send
-            .write_all(&self.write_buf)
+            .write_all(write_buf.as_slice())
             .await
             .map_err(|e| DnsError::protocol(format!("Failed to write QUIC DNS frame: {}", e)))?;
         Ok(())
@@ -141,7 +123,6 @@ pub(crate) enum QuicReadError {
 /// DNS message (2-byte big-endian length + body) and decodes it.
 pub struct QuicTransportReader {
     recv: RecvStream,
-    read_buf: Vec<u8>,
 }
 impl QuicTransportReader {
     #[inline]
@@ -160,13 +141,14 @@ impl QuicTransportReader {
             ));
         }
 
-        self.read_buf.resize(msg_len, 0);
+        let mut read_buf = wire_buffer_pool().acquire();
+        read_buf.resize(msg_len, 0);
         self.recv
-            .read_exact(&mut self.read_buf[..msg_len])
+            .read_exact(&mut read_buf[..msg_len])
             .await
             .map_err(|e| DnsError::protocol(format!("Failed to read QUIC DNS body: {e}")))?;
 
-        Message::from_bytes(&self.read_buf[..msg_len])
+        Message::from_bytes(&read_buf[..msg_len])
             .map_err(|e| DnsError::protocol(format!("Invalid DNS message over QUIC: {e}")))
     }
 
@@ -186,14 +168,14 @@ impl QuicTransportReader {
             ));
         }
 
-        self.read_buf.resize(msg_len, 0);
-        let mut body = std::mem::take(&mut self.read_buf);
-        let read_result = self.read_exact_doq(&mut body[..msg_len], "DNS body").await;
-        self.read_buf = body;
-        read_result?;
+        let mut read_buf = wire_buffer_pool().acquire();
+        read_buf.resize(msg_len, 0);
+        self.read_exact_doq(&mut read_buf[..msg_len], "DNS body")
+            .await?;
 
-        let message = Message::from_bytes(&self.read_buf[..msg_len])
+        let message = Message::from_bytes(&read_buf[..msg_len])
             .map_err(|e| QuicReadError::Protocol(format!("invalid DNS message: {e}")))?;
+        drop(read_buf);
         if message.id() != 0 {
             return Err(QuicReadError::Protocol(format!(
                 "received non-zero DNS message ID {}",

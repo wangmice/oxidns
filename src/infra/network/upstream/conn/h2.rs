@@ -87,10 +87,11 @@ impl H2Connection {
         request.append_to_with_id(0, &mut body_bytes)?;
 
         let request = build_dns_get_request(
-            self.request_uri.clone(),
+            self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_2,
         );
+        drop(body_bytes);
 
         let (response_future, _send_stream) = self
             .sender

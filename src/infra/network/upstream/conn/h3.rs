@@ -97,10 +97,11 @@ impl H3Connection {
         request.append_to_with_id(0, &mut body_bytes)?;
 
         let http_request = build_dns_get_request(
-            self.request_uri.clone(),
+            self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_3,
         );
+        drop(body_bytes);
 
         self.do_request(http_request, raw_id).await
     }

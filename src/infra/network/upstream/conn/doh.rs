@@ -39,16 +39,27 @@ const DNS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/dns-
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 #[inline]
-pub fn build_dns_get_request(mut uri: String, buf: &[u8], version: Version) -> Request<()> {
-    // Encode DNS message using base64url without padding (RFC 4648 Section 5)
-    uri.push_str(&BASE64_URL_SAFE_NO_PAD.encode(buf));
+pub fn build_dns_get_request(uri: &str, buf: &[u8], version: Version) -> Request<()> {
+    // Reserve the complete GET URI once and append Base64 directly into it.
+    // For unpadded Base64, every complete 3-byte group emits 4 bytes and the
+    // remainder emits either 2 or 3 bytes. DNS wire messages are <= 65535
+    // bytes, so this calculation cannot overflow in practice.
+    let encoded_len = (buf.len() / 3) * 4
+        + match buf.len() % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        };
+    let mut request_uri = String::with_capacity(uri.len() + encoded_len);
+    request_uri.push_str(uri);
+    BASE64_URL_SAFE_NO_PAD.encode_string(buf, &mut request_uri);
 
     http::Request::builder()
         .version(version)
         .header(header::CONTENT_TYPE, DNS_HEADER_VALUE)
         .header(header::ACCEPT, DNS_HEADER_VALUE)
         .method(Method::GET)
-        .uri(uri)
+        .uri(request_uri)
         .body(())
         .expect("Failed to build HTTP request (should never fail with static headers)")
 }
@@ -108,13 +119,12 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 /// - Standard port: `https://dns.example.com/dns-query?dns=`
 /// - Custom port: `https://dns.example.com:8443/dns-query?dns=`
 ///
-/// # Performance
-/// Pre-reserves 512 bytes to accommodate the base64-encoded DNS query without
-/// reallocation
+/// The returned value is an immutable URI template. Per-query capacity for the
+/// Base64 payload is reserved by `build_dns_get_request`.
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
-    let mut uri = if connection_info.port != ConnectionType::DoH.default_port() {
+    if connection_info.port != ConnectionType::DoH.default_port() {
         // Include port in URI for non-standard ports
         format!(
             "https://{}:{}{}?dns=",
@@ -126,12 +136,7 @@ pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
             "https://{}{}?dns=",
             connection_info.server_name, connection_info.path
         )
-    };
-
-    // Pre-allocate space for base64url-encoded DNS query (~600 bytes for
-    // typical query)
-    uri.reserve(512);
-    uri
+    }
 }
 
 #[cfg(test)]
@@ -141,7 +146,7 @@ mod tests {
     #[test]
     fn test_build_dns_get_request_sets_uri_method_and_headers() {
         let request = build_dns_get_request(
-            "https://dns.example.test/dns-query?dns=".to_string(),
+            "https://dns.example.test/dns-query?dns=",
             &[0, 1, 2, 3],
             Version::HTTP_2,
         );
