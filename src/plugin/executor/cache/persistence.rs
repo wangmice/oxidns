@@ -1462,21 +1462,23 @@ mod tests {
             lazy_cache_ttl: Some(3_600),
             ..CacheLoadPolicy::default()
         };
-        let now = AppClock::elapsed_millis();
+        let load_started_at = AppClock::elapsed_millis();
 
         assert_eq!(
             load_cache_from_bytes(&cache_map, &data, false, policy, false)
                 .expect("lazy restore should succeed"),
             1
         );
+        let load_finished_at = AppClock::elapsed_millis();
         let stored = cache_map
             .iter_entries_cloned()
             .into_iter()
             .next()
             .expect("lazy entry should be present");
-        assert!(stored.1.value.fresh_until_ms <= now);
+        assert!(stored.1.value.fresh_until_ms >= load_started_at);
+        assert!(stored.1.value.fresh_until_ms <= load_finished_at);
         assert!(stored.1.expire_at_ms > stored.1.value.fresh_until_ms);
-        assert!(stored.1.expire_at_ms >= now + 3_400_000);
+        assert!(stored.1.expire_at_ms >= load_started_at + 3_400_000);
     }
 
     #[test]

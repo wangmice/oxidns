@@ -246,6 +246,22 @@ mod tests {
     use super::*;
     use crate::infra::network::proxy::Socks5Opt;
 
+    async fn send_when_writable(
+        socket: &Arc<dyn AsyncUdpSocket>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        let mut poller = socket.clone().create_io_poller();
+        loop {
+            match socket.try_send(transmit) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    poll_fn(|cx| poller.as_mut().poll_writable(cx)).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[test]
     fn response_source_rejects_wrong_upstream() {
         let expected = TargetAddr::Ip("8.8.8.8:53".parse().unwrap());
@@ -397,15 +413,18 @@ mod tests {
         });
 
         let payload = vec![0xA5; 3_000];
-        socket
-            .try_send(&Transmit {
+        send_when_writable(
+            &socket,
+            &Transmit {
                 destination: peer_addr,
                 contents: &payload,
                 segment_size: None,
                 src_ip: None,
                 ecn: None,
-            })
-            .expect("QUIC transmit should succeed");
+            },
+        )
+        .await
+        .expect("QUIC transmit should succeed");
 
         let mut output = [0u8; 4096];
         let mut meta = [RecvMeta {
@@ -542,15 +561,18 @@ mod tests {
             relay.send_to(&packet[..len], client).await.unwrap();
         });
 
-        socket
-            .try_send(&Transmit {
+        send_when_writable(
+            &socket,
+            &Transmit {
                 destination: peer_addr,
                 contents: b"domain-target",
                 segment_size: None,
                 src_ip: None,
                 ecn: None,
-            })
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         relay_task.await.unwrap();
         let _ = close_proxy.send(());
@@ -823,15 +845,18 @@ mod tests {
             relay.send_to(&valid, client).await.unwrap();
         });
 
-        socket
-            .try_send(&Transmit {
+        send_when_writable(
+            &socket,
+            &Transmit {
                 destination: peer_addr,
                 contents: b"probe",
                 segment_size: None,
                 src_ip: None,
                 ecn: None,
-            })
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         let mut output = [0u8; 64];
         let mut meta = [RecvMeta {
