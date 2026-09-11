@@ -319,7 +319,7 @@ impl TestGlobalGuard {
     pub(crate) fn clean() -> Self {
         let lock = test_lock()
             .lock()
-            .expect("outbound test lock should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = global();
         clear_global();
         Self {

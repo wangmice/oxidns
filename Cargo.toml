@@ -81,7 +81,7 @@ ahash = "0.8.12"
 arc-swap = "1.9.1"
 bytes = "1.11"
 crossbeam-queue = "0.3.12"
-dashmap = "6"
+dashmap =  { version = "6", features = ["raw-api"] }
 inventory = "0.3"
 lazy_static = "1.5"
 libc = "0.2"

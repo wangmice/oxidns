@@ -598,7 +598,7 @@ export async function flushCache(tag: string): Promise<void> {
   const response = await fetch(
     apiUrl(`/plugins/${encodeURIComponent(tag)}/flush`),
     {
-      method: "GET",
+      method: "POST",
       headers: apiHeaders(),
     },
   );

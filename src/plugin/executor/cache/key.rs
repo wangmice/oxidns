@@ -3,11 +3,15 @@
 
 //! Cache key composition helpers.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::context::DnsContext;
 use crate::proto::{
-    ClientSubnet, DNSClass, EdnsCode, EdnsOption, Message, Name, Question, RecordType,
+    ClientSubnet, DNSClass, EdnsCode, EdnsOption, Message, MessageType, Name, Opcode, Question,
+    RecordType,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -21,7 +25,7 @@ pub(super) struct EcsScopeDigest {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub(super) struct CacheKey {
-    pub(super) domain: String,
+    pub(super) domain: Arc<str>,
     pub(super) record_type: RecordType,
     pub(super) dns_class: DNSClass,
     pub(super) do_bit: bool,
@@ -29,17 +33,80 @@ pub(super) struct CacheKey {
     pub(super) ecs_scope: Option<EcsScopeDigest>,
 }
 
+// #[derive(Debug, Default)]
+// pub(super) struct EcsLookupIndex;
+
+// impl EcsLookupIndex {
+//     /// Compatibility no-op while callers are migrated away from the old
+//     /// advisory ECS index. Cache correctness must not depend on this index.
+//     #[inline]
+//     pub(super) fn insert(&self, _key: &CacheKey) {}
+
+//     #[inline]
+//     pub(super) fn remove(&self, _key: &CacheKey) {}
+
+//     #[inline]
+//     pub(super) fn rebuild<I>(&self, _keys: I)
+//     where
+//         I: IntoIterator<Item = CacheKey>,
+//     {
+//     }
+// }
+
 impl CacheKey {
     #[inline]
     pub(super) fn question(&self) -> Option<Question> {
-        let name = Name::from_ascii(&self.domain).ok()?;
+        let name = Name::from_ascii(self.domain.as_ref()).ok()?;
         Some(Question::new(name, self.record_type, self.dns_class))
+    }
+
+    #[inline]
+    fn with_ecs_scope_prefix(&self, scope_prefix: u8) -> Self {
+        let Some(ecs) = &self.ecs_scope else {
+            return self.clone();
+        };
+
+        debug_assert!(
+            scope_prefix <= ecs.source_prefix,
+            "ECS scope prefix must not exceed the source prefix here"
+        );
+
+        let scope_prefix = scope_prefix.min(ecs.source_prefix);
+
+        let mut network = [0u8; 16];
+        let network_len = write_truncated_prefix(
+            &ecs.network[..usize::from(ecs.network_len)],
+            scope_prefix,
+            &mut network,
+        );
+
+        Self {
+            domain: self.domain.clone(),
+            record_type: self.record_type,
+            dns_class: self.dns_class,
+            do_bit: self.do_bit,
+            cd_bit: self.cd_bit,
+            ecs_scope: Some(EcsScopeDigest {
+                family: ecs.family,
+
+                // For a reusable scoped cache key this field represents the
+                // matching prefix.
+                source_prefix: scope_prefix,
+                scope_prefix,
+
+                network_len,
+                network,
+            }),
+        }
     }
 }
 
 #[inline]
 pub(super) fn normalize_domain_key(raw: &str) -> String {
     let mut normalized = raw.trim().to_ascii_lowercase();
+    if normalized == "." {
+        return normalized;
+    }
     if normalized.ends_with('.') {
         normalized.pop();
     }
@@ -70,6 +137,81 @@ fn write_truncated_prefix(src: &[u8], prefix: u8, out: &mut [u8; 16]) -> u8 {
     }
 }
 
+/// Build the canonical ECS digest shape used by runtime cache keys.
+///
+/// Request-specific keys use `(source, scope=0)`; reusable keys use
+/// `(source=scope)`. In both cases the stored network contains exactly the
+/// significant source-prefix bytes and has zero host bits.
+pub(super) fn canonical_ecs_key_digest(
+    family: u16,
+    source_prefix: u8,
+    scope_prefix: u8,
+    network: &[u8],
+) -> Option<EcsScopeDigest> {
+    let max_prefix = match family {
+        1 => 32,
+        2 => 128,
+        _ => return None,
+    };
+    if source_prefix > max_prefix
+        || scope_prefix > max_prefix
+        || (scope_prefix != 0 && scope_prefix != source_prefix)
+    {
+        return None;
+    }
+
+    let required_len = usize::from(source_prefix.saturating_add(7) / 8);
+    if network.len() != required_len {
+        return None;
+    }
+
+    let remaining_bits = source_prefix % 8;
+    if remaining_bits != 0
+        && network
+            .last()
+            .is_some_and(|last| *last & (0xFFu8 >> remaining_bits) != 0)
+    {
+        return None;
+    }
+
+    let mut digest_network = [0u8; 16];
+    digest_network[..required_len].copy_from_slice(network);
+    Some(EcsScopeDigest {
+        family,
+        source_prefix,
+        scope_prefix,
+        network_len: required_len as u8,
+        network: digest_network,
+    })
+}
+
+//******wangmice *******/
+#[inline]
+fn ecs_prefixes_are_valid(subnet: &ClientSubnet) -> bool {
+    let max_prefix = match subnet.addr() {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+
+    subnet.source_prefix() <= max_prefix && subnet.scope_prefix() <= max_prefix
+}
+#[inline]
+fn request_ecs_is_valid(subnet: &ClientSubnet) -> bool {
+    ecs_prefixes_are_valid(subnet)
+        // ECS queries must use SCOPE PREFIX-LENGTH zero.
+        && subnet.scope_prefix() == 0
+}
+#[inline]
+fn extract_ecs(message: &Message) -> Option<&ClientSubnet> {
+    message
+        .edns()
+        .as_ref()
+        .and_then(|edns| match edns.option(EdnsCode::Subnet) {
+            Some(EdnsOption::Subnet(subnet)) => Some(subnet),
+            _ => None,
+        })
+}
+
 #[inline]
 fn build_ecs_scope_digest(subnet: &ClientSubnet) -> EcsScopeDigest {
     let mut network = [0u8; 16];
@@ -98,30 +240,35 @@ fn build_ecs_scope_digest(subnet: &ClientSubnet) -> EcsScopeDigest {
     }
 }
 
-#[inline]
-fn extract_any_ecs_scope(request: &Message) -> Option<EcsScopeDigest> {
-    request
-        .edns()
-        .as_ref()
-        .and_then(|edns| match edns.option(EdnsCode::Subnet) {
-            Some(EdnsOption::Subnet(subnet)) => Some(subnet),
-            _ => None,
-        })
-        .map(build_ecs_scope_digest)
-}
-
-#[inline]
 pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Option<CacheKey> {
+    if !is_cacheable_request(&context.request) {
+        return None;
+    }
+
     let question = context.request.first_question()?;
-    let domain = question.name().normalized().to_string();
+    let domain = Arc::<str>::from(question.name().normalized().to_string());
     let record_type = question.qtype();
     let dns_class = question.qclass();
+
     let do_bit = context
         .request
         .edns()
         .as_ref()
         .is_some_and(|edns| edns.flags().dnssec_ok);
+
     let cd_bit = context.request.checking_disabled();
+
+    let ecs_scope = match extract_ecs(&context.request) {
+        Some(subnet) => {
+            if !ecs_in_key || !request_ecs_is_valid(subnet) {
+                return None;
+            }
+
+            Some(build_ecs_scope_digest(subnet))
+        }
+
+        None => None,
+    };
 
     Some(CacheKey {
         domain,
@@ -129,17 +276,374 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
         dns_class,
         do_bit,
         cd_bit,
-        ecs_scope: if ecs_in_key {
-            extract_any_ecs_scope(&context.request)
-        } else {
-            None
-        },
+        ecs_scope,
     })
+}
+
+/// Re-key an ECS response by the scope advertised by the upstream server.
+///
+/// RFC 7871 semantics:
+///
+/// * FAMILY, SOURCE PREFIX-LENGTH and the significant ADDRESS bits in the
+///   response must match the request.
+/// * SCOPE PREFIX-LENGTH is reusable cache metadata.
+/// * When SCOPE <= SOURCE, the answer may be shared by requests covered by that
+///   scope.
+/// * When SCOPE > SOURCE, the request did not provide enough address bits to
+///   safely construct the narrower scope. In that case retain the original
+///   request-specific key instead of widening/clamping it to SOURCE.
+#[inline]
+pub(super) fn cache_key_for_response_ecs_scope(
+    key: &CacheKey,
+    response: &Message,
+) -> Option<CacheKey> {
+    let response_subnet = extract_ecs(response);
+
+    let Some(request_ecs) = &key.ecs_scope else {
+        return response_subnet.is_none().then(|| key.clone());
+    };
+
+    let Some(response_subnet) = response_subnet else {
+        return Some(key.clone());
+    };
+
+    if !ecs_prefixes_are_valid(response_subnet) {
+        return None;
+    }
+
+    let response_ecs = build_ecs_scope_digest(response_subnet);
+
+    if response_ecs.family != request_ecs.family
+        || response_ecs.source_prefix != request_ecs.source_prefix
+        || response_ecs.network_len != request_ecs.network_len
+        || response_ecs.network[..usize::from(response_ecs.network_len)]
+            != request_ecs.network[..usize::from(request_ecs.network_len)]
+    {
+        return None;
+    }
+
+    if response_ecs.scope_prefix > request_ecs.source_prefix {
+        // RFC 7871 requires an exact-SOURCE cache entry in this case.
+        // With the current key representation, SOURCE=/0 exact entries are
+        // indistinguishable from globally reusable SCOPE=/0 entries. Reject
+        // that one ambiguous case rather than risk cross-scope reuse.
+        if request_ecs.source_prefix == 0 {
+            return None;
+        }
+
+        return Some(key.clone());
+    }
+
+    Some(key.with_ecs_scope_prefix(response_ecs.scope_prefix))
+}
+
+/// Validate the ECS metadata stored alongside a persisted cache response.
+///
+/// A reusable response key has already been narrowed to the advertised scope,
+/// so its key prefix is shorter than the response SOURCE prefix. A response
+/// whose SCOPE is more specific than SOURCE remains under the original
+/// request-specific key. Persistence stores only the final key, therefore both
+/// representations need to be accepted explicitly here.
+#[inline]
+pub(super) fn persisted_ecs_key_matches_response(key: &CacheKey, response: &Message) -> bool {
+    let response_subnet = extract_ecs(response);
+
+    let Some(key_ecs) = &key.ecs_scope else {
+        return response_subnet.is_none();
+    };
+
+    let Some(response_subnet) = response_subnet else {
+        // Upstream response without ECS is retained under the original
+        // request-specific key. Request ECS keys always have scope=0.
+        return key_ecs.scope_prefix == 0;
+    };
+
+    if !ecs_prefixes_are_valid(response_subnet) {
+        return false;
+    }
+
+    let response_ecs = build_ecs_scope_digest(response_subnet);
+
+    if response_ecs.family != key_ecs.family {
+        return false;
+    }
+
+    //  Canonical reusable SCOPE=0 entry.
+    //  Example:
+    //  request:
+    //       203.0.113.0/24
+    //  response:
+    //       SOURCE=/24
+    //       SCOPE=/0
+    //  Runtime storage canonicalizes this to:
+    //      key.source_prefix = 0
+    //      key.scope_prefix  = 0
+    //      key.network_len   = 0
+    //  The original response SOURCE/address are deliberately no longer
+    //  represented by the cache key because SCOPE=0 means the answer is
+    //  reusable globally within this address family.
+    if key_ecs.source_prefix == 0
+        && key_ecs.scope_prefix == 0
+        && key_ecs.network_len == 0
+        && response_ecs.scope_prefix == 0
+    {
+        return true;
+    }
+
+    //   Request-specific key retained because response SCOPE > SOURCE.
+    //  In this representation the key still carries the original request
+    //  SOURCE prefix and address, while scope remains zero because the
+    //   request itself necessarily had SCOPE=0.
+    if key_ecs.scope_prefix == 0 {
+        // SOURCE=/0 + SCOPE>0 cannot be represented without colliding with
+        // a globally reusable SCOPE=/0 key. Runtime admission rejects this
+        // shape, and persistence must reject legacy/crafted entries too.
+        if key_ecs.source_prefix == 0 {
+            return false;
+        }
+
+        return response_ecs.source_prefix == key_ecs.source_prefix
+            && response_ecs.scope_prefix > key_ecs.source_prefix
+            && ecs_network_prefix_matches(key_ecs, &response_ecs, key_ecs.source_prefix);
+    }
+
+    // Normal reusable scoped key.
+    //
+    // Runtime storage canonicalizes SOURCE to SCOPE:
+    //
+    // response: SOURCE=/24 SCOPE=/20
+    // key:      SOURCE=/20 SCOPE=/20
+    response_ecs.scope_prefix == key_ecs.scope_prefix
+        && key_ecs.source_prefix == key_ecs.scope_prefix
+        && response_ecs.source_prefix >= key_ecs.source_prefix
+        && ecs_network_prefix_matches(key_ecs, &response_ecs, key_ecs.source_prefix)
+}
+
+#[inline]
+fn ecs_network_prefix_matches(left: &EcsScopeDigest, right: &EcsScopeDigest, prefix: u8) -> bool {
+    let full_bytes = usize::from(prefix / 8);
+    if left.network[..full_bytes] != right.network[..full_bytes] {
+        return false;
+    }
+    let remaining_bits = prefix % 8;
+    remaining_bits == 0
+        || (left.network[full_bytes] & (0xFFu8 << (8 - remaining_bits)))
+            == (right.network[full_bytes] & (0xFFu8 << (8 - remaining_bits)))
+}
+
+/// Monotonic advisory index of reusable ECS scope prefixes observed by this
+/// cache plugin instance.
+///
+/// The main cache map remains authoritative. Bits are set before a reusable ECS
+/// key is published and are intentionally never cleared, so stale bits can only
+/// cause harmless extra lookups; eviction/expiration/flush never risks hiding a
+/// still-live cache entry by clearing a shared prefix bit.
+#[derive(Debug)]
+pub(super) struct EcsPrefixHints {
+    ipv4: AtomicU64,
+    ipv6: [AtomicU64; 3],
+}
+
+impl Default for EcsPrefixHints {
+    fn default() -> Self {
+        Self {
+            ipv4: AtomicU64::new(0),
+            ipv6: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl EcsPrefixHints {
+    #[inline]
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn observe_prefix(&self, family: u16, prefix: u8) {
+        match family {
+            1 if prefix <= 32 => {
+                self.ipv4.fetch_or(1u64 << prefix, Ordering::Release);
+            }
+            2 if prefix <= 128 => {
+                let word = usize::from(prefix / 64);
+                let bit = prefix % 64;
+                self.ipv6[word].fetch_or(1u64 << bit, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record a key only when it is reusable by ECS scope.
+    ///
+    /// Request-specific keys have `scope_prefix == 0` while
+    /// `source_prefix > 0`, so they intentionally do not create lookup hints.
+    #[inline]
+    pub(super) fn observe_cache_key(&self, key: &CacheKey) {
+        let Some(ecs) = &key.ecs_scope else {
+            return;
+        };
+        if ecs.source_prefix == ecs.scope_prefix {
+            self.observe_prefix(ecs.family, ecs.scope_prefix);
+        }
+    }
+
+    #[inline]
+    fn snapshot_for(&self, family: u16, max_prefix: u8) -> EcsPrefixMask {
+        let mut words = match family {
+            1 => [self.ipv4.load(Ordering::Acquire), 0, 0],
+            2 => [
+                self.ipv6[0].load(Ordering::Acquire),
+                self.ipv6[1].load(Ordering::Acquire),
+                self.ipv6[2].load(Ordering::Acquire),
+            ],
+            _ => [0; 3],
+        };
+
+        let max_prefix = match family {
+            1 => max_prefix.min(32),
+            2 => max_prefix.min(128),
+            _ => return EcsPrefixMask { words: [0; 3] },
+        };
+        let max_word = usize::from(max_prefix / 64);
+        for word in words.iter_mut().skip(max_word + 1) {
+            *word = 0;
+        }
+        let max_bit = max_prefix % 64;
+        if max_bit < 63 {
+            words[max_word] &= (1u64 << (max_bit + 1)) - 1;
+        }
+
+        EcsPrefixMask { words }
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv4_prefixes(&self) -> u32 {
+        self.ipv4.load(Ordering::Relaxed).count_ones()
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv6_prefixes(&self) -> u32 {
+        self.ipv6
+            .iter()
+            .map(|word| word.load(Ordering::Relaxed).count_ones())
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EcsPrefixMask {
+    words: [u64; 3],
+}
+
+impl EcsPrefixMask {
+    #[inline]
+    fn pop_highest(&mut self) -> Option<u8> {
+        for word_index in (0..self.words.len()).rev() {
+            let word = self.words[word_index];
+            if word == 0 {
+                continue;
+            }
+            let bit = 63u32.saturating_sub(word.leading_zeros()) as u8;
+            self.words[word_index] &= !(1u64 << bit);
+            return Some((word_index as u8).saturating_mul(64).saturating_add(bit));
+        }
+        None
+    }
+}
+
+/// Lazily return cache lookup candidates in RFC 7871 order.
+///
+/// For ECS requests, only reusable scope prefixes present in the advisory hint
+/// bitmap are materialized, longest-prefix first. The exact-SOURCE
+/// request-specific key is always yielded last. For non-ECS requests, only the
+/// ordinary request key is returned.
+pub(super) struct CacheLookupKeys<'a> {
+    key: &'a CacheKey,
+    reusable_prefixes: EcsPrefixMask,
+    exact_pending: bool,
+}
+
+impl<'a> CacheLookupKeys<'a> {
+    #[inline]
+    fn new(key: &'a CacheKey, hints: &EcsPrefixHints) -> Self {
+        let reusable_prefixes = key
+            .ecs_scope
+            .as_ref()
+            .map(|ecs| hints.snapshot_for(ecs.family, ecs.source_prefix))
+            .unwrap_or(EcsPrefixMask { words: [0; 3] });
+        Self {
+            key,
+            reusable_prefixes,
+            exact_pending: true,
+        }
+    }
+}
+
+impl<'a> Iterator for CacheLookupKeys<'a> {
+    type Item = Cow<'a, CacheKey>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(scope_prefix) = self.reusable_prefixes.pop_highest() {
+            let candidate = self.key.with_ecs_scope_prefix(scope_prefix);
+
+            // SOURCE=/0 has the same concrete key shape as reusable SCOPE=/0.
+            // Yield the concrete key only once.
+            if candidate == *self.key {
+                self.exact_pending = false;
+                return Some(Cow::Borrowed(self.key));
+            }
+
+            return Some(Cow::Owned(candidate));
+        }
+
+        if self.exact_pending {
+            self.exact_pending = false;
+            return Some(Cow::Borrowed(self.key));
+        }
+
+        None
+    }
+}
+
+#[inline]
+pub(super) fn cache_lookup_keys<'a>(
+    key: &'a CacheKey,
+    hints: &EcsPrefixHints,
+) -> CacheLookupKeys<'a> {
+    CacheLookupKeys::new(key, hints)
+}
+
+/// Only cache ordinary unsigned single-question DNS queries.
+#[inline]
+pub(super) fn is_cacheable_request(request: &Message) -> bool {
+    request.message_type() == MessageType::Query
+        && request.opcode() == Opcode::Query
+        && request.question_count() == 1
+        && request.signature().is_empty()
+        && request.edns().as_ref().is_none_or(|edns| {
+            edns.version() == 0
+                && edns
+                    .options()
+                    .iter()
+                    .all(|option| matches!(option, EdnsOption::Subnet(_)))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+
+    fn exhaustive_hints_for(key: &CacheKey) -> EcsPrefixHints {
+        let hints = EcsPrefixHints::new();
+        if let Some(ecs) = &key.ecs_scope {
+            for prefix in 0..=ecs.source_prefix {
+                hints.observe_prefix(ecs.family, prefix);
+            }
+        }
+        hints
+    }
 
     use super::*;
     use crate::proto::{DNSClass, Edns, EdnsOption, Message, Name, Question, RecordType};
@@ -159,6 +663,12 @@ mod tests {
         let normalized = normalize_domain_key("  WWW.Example.COM.  ");
 
         assert_eq!(normalized, "www.example.com");
+    }
+
+    #[test]
+    fn test_normalize_domain_key_preserves_root_domain() {
+        assert_eq!(normalize_domain_key(" . "), ".");
+        assert_eq!(normalize_domain_key(""), "");
     }
 
     #[test]
@@ -195,7 +705,7 @@ mod tests {
 
         let cache_key = build_cache_key(&mut context, false).expect("cache key should exist");
 
-        assert_eq!(cache_key.domain, "www.example.com");
+        assert_eq!(cache_key.domain.as_ref(), "www.example.com");
         assert_eq!(cache_key.record_type, RecordType::A);
         assert!(cache_key.do_bit);
         assert!(cache_key.cd_bit);
@@ -209,7 +719,7 @@ mod tests {
         edns.insert(EdnsOption::Subnet(ClientSubnet::new(
             IpAddr::from([203, 0, 113, 199]),
             20,
-            24,
+            0,
         )));
         context.request.set_edns(edns);
 
@@ -218,9 +728,289 @@ mod tests {
         let ecs = cache_key.ecs_scope.expect("ecs should be present");
         assert_eq!(ecs.family, 1);
         assert_eq!(ecs.source_prefix, 20);
-        assert_eq!(ecs.scope_prefix, 24);
+        assert_eq!(ecs.scope_prefix, 0);
         assert_eq!(ecs.network_len, 3);
         assert_eq!(&ecs.network[..3], &[203, 0, 112]);
+    }
+
+    #[test]
+    fn test_build_cache_key_rejects_ecs_request_with_nonzero_scope() {
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            24,
+        )));
+        context.request.set_edns(edns);
+
+        assert!(build_cache_key(&mut context, true).is_none());
+    }
+
+    #[test]
+    fn test_build_cache_key_rejects_ecs_when_keying_is_disabled() {
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            0,
+        )));
+        context.request.set_edns(edns);
+
+        assert!(build_cache_key(&mut context, false).is_none());
+    }
+
+    #[test]
+    fn test_cache_lookup_keys_places_exact_source_after_covering_scopes() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let candidates = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            candidates.first(),
+            Some(&request_key.with_ecs_scope_prefix(24))
+        );
+        assert_eq!(candidates.last(), Some(&request_key));
+        assert_eq!(candidates.len(), 26);
+    }
+
+    #[test]
+    fn test_ecs_lookup_uses_only_observed_scope_prefixes() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 1]),
+            128,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let hints = EcsPrefixHints::new();
+        let family = request_key.ecs_scope.as_ref().expect("ECS key").family;
+        for prefix in [0, 32, 48, 56, 64] {
+            hints.observe_prefix(family, prefix);
+        }
+
+        let prefixes = cache_lookup_keys(&request_key, &hints)
+            .filter_map(|candidate| {
+                if candidate.as_ref() == &request_key {
+                    None
+                } else {
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .map(|ecs| ecs.scope_prefix)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(prefixes, vec![64, 56, 48, 32, 0]);
+    }
+
+    #[test]
+    fn test_request_specific_ecs_key_does_not_create_hint() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let hints = EcsPrefixHints::new();
+        hints.observe_cache_key(&request_key);
+
+        let candidates = cache_lookup_keys(&request_key, &hints)
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates, vec![request_key]);
+    }
+
+    #[test]
+    fn test_non_ecs_lookup_borrows_request_key_without_candidates() {
+        let mut request = make_context("example.com.");
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
+
+        assert!(matches!(lookup_keys.next(), Some(Cow::Borrowed(key)) if key == &request_key));
+        assert!(lookup_keys.next().is_none());
+    }
+
+    #[test]
+    fn test_ecs_lookup_materializes_covering_scope_before_borrowed_exact_key() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
+
+        assert!(matches!(lookup_keys.next(), Some(Cow::Owned(_))));
+
+        let remaining = lookup_keys.collect::<Vec<_>>();
+        assert!(matches!(remaining.last(), Some(Cow::Borrowed(_))));
+        assert_eq!(
+            remaining.last().map(|candidate| candidate.as_ref()),
+            Some(&request_key)
+        );
+    }
+
+    #[test]
+    fn test_ecs_lookup_prefers_covering_scope_over_exact_source_fallback() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            0,
+        )));
+        request.request.set_edns(edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+        let scoped_key = request_key.with_ecs_scope_prefix(20);
+
+        // Both a reusable covering /20 entry and an exact-SOURCE fallback
+        // entry exist. RFC 7871 longest-prefix matching must choose /20 first.
+        let cached = [request_key.clone(), scoped_key.clone()];
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+            .find(|candidate| cached.contains(candidate.as_ref()))
+            .map(Cow::into_owned);
+
+        assert_eq!(first_hit, Some(scoped_key));
+    }
+
+    #[test]
+    fn test_ecs_lookup_uses_exact_source_when_no_covering_entry_exists() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            0,
+        )));
+        request.request.set_edns(edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+        let cached = [request_key.clone()];
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+            .find(|candidate| cached.contains(candidate.as_ref()))
+            .map(Cow::into_owned);
+
+        assert_eq!(first_hit, Some(request_key));
+    }
+
+    #[test]
+    fn test_cache_lookup_keys_do_not_duplicate_zero_scope_request_key() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            0,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        assert_eq!(
+            cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+                .map(Cow::into_owned)
+                .collect::<Vec<_>>(),
+            vec![request_key]
+        );
+    }
+
+    #[test]
+    fn test_response_ecs_scope_key_matches_broader_client_prefix() {
+        let mut request = make_context("example.com.");
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        response.set_edns(response_edns);
+        let scoped_key =
+            cache_key_for_response_ecs_scope(&request_key, &response).expect("ECS should match");
+
+        let ecs = scoped_key
+            .ecs_scope
+            .as_ref()
+            .expect("scope should be present");
+        assert_eq!(ecs.source_prefix, 20);
+        assert_eq!(ecs.scope_prefix, 20);
+        assert_eq!(&ecs.network[..3], &[203, 0, 112]);
+
+        let mut other_request = make_context("example.com.");
+        let mut other_edns = Edns::new();
+        other_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 127, 1]),
+            24,
+            0,
+        )));
+        other_request.request.set_edns(other_edns);
+        let other_key =
+            build_cache_key(&mut other_request, true).expect("request key should exist");
+
+        assert!(
+            cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+                .any(|candidate| candidate.as_ref() == &scoped_key)
+        );
+    }
+
+    #[test]
+    fn test_ecs_refresh_validates_against_request_key_not_scoped_cache_key() {
+        let mut request = make_context("example.com.");
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            16,
+        )));
+        response.set_edns(response_edns);
+
+        let scoped_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("refresh response should be accepted for the request key");
+        assert_ne!(scoped_key, request_key);
+        assert!(cache_key_for_response_ecs_scope(&scoped_key, &response).is_none());
     }
 
     #[test]
@@ -230,5 +1020,221 @@ mod tests {
         let cache_key = build_cache_key(&mut context, true);
 
         assert_eq!(cache_key, None);
+    }
+
+    #[test]
+    fn test_unsupported_edns_version_is_not_cacheable() {
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.set_version(1);
+        context.request.set_edns(edns);
+
+        assert!(!is_cacheable_request(&context.request));
+    }
+
+    #[test]
+    fn test_non_query_and_request_bound_options_are_not_cacheable() {
+        let mut context = make_context("example.com.");
+        context.request.set_opcode(Opcode::Notify);
+        assert!(!is_cacheable_request(&context.request));
+
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Cookie(crate::proto::EdnsCookie::new(vec![
+            1, 2,
+        ])));
+        context.request.set_edns(edns);
+        assert!(!is_cacheable_request(&context.request));
+    }
+
+    #[test]
+    fn test_response_ecs_scope_more_specific_than_source_stays_request_specific() {
+        let mut request = make_context("example.com.");
+
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+
+        // SOURCE matches the request (/20), but the server advertises a
+        // narrower cache scope (/24).
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 112, 0]),
+            20,
+            24,
+        )));
+
+        response.set_edns(response_edns);
+
+        let scoped_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("ECS response should be accepted");
+
+        // SCOPE > SOURCE must remain request-specific.
+        assert_eq!(scoped_key, request_key);
+
+        // A /24 request inside the same /20 must NOT hit the request-specific
+        // /20 entry merely because its lookup candidates contain /20.
+        let mut other_request = make_context("example.com.");
+
+        let mut other_edns = Edns::new();
+        other_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 1]),
+            24,
+            0,
+        )));
+        other_request.request.set_edns(other_edns);
+
+        let other_key =
+            build_cache_key(&mut other_request, true).expect("other request key should exist");
+
+        assert!(
+            !cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+                .any(|candidate| candidate.as_ref() == &scoped_key)
+        );
+    }
+
+    #[test]
+    fn test_response_ecs_source_zero_with_positive_scope_is_not_cached() {
+        let mut request = make_context("example.com.");
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0, 0, 0, 0]),
+            0,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0, 0, 0, 0]),
+            0,
+            24,
+        )));
+        response.set_edns(response_edns);
+
+        assert!(cache_key_for_response_ecs_scope(&request_key, &response).is_none());
+        assert!(!persisted_ecs_key_matches_response(&request_key, &response));
+    }
+
+    #[test]
+    fn test_response_ecs_rejects_mismatched_source_prefix() {
+        let mut request = make_context("example.com.");
+
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+
+        // Same general address area but wrong SOURCE PREFIX-LENGTH.
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 112, 0]),
+            23,
+            20,
+        )));
+
+        response.set_edns(response_edns);
+
+        assert!(cache_key_for_response_ecs_scope(&request_key, &response).is_none());
+    }
+
+    #[test]
+    fn test_persisted_ecs_key_matches_reusable_response_scope() {
+        let mut request = make_context("example.com.");
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        response.set_edns(response_edns);
+        let stored_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("response ECS should produce a reusable key");
+
+        assert!(persisted_ecs_key_matches_response(&stored_key, &response));
+
+        let mut mismatched_response = response.clone();
+        let mut mismatched_edns = Edns::new();
+        mismatched_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 129, 0]),
+            24,
+            20,
+        )));
+        mismatched_response.set_edns(mismatched_edns);
+        assert!(!persisted_ecs_key_matches_response(
+            &stored_key,
+            &mismatched_response
+        ));
+    }
+
+    #[test]
+    fn test_persisted_ecs_key_matches_global_scope_zero_response() {
+        let mut request = make_context("example.com.");
+
+        let mut request_edns = Edns::new();
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(request_edns);
+
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let mut response = Message::new();
+        let mut response_edns = Edns::new();
+
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            0,
+        )));
+
+        response.set_edns(response_edns);
+
+        let stored_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("response ECS should be accepted");
+
+        let ecs = stored_key
+            .ecs_scope
+            .as_ref()
+            .expect("stored key should contain ECS");
+
+        assert_eq!(ecs.source_prefix, 0);
+        assert_eq!(ecs.scope_prefix, 0);
+        assert_eq!(ecs.network_len, 0);
+
+        assert!(
+            persisted_ecs_key_matches_response(&stored_key, &response,),
+            "SCOPE=0 reusable ECS entry must survive persistence validation"
+        );
     }
 }
