@@ -18,7 +18,7 @@ use crate::infra::network::dial::{
 };
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::quic::{
-    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter,
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::pool::{ConnectionBuilder, QueryDeadline};
@@ -144,12 +144,33 @@ impl Connection for QuicConnection {
         let mut stream = DoqQueryStream::new(reader, writer);
 
         let raw_id = request.id();
-        if let Err(e) = stream.writer.write_message(&request).await {
-            self.close();
-            return Err(DnsError::protocol(format!(
-                "Failed to write DNS query to QUIC stream: {}",
-                e
-            )));
+        if let Err(e) = stream.writer.write_message_doq(&request).await {
+            match e {
+                QuicWriteError::Stopped(code) => {
+                    self.close_with_code(DOQ_PROTOCOL_ERROR, b"peer sent STOP_SENDING");
+                    warn!(
+                        conn_id = self.id,
+                        query_id = raw_id,
+                        %code,
+                        "DoQ peer sent forbidden STOP_SENDING"
+                    );
+                    return Err(DnsError::protocol(format!(
+                        "DoQ peer sent STOP_SENDING with code {code}"
+                    )));
+                }
+                QuicWriteError::ConnectionLost(error) => {
+                    self.close();
+                    return Err(DnsError::protocol(format!(
+                        "QUIC connection lost while writing DoQ query: {error}"
+                    )));
+                }
+                other => {
+                    self.close();
+                    return Err(DnsError::protocol(format!(
+                        "Failed to write DNS query to QUIC stream: {other}"
+                    )));
+                }
+            }
         }
         if let Err(e) = stream.writer.finish() {
             self.close();

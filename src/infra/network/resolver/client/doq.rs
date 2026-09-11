@@ -17,7 +17,7 @@ use crate::infra::network::dial::{
 };
 #[cfg(feature = "resolver-doq")]
 use crate::infra::network::transport::quic::{
-    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter,
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
 use crate::proto::Message;
 
@@ -117,8 +117,20 @@ async fn query_doq_config(
     };
     let mut stream = DoqQueryStream::new(reader, writer);
     let query_id = request.id();
-    match deadline.run(stream.writer.write_message(&request)).await {
-        DeadlineOutcome::Completed(result) => result?,
+    match deadline
+        .run(stream.writer.write_message_doq(&request))
+        .await
+    {
+        DeadlineOutcome::Completed(Ok(())) => {}
+        DeadlineOutcome::Completed(Err(QuicWriteError::Stopped(code))) => {
+            transport.close_with_code(DOQ_PROTOCOL_ERROR, b"peer sent STOP_SENDING");
+            return Err(DnsError::protocol(format!(
+                "DoQ peer sent STOP_SENDING with code {code}"
+            )));
+        }
+        DeadlineOutcome::Completed(Err(e)) => {
+            return Err(DnsError::protocol(e.to_string()));
+        }
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     }
     stream.writer.finish()?;
