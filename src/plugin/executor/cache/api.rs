@@ -41,16 +41,25 @@ pub(super) struct CacheMutationState {
     pub(super) dirty_generation: Arc<AtomicU64>,
 }
 
-pub(super) fn register(
-    tag: &str,
-    cache_map: CacheMap,
-    ecs_in_key: bool,
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
-    cache_size: usize,
-    policy: CacheLoadPolicy,
-    cache_reclaimer: CacheReclaimer,
-    state: CacheMutationState,
-) -> Result<()> {
+#[derive(Debug, Clone)]
+pub(super) struct CacheApiConfig {
+    pub(super) ecs_in_key: bool,
+    pub(super) ecs_prefix_hints: Arc<EcsPrefixHints>,
+    pub(super) cache_size: usize,
+    pub(super) policy: CacheLoadPolicy,
+    pub(super) cache_reclaimer: CacheReclaimer,
+    pub(super) state: CacheMutationState,
+}
+
+pub(super) fn register(tag: &str, cache_map: CacheMap, config: CacheApiConfig) -> Result<()> {
+    let CacheApiConfig {
+        ecs_in_key,
+        ecs_prefix_hints,
+        cache_size,
+        policy,
+        cache_reclaimer,
+        state,
+    } = config;
     let CacheMutationState {
         updated_keys,
         dirty_since_ms,

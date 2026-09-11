@@ -1754,15 +1754,17 @@ impl Plugin for Cache {
             api::register(
                 &self.tag,
                 cache_map.clone(),
-                self.ecs_in_key,
-                self.ecs_prefix_hints.clone(),
-                self.cache_size,
-                self.cache_load_policy(),
-                cache_reclaimer,
-                api::CacheMutationState {
-                    updated_keys: self.updated_keys.clone(),
-                    dirty_since_ms: self.dirty_since_ms.clone(),
-                    dirty_generation: self.dirty_generation.clone(),
+                api::CacheApiConfig {
+                    ecs_in_key: self.ecs_in_key,
+                    ecs_prefix_hints: self.ecs_prefix_hints.clone(),
+                    cache_size: self.cache_size,
+                    policy: self.cache_load_policy(),
+                    cache_reclaimer,
+                    state: api::CacheMutationState {
+                        updated_keys: self.updated_keys.clone(),
+                        dirty_since_ms: self.dirty_since_ms.clone(),
+                        dirty_generation: self.dirty_generation.clone(),
+                    },
                 },
             )?;
         }

@@ -884,10 +884,10 @@ mod tests {
             poll_fn(|cx| {
                 let mut bufs = [IoSliceMut::new(&mut output)];
                 let poll = Pin::new(&recv_socket).poll_recv(cx, &mut bufs, &mut meta);
-                if poll.is_pending() {
-                    if let Some(started) = poll_started.take() {
-                        let _ = started.send(());
-                    }
+                if poll.is_pending()
+                    && let Some(started) = poll_started.take()
+                {
+                    let _ = started.send(());
                 }
                 poll
             })
