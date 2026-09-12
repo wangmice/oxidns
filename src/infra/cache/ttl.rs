@@ -20,7 +20,14 @@ use arc_swap::ArcSwap;
 use dashmap::{DashMap, Entry, SharedValue};
 use rand::RngExt;
 
+const LAST_ACCESS_EVICTING_BIT: u64 = 1 << 63;
+
 /// Snapshot of one cached entry with metadata.
+///
+/// This is intentionally a detached value used by management, persistence,
+/// and compatibility APIs. Request-path lookups should prefer
+/// [`TtlCacheHandle`], which keeps a stable identity without cloning the value
+/// or reacquiring a DashMap write guard.
 #[derive(Debug, Clone)]
 pub struct TtlCacheEntry<V> {
     /// User data stored in cache.
@@ -35,7 +42,153 @@ pub struct TtlCacheEntry<V> {
     generation: u64,
 }
 
-/// Result of a retained-entry lookup.
+/// Immutable cache node stored behind a stable `Arc`.
+///
+/// Entry replacement always publishes a new node. The only mutable field is
+/// the approximate last-access timestamp, which can be updated lock-free.
+#[derive(Debug)]
+struct TtlCacheNode<V> {
+    value: V,
+    cache_time_ms: u64,
+    expire_at_ms: u64,
+    last_access_ms: AtomicU64,
+    generation: u64,
+}
+
+impl<V> TtlCacheNode<V> {
+    #[inline]
+    fn new(
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            value,
+            cache_time_ms,
+            expire_at_ms,
+            last_access_ms: AtomicU64::new(last_access_ms & !LAST_ACCESS_EVICTING_BIT),
+            generation,
+        }
+    }
+
+    #[inline]
+    fn last_access_ms(&self) -> u64 {
+        self.last_access_ms.load(Ordering::Relaxed) & !LAST_ACCESS_EVICTING_BIT
+    }
+
+    #[inline]
+    fn touch_last_access(&self, now_ms: u64) {
+        debug_assert_eq!(now_ms & LAST_ACCESS_EVICTING_BIT, 0);
+        let mut current = self.last_access_ms.load(Ordering::Relaxed);
+        loop {
+            if current & LAST_ACCESS_EVICTING_BIT != 0 || current >= now_ms {
+                return;
+            }
+            match self.last_access_ms.compare_exchange_weak(
+                current,
+                now_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[inline]
+    fn try_claim_eviction(&self, expected_last_access_ms: u64) -> bool {
+        debug_assert_eq!(expected_last_access_ms & LAST_ACCESS_EVICTING_BIT, 0);
+        self.last_access_ms
+            .compare_exchange(
+                expected_last_access_ms,
+                expected_last_access_ms | LAST_ACCESS_EVICTING_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    fn snapshot(&self) -> TtlCacheEntry<V>
+    where
+        V: Clone,
+    {
+        TtlCacheEntry {
+            value: self.value.clone(),
+            cache_time_ms: self.cache_time_ms,
+            expire_at_ms: self.expire_at_ms,
+            last_access_ms: self.last_access_ms(),
+            generation: self.generation,
+        }
+    }
+}
+
+/// Stable handle to one concrete cache entry generation.
+///
+/// Replacing a key creates a new node, so pointer identity is sufficient to
+/// detect whether a refresh/remove operation still targets the same entry.
+#[derive(Debug)]
+pub struct TtlCacheHandle<V> {
+    node: Arc<TtlCacheNode<V>>,
+}
+
+impl<V> Clone for TtlCacheHandle<V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+        }
+    }
+}
+
+impl<V> TtlCacheHandle<V> {
+    #[inline]
+    pub fn value(&self) -> &V {
+        &self.node.value
+    }
+
+    #[inline]
+    pub fn cache_time_ms(&self) -> u64 {
+        self.node.cache_time_ms
+    }
+
+    #[inline]
+    pub fn expire_at_ms(&self) -> u64 {
+        self.node.expire_at_ms
+    }
+
+    #[inline]
+    pub fn last_access_ms(&self) -> u64 {
+        self.node.last_access_ms()
+    }
+
+    #[inline]
+    fn same_node(&self, other: &Arc<TtlCacheNode<V>>) -> bool {
+        Arc::ptr_eq(&self.node, other)
+    }
+
+    #[inline]
+    fn snapshot(&self) -> TtlCacheEntry<V>
+    where
+        V: Clone,
+    {
+        self.node.snapshot()
+    }
+}
+
+/// Result of a stable-handle retained-entry lookup.
+#[derive(Debug)]
+pub enum TtlCacheHandleLookup<V> {
+    /// Entry exists and is still retained.
+    Hit(TtlCacheHandle<V>),
+    /// Entry existed but expired and was removed.
+    Expired,
+}
+
+/// Result of a detached retained-entry lookup.
 #[derive(Debug, Clone)]
 pub enum TtlCacheLookup<V> {
     /// Entry exists and is still retained.
@@ -103,7 +256,7 @@ struct TtlCacheState<K, V>
 where
     K: Eq + Hash,
 {
-    map: DashMap<K, TtlCacheEntry<V>, AHashBuilder>,
+    map: DashMap<K, Arc<TtlCacheNode<V>>, AHashBuilder>,
     entry_count: AtomicUsize,
     next_generation: AtomicU64,
 }
@@ -125,6 +278,23 @@ where
         self.next_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
+    }
+
+    #[inline]
+    fn new_node(
+        &self,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+    ) -> Arc<TtlCacheNode<V>> {
+        Arc::new(TtlCacheNode::new(
+            value,
+            cache_time_ms,
+            expire_at_ms,
+            last_access_ms,
+            self.next_generation(),
+        ))
     }
 }
 
@@ -241,23 +411,13 @@ where
         last_access_ms: u64,
     ) {
         let state = self.state.load();
+        let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
         match state.map.entry(key) {
             Entry::Occupied(mut e) => {
-                let existing = e.get_mut();
-                existing.value = value;
-                existing.cache_time_ms = cache_time_ms;
-                existing.expire_at_ms = expire_at_ms;
-                existing.last_access_ms = last_access_ms;
-                existing.generation = state.next_generation();
+                e.insert(node);
             }
             Entry::Vacant(e) => {
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(node);
                 state.entry_count.fetch_add(1, Ordering::Release);
             }
         }
@@ -277,13 +437,7 @@ where
         let state = self.state.load();
         match state.map.entry(key) {
             Entry::Occupied(mut e) => {
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 true
             }
             Entry::Vacant(e) => {
@@ -298,7 +452,7 @@ where
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => break, // 预占位成功，跳出循环进入第二阶段
+                        Ok(_) => break, // reserve a slot before physical insertion
                         Err(actual) => count = actual,
                     }
                 }
@@ -310,7 +464,7 @@ where
                 impl Drop for RollbackGuard<'_> {
                     fn drop(&mut self) {
                         if !self.success {
-                            // 如果中途失败或被取消，将预占的名额无锁回滚
+                            // Roll back the reserved slot if insertion cannot complete.
                             self.entry_count.fetch_sub(1, Ordering::Release);
                         }
                     }
@@ -321,23 +475,36 @@ where
                     success: false,
                 };
 
-                // 执行真正的物理插入
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
-
-                // 物理插入成功，解除回滚守卫
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 guard.success = true;
                 true
             }
         }
     }
 
-    /// Replace an existing entry only when it still matches `predicate`.
+    /// Replace an existing entry only if it is still the exact generation
+    /// represented by `expected`.
+    pub fn replace_handle(
+        &self,
+        key: K,
+        expected: &TtlCacheHandle<V>,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+    ) -> bool {
+        let state = self.state.load();
+        let Entry::Occupied(mut entry) = state.map.entry(key) else {
+            return false;
+        };
+        if !expected.same_node(entry.get()) {
+            return false;
+        }
+        entry.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
+        true
+    }
+
+    /// Compatibility helper for callers that still match detached metadata.
     pub fn replace_if(
         &self,
         key: K,
@@ -346,21 +513,19 @@ where
         expire_at_ms: u64,
         last_access_ms: u64,
         predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool,
-    ) -> bool {
+    ) -> bool
+    where
+        V: Clone,
+    {
         let state = self.state.load();
         let Entry::Occupied(mut entry) = state.map.entry(key) else {
             return false;
         };
-        if !predicate(entry.get()) {
+        let snapshot = entry.get().snapshot();
+        if !predicate(&snapshot) {
             return false;
         }
-        entry.insert(TtlCacheEntry {
-            value,
-            cache_time_ms,
-            expire_at_ms,
-            last_access_ms,
-            generation: state.next_generation(),
-        });
+        entry.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
         true
     }
 
@@ -379,23 +544,11 @@ where
                 if e.get().cache_time_ms > cache_time_ms {
                     return false;
                 }
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 true
             }
             Entry::Vacant(e) => {
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 state.entry_count.fetch_add(1, Ordering::Release);
                 true
             }
@@ -422,13 +575,7 @@ where
                 if e.get().cache_time_ms > cache_time_ms {
                     return TtlCacheInsertIfNotNewerResult::NewerPresent;
                 }
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 TtlCacheInsertIfNotNewerResult::Inserted
             }
             Entry::Vacant(e) => {
@@ -465,21 +612,15 @@ where
                     success: false,
                 };
 
-                e.insert(TtlCacheEntry {
-                    value,
-                    cache_time_ms,
-                    expire_at_ms,
-                    last_access_ms,
-                    generation: state.next_generation(),
-                });
+                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
                 guard.success = true;
                 TtlCacheInsertIfNotNewerResult::Inserted
             }
         }
     }
 
-    /// Move one existing entry to a different key only when the source still
-    /// matches `predicate` and the target key is vacant.
+    /// Move one existing entry to a different key only when the source is still
+    /// the exact generation represented by `expected` and the target is vacant.
     ///
     /// The operation is bound to one cache state loaded at entry, so a
     /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
@@ -493,15 +634,13 @@ where
     /// accounting does not need a release/reacquire cycle and concurrent
     /// bounded insertions cannot steal the source entry's slot mid-move.
     ///
-    /// `predicate` runs while the affected shard write locks are held and must
-    /// not call back into ordinary map operations on this cache.
-    pub(crate) fn conditional_move_if(
+    pub(crate) fn conditional_move_handle(
         &self,
         source_key: &K,
         target_key: K,
+        expected: &TtlCacheHandle<V>,
         value: V,
         metadata: TtlCacheMoveMetadata,
-        predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool,
     ) -> TtlCacheConditionalMoveResult {
         let state = self.state.load();
 
@@ -531,7 +670,7 @@ where
 
                     let source_matches = unsafe {
                         let (_, stored) = source_bucket.as_ref();
-                        predicate(stored.get())
+                        expected.same_node(stored.get())
                     };
                     if !source_matches {
                         TtlCacheConditionalMoveResult::SourceChanged
@@ -546,13 +685,12 @@ where
                             target_hash,
                             (
                                 target_key,
-                                SharedValue::new(TtlCacheEntry {
+                                SharedValue::new(state.new_node(
                                     value,
-                                    cache_time_ms: metadata.cache_time_ms,
-                                    expire_at_ms: metadata.expire_at_ms,
-                                    last_access_ms: metadata.last_access_ms,
-                                    generation: state.next_generation(),
-                                }),
+                                    metadata.cache_time_ms,
+                                    metadata.expire_at_ms,
+                                    metadata.last_access_ms,
+                                )),
                             ),
                             |(key, _)| hash_key(key),
                         );
@@ -581,7 +719,7 @@ where
 
                     let source_matches = unsafe {
                         let (_, stored) = source_bucket.as_ref();
-                        predicate(stored.get())
+                        expected.same_node(stored.get())
                     };
                     if !source_matches {
                         TtlCacheConditionalMoveResult::SourceChanged
@@ -596,13 +734,12 @@ where
                             target_hash,
                             (
                                 target_key,
-                                SharedValue::new(TtlCacheEntry {
+                                SharedValue::new(state.new_node(
                                     value,
-                                    cache_time_ms: metadata.cache_time_ms,
-                                    expire_at_ms: metadata.expire_at_ms,
-                                    last_access_ms: metadata.last_access_ms,
-                                    generation: state.next_generation(),
-                                }),
+                                    metadata.cache_time_ms,
+                                    metadata.expire_at_ms,
+                                    metadata.last_access_ms,
+                                )),
                             ),
                             |(key, _)| hash_key(key),
                         );
@@ -628,12 +765,53 @@ where
         }
     }
 
-    /// Get one retained, non-expired entry and optionally refresh its access
-    /// timestamp.
+    /// Get one retained, non-expired stable handle and optionally refresh its
+    /// access timestamp without reacquiring a DashMap write guard.
     ///
     /// This method only enforces the shared cache-retention deadline
     /// (`expire_at_ms`). Callers that need a fresh/stale split can apply their
-    /// own semantics using the returned metadata.
+    /// own semantics using the returned handle.
+    #[inline]
+    pub fn get_retained_handle_status(
+        &self,
+        key: &K,
+        now_ms: u64,
+        touch_interval_ms: u64,
+    ) -> Option<TtlCacheHandleLookup<V>> {
+        let state = self.state.load();
+        loop {
+            let entry = state.map.get(key)?;
+            let node = entry.value().clone();
+            drop(entry);
+
+            if node.expire_at_ms <= now_ms {
+                if state
+                    .map
+                    .remove_if(key, |_, existing| Arc::ptr_eq(existing, &node))
+                    .is_some()
+                {
+                    state.entry_count.fetch_sub(1, Ordering::Release);
+                    return Some(TtlCacheHandleLookup::Expired);
+                }
+                // A writer replaced the expired node after the read. Re-read
+                // instead of reporting a miss for the replacement generation.
+                continue;
+            }
+
+            if touch_interval_ms > 0 {
+                let last_access_ms = node.last_access_ms();
+                if now_ms.saturating_sub(last_access_ms) >= touch_interval_ms
+                    && last_access_ms < now_ms
+                {
+                    node.touch_last_access(now_ms);
+                }
+            }
+
+            return Some(TtlCacheHandleLookup::Hit(TtlCacheHandle { node }));
+        }
+    }
+
+    /// Get one retained, non-expired entry as a detached snapshot.
     #[inline]
     pub fn get_retained_cloned(
         &self,
@@ -650,8 +828,8 @@ where
         }
     }
 
-    /// Get one retained entry and distinguish expired entries from missing
-    /// keys while preserving the expired-entry removal behavior.
+    /// Compatibility lookup returning a detached snapshot while preserving the
+    /// old miss-vs-expired distinction and pre-touch snapshot semantics.
     #[inline]
     pub fn get_retained_cloned_status(
         &self,
@@ -662,43 +840,19 @@ where
     where
         V: Clone,
     {
-        let state = self.state.load();
-        loop {
-            let entry = state.map.get(key)?;
-            if entry.expire_at_ms <= now_ms {
-                drop(entry);
-                if state
-                    .map
-                    .remove_if(key, |_, existing| existing.expire_at_ms <= now_ms)
-                    .is_some()
+        match self.get_retained_handle_status(key, now_ms, 0) {
+            Some(TtlCacheHandleLookup::Hit(handle)) => {
+                let snapshot = handle.snapshot();
+                if touch_interval_ms > 0
+                    && now_ms.saturating_sub(snapshot.last_access_ms) >= touch_interval_ms
+                    && snapshot.last_access_ms < now_ms
                 {
-                    state.entry_count.fetch_sub(1, Ordering::Release);
-                    return Some(TtlCacheLookup::Expired);
+                    handle.node.touch_last_access(now_ms);
                 }
-                // A writer replaced the expired entry between the read and
-                // conditional removal. Re-read instead of reporting a miss.
-                continue;
+                Some(TtlCacheLookup::Hit(snapshot))
             }
-
-            let snapshot = TtlCacheEntry {
-                value: entry.value.clone(),
-                cache_time_ms: entry.cache_time_ms,
-                expire_at_ms: entry.expire_at_ms,
-                last_access_ms: entry.last_access_ms,
-                generation: entry.generation,
-            };
-            drop(entry);
-
-            if touch_interval_ms > 0
-                && now_ms.saturating_sub(snapshot.last_access_ms) >= touch_interval_ms
-                && let Some(mut existing) = state.map.get_mut(key)
-                && existing.expire_at_ms > now_ms
-                && existing.last_access_ms < now_ms
-            {
-                existing.last_access_ms = now_ms;
-            }
-
-            return Some(TtlCacheLookup::Hit(snapshot));
+            Some(TtlCacheHandleLookup::Expired) => Some(TtlCacheLookup::Expired),
+            None => None,
         }
     }
 
@@ -727,13 +881,34 @@ where
         removed
     }
 
-    /// Remove one entry only when the current entry matches `predicate`.
+    /// Remove one entry only if it is still the exact generation represented
+    /// by `expected`.
     #[inline]
-    pub fn remove_if(&self, key: &K, predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool) -> bool {
+    pub fn remove_handle(&self, key: &K, expected: &TtlCacheHandle<V>) -> bool {
         let state = self.state.load();
         let removed = state
             .map
-            .remove_if(key, |_, existing| predicate(existing))
+            .remove_if(key, |_, existing| expected.same_node(existing))
+            .is_some();
+        if removed {
+            state.entry_count.fetch_sub(1, Ordering::Release);
+        }
+        removed
+    }
+
+    /// Compatibility helper for callers that still match detached metadata.
+    #[inline]
+    pub fn remove_if(&self, key: &K, predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool) -> bool
+    where
+        V: Clone,
+    {
+        let state = self.state.load();
+        let removed = state
+            .map
+            .remove_if(key, |_, existing| {
+                let snapshot = existing.snapshot();
+                predicate(&snapshot)
+            })
             .is_some();
         if removed {
             state.entry_count.fetch_sub(1, Ordering::Release);
@@ -854,7 +1029,7 @@ where
     {
         let state = self.state.load();
         Self::sample_sharded_bounded(&state, limit, |key, entry| {
-            (key.clone(), entry.last_access_ms, entry.value.clone())
+            (key.clone(), entry.last_access_ms(), entry.value.clone())
         })
     }
 
@@ -872,7 +1047,7 @@ where
     fn sample_sharded_bounded<R>(
         state: &TtlCacheState<K, V>,
         limit: usize,
-        mut project: impl FnMut(&K, &TtlCacheEntry<V>) -> R,
+        mut project: impl FnMut(&K, &TtlCacheNode<V>) -> R,
     ) -> Vec<R> {
         const MAX_BUCKET_PROBES_PER_WANTED_ENTRY: usize = 8;
 
@@ -948,7 +1123,7 @@ where
                     continue;
                 }
                 let (key, shared_entry) = unsafe { shard.bucket(bucket_index).as_ref() };
-                sample.push(project(key, shared_entry.get()));
+                sample.push(project(key, shared_entry.get().as_ref()));
             }
 
             let collected = sample.len() - before;
@@ -958,32 +1133,34 @@ where
         sample
     }
 
-    /// Visit cache entries by reference without cloning their values.
+    /// Visit cache entries through stable handles without cloning values.
     ///
     /// The callback runs while the corresponding DashMap read guard is held, so
     /// it must stay lightweight and must not call back into this cache.
-    /// Returning `false` stops traversal early.
-    pub(crate) fn visit_entries(&self, mut visitor: impl FnMut(&K, &TtlCacheEntry<V>) -> bool) {
+    pub(crate) fn visit_handles(
+        &self,
+        mut visitor: impl FnMut(&K, TtlCacheHandle<V>) -> bool,
+    ) {
         let state = self.state.load();
         for item in state.map.iter() {
-            if !visitor(item.key(), item.value()) {
+            let handle = TtlCacheHandle {
+                node: item.value().clone(),
+            };
+            if !visitor(item.key(), handle) {
                 break;
             }
         }
     }
 
-    /// Visit cache entries one shard at a time using cloned snapshots.
+    /// Visit cache entries one shard at a time using stable handles.
     ///
-    /// The shard-local clone keeps expensive caller work (for example DNS
-    /// message encoding during persistence) outside DashMap shard read locks,
-    /// while avoiding a full-cache snapshot allocation. Returning `false` from
-    /// the visitor stops traversal early.
-    pub(crate) fn visit_entries_cloned_by_shard(
+    /// Only keys and `Arc` handles are cloned while the shard lock is held;
+    /// expensive value processing can happen after the lock is released.
+    pub(crate) fn visit_handles_cloned_by_shard(
         &self,
-        mut visitor: impl FnMut(Vec<(K, TtlCacheEntry<V>)>) -> bool,
+        mut visitor: impl FnMut(Vec<(K, TtlCacheHandle<V>)>) -> bool,
     ) where
         K: Clone,
-        V: Clone,
     {
         let state = self.state.load();
 
@@ -1004,15 +1181,10 @@ where
                 }
 
                 let (key, shared_entry) = unsafe { shard.bucket(bucket_index).as_ref() };
-                let value = shared_entry.get();
                 entries.push((
                     key.clone(),
-                    TtlCacheEntry {
-                        value: value.value.clone(),
-                        cache_time_ms: value.cache_time_ms,
-                        expire_at_ms: value.expire_at_ms,
-                        last_access_ms: value.last_access_ms,
-                        generation: value.generation,
+                    TtlCacheHandle {
+                        node: shared_entry.get().clone(),
                     },
                 ));
             }
@@ -1034,16 +1206,7 @@ where
         let mut entries = Vec::with_capacity(state.map.len());
         for item in state.map.iter() {
             let value = item.value();
-            entries.push((
-                item.key().clone(),
-                TtlCacheEntry {
-                    value: value.value.clone(),
-                    cache_time_ms: value.cache_time_ms,
-                    expire_at_ms: value.expire_at_ms,
-                    last_access_ms: value.last_access_ms,
-                    generation: value.generation,
-                },
-            ));
+            entries.push((item.key().clone(), value.snapshot()));
         }
         entries
     }
@@ -1051,7 +1214,6 @@ where
 impl<K, V> TtlCache<K, V>
 where
     K: Eq + Hash + Clone,
-    V: Clone,
 {
     /// Prune expired entries and evict according to an explicit capacity mode.
     ///
@@ -1140,7 +1302,7 @@ where
         let mut candidates = Vec::with_capacity(state.entry_count.load(Ordering::Acquire));
         for item in state.map.iter() {
             let entry = item.value();
-            candidates.push((item.key().clone(), entry.last_access_ms, entry.generation));
+            candidates.push((item.key().clone(), entry.last_access_ms(), entry.generation));
         }
         candidates
             .sort_unstable_by_key(|(_, last_access_ms, generation)| (*last_access_ms, *generation));
@@ -1195,7 +1357,7 @@ where
             }
 
             let mut sample = Self::sample_sharded_bounded(state, sample_limit, |key, entry| {
-                (key.clone(), entry.last_access_ms, entry.generation)
+                (key.clone(), entry.last_access_ms(), entry.generation)
             });
 
             if sample.is_empty() {
@@ -1216,8 +1378,8 @@ where
                 let removed = state
                     .map
                     .remove_if(&key, |_, existing| {
-                        existing.last_access_ms == sampled_last_access_ms
-                            && existing.generation == sampled_generation
+                        existing.generation == sampled_generation
+                            && existing.try_claim_eviction(sampled_last_access_ms)
                     })
                     .is_some();
 
@@ -1382,24 +1544,32 @@ mod tests {
             .expect("a different-shard key should exist")
     }
 
+    fn retained_handle(cache: &TtlCache<u64, u32>, key: &u64, now_ms: u64) -> TtlCacheHandle<u32> {
+        match cache.get_retained_handle_status(key, now_ms, 0) {
+            Some(TtlCacheHandleLookup::Hit(handle)) => handle,
+            _ => panic!("entry should be retained"),
+        }
+    }
+
     #[test]
     fn conditional_move_same_shard_preserves_capacity_accounting() {
         let cache = TtlCache::with_capacity(4);
         let source = 1u64;
         let target = key_on_same_shard(&cache, source);
         cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        let expected = retained_handle(&cache, &source, 20);
 
         assert_eq!(
-            cache.conditional_move_if(
+            cache.conditional_move_handle(
                 &source,
                 target,
+                &expected,
                 20u32,
                 TtlCacheMoveMetadata {
                     cache_time_ms: 20,
                     expire_at_ms: 200,
                     last_access_ms: 20,
                 },
-                |entry| { entry.value == 10 && entry.cache_time_ms == 10 }
             ),
             TtlCacheConditionalMoveResult::Moved
         );
@@ -1415,18 +1585,19 @@ mod tests {
         let target = key_on_different_shard(&cache, source);
         cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
         cache.insert_or_update_with_meta(target, 99u32, 30, 300, 30);
+        let expected = retained_handle(&cache, &source, 20);
 
         assert_eq!(
-            cache.conditional_move_if(
+            cache.conditional_move_handle(
                 &source,
                 target,
+                &expected,
                 20u32,
                 TtlCacheMoveMetadata {
                     cache_time_ms: 20,
                     expire_at_ms: 200,
                     last_access_ms: 20,
                 },
-                |entry| { entry.value == 10 && entry.cache_time_ms == 10 }
             ),
             TtlCacheConditionalMoveResult::TargetPresent
         );
@@ -1436,38 +1607,51 @@ mod tests {
     }
 
     #[test]
-    fn conditional_move_stays_on_state_captured_before_replacement() {
+    fn conditional_move_rejects_handle_from_replaced_state() {
         let cache = TtlCache::with_capacity(4);
         let source = 1u64;
         let target = key_on_different_shard(&cache, source);
         cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        let expected = retained_handle(&cache, &source, 20);
         let replacement = TtlCache::with_capacity(4);
+        cache.replace_with(&replacement);
 
         assert_eq!(
-            cache.conditional_move_if(
+            cache.conditional_move_handle(
                 &source,
                 target,
+                &expected,
                 20u32,
                 TtlCacheMoveMetadata {
                     cache_time_ms: 20,
                     expire_at_ms: 200,
                     last_access_ms: 20,
                 },
-                |entry| {
-                    assert_eq!(entry.value, 10);
-                    cache.replace_with(&replacement);
-                    true
-                }
             ),
-            TtlCacheConditionalMoveResult::Moved
+            TtlCacheConditionalMoveResult::SourceChanged
         );
-
-        // The move completed only against the state captured before the swap;
-        // it cannot repopulate the newly installed generation.
         assert!(cache.is_empty());
-        assert!(cache.get_retained_cloned(&source, 20, 0).is_none());
-        assert!(cache.get_retained_cloned(&target, 20, 0).is_none());
-        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn replace_handle_rejects_replaced_generation() {
+        let cache = TtlCache::with_capacity(1);
+        cache.insert_or_update_with_meta("k", 1u32, 10, 100, 10);
+        let expected = match cache.get_retained_handle_status(&"k", 20, 0) {
+            Some(TtlCacheHandleLookup::Hit(handle)) => handle,
+            _ => panic!("entry should exist"),
+        };
+
+        cache.insert_or_update_with_meta("k", 2u32, 20, 200, 20);
+        assert!(!cache.replace_handle("k", &expected, 3, 30, 300, 30));
+        assert_eq!(cache.get_retained_cloned(&"k", 20, 0).unwrap().value, 2);
+
+        let current = match cache.get_retained_handle_status(&"k", 20, 0) {
+            Some(TtlCacheHandleLookup::Hit(handle)) => handle,
+            _ => panic!("entry should exist"),
+        };
+        assert!(cache.replace_handle("k", &current, 3, 30, 300, 30));
+        assert_eq!(cache.get_retained_cloned(&"k", 30, 0).unwrap().value, 3);
     }
 
     #[test]
@@ -1485,6 +1669,15 @@ mod tests {
             entry.cache_time_ms == 20 && entry.expire_at_ms == 200
         }));
         assert_eq!(cache.get_retained_cloned(&"k", 30, 0).unwrap().value, 3);
+    }
+
+    #[test]
+    fn eviction_claim_blocks_late_touch_without_exposing_marker() {
+        let node = TtlCacheNode::new(1u32, 0, 100, 10, 1);
+
+        assert!(node.try_claim_eviction(10));
+        node.touch_last_access(20);
+        assert_eq!(node.last_access_ms(), 10);
     }
 
     #[test]
@@ -1619,7 +1812,7 @@ mod tests {
             state
                 .map
                 .remove_if(&"k", |_, existing| {
-                    existing.last_access_ms == sampled.last_access_ms
+                    existing.last_access_ms() == sampled.last_access_ms
                         && existing.generation == sampled.generation
                 })
                 .is_none()

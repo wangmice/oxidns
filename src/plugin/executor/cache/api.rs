@@ -25,7 +25,7 @@ use super::persistence::{
 use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer, mark_dirty};
 use crate::api::query::{optional_text, parse_usize_param, visit_query_params};
 use crate::api::{ApiHandler, json_error, json_ok, simple_response};
-use crate::infra::cache::ttl::TtlCachePruneMode;
+use crate::infra::cache::ttl::{TtlCacheHandle, TtlCachePruneMode};
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
 use crate::plugin::executor::rdata_json::{RDataPayloadMode, rdata_payload};
@@ -507,7 +507,7 @@ struct CacheEntryEcsRow {
 
 struct CacheEntryPageCandidate {
     key: CacheKey,
-    entry: crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>,
+    entry: TtlCacheHandle<CacheItem>,
 }
 
 impl PartialEq for CacheEntryPageCandidate {
@@ -553,8 +553,8 @@ impl ApiHandler for CacheEntriesListHandler {
             let mut candidates = BinaryHeap::with_capacity(candidate_limit);
             let mut total_entries = 0usize;
 
-            cache_map.visit_entries(|key, entry| {
-                if entry.expire_at_ms <= now || !cache_entry_matches_query(key, &query) {
+            cache_map.visit_handles(|key, entry| {
+                if entry.expire_at_ms() <= now || !cache_entry_matches_query(key, &query) {
                     return true;
                 }
 
@@ -581,7 +581,7 @@ impl ApiHandler for CacheEntriesListHandler {
                     }
                     candidates.push(CacheEntryPageCandidate {
                         key: key.clone(),
-                        entry: entry.clone(),
+                        entry,
                     });
                 }
 
@@ -808,13 +808,13 @@ fn cache_entry_matches_query(key: &CacheKey, query: &CacheEntriesQuery) -> bool 
 
 fn cache_entry_row(
     key: &CacheKey,
-    entry: &crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>,
+    entry: &TtlCacheHandle<CacheItem>,
     now: u64,
     now_unix_ms: u64,
 ) -> std::result::Result<CacheEntryRow, String> {
-    let item = entry.value.as_ref();
+    let item = entry.value();
     let fresh = now < item.fresh_until_ms;
-    let stale = !fresh && now < entry.expire_at_ms;
+    let stale = !fresh && now < entry.expire_at_ms();
     let ecs_scope = match key.ecs_scope.as_ref() {
         Some(ecs) => {
             let network_len = usize::from(ecs.network_len);
@@ -844,15 +844,15 @@ fn cache_entry_row(
         authority_count: item.resp.authority_count(),
         additional_count: item.resp.additionals().len() as u16,
         ttl: item.ttl,
-        remaining_ttl: entry.expire_at_ms.saturating_sub(now).saturating_div(1000) as u32,
+        remaining_ttl: entry.expire_at_ms().saturating_sub(now).saturating_div(1000) as u32,
         fresh,
         stale,
-        cache_time_ms: entry.cache_time_ms,
-        expire_at_ms: entry.expire_at_ms,
-        last_access_ms: entry.last_access_ms,
-        cache_time_unix_ms: elapsed_to_unix_ms(entry.cache_time_ms, now, now_unix_ms),
-        expire_at_unix_ms: elapsed_to_unix_ms(entry.expire_at_ms, now, now_unix_ms),
-        last_access_unix_ms: elapsed_to_unix_ms(entry.last_access_ms, now, now_unix_ms),
+        cache_time_ms: entry.cache_time_ms(),
+        expire_at_ms: entry.expire_at_ms(),
+        last_access_ms: entry.last_access_ms(),
+        cache_time_unix_ms: elapsed_to_unix_ms(entry.cache_time_ms(), now, now_unix_ms),
+        expire_at_unix_ms: elapsed_to_unix_ms(entry.expire_at_ms(), now, now_unix_ms),
+        last_access_unix_ms: elapsed_to_unix_ms(entry.last_access_ms(), now, now_unix_ms),
         do_bit: key.do_bit,
         cd_bit: key.cd_bit,
         answers_json: item.resp.answers().iter().map(cache_record_json).collect(),

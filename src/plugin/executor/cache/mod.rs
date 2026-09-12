@@ -31,8 +31,8 @@ use crate::core::response::{ResponseDisposition, classify_response};
 #[cfg(feature = "api")]
 use crate::infra::cache::ttl::TtlCacheRetiredState;
 use crate::infra::cache::ttl::{
-    TtlCache, TtlCacheConditionalMoveResult, TtlCacheLookup, TtlCacheMoveMetadata,
-    TtlCachePruneMode,
+    TtlCache, TtlCacheConditionalMoveResult, TtlCacheHandle, TtlCacheHandleLookup,
+    TtlCacheMoveMetadata, TtlCachePruneMode,
 };
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -247,10 +247,11 @@ impl Default for CacheLoadPolicy {
     }
 }
 
-type CacheMap = TtlCache<CacheKey, Arc<CacheItem>>;
+type CacheMap = TtlCache<CacheKey, CacheItem>;
+type CacheEntryHandle = TtlCacheHandle<CacheItem>;
 
 #[cfg(feature = "api")]
-type CacheRetiredState = TtlCacheRetiredState<CacheKey, Arc<CacheItem>>;
+type CacheRetiredState = TtlCacheRetiredState<CacheKey, CacheItem>;
 
 /// Dedicated retirement path for large cache states replaced by online API
 /// mutations. A single permit intentionally serializes destructive replacement
@@ -545,14 +546,7 @@ enum CacheTtlDecision {
 struct CacheLookup {
     key: CacheKey,
     hit_kind: Option<CacheHitKind>,
-    refresh_entry: Option<CacheEntryIdentity>,
-}
-
-#[derive(Debug, Clone)]
-struct CacheEntryIdentity {
-    value: Arc<CacheItem>,
-    cache_time_ms: u64,
-    expire_at_ms: u64,
+    refresh_entry: Option<CacheEntryHandle>,
 }
 
 #[derive(Debug)]
@@ -1215,20 +1209,17 @@ impl Cache {
             }
 
             let key = candidate.as_ref();
-            match cache_map.get_retained_cloned_status(key, now, touch_interval_ms) {
-                Some(TtlCacheLookup::Hit(item)) => {
-                    let invalid_disposition = if item.value.is_validated() {
+            match cache_map.get_retained_handle_status(key, now, touch_interval_ms) {
+                Some(TtlCacheHandleLookup::Hit(item)) => {
+                    let value = item.value();
+                    let invalid_disposition = if value.is_validated() {
                         None
                     } else {
-                        let disposition = response_disposition_for_cache(&item.value.resp, key);
+                        let disposition = response_disposition_for_cache(&value.resp, key);
                         (!is_cache_disposition_valid(disposition)).then_some(disposition)
                     };
                     if let Some(disposition) = invalid_disposition {
-                        if cache_map.remove_if(key, |existing| {
-                            existing.cache_time_ms == item.cache_time_ms
-                                && existing.expire_at_ms == item.expire_at_ms
-                                && Arc::ptr_eq(&existing.value, &item.value)
-                        }) {
+                        if cache_map.remove_handle(key, &item) {
                             self.mark_dirty(1);
                             self.metrics
                                 .record_skip(cache_skip_reason_for_disposition(disposition));
@@ -1242,15 +1233,14 @@ impl Cache {
                                 key.ecs_scope.is_some()
                             );
                         }
-                    } else if now < item.value.fresh_until_ms {
+                    } else if now < value.fresh_until_ms {
                         self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
-                        let remaining_ttl =
-                            item.value
-                                .fresh_until_ms
-                                .saturating_sub(now)
-                                .saturating_div(1000) as u32;
+                        let remaining_ttl = value
+                            .fresh_until_ms
+                            .saturating_sub(now)
+                            .saturating_div(1000) as u32;
                         let resp = Self::restore_cached_message(
-                            &item.value,
+                            value,
                             &context.request,
                             remaining_ttl,
                         );
@@ -1270,17 +1260,12 @@ impl Cache {
                             hit_kind: Some(CacheHitKind::Fresh),
                             refresh_entry: None,
                         });
-                    } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms {
-                        let refresh_entry = CacheEntryIdentity {
-                            value: item.value.clone(),
-                            cache_time_ms: item.cache_time_ms,
-                            expire_at_ms: item.expire_at_ms,
-                        };
+                    } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms() {
                         self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
                         let resp = Self::restore_cached_message(
-                            &item.value,
+                            value,
                             &context.request,
-                            self.stale_reply_ttl(&item.value),
+                            self.stale_reply_ttl(value),
                         );
                         context.set_response(resp);
 
@@ -1296,11 +1281,11 @@ impl Cache {
                         return Some(CacheLookup {
                             key: key.clone(),
                             hit_kind: Some(CacheHitKind::Stale),
-                            refresh_entry: Some(refresh_entry),
+                            refresh_entry: Some(item),
                         });
                     }
                 }
-                Some(TtlCacheLookup::Expired) => {
+                Some(TtlCacheHandleLookup::Expired) => {
                     self.mark_dirty(1);
                     self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
                     expired = true;
@@ -1494,7 +1479,7 @@ impl Cache {
         self.ecs_prefix_hints.observe_cache_key(&key);
         let inserted = cache_map.try_insert_or_update_with_limit(
             key,
-            Arc::new(item),
+            item,
             now,
             expire_time,
             now,
@@ -1513,7 +1498,7 @@ impl Cache {
         &self,
         cache_key: &CacheKey,
         request_key: &CacheKey,
-        refresh_entry: &CacheEntryIdentity,
+        refresh_entry: &CacheEntryHandle,
         cache_map: &CacheMap,
         context: &DnsContext,
         next: Option<&ExecutorNext>,
@@ -1595,37 +1580,31 @@ impl Cache {
                             fresh_until_ms
                         };
                         let new_item =
-                            Arc::new(CacheItem::new_validated(response, ttl, fresh_until_ms));
+                            CacheItem::new_validated(response, ttl, fresh_until_ms);
                         // Set-before-publish keeps the hint advisory-only:
                         // failed writes leave at most a false-positive bit.
                         ecs_prefix_hints.observe_cache_key(&response_key);
-                        let matches_stale =
-                            |existing: &crate::infra::cache::ttl::TtlCacheEntry<Arc<CacheItem>>| {
-                                existing.cache_time_ms == refresh_entry.cache_time_ms
-                                    && existing.expire_at_ms == refresh_entry.expire_at_ms
-                                    && Arc::ptr_eq(&existing.value, &refresh_entry.value)
-                            };
                         let inserted = if response_key == cache_key {
-                            cache_map.replace_if(
+                            cache_map.replace_handle(
                                 cache_key.clone(),
+                                &refresh_entry,
                                 new_item,
                                 now,
                                 expire_at_ms,
                                 now,
-                                matches_stale,
                             )
                         } else {
                             matches!(
-                                cache_map.conditional_move_if(
+                                cache_map.conditional_move_handle(
                                     &cache_key,
                                     response_key,
+                                    &refresh_entry,
                                     new_item,
                                     TtlCacheMoveMetadata {
                                         cache_time_ms: now,
                                         expire_at_ms,
                                         last_access_ms: now,
                                     },
-                                    matches_stale,
                                 ),
                                 TtlCacheConditionalMoveResult::Moved
                             )
@@ -1644,11 +1623,7 @@ impl Cache {
                     } else {
                         if let CacheTtlDecision::Skip(reason) = ttl {
                             if reason == CacheSkipReason::LowPositiveTtl
-                                && cache_map.remove_if(&cache_key, |existing| {
-                                    existing.cache_time_ms == refresh_entry.cache_time_ms
-                                        && existing.expire_at_ms == refresh_entry.expire_at_ms
-                                        && Arc::ptr_eq(&existing.value, &refresh_entry.value)
-                                })
+                                && cache_map.remove_handle(&cache_key, &refresh_entry)
                             {
                                 mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
                                 debug!(
@@ -2653,7 +2628,7 @@ mod tests {
     fn insert_test_cache_entry(cache_map: &CacheMap, domain: String, expire_at: u64, last: u64) {
         cache_map.insert_or_update_with_meta(
             cache_key_for_domain(domain),
-            Arc::new(CacheItem::new(Message::new(), 60, expire_at)),
+            CacheItem::new(Message::new(), 60, expire_at),
             last,
             expire_at,
             last,
@@ -3174,11 +3149,11 @@ mod tests {
 
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(
+            CacheItem::new(
                 cacheable_response_for_domain("example.com.", 120),
                 120,
                 now.saturating_add(120_000),
-            )),
+            ),
             now,
             now.saturating_add(120_000),
             last_access_ms,
@@ -3529,11 +3504,11 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key,
-            Arc::new(CacheItem::new(
+            CacheItem::new(
                 cname_only_response_for_domain("example.com.", 60),
                 60,
                 now.saturating_add(60_000),
-            )),
+            ),
             now,
             now.saturating_add(60_000),
             now,
@@ -3569,11 +3544,11 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key,
-            Arc::new(CacheItem::new(
+            CacheItem::new(
                 cname_only_response_for_domain("example.com.", 60),
                 60,
                 now.saturating_sub(1_000),
-            )),
+            ),
             now.saturating_sub(61_000),
             now.saturating_add(30_000),
             now,
@@ -3773,7 +3748,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key,
-            Arc::new(CacheItem::new(response, 120, now.saturating_sub(1_000))),
+            CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -3823,11 +3798,11 @@ mod tests {
         cache.ecs_prefix_hints.observe_cache_key(&stored_key);
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             stored_key.clone(),
-            Arc::new(CacheItem::new_validated(
+            CacheItem::new_validated(
                 response,
                 120,
                 now.saturating_sub(1),
-            )),
+            ),
             now.saturating_sub(121_000),
             now.saturating_add(3_000_000),
             now,
@@ -3894,7 +3869,7 @@ mod tests {
         ));
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key,
-            Arc::new(CacheItem::new(response, 1, AppClock::elapsed_millis())),
+            CacheItem::new(response, 1, AppClock::elapsed_millis()),
             0,
             AppClock::elapsed_millis(),
             0,
@@ -4060,7 +4035,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(response, 120, now.saturating_sub(1_000))),
+            CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -4133,7 +4108,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(old_response, 120, now.saturating_sub(1_000))),
+            CacheItem::new(old_response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -4205,7 +4180,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key,
-            Arc::new(CacheItem::new(response, 120, now.saturating_sub(1_000))),
+            CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -4272,7 +4247,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(response, 120, now.saturating_sub(1_000))),
+            CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -4345,11 +4320,11 @@ mod tests {
         let now = AppClock::elapsed_millis();
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(
+            CacheItem::new(
                 stale_response,
                 120,
                 now.saturating_sub(1_000),
-            )),
+            ),
             now.saturating_sub(121_000),
             now.saturating_add(10_000),
             now.saturating_sub(100),
@@ -4382,11 +4357,11 @@ mod tests {
         ));
         cache.cache_map.get().unwrap().insert_or_update_with_meta(
             key.clone(),
-            Arc::new(CacheItem::new(
+            CacheItem::new(
                 newer_response,
                 90,
                 now.saturating_add(90_000),
-            )),
+            ),
             now.saturating_add(1),
             now.saturating_add(90_000),
             now.saturating_add(1),

@@ -22,7 +22,7 @@ use super::{
     CacheItem, CacheLoadPolicy, CacheMap, clamp_persisted_cache_ttl, is_cache_disposition_valid,
     response_disposition_for_cache,
 };
-use crate::infra::cache::ttl::TtlCacheEntry;
+use crate::infra::cache::ttl::TtlCacheHandle;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::system::file_len_if_exists;
@@ -86,7 +86,7 @@ struct PersistedCacheEntry {
 
 struct PreparedCacheEntry {
     key: CacheKey,
-    value: Arc<CacheItem>,
+    value: CacheItem,
     cache_time_ms: u64,
     expire_at_ms: u64,
     last_access_ms: u64,
@@ -179,16 +179,16 @@ fn persisted_entry_serialized_size<const PREALLOCATION_LIMIT: usize>(
 
 fn prepare_persisted_entry(
     key: &CacheKey,
-    item: &TtlCacheEntry<Arc<CacheItem>>,
+    item: &TtlCacheHandle<CacheItem>,
     now_elapsed_ms: u64,
 ) -> Option<PersistedCacheEntry> {
-    let value = &item.value;
+    let value = item.value();
 
-    if item.expire_at_ms <= now_elapsed_ms {
+    if item.expire_at_ms() <= now_elapsed_ms {
         return None;
     }
 
-    let remaining_ttl_ms = item.expire_at_ms.saturating_sub(now_elapsed_ms);
+    let remaining_ttl_ms = item.expire_at_ms().saturating_sub(now_elapsed_ms);
     if remaining_ttl_ms == 0 {
         return None;
     }
@@ -244,7 +244,7 @@ fn prepare_persisted_entry(
     // it to reconstruct age would pin every stale entry at exactly its fresh
     // TTL and could incorrectly revive it under a shorter lazy-retention
     // policy.
-    let cache_age_ms = value.total_cache_age_ms(item.cache_time_ms, now_elapsed_ms);
+    let cache_age_ms = value.total_cache_age_ms(item.cache_time_ms(), now_elapsed_ms);
 
     Some(PersistedCacheEntry {
         domain: key.domain.to_string(),
@@ -258,7 +258,7 @@ fn prepare_persisted_entry(
         ecs_network,
         resp_bytes,
         cache_age_ms,
-        last_access_age_ms: now_elapsed_ms.saturating_sub(item.last_access_ms),
+        last_access_age_ms: now_elapsed_ms.saturating_sub(item.last_access_ms()),
         ttl: value.ttl,
         remaining_ttl_ms,
     })
@@ -301,7 +301,7 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
     let mut build_error: Option<DnsError> = None;
     let mut too_large: Option<usize> = None;
 
-    cache_map.visit_entries_cloned_by_shard(|batch| {
+    cache_map.visit_handles_cloned_by_shard(|batch| {
         for (key, item) in batch {
             let Some(entry) = prepare_persisted_entry(&key, &item, now_elapsed_ms) else {
                 continue;
@@ -539,12 +539,12 @@ fn prepare_persisted_entries(
 
         prepared.push(PreparedCacheEntry {
             key,
-            value: Arc::new(CacheItem::new_validated_with_age_offset(
+            value: CacheItem::new_validated_with_age_offset(
                 resp,
                 ttl,
                 fresh_until_ms,
                 cache_age_offset_ms,
-            )),
+            ),
             cache_time_ms,
             expire_at_ms,
             last_access_ms,
@@ -871,11 +871,11 @@ mod tests {
                     cd_bit: false,
                     ecs_scope: None,
                 },
-                Arc::new(CacheItem::new_validated(
+                CacheItem::new_validated(
                     response,
                     120,
                     now.saturating_add(120_000),
-                )),
+                ),
                 now,
                 now.saturating_add(120_000),
                 now,
@@ -1672,11 +1672,11 @@ mod tests {
 
         cache_map.insert_if_not_newer(
             stored_key,
-            Arc::new(CacheItem::new_validated(
+            CacheItem::new_validated(
                 response,
                 120,
                 now.saturating_add(120_000),
-            )),
+            ),
             now,
             now.saturating_add(120_000),
             now,
@@ -1718,11 +1718,11 @@ mod tests {
         };
         cache_map.insert_if_not_newer(
             key,
-            Arc::new(CacheItem::new_validated(
+            CacheItem::new_validated(
                 positive_response_message(120),
                 120,
                 now.saturating_add(120_000),
-            )),
+            ),
             now,
             now.saturating_add(120_000),
             now,
