@@ -1,18 +1,23 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! DNS-cache mutation facade.
+//! Live DNS-cache store facade.
 //!
-//! `TtlCache` deliberately stays policy-agnostic. This layer owns the DNS
-//! cache's mutation side effects so callers cannot update the live map without
-//! also updating persistence dirtiness, ECS lookup hints, pressure signalling,
-//! and mutation metrics.
+//! `TtlCache` deliberately stays policy-agnostic. This layer owns DNS-level
+//! lookup semantics and mutation side effects so callers do not interpret raw
+//! TTL-container states or update the live map without persistence dirtiness,
+//! ECS lookup hints, pressure signalling, and metrics staying in sync.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::key::{CacheKey, EcsPrefixHints};
-use super::{CacheEntryHandle, CacheItem, CacheMap, CacheMetrics};
+use tracing::debug;
+
+use super::key::{cache_lookup_keys, CacheKey, EcsPrefixHints};
+use super::{
+    cache_skip_reason_for_disposition, is_cache_disposition_valid,
+    response_disposition_for_cache, CacheEntryHandle, CacheItem, CacheMap, CacheMetrics,
+};
 use crate::infra::cache::ttl::{
     TtlCacheConditionalMoveResult, TtlCacheHandleLookup, TtlCacheMoveMetadata,
     TtlCachePruneMode,
@@ -231,9 +236,37 @@ impl CacheMutationState {
     }
 }
 
+/// DNS-level result of one cache lookup.
+///
+/// TTL-container details such as `Expired` are intentionally hidden here.
+/// Callers only need to distinguish a usable fresh response, a retained stale
+/// response that may be refreshed, and a miss that should enter miss handling.
+#[derive(Debug, Clone)]
+pub(super) enum DnsCacheLookup {
+    Fresh {
+        entry: CacheEntryHandle,
+        remaining_ttl: u32,
+    },
+    Stale {
+        key: CacheKey,
+        request_key: CacheKey,
+        entry: CacheEntryHandle,
+    },
+    Miss {
+        key: CacheKey,
+    },
+}
+
+impl DnsCacheLookup {
+    #[inline]
+    pub(super) fn is_hit(&self) -> bool {
+        !matches!(self, Self::Miss { .. })
+    }
+}
+
 /// Live DNS-cache store.
 ///
-/// All *online* mutations of the published cache should pass through this
+/// All *online* reads and mutations of the published cache pass through this
 /// facade. Staged/offline cache construction used by persistence remains free
 /// to work directly with `CacheMap` because it is not visible to readers yet.
 #[derive(Clone, Debug)]
@@ -304,23 +337,162 @@ impl DnsCacheStore {
         self.pressure_requested.swap(false, Ordering::AcqRel)
     }
 
-    /// Lookup one live entry. Expired-entry removal happens inside `TtlCache`;
-    /// account for that mutation here before exposing the result to callers.
+    /// Resolve one DNS cache lookup across ECS candidates.
+    ///
+    /// This is the read-side boundary for the live DNS cache. It owns candidate
+    /// traversal, validation, fresh/stale classification, expiry accounting,
+    /// and lookup metrics so executor code never needs to interpret raw
+    /// `TtlCacheHandleLookup` states.
     #[inline]
-    pub(super) fn get_retained_handle_status(
+    pub(super) fn lookup(
         &self,
-        key: &CacheKey,
+        request_key: CacheKey,
         now_ms: u64,
         touch_interval_ms: u64,
-    ) -> Option<TtlCacheHandleLookup<CacheItem>> {
-        let result = self
-            .cache_map
-            .get_retained_handle_status(key, now_ms, touch_interval_ms);
-        if matches!(result.as_ref(), Some(TtlCacheHandleLookup::Expired)) {
-            self.mutations.mark_dirty(1);
-            self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
+        allow_stale: bool,
+    ) -> DnsCacheLookup {
+        self.metrics.lookup_total.fetch_add(1, Ordering::Relaxed);
+
+        let ecs_lookup = request_key.ecs_scope.is_some();
+        if ecs_lookup {
+            self.metrics
+                .ecs_lookup_requests_total
+                .fetch_add(1, Ordering::Relaxed);
         }
-        result
+
+        let mut expired = false;
+        for candidate in cache_lookup_keys(&request_key, &self.ecs_prefix_hints) {
+            if ecs_lookup {
+                self.metrics
+                    .ecs_lookup_candidates_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if candidate.as_ref() == &request_key {
+                    self.metrics
+                        .ecs_lookup_exact_fallback_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let key = candidate.as_ref();
+            match self
+                .cache_map
+                .get_retained_handle_status(key, now_ms, touch_interval_ms)
+            {
+                Some(TtlCacheHandleLookup::Hit(entry)) => {
+                    let value = entry.value();
+                    let invalid_disposition = if value.is_validated() {
+                        None
+                    } else {
+                        let disposition = response_disposition_for_cache(&value.resp, key);
+                        (!is_cache_disposition_valid(disposition)).then_some(disposition)
+                    };
+
+                    if let Some(disposition) = invalid_disposition {
+                        if self.remove_handle(key, &entry) {
+                            self.metrics
+                                .record_skip(cache_skip_reason_for_disposition(disposition));
+                            debug!(
+                                "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                                key.domain,
+                                key.record_type,
+                                key.dns_class,
+                                key.do_bit,
+                                key.cd_bit,
+                                key.ecs_scope.is_some()
+                            );
+                        }
+                        continue;
+                    }
+
+                    if now_ms < value.fresh_until_ms {
+                        self.metrics
+                            .fresh_hit_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        let remaining_ttl = value
+                            .fresh_until_ms
+                            .saturating_sub(now_ms)
+                            .saturating_div(1000) as u32;
+                        debug!(
+                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=fresh",
+                            key.domain,
+                            key.record_type,
+                            key.dns_class,
+                            key.do_bit,
+                            key.cd_bit,
+                            key.ecs_scope.is_some()
+                        );
+                        return DnsCacheLookup::Fresh {
+                            entry,
+                            remaining_ttl,
+                        };
+                    }
+
+                    if allow_stale && now_ms < entry.expire_at_ms() {
+                        self.metrics
+                            .stale_hit_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=stale",
+                            key.domain,
+                            key.record_type,
+                            key.dns_class,
+                            key.do_bit,
+                            key.cd_bit,
+                            key.ecs_scope.is_some()
+                        );
+                        return DnsCacheLookup::Stale {
+                            key: key.clone(),
+                            request_key: request_key.clone(),
+                            entry,
+                        };
+                    }
+                }
+                Some(TtlCacheHandleLookup::Expired) => {
+                    self.mutations.mark_dirty(1);
+                    self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
+                    expired = true;
+                    debug!(
+                        "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                        key.domain,
+                        key.record_type,
+                        key.dns_class,
+                        key.do_bit,
+                        key.cd_bit,
+                        key.ecs_scope.is_some()
+                    );
+                }
+                None => {}
+            }
+        }
+
+        // Preserve the previous read-path metric semantics: an expired entry
+        // removed during candidate traversal is an expiry event, not a miss.
+        if !expired {
+            if self.remove_if_expired(&request_key, now_ms) {
+                debug!(
+                    "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                    request_key.domain,
+                    request_key.record_type,
+                    request_key.dns_class,
+                    request_key.do_bit,
+                    request_key.cd_bit,
+                    request_key.ecs_scope.is_some()
+                );
+            } else {
+                self.metrics.miss_total.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "cache miss: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
+                    request_key.domain,
+                    request_key.record_type,
+                    request_key.dns_class,
+                    request_key.do_bit,
+                    request_key.cd_bit,
+                    request_key.ecs_scope.is_some()
+                );
+            }
+        }
+
+        DnsCacheLookup::Miss { key: request_key }
     }
 
     /// Publish a normal cache insert/update and all associated bookkeeping.
@@ -415,7 +587,7 @@ impl DnsCacheStore {
     /// Remove an entry only when it is expired, accounting for both the
     /// mutation and the expired-lookup metric.
     #[inline]
-    pub(super) fn remove_if_expired(&self, key: &CacheKey, now_ms: u64) -> bool {
+    fn remove_if_expired(&self, key: &CacheKey, now_ms: u64) -> bool {
         let removed = self.cache_map.remove_if_expired(key, now_ms);
         if removed {
             self.mutations.mark_dirty(1);
@@ -539,6 +711,49 @@ mod tests {
         assert_eq!(mutations.inner.dirty_generation.load(Ordering::Acquire), before_dirty);
         assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
     }
+
+    #[test]
+    fn lookup_classifies_fresh_stale_and_miss() {
+        AppClock::start();
+        let (store, _, metrics) = test_store(4);
+        let now = AppClock::elapsed_millis();
+
+        let fresh_key = test_key("fresh.example");
+        assert!(store.insert_or_update(
+            fresh_key.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        ));
+        let fresh = store.lookup(fresh_key, now, 0, false);
+        assert!(matches!(
+            fresh,
+            DnsCacheLookup::Fresh {
+                remaining_ttl: 60,
+                ..
+            }
+        ));
+
+        let stale_key = test_key("stale.example");
+        assert!(store.insert_or_update(
+            stale_key.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_sub(1)),
+            now.saturating_sub(60_001),
+            now.saturating_add(60_000),
+            now,
+        ));
+        let stale = store.lookup(stale_key, now, 0, true);
+        assert!(matches!(stale, DnsCacheLookup::Stale { .. }));
+
+        let miss = store.lookup(test_key("missing.example"), now, 0, false);
+        assert!(matches!(miss, DnsCacheLookup::Miss { .. }));
+        assert_eq!(metrics.lookup_total.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.fresh_hit_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.stale_hit_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.miss_total.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn expired_lookup_accounts_for_internal_ttl_removal_once() {
         AppClock::start();
@@ -559,8 +774,8 @@ mod tests {
         mutations.inner.dirty_generation.store(0, Ordering::Release);
         metrics.expired_total.store(0, Ordering::Release);
 
-        let result = store.get_retained_handle_status(&key, now.saturating_add(2), 0);
-        assert!(matches!(result, Some(TtlCacheHandleLookup::Expired)));
+        let result = store.lookup(key.clone(), now.saturating_add(2), 0, false);
+        assert!(matches!(result, DnsCacheLookup::Miss { .. }));
         assert_eq!(mutations.inner.updated_keys.load(Ordering::Relaxed), 1);
         assert_eq!(mutations.inner.dirty_generation.load(Ordering::Acquire), 1);
         assert_eq!(metrics.expired_total.load(Ordering::Relaxed), 1);

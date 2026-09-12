@@ -22,18 +22,18 @@ use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{
     CacheKey, EcsPrefixHints, build_cache_key as build_cache_key_internal,
-    cache_key_for_response_ecs_scope, cache_lookup_keys,
+    cache_key_for_response_ecs_scope,
 };
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
-use self::store::DnsCacheStore;
+use self::store::{DnsCacheLookup, DnsCacheStore};
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
 use crate::core::response::{ResponseDisposition, classify_response};
 #[cfg(feature = "api")]
 use crate::infra::cache::ttl::TtlCacheRetiredState;
 use crate::infra::cache::ttl::{
-    TtlCache, TtlCacheConditionalMoveResult, TtlCacheHandle, TtlCacheHandleLookup,
-    TtlCacheMoveMetadata, TtlCachePruneMode,
+    TtlCache, TtlCacheConditionalMoveResult, TtlCacheHandle, TtlCacheMoveMetadata,
+    TtlCachePruneMode,
 };
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -431,12 +431,6 @@ impl CacheItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CacheHitKind {
-    Fresh,
-    Stale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheSkipReason {
     NoTtl,
     IncompleteAnswer,
@@ -447,13 +441,6 @@ enum CacheSkipReason {
 enum CacheTtlDecision {
     Cache(u32),
     Skip(CacheSkipReason),
-}
-
-#[derive(Debug, Clone)]
-struct CacheLookup {
-    key: CacheKey,
-    hit_kind: Option<CacheHitKind>,
-    refresh_entry: Option<CacheEntryHandle>,
 }
 
 #[derive(Debug)]
@@ -1021,163 +1008,47 @@ impl Cache {
 
     #[inline]
     #[hotpath::measure]
-    fn try_cache_hit(&self, context: &mut DnsContext, store: &DnsCacheStore) -> Option<CacheLookup> {
+    fn try_cache_hit(
+        &self,
+        context: &mut DnsContext,
+        store: &DnsCacheStore,
+    ) -> Option<DnsCacheLookup> {
         let request_key = Self::build_cache_key(context, self.ecs_in_key)?;
-        self.metrics().lookup_total.fetch_add(1, Ordering::Relaxed);
-
         let now = AppClock::elapsed_millis();
         let touch_interval_ms = self.current_touch_interval_ms(now);
 
-        let ecs_lookup = request_key.ecs_scope.is_some();
-        if ecs_lookup {
-            self.metrics()
-                .ecs_lookup_requests_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let lookup = store.lookup(
+            request_key,
+            now,
+            touch_interval_ms,
+            self.config.lazy_cache_ttl.is_some(),
+        );
 
-        let mut expired = false;
-        for candidate in cache_lookup_keys(&request_key, store.ecs_prefix_hints()) {
-            if ecs_lookup {
-                self.metrics()
-                    .ecs_lookup_candidates_total
-                    .fetch_add(1, Ordering::Relaxed);
-                if candidate.as_ref() == &request_key {
-                    self.metrics()
-                        .ecs_lookup_exact_fallback_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+        match &lookup {
+            DnsCacheLookup::Fresh {
+                entry,
+                remaining_ttl,
+            } => {
+                let resp = Self::restore_cached_message(
+                    entry.value(),
+                    &context.request,
+                    *remaining_ttl,
+                );
+                context.set_response(resp);
             }
-
-            let key = candidate.as_ref();
-            match store.get_retained_handle_status(key, now, touch_interval_ms) {
-                Some(TtlCacheHandleLookup::Hit(item)) => {
-                    let value = item.value();
-                    let invalid_disposition = if value.is_validated() {
-                        None
-                    } else {
-                        let disposition = response_disposition_for_cache(&value.resp, key);
-                        (!is_cache_disposition_valid(disposition)).then_some(disposition)
-                    };
-                    if let Some(disposition) = invalid_disposition {
-                        if store.remove_handle(key, &item) {
-                            self.metrics()
-                                .record_skip(cache_skip_reason_for_disposition(disposition));
-                            debug!(
-                                "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
-                                key.domain,
-                                key.record_type,
-                                key.dns_class,
-                                key.do_bit,
-                                key.cd_bit,
-                                key.ecs_scope.is_some()
-                            );
-                        }
-                    } else if now < value.fresh_until_ms {
-                        self.metrics().fresh_hit_total.fetch_add(1, Ordering::Relaxed);
-                        let remaining_ttl = value
-                            .fresh_until_ms
-                            .saturating_sub(now)
-                            .saturating_div(1000) as u32;
-                        let resp = Self::restore_cached_message(
-                            value,
-                            &context.request,
-                            remaining_ttl,
-                        );
-                        context.set_response(resp);
-
-                        debug!(
-                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=fresh",
-                            key.domain,
-                            key.record_type,
-                            key.dns_class,
-                            key.do_bit,
-                            key.cd_bit,
-                            key.ecs_scope.is_some()
-                        );
-                        return Some(CacheLookup {
-                            key: key.clone(),
-                            hit_kind: Some(CacheHitKind::Fresh),
-                            refresh_entry: None,
-                        });
-                    } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms() {
-                        self.metrics().stale_hit_total.fetch_add(1, Ordering::Relaxed);
-                        let resp = Self::restore_cached_message(
-                            value,
-                            &context.request,
-                            self.stale_reply_ttl(value),
-                        );
-                        context.set_response(resp);
-
-                        debug!(
-                            "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=stale",
-                            key.domain,
-                            key.record_type,
-                            key.dns_class,
-                            key.do_bit,
-                            key.cd_bit,
-                            key.ecs_scope.is_some()
-                        );
-                        return Some(CacheLookup {
-                            key: key.clone(),
-                            hit_kind: Some(CacheHitKind::Stale),
-                            refresh_entry: Some(item),
-                        });
-                    }
-                }
-                Some(TtlCacheHandleLookup::Expired) => {
-                    expired = true;
-                    debug!(
-                        "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
-                        key.domain,
-                        key.record_type,
-                        key.dns_class,
-                        key.do_bit,
-                        key.cd_bit,
-                        key.ecs_scope.is_some()
-                    );
-                    continue;
-                }
-                None => {}
+            DnsCacheLookup::Stale { entry, .. } => {
+                let value = entry.value();
+                let resp = Self::restore_cached_message(
+                    value,
+                    &context.request,
+                    self.stale_reply_ttl(value),
+                );
+                context.set_response(resp);
             }
+            DnsCacheLookup::Miss { .. } => {}
         }
 
-        if expired {
-            return Some(CacheLookup {
-                key: request_key,
-                hit_kind: None,
-                refresh_entry: None,
-            });
-        }
-
-        let key = request_key;
-        if store.remove_if_expired(&key, now) {
-            debug!(
-                "cache expired: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
-                key.domain,
-                key.record_type,
-                key.dns_class,
-                key.do_bit,
-                key.cd_bit,
-                key.ecs_scope.is_some()
-            );
-        } else {
-            self.metrics().miss_total.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                "cache miss: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
-                key.domain,
-                key.record_type,
-                key.dns_class,
-                key.do_bit,
-                key.cd_bit,
-                key.ecs_scope.is_some()
-            );
-        }
-
-        Some(CacheLookup {
-            key,
-            hit_kind: None,
-            refresh_entry: None,
-        })
+        Some(lookup)
     }
 
     #[inline]
@@ -1599,18 +1470,18 @@ impl Executor for Cache {
         let cache_lookup = self.try_cache_hit(context, store);
         let cache_hit = cache_lookup
             .as_ref()
-            .and_then(|lookup| lookup.hit_kind)
-            .is_some();
+            .is_some_and(DnsCacheLookup::is_hit);
 
-        if let Some(lookup) = cache_lookup.as_ref()
-            && lookup.hit_kind == Some(CacheHitKind::Stale)
-            && let Some(refresh_entry) = lookup.refresh_entry.as_ref()
-            && let Some(request_key) = Self::build_cache_key(context, self.ecs_in_key)
+        if let Some(DnsCacheLookup::Stale {
+            key,
+            request_key,
+            entry,
+        }) = cache_lookup.as_ref()
         {
             self.try_start_lazy_refresh(
-                &lookup.key,
-                &request_key,
-                refresh_entry,
+                key,
+                request_key,
+                entry,
                 store,
                 context,
                 next.as_ref(),
@@ -1627,9 +1498,10 @@ impl Executor for Cache {
             return continue_next!(next, context);
         }
 
-        let Some(key) = cache_lookup.as_ref().map(|lookup| lookup.key.clone()) else {
+        let Some(DnsCacheLookup::Miss { key }) = cache_lookup.as_ref() else {
             return continue_next!(next, context);
         };
+        let key = key.clone();
 
         match self.miss_coalescer.register(key.clone()) {
             MissRole::Follower(mut ready) => {
@@ -1648,7 +1520,7 @@ impl Executor for Cache {
                 if ready.borrow().to_owned()
                     && self
                         .try_cache_hit(context, store)
-                        .is_some_and(|lookup| lookup.hit_kind.is_some())
+                        .is_some_and(|lookup| lookup.is_hit())
                 {
                     if self.should_short_circuit(true) {
                         return Ok(ExecStep::Stop);
@@ -2728,7 +2600,7 @@ mod tests {
         let lookup = cache
             .try_cache_hit(&mut second_context, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
+        assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
         let response = second_context
             .response()
             .expect("cache hit should set response");
@@ -2832,7 +2704,7 @@ mod tests {
         let lookup = cache
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
+        assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
 
         let stored = cache.store.cache_map()
             .iter_entries_cloned()
@@ -3183,7 +3055,7 @@ mod tests {
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
 
-        assert_eq!(lookup.hit_kind, None);
+        assert!(matches!(lookup, DnsCacheLookup::Miss { .. }));
         assert!(context.response().is_none());
         assert_eq!(cache.store.cache_map().len(), 0);
         assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
@@ -3222,7 +3094,7 @@ mod tests {
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
 
-        assert_eq!(lookup.hit_kind, None);
+        assert!(matches!(lookup, DnsCacheLookup::Miss { .. }));
         assert!(context.response().is_none());
         assert_eq!(cache.store.cache_map().len(), 0);
         assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
@@ -3312,7 +3184,7 @@ mod tests {
         let lookup = cache
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
+        assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
         assert!(context.response().is_some_and(|response| {
             response.has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         }));
@@ -3417,7 +3289,7 @@ mod tests {
         let lookup = cache
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Stale));
+        assert!(matches!(lookup, DnsCacheLookup::Stale { .. }));
         let response = context
             .response()
             .expect("stale cache hit should populate response");
@@ -3471,7 +3343,7 @@ mod tests {
         let lookup = cache
             .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(lookup.hit_kind, Some(CacheHitKind::Stale));
+        assert!(matches!(lookup, DnsCacheLookup::Stale { .. }));
         assert_eq!(
             cache.store.metrics().stale_hit_total.load(AtomicOrdering::Relaxed),
             1
@@ -3512,7 +3384,7 @@ mod tests {
         let miss_lookup = cache
             .try_cache_hit(&mut miss, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(miss_lookup.hit_kind, None);
+        assert!(matches!(miss_lookup, DnsCacheLookup::Miss { .. }));
 
         let mut expired = make_context(make_request_with_query("expired.example.", false, false));
         let key = Cache::build_cache_key(&mut expired, false).unwrap();
@@ -3534,7 +3406,7 @@ mod tests {
         let expired_lookup = cache
             .try_cache_hit(&mut expired, &cache.store)
             .expect("cache lookup should exist");
-        assert_eq!(expired_lookup.hit_kind, None);
+        assert!(matches!(expired_lookup, DnsCacheLookup::Miss { .. }));
 
         assert_eq!(cache.store.metrics().lookup_total.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
