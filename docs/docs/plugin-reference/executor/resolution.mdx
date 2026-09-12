@@ -405,7 +405,11 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`integer`；必填：否；默认值：`600`
 - 单位：秒
-- 作用：定义缓存定期落盘周期。
+- 作用：定义自动周期 dump 的最小检查间隔。
+- 行为：
+  - 自动周期 dump 不会以短于该配置值的间隔执行。
+  - 内部 dirty-age 策略可以延后低变更量缓存的 dump，但不会缩短 `dump_interval`。
+  - shutdown 时的最终 dump 和显式 API 手动 dump 不受该间隔限制。
 
 #### `short_circuit`
 

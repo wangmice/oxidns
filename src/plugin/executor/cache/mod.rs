@@ -86,8 +86,10 @@ const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
 const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_DIRTY_AGE_SECS: u64 = 120;
-const MAX_DIRTY_AGE_MS: u64 = MAX_DIRTY_AGE_SECS * 1000;
+// Soft dirty-age target for low-churn caches. The effective target is never
+// allowed to undercut the user-configured dump interval.
+const DIRTY_DUMP_TARGET_SECS: u64 = 120;
+const DIRTY_DUMP_TARGET_MS: u64 = DIRTY_DUMP_TARGET_SECS * 1000;
 #[cfg(feature = "api")]
 const MAX_PENDING_CACHE_RECLAIMS: usize = 1;
 
@@ -110,7 +112,9 @@ pub struct CacheConfig {
     /// Optional path to persist cache contents.
     dump_file: Option<String>,
 
-    /// Interval (seconds) for dumping cache contents to disk.
+    /// Minimum interval (seconds) between automatic periodic dump checks.
+    ///
+    /// Shutdown and explicit API-triggered dumps are not delayed by this interval.
     dump_interval: Option<u64>,
 
     /// Whether to short-circuit the executor chain on cache hit.
@@ -804,9 +808,20 @@ impl Cache {
         }
     }
 
-    fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
-        let dump_interval = dump_interval.clamp(1, MAX_DIRTY_AGE_SECS);
+    #[inline]
+    fn dump_schedule(dump_interval: u64) -> (u64, u64, u64) {
+        let dump_interval = dump_interval.max(1);
         let check_interval_ms = dump_interval.saturating_mul(1000);
+        // `dump_interval` is a hard lower bound for periodic dumps. The
+        // dirty-age target may defer low-churn dumps further, but it must
+        // never shorten the user-configured interval.
+        let dirty_age_target_ms = DIRTY_DUMP_TARGET_MS.max(check_interval_ms);
+        (dump_interval, check_interval_ms, dirty_age_target_ms)
+    }
+
+    fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
+        let (dump_interval, check_interval_ms, dirty_age_target_ms) =
+            Self::dump_schedule(dump_interval);
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
@@ -817,7 +832,7 @@ impl Cache {
                     let Some(handoff) = store.begin_dump_if_due(
                         AppClock::elapsed_millis(),
                         MINIMUM_CHANGES_TO_DUMP,
-                        MAX_DIRTY_AGE_MS,
+                        dirty_age_target_ms,
                         check_interval_ms,
                     ) else {
                         return;
@@ -4239,6 +4254,26 @@ mod tests {
                 .resp
                 .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
         );
+    }
+
+    #[test]
+    fn dump_schedule_preserves_user_interval_above_dirty_age_target() {
+        let (interval_secs, check_interval_ms, dirty_age_target_ms) =
+            Cache::dump_schedule(7_200);
+
+        assert_eq!(interval_secs, 7_200);
+        assert_eq!(check_interval_ms, 7_200_000);
+        assert_eq!(dirty_age_target_ms, 7_200_000);
+    }
+
+    #[test]
+    fn dump_schedule_keeps_dirty_age_target_for_short_intervals() {
+        let (interval_secs, check_interval_ms, dirty_age_target_ms) =
+            Cache::dump_schedule(60);
+
+        assert_eq!(interval_secs, 60);
+        assert_eq!(check_interval_ms, 60_000);
+        assert_eq!(dirty_age_target_ms, DIRTY_DUMP_TARGET_MS);
     }
 
     #[test]

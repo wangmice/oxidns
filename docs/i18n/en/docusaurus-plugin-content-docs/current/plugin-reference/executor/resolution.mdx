@@ -355,7 +355,11 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `dump_interval`
 
 - Type: `duration`; Required: no; Default: `600s`
-- Purpose: Periodic dump interval.
+- Purpose: Minimum interval between automatic periodic dump checks.
+- Behavior:
+  - Automatic periodic dumps never run more frequently than this configured interval.
+  - The internal dirty-age policy may defer a low-churn dump, but never shortens `dump_interval`.
+  - The final dump during shutdown and explicit API-triggered dumps are not delayed by this interval.
 
 #### `short_circuit`
 
