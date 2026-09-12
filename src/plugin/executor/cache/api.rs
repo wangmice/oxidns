@@ -4,8 +4,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -26,8 +24,6 @@ use super::persistence::{
     CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes,
 };
 use super::store::DnsCacheStore;
-#[cfg(test)]
-use super::store::CacheMutationState;
 use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer};
 #[cfg(test)]
 use super::CacheMetrics;
@@ -55,7 +51,6 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
         policy,
         cache_reclaimer,
     } = config;
-    let cache_map = store.cache_map().clone();
     // The gate is an API-internal implementation detail. All destructive cache
     // management handlers share this same mutex.
     let mutation_gate = Arc::new(Mutex::new(()));
@@ -64,7 +59,7 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
         tag,
         |plugin_api|
         GET "/entries" => CacheEntriesListHandler {
-            cache_map: cache_map.clone(),
+            store: store.clone(),
         },
         DELETE_PREFIX "/entries/" => CacheEntryDeleteHandler {
             store: store.clone(),
@@ -77,7 +72,7 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
             mutation_gate: mutation_gate.clone(),
         },
         GET "/dump" => CacheDumpHandler {
-            cache_map,
+            store: store.clone(),
             tag: tag.to_string(),
         },
         POST "/load_dump" => CacheLoadDumpHandler {
@@ -162,16 +157,19 @@ impl ApiHandler for CacheFlushHandler {
 
 #[derive(Debug)]
 struct CacheDumpHandler {
-    cache_map: CacheMap,
+    store: DnsCacheStore,
     tag: String,
 }
 
 #[async_trait]
 impl ApiHandler for CacheDumpHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
-        let cache_map = self.cache_map.clone();
+        let store = self.store.clone();
         match tokio::task::spawn_blocking(move || {
-            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(&cache_map, MAX_CACHE_DUMP_BODY)
+            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(
+                store.cache_map(),
+                MAX_CACHE_DUMP_BODY,
+            )
         })
         .await
         {
@@ -366,7 +364,7 @@ impl ApiHandler for CacheLoadDumpHandler {
 
 #[derive(Debug)]
 struct CacheEntriesListHandler {
-    cache_map: CacheMap,
+    store: DnsCacheStore,
 }
 
 #[derive(Debug)]
@@ -495,7 +493,7 @@ impl ApiHandler for CacheEntriesListHandler {
 
         let now = AppClock::elapsed_millis();
         let now_unix_ms = AppClock::now_timestamp();
-        let cache_map = self.cache_map.clone();
+        let store = self.store.clone();
 
         match tokio::task::spawn_blocking(move || {
             // Keep only the smallest `limit + 1` keys after the cursor. This
@@ -505,7 +503,7 @@ impl ApiHandler for CacheEntriesListHandler {
             let mut candidates = BinaryHeap::with_capacity(candidate_limit);
             let mut total_entries = 0usize;
 
-            cache_map.visit_handles(|key, entry| {
+            store.cache_map().visit_handles(|key, entry| {
                 if entry.expire_at_ms() <= now || !cache_entry_matches_query(key, &query) {
                     return true;
                 }
@@ -935,23 +933,8 @@ mod tests {
 
     fn test_store(cache_map: CacheMap, cache_size: usize) -> DnsCacheStore {
         let hints = Arc::new(EcsPrefixHints::new());
-        let metrics = Arc::new(CacheMetrics::new(
-            "api-test".to_string(),
-            hints.clone(),
-        ));
-        metrics.set_cache_map(cache_map.clone());
-        DnsCacheStore::new(
-            cache_map,
-            cache_size,
-            hints,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            CacheMutationState {
-                updated_keys: Arc::new(AtomicU64::new(0)),
-                dirty_since_ms: Arc::new(AtomicU64::new(0)),
-                dirty_generation: Arc::new(AtomicU64::new(0)),
-            },
-            metrics,
-        )
+        let metrics = Arc::new(CacheMetrics::new("api-test".to_string()));
+        DnsCacheStore::new(cache_map, cache_size, hints, metrics)
     }
 
     fn test_cache_key(domain: &str) -> CacheKey {

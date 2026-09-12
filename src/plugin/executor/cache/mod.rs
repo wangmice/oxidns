@@ -8,14 +8,14 @@
 //! are periodically cleaned up.
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::watch;
 #[cfg(feature = "api")]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Level, debug, event_enabled, warn};
@@ -25,7 +25,7 @@ use self::key::{
     cache_key_for_response_ecs_scope, cache_lookup_keys,
 };
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
-use self::store::{CacheMutationState, DnsCacheStore};
+use self::store::DnsCacheStore;
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
 use crate::core::response::{ResponseDisposition, classify_response};
@@ -554,8 +554,6 @@ struct CacheLookup {
 #[derive(Debug)]
 struct CacheMetrics {
     tag: String,
-    cache_map: OnceLock<CacheMap>,
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
     lookup_total: AtomicU64,
     ecs_lookup_requests_total: AtomicU64,
     ecs_lookup_candidates_total: AtomicU64,
@@ -577,11 +575,9 @@ struct CacheMetrics {
 }
 
 impl CacheMetrics {
-    fn new(tag: String, ecs_prefix_hints: Arc<EcsPrefixHints>) -> Self {
+    fn new(tag: String) -> Self {
         Self {
             tag,
-            cache_map: OnceLock::new(),
-            ecs_prefix_hints,
             lookup_total: AtomicU64::new(0),
             ecs_lookup_requests_total: AtomicU64::new(0),
             ecs_lookup_candidates_total: AtomicU64::new(0),
@@ -603,10 +599,6 @@ impl CacheMetrics {
         }
     }
 
-    fn set_cache_map(&self, cache_map: CacheMap) {
-        let _ = self.cache_map.set(cache_map);
-    }
-
     fn record_skip(&self, reason: CacheSkipReason) {
         match reason {
             CacheSkipReason::NoTtl => {
@@ -624,9 +616,20 @@ impl CacheMetrics {
     }
 }
 
-impl MetricSource for CacheMetrics {
+#[derive(Debug)]
+struct CacheMetricSource {
+    store: DnsCacheStore,
+}
+
+impl CacheMetricSource {
+    fn new(store: DnsCacheStore) -> Self {
+        Self { store }
+    }
+}
+
+impl MetricSource for CacheMetricSource {
     fn tag(&self) -> &str {
-        &self.tag
+        self.store.metrics().tag.as_str()
     }
 
     fn plugin_type(&self) -> &'static str {
@@ -634,179 +637,177 @@ impl MetricSource for CacheMetrics {
     }
 
     fn collect(&self, sink: &mut dyn MetricSink) {
-        let base = [MetricLabel::new("plugin_tag", self.tag.as_str())];
+        let metrics = self.store.metrics();
+        let base = [MetricLabel::new("plugin_tag", metrics.tag.as_str())];
         sink.emit(MetricSample::counter(
             "cache_lookup_total",
             "Total cache lookups with a cacheable request key.",
             &base,
-            self.lookup_total.load(Ordering::Relaxed),
+            metrics.lookup_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_ecs_lookup_requests_total",
             "Total cache lookups carrying an ECS request key.",
             &base,
-            self.ecs_lookup_requests_total.load(Ordering::Relaxed),
+            metrics.ecs_lookup_requests_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_ecs_lookup_candidates_total",
             "Total ECS cache key candidates probed after prefix-hint filtering.",
             &base,
-            self.ecs_lookup_candidates_total.load(Ordering::Relaxed),
+            metrics.ecs_lookup_candidates_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_ecs_lookup_exact_fallback_total",
             "Total ECS lookups that reached the exact-SOURCE fallback key.",
             &base,
-            self.ecs_lookup_exact_fallback_total.load(Ordering::Relaxed),
+            metrics.ecs_lookup_exact_fallback_total.load(Ordering::Relaxed),
         ));
         let ecs_v4 = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("family", "ipv4"),
         ];
         sink.emit(MetricSample::gauge(
             "cache_ecs_prefix_hint_count",
             "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
             &ecs_v4,
-            u64::from(self.ecs_prefix_hints.observed_ipv4_prefixes()),
+            u64::from(self.store.ecs_prefix_hints().observed_ipv4_prefixes()),
         ));
         let ecs_v6 = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("family", "ipv6"),
         ];
         sink.emit(MetricSample::gauge(
             "cache_ecs_prefix_hint_count",
             "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
             &ecs_v6,
-            u64::from(self.ecs_prefix_hints.observed_ipv6_prefixes()),
+            u64::from(self.store.ecs_prefix_hints().observed_ipv6_prefixes()),
         ));
         let fresh = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("kind", "fresh"),
         ];
         sink.emit(MetricSample::counter(
             "cache_hit_total",
             "Total cache hits by freshness kind.",
             &fresh,
-            self.fresh_hit_total.load(Ordering::Relaxed),
+            metrics.fresh_hit_total.load(Ordering::Relaxed),
         ));
         let stale = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("kind", "stale"),
         ];
         sink.emit(MetricSample::counter(
             "cache_hit_total",
             "Total cache hits by freshness kind.",
             &stale,
-            self.stale_hit_total.load(Ordering::Relaxed),
+            metrics.stale_hit_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_miss_total",
             "Total cache misses.",
             &base,
-            self.miss_total.load(Ordering::Relaxed),
+            metrics.miss_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_miss_coalesced_total",
             "Total cache misses served by a concurrent in-flight fetch.",
             &base,
-            self.miss_coalesced_total.load(Ordering::Relaxed),
+            metrics.miss_coalesced_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_miss_coalesce_timeout_total",
             "Total cache miss coalescing waits that timed out.",
             &base,
-            self.miss_coalesce_timeout_total.load(Ordering::Relaxed),
+            metrics.miss_coalesce_timeout_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_expired_total",
             "Total cache lookups that found and removed expired entries.",
             &base,
-            self.expired_total.load(Ordering::Relaxed),
+            metrics.expired_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_insert_total",
             "Total cache entry inserts or updates.",
             &base,
-            self.insert_total.load(Ordering::Relaxed),
+            metrics.insert_total.load(Ordering::Relaxed),
         ));
         let skip_truncated = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("reason", "truncated"),
         ];
         sink.emit(MetricSample::counter(
             "cache_skip_total",
             "Total responses skipped by cache write policy.",
             &skip_truncated,
-            self.skip_truncated_total.load(Ordering::Relaxed),
+            metrics.skip_truncated_total.load(Ordering::Relaxed),
         ));
         let skip_no_ttl = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("reason", "no_ttl"),
         ];
         sink.emit(MetricSample::counter(
             "cache_skip_total",
             "Total responses skipped by cache write policy.",
             &skip_no_ttl,
-            self.skip_no_ttl_total.load(Ordering::Relaxed),
+            metrics.skip_no_ttl_total.load(Ordering::Relaxed),
         ));
         let skip_incomplete_answer = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("reason", "incomplete_answer"),
         ];
         sink.emit(MetricSample::counter(
             "cache_skip_total",
             "Total responses skipped by cache write policy.",
             &skip_incomplete_answer,
-            self.skip_incomplete_answer_total.load(Ordering::Relaxed),
+            metrics.skip_incomplete_answer_total.load(Ordering::Relaxed),
         ));
         let skip_low_positive_ttl = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("reason", "low_positive_ttl"),
         ];
         sink.emit(MetricSample::counter(
             "cache_skip_total",
             "Total responses skipped by cache write policy.",
             &skip_low_positive_ttl,
-            self.skip_low_positive_ttl_total.load(Ordering::Relaxed),
+            metrics.skip_low_positive_ttl_total.load(Ordering::Relaxed),
         ));
         let lazy_started = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("result", "started"),
         ];
         sink.emit(MetricSample::counter(
             "cache_lazy_refresh_total",
             "Total lazy refresh attempts by result.",
             &lazy_started,
-            self.lazy_refresh_started_total.load(Ordering::Relaxed),
+            metrics.lazy_refresh_started_total.load(Ordering::Relaxed),
         ));
         let lazy_success = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("result", "success"),
         ];
         sink.emit(MetricSample::counter(
             "cache_lazy_refresh_total",
             "Total lazy refresh attempts by result.",
             &lazy_success,
-            self.lazy_refresh_success_total.load(Ordering::Relaxed),
+            metrics.lazy_refresh_success_total.load(Ordering::Relaxed),
         ));
         let lazy_failed = [
-            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
             MetricLabel::new("result", "failed"),
         ];
         sink.emit(MetricSample::counter(
             "cache_lazy_refresh_total",
             "Total lazy refresh attempts by result.",
             &lazy_failed,
-            self.lazy_refresh_failed_total.load(Ordering::Relaxed),
+            metrics.lazy_refresh_failed_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::gauge(
             "cache_entry_count",
             "Current number of cache entries.",
             &base,
-            self.cache_map
-                .get()
-                .map(|cache_map| cache_map.len() as u64)
-                .unwrap_or(0),
+            self.store.cache_map().len() as u64,
         ));
     }
 }
@@ -814,11 +815,8 @@ impl MetricSource for CacheMetrics {
 /// DNS response cache executor.
 #[derive(Debug)]
 pub struct Cache {
-    /// Thread-safe cache map shared across tasks.
-    cache_map: OnceCell<CacheMap>,
-
-    /// DNS-aware mutation facade for the published cache generation.
-    cache_store: OnceCell<DnsCacheStore>,
+    /// Single live-state facade for cache data and mutation bookkeeping.
+    store: DnsCacheStore,
 
     /// Plugin identifier.
     tag: String,
@@ -834,9 +832,6 @@ pub struct Cache {
     /// If set to 0, negative response without SOA will not be cached.
     negative_ttl_without_soa: u32,
 
-    /// Maximum number of entries allowed in the cache.
-    cache_size: usize,
-
     /// Cache configuration parameters.
     config: CacheConfig,
 
@@ -845,29 +840,6 @@ pub struct Cache {
 
     /// Whether to include ECS scope in cache key.
     ecs_in_key: bool,
-
-    /// Monotonic advisory bitmap of reusable ECS scope prefixes. The main
-    /// cache map remains authoritative; stale bits only add harmless lookups.
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
-
-    /// Set by rejected admissions; consumed by the background cleanup task.
-    pressure_requested: Arc<AtomicBool>,
-
-    /// Number of cache entry updates since last dump.
-    updated_keys: Arc<AtomicU64>,
-
-    /// Lower-bound timestamp of the oldest unsaved mutation. It is retained as
-    /// a conservative watermark; generation equality determines cleanliness.
-    dirty_since_ms: Arc<AtomicU64>,
-
-    /// Monotonic dirty generation used to protect dump completion from races.
-    dirty_generation: Arc<AtomicU64>,
-
-    /// Generation covered by the last successful dump.
-    persisted_generation: Arc<AtomicU64>,
-
-    /// Low-overhead cache metrics.
-    metrics: Arc<CacheMetrics>,
 
     /// Periodic dump task id, if dump persistence is enabled.
     dump_task_id: Mutex<Option<u64>>,
@@ -890,6 +862,11 @@ pub struct Cache {
 
 impl Cache {
     #[inline]
+    fn metrics(&self) -> &CacheMetrics {
+        self.store.metrics().as_ref()
+    }
+
+    #[inline]
     fn cache_load_policy(&self) -> CacheLoadPolicy {
         CacheLoadPolicy {
             lazy_cache_ttl: self.config.lazy_cache_ttl,
@@ -901,62 +878,48 @@ impl Cache {
         }
     }
 
-    fn spawn_dump_task(&self, cache_map: CacheMap, dump_path: String, dump_interval: u64) -> u64 {
+    fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
         let dump_interval = dump_interval.clamp(1, MAX_DIRTY_AGE_SECS);
         let check_interval_ms = dump_interval.saturating_mul(1000);
-        let updated_keys = self.updated_keys.clone();
-        let dirty_since_ms = self.dirty_since_ms.clone();
-        let dirty_generation = self.dirty_generation.clone();
-        let persisted_generation = self.persisted_generation.clone();
+        let mutations = store.mutations().clone();
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
             move || {
-                let cache_map = cache_map.clone();
+                let store = store.clone();
                 let dump_path = dump_path.clone();
-                let updated_keys = updated_keys.clone();
-                let dirty_since_ms = dirty_since_ms.clone();
-                let dirty_generation = dirty_generation.clone();
-                let persisted_generation = persisted_generation.clone();
+                let mutations = mutations.clone();
                 async move {
-                    let changed = updated_keys.swap(0, Ordering::AcqRel);
+                    let changed = mutations.updated_keys.swap(0, Ordering::AcqRel);
                     let now = AppClock::elapsed_millis();
-                    let dirty_since = dirty_since_ms.load(Ordering::Acquire);
-                    let dirty = dirty_generation.load(Ordering::Acquire)
-                        != persisted_generation.load(Ordering::Acquire);
+                    let dirty_since = mutations.dirty_since_ms.load(Ordering::Acquire);
+                    let dirty = mutations.dirty_generation.load(Ordering::Acquire)
+                        != mutations.persisted_generation.load(Ordering::Acquire);
                     let age_due = dirty && dump_age_due(now, dirty_since, check_interval_ms);
 
-                    //   We consumed `changed` with swap(0), but no dump is
-                    // being attempted yet.
-                    //
-                    //   Put only the counter back.
-                    //
-                    //   IMPORTANT:
-                    //   Do not call mark_dirty() here. These are not new
-                    // mutations and therefore   must not
-                    // increment dirty_generation or change dirty_since_ms.
+                    // We consumed `changed` with swap(0), but no dump is being
+                    // attempted yet. Restore only the counter; these are not new
+                    // mutations and must not advance the dirty generation.
                     if changed < MINIMUM_CHANGES_TO_DUMP && !age_due {
-                        updated_keys.fetch_add(changed, Ordering::Relaxed);
-
+                        mutations.updated_keys.fetch_add(changed, Ordering::Relaxed);
                         return;
                     }
 
-                    //  Hand the current dirty watermark to this dump.
-                    //
-                    //  Any mutation from this point onward gets a new
-                    // dirty_since value and belongs
-                    //  to a generation newer than dump_generation.
-                    let (dump_generation, previous_dirty_since) =
-                        begin_dump_watermark(&dirty_generation, &dirty_since_ms);
+                    // Hand the current dirty watermark to this dump. Mutations
+                    // after this point install their own watermark/generation.
+                    let (dump_generation, previous_dirty_since) = begin_dump_watermark(
+                        &mutations.dirty_generation,
+                        &mutations.dirty_since_ms,
+                    );
 
-                    if let Err(e) = dump_cache_to_file(&cache_map, &dump_path).await {
-                        updated_keys.fetch_add(changed, Ordering::Relaxed);
-                        restore_dirty_since(&dirty_since_ms, previous_dirty_since);
+                    if let Err(e) = dump_cache_to_file(store.cache_map(), &dump_path).await {
+                        mutations.updated_keys.fetch_add(changed, Ordering::Relaxed);
+                        restore_dirty_since(&mutations.dirty_since_ms, previous_dirty_since);
                         warn!("Failed to dump cache to {}: {}", dump_path, e);
                     } else {
                         let _ = finish_dump_if_unchanged(
-                            &dirty_generation,
-                            &persisted_generation,
+                            &mutations.dirty_generation,
+                            &mutations.persisted_generation,
                             dump_generation,
                         );
                     }
@@ -1029,6 +992,13 @@ impl Cache {
         cache_size.clamp(1, MAX_INITIAL_CACHE_CAPACITY)
     }
 
+    fn new_store(tag: &str, cache_size: usize) -> DnsCacheStore {
+        let cache_map = CacheMap::with_capacity(Self::initial_cache_capacity(cache_size));
+        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
+        let metrics = Arc::new(CacheMetrics::new(tag.to_string()));
+        DnsCacheStore::new(cache_map, cache_size, ecs_prefix_hints, metrics)
+    }
+
     #[inline]
     fn adaptive_touch_interval_ms(cache_len: usize, cache_size: usize) -> u64 {
         let occupancy_percent = cache_len.saturating_mul(100) / cache_size.max(1);
@@ -1062,7 +1032,7 @@ impl Cache {
     }
 
     #[inline]
-    fn current_touch_interval_ms(&self, cache_map: &CacheMap, now: u64) -> u64 {
+    fn current_touch_interval_ms(&self, now: u64) -> u64 {
         let cached = self.touch_interval_ms.load(Ordering::Relaxed);
         let next_refresh = self.next_touch_interval_refresh_ms.load(Ordering::Relaxed);
         if now < next_refresh {
@@ -1083,7 +1053,10 @@ impl Cache {
             return cached;
         }
 
-        let interval = Self::adaptive_touch_interval_ms(cache_map.len(), self.cache_size);
+        let interval = Self::adaptive_touch_interval_ms(
+            self.store.cache_map().len(),
+            self.store.cache_size(),
+        );
         self.touch_interval_ms.store(interval, Ordering::Relaxed);
         interval
     }
@@ -1164,16 +1137,15 @@ impl Cache {
     #[inline]
     #[hotpath::measure]
     fn try_cache_hit(&self, context: &mut DnsContext, store: &DnsCacheStore) -> Option<CacheLookup> {
-        let cache_map = store.cache_map();
         let request_key = Self::build_cache_key(context, self.ecs_in_key)?;
-        self.metrics.lookup_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics().lookup_total.fetch_add(1, Ordering::Relaxed);
 
         let now = AppClock::elapsed_millis();
-        let touch_interval_ms = self.current_touch_interval_ms(cache_map, now);
+        let touch_interval_ms = self.current_touch_interval_ms(now);
 
         let ecs_lookup = request_key.ecs_scope.is_some();
         if ecs_lookup {
-            self.metrics
+            self.metrics()
                 .ecs_lookup_requests_total
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -1181,11 +1153,11 @@ impl Cache {
         let mut expired = false;
         for candidate in cache_lookup_keys(&request_key, store.ecs_prefix_hints()) {
             if ecs_lookup {
-                self.metrics
+                self.metrics()
                     .ecs_lookup_candidates_total
                     .fetch_add(1, Ordering::Relaxed);
                 if candidate.as_ref() == &request_key {
-                    self.metrics
+                    self.metrics()
                         .ecs_lookup_exact_fallback_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1203,7 +1175,7 @@ impl Cache {
                     };
                     if let Some(disposition) = invalid_disposition {
                         if store.remove_handle(key, &item) {
-                            self.metrics
+                            self.metrics()
                                 .record_skip(cache_skip_reason_for_disposition(disposition));
                             debug!(
                                 "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
@@ -1216,7 +1188,7 @@ impl Cache {
                             );
                         }
                     } else if now < value.fresh_until_ms {
-                        self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
+                        self.metrics().fresh_hit_total.fetch_add(1, Ordering::Relaxed);
                         let remaining_ttl = value
                             .fresh_until_ms
                             .saturating_sub(now)
@@ -1243,7 +1215,7 @@ impl Cache {
                             refresh_entry: None,
                         });
                     } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms() {
-                        self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
+                        self.metrics().stale_hit_total.fetch_add(1, Ordering::Relaxed);
                         let resp = Self::restore_cached_message(
                             value,
                             &context.request,
@@ -1304,7 +1276,7 @@ impl Cache {
                 key.ecs_scope.is_some()
             );
         } else {
-            self.metrics.miss_total.fetch_add(1, Ordering::Relaxed);
+            self.metrics().miss_total.fetch_add(1, Ordering::Relaxed);
             debug!(
                 "cache miss: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
                 key.domain,
@@ -1471,7 +1443,7 @@ impl Cache {
         if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
             return;
         }
-        self.metrics
+        self.metrics()
             .lazy_refresh_started_total
             .fetch_add(1, Ordering::Relaxed);
 
@@ -1491,7 +1463,7 @@ impl Cache {
         let cache_negative = self.cache_negative;
         let max_negative_ttl = self.max_negative_ttl;
         let negative_ttl_without_soa = self.negative_ttl_without_soa;
-        let metrics = self.metrics.clone();
+        let metrics = self.store.metrics().clone();
 
         tokio::spawn(async move {
             let _refresh_guard = refresh_guard;
@@ -1621,38 +1593,20 @@ impl Plugin for Cache {
     }
 
     async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
-        let cache_map = CacheMap::with_capacity(Self::initial_cache_capacity(self.cache_size));
-        let cache_store = DnsCacheStore::new(
-            cache_map.clone(),
-            self.cache_size,
-            self.ecs_prefix_hints.clone(),
-            self.pressure_requested.clone(),
-            CacheMutationState {
-                updated_keys: self.updated_keys.clone(),
-                dirty_since_ms: self.dirty_since_ms.clone(),
-                dirty_generation: self.dirty_generation.clone(),
-            },
-            self.metrics.clone(),
-        );
-
-        let _ = self.cache_map.set(cache_map.clone());
-        let _ = self.cache_store.set(cache_store.clone());
-        self.metrics.set_cache_map(cache_map.clone());
-
         if let Some(dump_file) = &self.config.dump_file {
             if let Err(e) = load_cache_from_file(
-                &cache_map,
+                self.store.cache_map(),
                 dump_file,
                 self.ecs_in_key,
-                self.ecs_prefix_hints.clone(),
+                self.store.ecs_prefix_hints().clone(),
                 self.cache_load_policy(),
             )
             .await
             {
                 warn!("Failed to load cache from {}: {}", dump_file, e);
             } else {
-                let store_for_prune = cache_store.clone();
-                let cache_size = self.cache_size;
+                let store_for_prune = self.store.clone();
+                let cache_size = self.store.cache_size();
                 match tokio::task::spawn_blocking(move || {
                     store_for_prune.prune(
                         TtlCachePruneMode::Exact {
@@ -1663,12 +1617,9 @@ impl Plugin for Cache {
                 })
                 .await
                 {
-                    // 通过模式匹配解构提取出统计三元组
                     Ok((expired_removed, evicted, after_len)) => {
                         let total_removed = expired_removed.saturating_add(evicted);
                         if total_removed > 0 {
-                            // 纯算术反向推导清理前的长度，
-                            // 省去调用底层读锁的开销
                             let before_len = after_len.saturating_add(total_removed);
                             debug!(
                                 expired_removed = expired_removed,
@@ -1689,7 +1640,7 @@ impl Plugin for Cache {
             let cache_reclaimer = CacheReclaimer::new(&self.tag)?;
             api::register(
                 &self.tag,
-                cache_store.clone(),
+                self.store.clone(),
                 api::CacheApiConfig {
                     ecs_in_key: self.ecs_in_key,
                     policy: self.cache_load_policy(),
@@ -1697,15 +1648,16 @@ impl Plugin for Cache {
                 },
             )?;
         }
-        register_metric_source(self.metrics.clone())?;
+        register_metric_source(Arc::new(CacheMetricSource::new(self.store.clone())))?;
 
         if let Some(dump_file) = &self.config.dump_file {
             let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
-            let task_id = self.spawn_dump_task(cache_map.clone(), dump_file.clone(), dump_interval);
+            let task_id =
+                self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval);
             *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
         }
 
-        let cleanup_task_id = self.spawn_cleanup_task(cache_store);
+        let cleanup_task_id = self.spawn_cleanup_task(self.store.clone());
         *self
             .cleanup_task_id
             .lock()
@@ -1733,8 +1685,7 @@ impl Plugin for Cache {
             task_center::stop_task(task_id).await;
         }
         if let Some(dump_file) = &self.config.dump_file
-            && let Some(cache_map) = self.cache_map.get()
-            && let Err(e) = dump_cache_to_file(cache_map, dump_file).await
+            && let Err(e) = dump_cache_to_file(self.store.cache_map(), dump_file).await
         {
             warn!("Failed to dump cache to {}: {}", dump_file, e);
         }
@@ -1759,10 +1710,7 @@ impl Executor for Cache {
         context: &mut DnsContext,
         next: Option<ExecutorNext>,
     ) -> Result<ExecStep> {
-        let Some(store) = self.cache_store.get() else {
-            return continue_next!(next, context);
-        };
-
+        let store = &self.store;
         let cache_lookup = self.try_cache_hit(context, store);
         let cache_hit = cache_lookup
             .as_ref()
@@ -1800,14 +1748,14 @@ impl Executor for Cache {
 
         match self.miss_coalescer.register(key.clone()) {
             MissRole::Follower(mut ready) => {
-                self.metrics
+                self.metrics()
                     .miss_coalesced_total
                     .fetch_add(1, Ordering::Relaxed);
                 if tokio::time::timeout(DEFAULT_MISS_COALESCE_TIMEOUT, ready.changed())
                     .await
                     .is_err()
                 {
-                    self.metrics
+                    self.metrics()
                         .miss_coalesce_timeout_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1831,7 +1779,7 @@ impl Executor for Cache {
                 let next_step = continue_next!(next, context)?;
                 let cached = if let Some(response) = context.response() {
                     if response.truncated() {
-                        self.metrics
+                        self.metrics()
                             .skip_truncated_total
                             .fetch_add(1, Ordering::Relaxed);
                         false
@@ -1846,7 +1794,7 @@ impl Executor for Cache {
                                 disposition,
                             ),
                             CacheTtlDecision::Skip(reason) => {
-                                self.metrics.record_skip(reason);
+                                self.metrics().record_skip(reason);
                                 false
                             }
                         }
@@ -2170,11 +2118,10 @@ impl PluginFactory for CacheFactory {
 
 impl CacheFactory {
     fn build_cache(&self, tag: String, cache_config: CacheConfig) -> Result<UninitializedPlugin> {
-        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
-        let metrics = Arc::new(CacheMetrics::new(tag.clone(), ecs_prefix_hints.clone()));
+        let cache_size = cache_config.size.unwrap_or(DEFAULT_CACHE_SIZE);
+        let store = Cache::new_store(&tag, cache_size);
         Ok(UninitializedPlugin::Executor(Box::new(Cache {
-            cache_map: OnceCell::new(),
-            cache_store: OnceCell::new(),
+            store,
             tag,
             cache_negative: cache_config.cache_negative.unwrap_or(true),
             max_negative_ttl: cache_config
@@ -2185,15 +2132,7 @@ impl CacheFactory {
                 .unwrap_or(DEFAULT_NEGATIVE_TTL_WITHOUT_SOA),
             short_circuit: cache_config.short_circuit.unwrap_or(false),
             ecs_in_key: cache_config.ecs_in_key.unwrap_or(false),
-            ecs_prefix_hints,
-            pressure_requested: Arc::new(AtomicBool::new(false)),
-            cache_size: cache_config.size.unwrap_or(DEFAULT_CACHE_SIZE),
             config: cache_config,
-            updated_keys: Arc::new(AtomicU64::new(0)),
-            dirty_since_ms: Arc::new(AtomicU64::new(0)),
-            dirty_generation: Arc::new(AtomicU64::new(0)),
-            persisted_generation: Arc::new(AtomicU64::new(0)),
-            metrics,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2285,29 +2224,16 @@ mod tests {
         let cache_size = config.size.unwrap_or(DEFAULT_CACHE_SIZE);
         let ecs_in_key = config.ecs_in_key.unwrap_or(false);
         let short_circuit = config.short_circuit.unwrap_or(false);
-        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
 
         Cache {
-            cache_map: OnceCell::new(),
-            cache_store: OnceCell::new(),
+            store: Cache::new_store("cache_test", cache_size),
             tag: "cache_test".to_string(),
             cache_negative,
             max_negative_ttl,
             negative_ttl_without_soa,
             short_circuit,
             ecs_in_key,
-            ecs_prefix_hints: ecs_prefix_hints.clone(),
-            pressure_requested: Arc::new(AtomicBool::new(false)),
             config,
-            updated_keys: Arc::new(AtomicU64::new(0)),
-            dirty_since_ms: Arc::new(AtomicU64::new(0)),
-            dirty_generation: Arc::new(AtomicU64::new(0)),
-            persisted_generation: Arc::new(AtomicU64::new(0)),
-            metrics: Arc::new(CacheMetrics::new(
-                "cache_test".to_string(),
-                ecs_prefix_hints,
-            )),
-            cache_size,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2412,10 +2338,10 @@ mod tests {
         let mut cfg = default_test_config();
         cfg.size = Some(4);
         let cache = test_cache(cfg);
-        let cache_map = CacheMap::with_capacity(4);
+        let cache_map = cache.store.cache_map();
         for idx in 0..4 {
             insert_test_cache_entry(
-                &cache_map,
+                cache_map,
                 format!("live-{idx}.example"),
                 100_000,
                 idx as u64,
@@ -2423,7 +2349,7 @@ mod tests {
         }
 
         assert_eq!(
-            cache.current_touch_interval_ms(&cache_map, 10_000),
+            cache.current_touch_interval_ms(10_000),
             TOUCH_CRITICAL_INTERVAL_MS
         );
         cache_map.remove(&cache_key_for_domain("live-0.example"));
@@ -2431,10 +2357,10 @@ mod tests {
         cache_map.remove(&cache_key_for_domain("live-2.example"));
 
         assert_eq!(
-            cache.current_touch_interval_ms(&cache_map, 10_500),
+            cache.current_touch_interval_ms(10_500),
             TOUCH_CRITICAL_INTERVAL_MS
         );
-        assert_eq!(cache.current_touch_interval_ms(&cache_map, 11_000), 0);
+        assert_eq!(cache.current_touch_interval_ms(11_000), 0);
     }
 
     fn make_context(request: Message) -> DnsContext {
@@ -3001,7 +2927,7 @@ mod tests {
         response.set_edns(response_edns);
         let disposition = response_disposition_for_cache(&response, &first_key);
         assert!(cache.update_cache_entry(
-            cache.cache_store.get().unwrap(),
+            &cache.store,
             first_key,
             response,
             120,
@@ -3013,7 +2939,7 @@ mod tests {
         let mut second_context = make_context(second_request);
 
         let lookup = cache
-            .try_cache_hit(&mut second_context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut second_context, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
         let response = second_context
@@ -3056,13 +2982,13 @@ mod tests {
         let disposition = response_disposition_for_cache(&response, &key);
 
         assert!(!cache.update_cache_entry(
-            cache.cache_store.get().unwrap(),
+            &cache.store,
             key,
             response,
             120,
             disposition,
         ));
-        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
+        assert_eq!(cache.store.cache_map().len(), 0);
     }
 
     #[test]
@@ -3104,7 +3030,7 @@ mod tests {
         let now = AppClock::elapsed_millis();
         let last_access_ms = now.saturating_sub(60_000);
 
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(
                 cacheable_response_for_domain("example.com.", 120),
@@ -3117,14 +3043,11 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
 
-        let stored = cache
-            .cache_map
-            .get()
-            .unwrap()
+        let stored = cache.store.cache_map()
             .iter_entries_cloned()
             .into_iter()
             .find(|(stored_key, _)| stored_key == &key)
@@ -3391,11 +3314,10 @@ mod tests {
 
         cache.execute_with_next(&mut context, None).await.unwrap();
 
-        let cache_map = cache.cache_map.get().unwrap();
+        let cache_map = cache.store.cache_map();
         assert_eq!(cache_map.len(), 0);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_truncated_total
                 .load(AtomicOrdering::Relaxed),
             1
@@ -3425,7 +3347,7 @@ mod tests {
 
         assert_eq!(step, ExecStep::Next);
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(cache.cache_map.get().unwrap().len(), 1);
+        assert_eq!(cache.store.cache_map().len(), 1);
     }
 
     #[tokio::test]
@@ -3439,11 +3361,10 @@ mod tests {
 
         cache.execute_with_next(&mut context, None).await.unwrap();
 
-        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(cache.store.cache_map().len(), 0);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 0);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
@@ -3459,7 +3380,7 @@ mod tests {
         let mut context = make_context(make_request_with_query("example.com.", false, false));
         let key = Cache::build_cache_key(&mut context, false).unwrap();
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key,
             CacheItem::new(
                 cname_only_response_for_domain("example.com.", 60),
@@ -3472,16 +3393,15 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
 
         assert_eq!(lookup.hit_kind, None);
         assert!(context.response().is_none());
-        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
-        assert_eq!(cache.metrics.miss_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.cache_map().len(), 0);
+        assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
@@ -3499,7 +3419,7 @@ mod tests {
         let mut context = make_context(make_request_with_query("example.com.", false, false));
         let key = Cache::build_cache_key(&mut context, false).unwrap();
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key,
             CacheItem::new(
                 cname_only_response_for_domain("example.com.", 60),
@@ -3512,20 +3432,19 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
 
         assert_eq!(lookup.hit_kind, None);
         assert!(context.response().is_none());
-        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
-        assert_eq!(cache.metrics.miss_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.cache_map().len(), 0);
+        assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
-            cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
+            cache.store.metrics().stale_hit_total.load(AtomicOrdering::Relaxed),
             0
         );
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
@@ -3553,12 +3472,9 @@ mod tests {
 
         cache.execute_with_next(&mut context, None).await.unwrap();
 
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
         assert!(
-            cache
-                .cache_map
-                .get()
-                .unwrap()
+            cache.store.cache_map()
                 .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
                 .is_some()
         );
@@ -3599,7 +3515,7 @@ mod tests {
 
         let disposition = response_disposition_for_cache(&response, &key);
         cache.update_cache_entry(
-            cache.cache_store.get().unwrap(),
+            &cache.store,
             key,
             response,
             120,
@@ -3607,7 +3523,7 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(lookup.hit_kind, Some(CacheHitKind::Fresh));
         assert!(context.response().is_some_and(|response| {
@@ -3625,12 +3541,12 @@ mod tests {
             (119..=120).contains(&response.answers()[0].ttl()),
             "fresh cache hit should preserve the original TTL or decrement by at most one second"
         );
-        assert_eq!(cache.metrics.lookup_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().lookup_total.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
-            cache.metrics.fresh_hit_total.load(AtomicOrdering::Relaxed),
+            cache.store.metrics().fresh_hit_total.load(AtomicOrdering::Relaxed),
             1
         );
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
@@ -3703,7 +3619,7 @@ mod tests {
         ));
 
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key,
             CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
@@ -3712,7 +3628,7 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(lookup.hit_kind, Some(CacheHitKind::Stale));
         let response = context
@@ -3720,9 +3636,9 @@ mod tests {
             .expect("stale cache hit should populate response");
         assert_eq!(response.id(), 9);
         assert_eq!(response.answers()[0].ttl(), 30);
-        assert_eq!(cache.metrics.lookup_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().lookup_total.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
-            cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
+            cache.store.metrics().stale_hit_total.load(AtomicOrdering::Relaxed),
             1
         );
     }
@@ -3752,8 +3668,8 @@ mod tests {
             .expect("initial ECS response should produce a scoped cache key");
         let now = AppClock::elapsed_millis();
 
-        cache.ecs_prefix_hints.observe_cache_key(&stored_key);
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.ecs_prefix_hints().observe_cache_key(&stored_key);
+        cache.store.cache_map().insert_or_update_with_meta(
             stored_key.clone(),
             CacheItem::new_validated(
                 response,
@@ -3766,11 +3682,11 @@ mod tests {
         );
 
         let lookup = cache
-            .try_cache_hit(&mut context, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut context, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(lookup.hit_kind, Some(CacheHitKind::Stale));
         assert_eq!(
-            cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
+            cache.store.metrics().stale_hit_total.load(AtomicOrdering::Relaxed),
             1
         );
 
@@ -3785,8 +3701,7 @@ mod tests {
             .await
             .expect("stale ECS refresh should succeed");
         wait_until("ECS lazy refresh should complete", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_success_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
@@ -3794,10 +3709,7 @@ mod tests {
         .await;
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
         assert!(
-            cache
-                .cache_map
-                .get()
-                .unwrap()
+            cache.store.cache_map()
                 .get_retained_cloned(&stored_key, AppClock::elapsed_millis(), 0)
                 .is_none()
         );
@@ -3811,7 +3723,7 @@ mod tests {
 
         let mut miss = make_context(make_request_with_query("missing.example.", false, false));
         let miss_lookup = cache
-            .try_cache_hit(&mut miss, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut miss, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(miss_lookup.hit_kind, None);
 
@@ -3824,7 +3736,7 @@ mod tests {
             1,
             RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
         ));
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key,
             CacheItem::new(response, 1, AppClock::elapsed_millis()),
             0,
@@ -3833,13 +3745,13 @@ mod tests {
         );
 
         let expired_lookup = cache
-            .try_cache_hit(&mut expired, cache.cache_store.get().unwrap())
+            .try_cache_hit(&mut expired, &cache.store)
             .expect("cache lookup should exist");
         assert_eq!(expired_lookup.hit_kind, None);
 
-        assert_eq!(cache.metrics.lookup_total.load(AtomicOrdering::Relaxed), 2);
-        assert_eq!(cache.metrics.miss_total.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(cache.metrics.expired_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().lookup_total.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(cache.store.metrics().miss_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.metrics().expired_total.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -3858,13 +3770,12 @@ mod tests {
         cache.execute_with_next(&mut context, None).await.unwrap();
 
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_no_ttl_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3889,15 +3800,14 @@ mod tests {
 
         cache.execute_with_next(&mut context, None).await.unwrap();
 
-        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
+        assert_eq!(cache.store.cache_map().len(), 0);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_low_positive_ttl_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3926,17 +3836,14 @@ mod tests {
         let key = Cache::build_cache_key(&mut context, false).unwrap();
         let disposition = response_disposition_for_cache(&response, &key);
         cache.update_cache_entry(
-            cache.cache_store.get().unwrap(),
+            &cache.store,
             key.clone(),
             response,
             120,
             disposition,
         );
 
-        let stored = cache
-            .cache_map
-            .get()
-            .unwrap()
+        let stored = cache.store.cache_map()
             .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
             .expect("entry should be present");
         assert_eq!(
@@ -3990,7 +3897,7 @@ mod tests {
         ));
 
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
@@ -4008,8 +3915,7 @@ mod tests {
             .unwrap();
 
         wait_until("lazy refresh should complete", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_success_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
@@ -4018,24 +3924,19 @@ mod tests {
 
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_started_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_success_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 1);
-        let stored = cache
-            .cache_map
-            .get()
-            .unwrap()
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
+        let stored = cache.store.cache_map()
             .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
             .expect("entry should exist");
         assert!(
@@ -4063,7 +3964,7 @@ mod tests {
         let key = Cache::build_cache_key(&mut context, false).unwrap();
         let old_response = cacheable_response_for_domain("example.com.", 120);
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(old_response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
@@ -4076,26 +3977,21 @@ mod tests {
             .await
             .unwrap();
         wait_until("lazy refresh CNAME-only skip should be recorded", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_failed_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
         })
         .await;
 
-        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 0);
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
-        let stored = cache
-            .cache_map
-            .get()
-            .unwrap()
+        let stored = cache.store.cache_map()
             .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
             .expect("old stale entry should remain present");
         assert!(
@@ -4135,7 +4031,7 @@ mod tests {
         ));
 
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key,
             CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
@@ -4148,8 +4044,7 @@ mod tests {
             .await
             .unwrap();
         wait_until("lazy refresh failure should be recorded", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_failed_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
@@ -4157,15 +4052,13 @@ mod tests {
         .await;
 
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_started_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_failed_total
                 .load(AtomicOrdering::Relaxed),
             1
@@ -4202,7 +4095,7 @@ mod tests {
         ));
 
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(response, 120, now.saturating_sub(1_000)),
             now.saturating_sub(121_000),
@@ -4215,8 +4108,7 @@ mod tests {
             .await
             .unwrap();
         wait_until("lazy refresh low ttl skip should be recorded", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_low_positive_ttl_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
@@ -4224,17 +4116,13 @@ mod tests {
         .await;
 
         assert_eq!(
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_failed_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
         assert!(
-            cache
-                .cache_map
-                .get()
-                .unwrap()
+            cache.store.cache_map()
                 .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
                 .is_none(),
             "low TTL refresh should evict the old stale cache entry"
@@ -4275,7 +4163,7 @@ mod tests {
         ));
 
         let now = AppClock::elapsed_millis();
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(
                 stale_response,
@@ -4292,8 +4180,7 @@ mod tests {
             .await
             .unwrap();
         wait_until("lazy refresh should be waiting", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .lazy_refresh_started_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
@@ -4312,7 +4199,7 @@ mod tests {
             90,
             RData::A(crate::proto::rdata::A(Ipv4Addr::new(2, 2, 2, 2))),
         ));
-        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+        cache.store.cache_map().insert_or_update_with_meta(
             key.clone(),
             CacheItem::new(
                 newer_response,
@@ -4326,18 +4213,14 @@ mod tests {
 
         release.notify_one();
         wait_until("lazy refresh low ttl skip should be recorded", || {
-            cache
-                .metrics
+            cache.store.metrics()
                 .skip_low_positive_ttl_total
                 .load(AtomicOrdering::Relaxed)
                 == 1
         })
         .await;
 
-        let stored = cache
-            .cache_map
-            .get()
-            .unwrap()
+        let stored = cache.store.cache_map()
             .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
             .expect("newer cache entry should remain present");
         assert!(

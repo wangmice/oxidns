@@ -24,9 +24,19 @@ pub(super) struct CacheMutationState {
     pub(super) updated_keys: Arc<AtomicU64>,
     pub(super) dirty_since_ms: Arc<AtomicU64>,
     pub(super) dirty_generation: Arc<AtomicU64>,
+    pub(super) persisted_generation: Arc<AtomicU64>,
 }
 
 impl CacheMutationState {
+    pub(super) fn new() -> Self {
+        Self {
+            updated_keys: Arc::new(AtomicU64::new(0)),
+            dirty_since_ms: Arc::new(AtomicU64::new(0)),
+            dirty_generation: Arc::new(AtomicU64::new(0)),
+            persisted_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     #[inline]
     pub(super) fn mark_dirty(&self, changes: u64) {
         mark_dirty(
@@ -58,16 +68,14 @@ impl DnsCacheStore {
         cache_map: CacheMap,
         cache_size: usize,
         ecs_prefix_hints: Arc<EcsPrefixHints>,
-        pressure_requested: Arc<AtomicBool>,
-        mutations: CacheMutationState,
         metrics: Arc<CacheMetrics>,
     ) -> Self {
         Self {
             cache_map,
             cache_size,
             ecs_prefix_hints,
-            pressure_requested,
-            mutations,
+            pressure_requested: Arc::new(AtomicBool::new(false)),
+            mutations: CacheMutationState::new(),
             metrics,
         }
     }
@@ -85,6 +93,16 @@ impl DnsCacheStore {
     #[inline]
     pub(super) fn ecs_prefix_hints(&self) -> &Arc<EcsPrefixHints> {
         &self.ecs_prefix_hints
+    }
+
+    #[inline]
+    pub(super) fn mutations(&self) -> &CacheMutationState {
+        &self.mutations
+    }
+
+    #[inline]
+    pub(super) fn metrics(&self) -> &Arc<CacheMetrics> {
+        &self.metrics
     }
 
     #[inline]
@@ -270,21 +288,9 @@ mod tests {
     fn test_store(cache_size: usize) -> (DnsCacheStore, CacheMutationState, Arc<CacheMetrics>) {
         let cache_map = CacheMap::with_capacity(cache_size.max(1));
         let hints = Arc::new(EcsPrefixHints::new());
-        let metrics = Arc::new(CacheMetrics::new("store-test".to_string(), hints.clone()));
-        metrics.set_cache_map(cache_map.clone());
-        let mutations = CacheMutationState {
-            updated_keys: Arc::new(AtomicU64::new(0)),
-            dirty_since_ms: Arc::new(AtomicU64::new(0)),
-            dirty_generation: Arc::new(AtomicU64::new(0)),
-        };
-        let store = DnsCacheStore::new(
-            cache_map,
-            cache_size,
-            hints,
-            Arc::new(AtomicBool::new(false)),
-            mutations.clone(),
-            metrics.clone(),
-        );
+        let metrics = Arc::new(CacheMetrics::new("store-test".to_string()));
+        let store = DnsCacheStore::new(cache_map, cache_size, hints, metrics.clone());
+        let mutations = store.mutations().clone();
         (store, mutations, metrics)
     }
 
