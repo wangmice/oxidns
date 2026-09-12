@@ -85,6 +85,7 @@ const EVICT_HIGH_WATERMARK_PERCENT: usize = 95;
 const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
 const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
+const DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS: u64 = 30;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
 // Soft dirty-age target for low-churn caches. The effective target is never
 // allowed to undercut the user-configured dump interval.
@@ -108,6 +109,11 @@ pub struct CacheConfig {
     ///
     /// Default: 64.
     lazy_refresh_concurrency: Option<usize>,
+
+    /// Minimum retry delay (seconds) after a lazy refresh failure.
+    ///
+    /// Default: 30.
+    lazy_refresh_failure_cooldown: Option<u64>,
 
     /// Optional path to persist cache contents.
     dump_file: Option<String>,
@@ -369,7 +375,7 @@ impl Drop for LazyRefreshGuard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CacheItem {
     /// Cached DNS response message.
     resp: Message,
@@ -390,6 +396,27 @@ pub struct CacheItem {
     /// Whether cache admission or persistence loading has already validated
     /// this response against its query key.
     validation: CacheEntryValidation,
+
+    /// Process-local deadline before another failed lazy refresh may be retried.
+    ///
+    /// This is intentionally not persisted because `AppClock` uses a
+    /// process-local monotonic epoch.
+    lazy_refresh_retry_after_ms: AtomicU64,
+}
+
+impl Clone for CacheItem {
+    fn clone(&self) -> Self {
+        Self {
+            resp: self.resp.clone(),
+            ttl: self.ttl,
+            fresh_until_ms: self.fresh_until_ms,
+            cache_age_offset_ms: self.cache_age_offset_ms,
+            validation: self.validation,
+            lazy_refresh_retry_after_ms: AtomicU64::new(
+                self.lazy_refresh_retry_after_ms.load(Ordering::Acquire),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +435,7 @@ impl CacheItem {
             fresh_until_ms,
             cache_age_offset_ms: 0,
             validation: CacheEntryValidation::Unknown,
+            lazy_refresh_retry_after_ms: AtomicU64::new(0),
         }
     }
 
@@ -427,7 +455,21 @@ impl CacheItem {
             fresh_until_ms,
             cache_age_offset_ms,
             validation: CacheEntryValidation::Validated,
+            lazy_refresh_retry_after_ms: AtomicU64::new(0),
         }
+    }
+
+    #[inline]
+    fn lazy_refresh_retry_allowed(&self, now_ms: u64) -> bool {
+        now_ms >= self.lazy_refresh_retry_after_ms.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn defer_lazy_refresh(&self, now_ms: u64, cooldown_ms: u64) {
+        self.lazy_refresh_retry_after_ms.store(
+            now_ms.saturating_add(cooldown_ms),
+            Ordering::Release,
+        );
     }
 
     #[inline]
@@ -477,6 +519,7 @@ struct CacheMetrics {
     lazy_refresh_success_total: AtomicU64,
     lazy_refresh_failed_total: AtomicU64,
     lazy_refresh_skipped_busy_total: AtomicU64,
+    lazy_refresh_skipped_cooldown_total: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -502,6 +545,7 @@ impl CacheMetrics {
             lazy_refresh_success_total: AtomicU64::new(0),
             lazy_refresh_failed_total: AtomicU64::new(0),
             lazy_refresh_skipped_busy_total: AtomicU64::new(0),
+            lazy_refresh_skipped_cooldown_total: AtomicU64::new(0),
         }
     }
 
@@ -719,6 +763,18 @@ impl MetricSource for CacheMetricSource {
             &lazy_skipped_busy,
             metrics
                 .lazy_refresh_skipped_busy_total
+                .load(Ordering::Relaxed),
+        ));
+        let lazy_skipped_cooldown = [
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
+            MetricLabel::new("result", "skipped_cooldown"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_lazy_refresh_total",
+            "Total lazy refresh attempts by result.",
+            &lazy_skipped_cooldown,
+            metrics
+                .lazy_refresh_skipped_cooldown_total
                 .load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::gauge(
@@ -1245,6 +1301,14 @@ impl Cache {
             return;
         };
 
+        let now = AppClock::elapsed_millis();
+        if !refresh_entry.value().lazy_refresh_retry_allowed(now) {
+            self.metrics()
+                .lazy_refresh_skipped_cooldown_total
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
             return;
         }
@@ -1278,6 +1342,11 @@ impl Cache {
         let negative_ttl_without_soa = self.negative_ttl_without_soa;
         let metrics = self.store.metrics().clone();
         let shutdown = self.lazy_refresh_shutdown.clone();
+        let failure_cooldown_ms = self
+            .config
+            .lazy_refresh_failure_cooldown
+            .unwrap_or(DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS)
+            .saturating_mul(1000);
 
         let refresh_task = async move {
             let _refresh_guard = refresh_guard;
@@ -1306,6 +1375,10 @@ impl Cache {
                         let Some(response_key) =
                             cache_key_for_response_ecs_scope(&request_key, &response)
                         else {
+                            refresh_entry.value().defer_lazy_refresh(
+                                AppClock::elapsed_millis(),
+                                failure_cooldown_ms,
+                            );
                             metrics
                                 .lazy_refresh_failed_total
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1364,12 +1437,17 @@ impl Cache {
                         }
                     } else {
                         if let CacheTtlDecision::Skip(reason) = ttl {
-                            if reason == CacheSkipReason::LowPositiveTtl
-                                && store.remove_handle(&cache_key, &refresh_entry)
-                            {
-                                debug!(
-                                    "evicted stale lazy cache entry after low positive TTL refresh: domain={}, type={:?}, class={:?}",
-                                    cache_key.domain, cache_key.record_type, cache_key.dns_class
+                            if reason == CacheSkipReason::LowPositiveTtl {
+                                if store.remove_handle(&cache_key, &refresh_entry) {
+                                    debug!(
+                                        "evicted stale lazy cache entry after low positive TTL refresh: domain={}, type={:?}, class={:?}",
+                                        cache_key.domain, cache_key.record_type, cache_key.dns_class
+                                    );
+                                }
+                            } else {
+                                refresh_entry.value().defer_lazy_refresh(
+                                    AppClock::elapsed_millis(),
+                                    failure_cooldown_ms,
                                 );
                             }
                             metrics.record_skip(reason);
@@ -1380,11 +1458,19 @@ impl Cache {
                     }
                 }
                 Ok(Ok(_)) => {
+                    refresh_entry.value().defer_lazy_refresh(
+                        AppClock::elapsed_millis(),
+                        failure_cooldown_ms,
+                    );
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Err(err)) => {
+                    refresh_entry.value().defer_lazy_refresh(
+                        AppClock::elapsed_millis(),
+                        failure_cooldown_ms,
+                    );
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -1394,6 +1480,10 @@ impl Cache {
                     );
                 }
                 Err(_) => {
+                    refresh_entry.value().defer_lazy_refresh(
+                        AppClock::elapsed_millis(),
+                        failure_cooldown_ms,
+                    );
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -1872,6 +1962,7 @@ fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
         size: None,
         lazy_cache_ttl: None,
         lazy_refresh_concurrency: None,
+        lazy_refresh_failure_cooldown: None,
         dump_file: None,
         dump_interval: None,
         short_circuit: None,
@@ -1913,6 +2004,14 @@ fn validate_cache_config(config: &CacheConfig) -> Result<()> {
     {
         return Err(DnsError::plugin(
             "cache lazy_refresh_concurrency must be greater than 0",
+        ));
+    }
+
+    if let Some(cooldown) = config.lazy_refresh_failure_cooldown
+        && cooldown == 0
+    {
+        return Err(DnsError::plugin(
+            "cache lazy_refresh_failure_cooldown must be greater than 0",
         ));
     }
 
@@ -2013,6 +2112,7 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
         size: None,
         lazy_cache_ttl: None,
         lazy_refresh_concurrency: None,
+        lazy_refresh_failure_cooldown: None,
         dump_file: None,
         dump_interval: None,
         short_circuit: None,
@@ -2121,6 +2221,7 @@ mod tests {
             size: Some(128),
             lazy_cache_ttl: None,
             lazy_refresh_concurrency: None,
+            lazy_refresh_failure_cooldown: None,
             dump_file: None,
             dump_interval: None,
             short_circuit: Some(false),
@@ -4091,6 +4192,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lazy_refresh_failure_cooldown_suppresses_immediate_retry() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.lazy_refresh_failure_cooldown = Some(30);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(FailingRefreshExecutor));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let mut response = Message::new();
+        response.set_rcode(Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
+        ));
+
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key.clone(),
+            CacheItem::new(response, 120, now.saturating_sub(1_000)),
+            now.saturating_sub(121_000),
+            now.saturating_add(60_000),
+            now.saturating_sub(100),
+        );
+
+        cache
+            .execute_with_next(&mut context, Some(next.clone()))
+            .await
+            .expect("stale hit should be served while refresh fails");
+        wait_until("first lazy refresh failure should be recorded", || {
+            cache.store.metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+        wait_until("failed refresh should leave the per-key inflight set", || {
+            cache.lazy_refresh_inflight.is_empty()
+        })
+        .await;
+
+        let stored = cache.store.cache_map()
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
+            .expect("stale entry should remain after refresh failure");
+        assert!(!stored
+            .value()
+            .lazy_refresh_retry_allowed(AppClock::elapsed_millis()));
+
+        context.clear_response();
+        cache
+            .execute_with_next(&mut context, Some(next.clone()))
+            .await
+            .expect("cooldown hit should still serve stale response");
+
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_started_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_skipped_cooldown_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+
+        stored.value().defer_lazy_refresh(0, 0);
+        context.clear_response();
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("refresh should retry after the cooldown expires");
+        wait_until("second lazy refresh failure should be recorded", || {
+            cache.store.metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed)
+                == 2
+        })
+        .await;
+
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_started_total
+                .load(AtomicOrdering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn lazy_refresh_skips_low_positive_ttl_response() {
         AppClock::start();
         let mut cfg = default_test_config();
@@ -4282,6 +4485,7 @@ mod tests {
             size: Some(128),
             lazy_cache_ttl: None,
             lazy_refresh_concurrency: None,
+            lazy_refresh_failure_cooldown: None,
             dump_file: Some("cache.dump".to_string()),
             dump_interval: Some(0),
             short_circuit: Some(false),
@@ -4300,6 +4504,14 @@ mod tests {
     fn validate_config_rejects_zero_lazy_refresh_concurrency() {
         let mut cfg = default_test_config();
         cfg.lazy_refresh_concurrency = Some(0);
+
+        assert!(validate_cache_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_lazy_refresh_failure_cooldown() {
+        let mut cfg = default_test_config();
+        cfg.lazy_refresh_failure_cooldown = Some(0);
 
         assert!(validate_cache_config(&cfg).is_err());
     }
