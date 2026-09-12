@@ -31,7 +31,8 @@ use crate::proto::{DNSClass, Message, RecordType};
 // Little-endian bytes spell "DSCACHE1". The magic lets us distinguish the
 // versioned format from the old unversioned Vec<PersistedCacheEntry> format.
 const CACHE_DUMP_MAGIC: u64 = 0x3145_4843_4143_5344;
-const CACHE_DUMP_VERSION: u32 = 1;
+const LEGACY_CACHE_DUMP_VERSION: u32 = 1;
+const CACHE_DUMP_VERSION: u32 = 2;
 /// Maximum cache dump size accepted/written by file persistence.
 ///
 /// The API has its own smaller request-body limit. Disk persistence is allowed
@@ -238,17 +239,12 @@ fn prepare_persisted_entry(
         None => (None, None, None, None),
     };
 
-    // Derive age from the freshness deadline rather than cache_time_ms.
-    // After a process restart cache_time_ms may saturate at zero because
-    // AppClock's monotonic epoch restarted; fresh_until_ms still carries
-    // the correct remaining freshness and therefore survives repeated
-    // dump -> restart -> dump cycles without rejuvenating the TTL.
-    let ttl_ms = u64::from(value.ttl) * 1000;
-    let fresh_remaining_ms = value
-        .fresh_until_ms
-        .saturating_sub(now_elapsed_ms)
-        .min(ttl_ms);
-    let cache_age_ms = ttl_ms.saturating_sub(fresh_remaining_ms);
+    // Persist the true accumulated cache age, not freshness-derived age.
+    // Once an entry becomes stale, fresh_until_ms no longer advances, so using
+    // it to reconstruct age would pin every stale entry at exactly its fresh
+    // TTL and could incorrectly revive it under a shorter lazy-retention
+    // policy.
+    let cache_age_ms = value.total_cache_age_ms(item.cache_time_ms, now_elapsed_ms);
 
     Some(PersistedCacheEntry {
         domain: key.domain.to_string(),
@@ -391,10 +387,10 @@ fn parse_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(
     if dump.magic != CACHE_DUMP_MAGIC {
         return Err(invalid_dump("bad magic or legacy unversioned format"));
     }
-    if dump.version != CACHE_DUMP_VERSION {
+    if dump.version != LEGACY_CACHE_DUMP_VERSION && dump.version != CACHE_DUMP_VERSION {
         return Err(invalid_dump(format!(
-            "unsupported version {}, expected {}",
-            dump.version, CACHE_DUMP_VERSION
+            "unsupported version {}, expected {} or {}",
+            dump.version, LEGACY_CACHE_DUMP_VERSION, CACHE_DUMP_VERSION
         )));
     }
 
@@ -468,6 +464,7 @@ fn prepare_persisted_entries(
     // Wall-clock time is used only to account for process downtime. Runtime
     // expiry still uses AppClock's monotonic elapsed time.
     let downtime_ms = now_unix_ms.saturating_sub(dump.dumped_at_unix_ms);
+    let dump_version = dump.version;
     let mut prepared = Vec::with_capacity(dump.entries.len());
 
     for entry in dump.entries {
@@ -505,6 +502,17 @@ fn prepare_persisted_entries(
             )));
         }
 
+        // Version 1 derived cache_age_ms from the freshness deadline. For an
+        // entry that was already stale when dumped, that value is pinned at
+        // ttl_ms and its real age is unrecoverable. Keep compatible v1 fresh
+        // entries, whose age is exact, but conservatively drop ambiguous stale
+        // entries instead of potentially reviving them under a new lazy TTL.
+        if dump_version == LEGACY_CACHE_DUMP_VERSION
+            && entry.cache_age_ms >= u64::from(entry.ttl).saturating_mul(1000)
+        {
+            continue;
+        }
+
         let (ttl, fresh_remaining_ms, retention_remaining_ms) = clamp_persisted_cache_ttl(
             &resp,
             &key,
@@ -519,17 +527,24 @@ fn prepare_persisted_entries(
         }
 
         let expire_at_ms = now_elapsed_ms.saturating_add(retention_remaining_ms);
-        let cache_time_ms = now_elapsed_ms.saturating_sub(effective_cache_age_ms);
+        let represented_cache_age_ms = effective_cache_age_ms.min(now_elapsed_ms);
+        let cache_time_ms = now_elapsed_ms.saturating_sub(represented_cache_age_ms);
+        let cache_age_offset_ms = effective_cache_age_ms.saturating_sub(represented_cache_age_ms);
         let last_access_ms = now_elapsed_ms.saturating_sub(effective_last_access_age_ms);
 
-        // `cache_time_ms` cannot represent time before the current process
-        // started, so compute freshness from the persisted age directly rather
-        // than deriving it from the saturated cache_time_ms value.
+        // Freshness and stale retention are both calculated from the true
+        // persisted age above. Preserve the part that the current process's
+        // monotonic epoch cannot encode so later dumps continue that same age.
         let fresh_until_ms = now_elapsed_ms.saturating_add(fresh_remaining_ms);
 
         prepared.push(PreparedCacheEntry {
             key,
-            value: Arc::new(CacheItem::new_validated(resp, ttl, fresh_until_ms)),
+            value: Arc::new(CacheItem::new_validated_with_age_offset(
+                resp,
+                ttl,
+                fresh_until_ms,
+                cache_age_offset_ms,
+            )),
             cache_time_ms,
             expire_at_ms,
             last_access_ms,
@@ -749,11 +764,15 @@ mod tests {
         }
     }
 
-    fn serialize_dump_at(entries: Vec<PersistedCacheEntry>, dumped_at_unix_ms: u64) -> Vec<u8> {
+    fn serialize_dump_at_version(
+        version: u32,
+        entries: Vec<PersistedCacheEntry>,
+        dumped_at_unix_ms: u64,
+    ) -> Vec<u8> {
         wincode::config::serialize(
             &PersistedCacheDump {
                 magic: CACHE_DUMP_MAGIC,
-                version: CACHE_DUMP_VERSION,
+                version,
                 dumped_at_unix_ms,
                 entries,
             },
@@ -762,12 +781,16 @@ mod tests {
         .expect("dump should serialize")
     }
 
+    fn serialize_dump_at(entries: Vec<PersistedCacheEntry>, dumped_at_unix_ms: u64) -> Vec<u8> {
+        serialize_dump_at_version(CACHE_DUMP_VERSION, entries, dumped_at_unix_ms)
+    }
+
     fn serialize_current_dump(entries: Vec<PersistedCacheEntry>) -> Vec<u8> {
         serialize_dump_at(entries, AppClock::now_timestamp())
     }
 
     #[test]
-    fn test_explicit_wincode_config_preserves_v1_wire_format() {
+    fn test_explicit_wincode_config_preserves_current_wire_format() {
         let dump = PersistedCacheDump {
             magic: CACHE_DUMP_MAGIC,
             version: CACHE_DUMP_VERSION,
@@ -998,6 +1021,56 @@ mod tests {
         )
         .expect("dump should serialize");
         assert!(parse_persisted_dump(&data).is_err());
+    }
+
+    #[test]
+    fn test_load_cache_accepts_v1_fresh_entry_with_exact_age() {
+        AppClock::start();
+        let mut entry = valid_address_entry();
+        entry.ttl = 60;
+        entry.cache_age_ms = 30_000;
+        entry.remaining_ttl_ms = 30_000;
+        entry.resp_bytes = positive_response_bytes(60);
+        let data = serialize_dump_at_version(
+            LEGACY_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
+
+        let cache_map = CacheMap::with_capacity(1);
+        assert_eq!(
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false,)
+                .expect("v1 fresh restore should succeed"),
+            1
+        );
+        assert_eq!(cache_map.len(), 1);
+    }
+
+    #[test]
+    fn test_load_cache_drops_v1_stale_entry_with_ambiguous_age() {
+        AppClock::start();
+        let mut entry = valid_address_entry();
+        entry.ttl = 60;
+        entry.cache_age_ms = 60_000;
+        entry.remaining_ttl_ms = 3_540_000;
+        entry.resp_bytes = positive_response_bytes(60);
+        let data = serialize_dump_at_version(
+            LEGACY_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
+
+        let cache_map = CacheMap::with_capacity(1);
+        let policy = CacheLoadPolicy {
+            lazy_cache_ttl: Some(3_600),
+            ..CacheLoadPolicy::default()
+        };
+        assert_eq!(
+            load_cache_from_bytes(&cache_map, &data, false, policy, false)
+                .expect("v1 stale restore should be skipped safely"),
+            0
+        );
+        assert!(cache_map.is_empty());
     }
 
     #[test]
@@ -1479,6 +1552,54 @@ mod tests {
         assert!(stored.1.value.fresh_until_ms <= load_finished_at);
         assert!(stored.1.expire_at_ms > stored.1.value.fresh_until_ms);
         assert!(stored.1.expire_at_ms >= load_started_at + 3_400_000);
+    }
+
+    #[test]
+    fn test_redump_preserves_true_stale_age_and_shorter_lazy_ttl_drops_entry() {
+        AppClock::start();
+        let mut entry = valid_address_entry();
+        entry.resp_bytes = positive_response_bytes(60);
+        entry.ttl = 60;
+        entry.cache_age_ms = 600_000;
+        entry.remaining_ttl_ms = 3_000_000;
+        let data = serialize_current_dump(vec![entry]);
+
+        let first_cache = CacheMap::with_capacity(1);
+        let old_policy = CacheLoadPolicy {
+            lazy_cache_ttl: Some(3_600),
+            ..CacheLoadPolicy::default()
+        };
+        assert_eq!(
+            load_cache_from_bytes(&first_cache, &data, false, old_policy, false)
+                .expect("stale restore should succeed under the old lazy window"),
+            1
+        );
+
+        let redump = dump_cache_to_bytes(&first_cache).expect("redump should serialize");
+        let parsed = parse_persisted_dump(&redump).expect("redump should parse");
+        assert_eq!(parsed.version, CACHE_DUMP_VERSION);
+        let redumped = parsed
+            .entries
+            .into_iter()
+            .next()
+            .expect("entry should be dumped");
+        assert!(
+            redumped.cache_age_ms >= 600_000,
+            "stale cache age was rejuvenated to {}ms",
+            redumped.cache_age_ms
+        );
+
+        let shortened_cache = CacheMap::with_capacity(1);
+        let shortened_policy = CacheLoadPolicy {
+            lazy_cache_ttl: Some(300),
+            ..CacheLoadPolicy::default()
+        };
+        assert_eq!(
+            load_cache_from_bytes(&shortened_cache, &redump, false, shortened_policy, false,)
+                .expect("restore with shorter lazy TTL should succeed"),
+            0
+        );
+        assert!(shortened_cache.is_empty());
     }
 
     #[test]

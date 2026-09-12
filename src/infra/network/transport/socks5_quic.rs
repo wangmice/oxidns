@@ -31,6 +31,8 @@ pub(crate) struct Socks5QuicSocket {
     association: Socks5UdpAssociation,
     target: TargetAddr,
     quic_peer_addr: SocketAddr,
+    send_header: [u8; SOCKS5_UDP_HEADER_MAX_SIZE],
+    send_header_len: usize,
 }
 
 thread_local! {
@@ -57,10 +59,14 @@ impl Socks5QuicSocket {
         // same connected UDP socket avoids Quinn rejecting or
         // IPv4-mapping a cross-family upstream address.
         let quic_peer_addr = association.get_ref().peer_addr()?;
+        let mut send_header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
+        let send_header_len = write_socks5_udp_header(&mut send_header, &target_addr)?;
         let socket = Arc::new(Self {
             association,
             target: target_addr,
             quic_peer_addr,
+            send_header,
+            send_header_len,
         });
         Ok((socket, quic_peer_addr))
     }
@@ -91,21 +97,11 @@ impl AsyncUdpSocket for Socks5QuicSocket {
         }
         self.association.check_control_open()?;
 
-        let mut header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
-        let header_len = write_socks5_udp_header(&mut header, &self.target)?;
-
-        if header_len + transmit.contents.len() <= SMALL_SEND_BUFFER_SIZE {
-            let mut buf = [0u8; SMALL_SEND_BUFFER_SIZE];
-            buf[..header_len].copy_from_slice(&header[..header_len]);
-            buf[header_len..header_len + transmit.contents.len()]
-                .copy_from_slice(transmit.contents);
-            send_complete(self, &buf[..header_len + transmit.contents.len()])
-        } else {
-            let mut buf = Vec::with_capacity(header_len + transmit.contents.len());
-            buf.extend_from_slice(&header[..header_len]);
-            buf.extend_from_slice(transmit.contents);
-            send_complete(self, &buf)
-        }
+        send_socks5_udp(
+            self.association.get_ref(),
+            &self.send_header[..self.send_header_len],
+            transmit.contents,
+        )
     }
 
     fn poll_recv(
@@ -221,11 +217,46 @@ impl UdpPoller for Socks5QuicPoller {
     }
 }
 
+#[cfg(any(target_os = "redox", target_os = "wasi", target_os = "horizon"))]
 const SMALL_SEND_BUFFER_SIZE: usize = 2_048;
 
-fn send_complete(socket: &Socks5QuicSocket, buf: &[u8]) -> io::Result<()> {
-    let sent = socket.association.get_ref().try_send(buf)?;
-    if sent != buf.len() {
+fn send_socks5_udp(
+    socket: &tokio::net::UdpSocket,
+    header: &[u8],
+    payload: &[u8],
+) -> io::Result<()> {
+    let expected_len = header.len().checked_add(payload.len()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SOCKS5 UDP packet length overflow",
+        )
+    })?;
+
+    #[cfg(not(any(target_os = "redox", target_os = "wasi", target_os = "horizon")))]
+    let sent = {
+        let bufs = [io::IoSlice::new(header), io::IoSlice::new(payload)];
+        // The association socket is connected to the SOCKS5 UDP relay. Both
+        // slices therefore form one UDP datagram without copying the QUIC
+        // payload into a temporary contiguous buffer.
+        socket.try_io(tokio::io::Interest::WRITABLE, || {
+            socket2::SockRef::from(socket).send_vectored(&bufs)
+        })?
+    };
+
+    #[cfg(any(target_os = "redox", target_os = "wasi", target_os = "horizon"))]
+    let sent = if expected_len <= SMALL_SEND_BUFFER_SIZE {
+        let mut packet = [0u8; SMALL_SEND_BUFFER_SIZE];
+        packet[..header.len()].copy_from_slice(header);
+        packet[header.len()..expected_len].copy_from_slice(payload);
+        socket.try_send(&packet[..expected_len])?
+    } else {
+        let mut packet = Vec::with_capacity(expected_len);
+        packet.extend_from_slice(header);
+        packet.extend_from_slice(payload);
+        socket.try_send(&packet)?
+    };
+
+    if sent != expected_len {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,
             "partial SOCKS5 QUIC UDP send",
@@ -264,6 +295,46 @@ mod tests {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn send_socks5_udp_keeps_header_and_payload_in_one_datagram() {
+        timeout(Duration::from_secs(5), async {
+            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sender.connect(relay.local_addr().unwrap()).await.unwrap();
+
+            let targets = [
+                TargetAddr::Ip("198.51.100.53:853".parse().unwrap()),
+                TargetAddr::Ip("[2001:db8::53]:853".parse().unwrap()),
+                TargetAddr::Domain("x".repeat(255), 853),
+            ];
+            let mut packet = vec![0u8; MAX_UDP_PACKET_SIZE];
+            for target in targets {
+                let mut header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
+                let header_len = write_socks5_udp_header(&mut header, &target).unwrap();
+                let header = &header[..header_len];
+                for payload_len in [0, 1_200, 2_048, 3_000, 16_384] {
+                    let payload: Vec<u8> =
+                        (0..payload_len).map(|index| (index % 251) as u8).collect();
+                    loop {
+                        sender.writable().await.unwrap();
+                        match send_socks5_udp(&sender, header, &payload) {
+                            Ok(()) => break,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(error) => panic!("SOCKS5 UDP send failed: {error}"),
+                        }
+                    }
+
+                    let (len, _) = relay.recv_from(&mut packet).await.unwrap();
+                    assert_eq!(len, header_len + payload.len());
+                    assert_eq!(&packet[..header_len], header);
+                    assert_eq!(&packet[header_len..len], payload.as_slice());
+                }
+            }
+        })
+        .await
+        .expect("SOCKS5 UDP datagram sends should complete");
     }
 
     #[test]

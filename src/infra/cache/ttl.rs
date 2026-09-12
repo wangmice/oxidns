@@ -11,13 +11,13 @@
 //! It is designed for plugin-level caches where each plugin keeps its own key
 //! and value types but shares the same cache behavior.
 
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ahash::RandomState as AHashBuilder;
 use arc_swap::ArcSwap;
-use dashmap::{DashMap, Entry};
+use dashmap::{DashMap, Entry, SharedValue};
 use rand::RngExt;
 
 /// Snapshot of one cached entry with metadata.
@@ -53,6 +53,18 @@ pub enum TtlCacheInsertIfNotNewerResult {
     NewerPresent,
     /// The key is vacant but the cache has no free capacity for a new entry.
     AtCapacity,
+}
+
+/// Outcome of atomically moving a conditionally matched entry to a different
+/// key.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TtlCacheConditionalMoveResult {
+    /// The source still matched, the target was vacant, and the move committed.
+    Moved,
+    /// The source entry was missing or no longer matched the supplied identity.
+    SourceChanged,
+    /// The target key was already occupied, so neither entry was modified.
+    TargetPresent,
 }
 
 /// Capacity policy for one background cache-pruning pass.
@@ -455,6 +467,162 @@ where
                 guard.success = true;
                 TtlCacheInsertIfNotNewerResult::Inserted
             }
+        }
+    }
+
+    /// Move one existing entry to a different key only when the source still
+    /// matches `predicate` and the target key is vacant.
+    ///
+    /// The operation is bound to one cache state loaded at entry, so a
+    /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
+    /// a refresh that started on an old generation write into the
+    /// replacement generation. Source and target shards are write-locked in
+    /// stable shard order, making the identity check, target-vacancy check,
+    /// removal, and insertion one conditional commit with respect to both
+    /// keys.
+    ///
+    /// Moving an existing entry preserves cache cardinality, so capacity
+    /// accounting does not need a release/reacquire cycle and concurrent
+    /// bounded insertions cannot steal the source entry's slot mid-move.
+    ///
+    /// `predicate` runs while the affected shard write locks are held and must
+    /// not call back into ordinary map operations on this cache.
+    pub(crate) fn conditional_move_if(
+        &self,
+        source_key: &K,
+        target_key: K,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+        predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool,
+    ) -> TtlCacheConditionalMoveResult {
+        let state = self.state.load();
+
+        // Compute the exact 64-bit hashes used by DashMap's underlying
+        // RawTable. `hash_usize()` would lose bits on 32-bit targets.
+        let hash_key = |key: &K| {
+            let mut hasher = state.map.hasher().build_hasher();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+        let source_hash = hash_key(source_key);
+        let target_hash = hash_key(&target_key);
+        let source_shard_index = state.map.determine_shard(source_hash as usize);
+        let target_shard_index = state.map.determine_shard(target_hash as usize);
+        let shards = state.map.shards();
+
+        macro_rules! commit_same_shard {
+            ($shard:expr) => {{
+                let shard = &mut *$shard;
+
+                if shard
+                    .find(target_hash, |(key, _)| key == &target_key)
+                    .is_some()
+                {
+                    TtlCacheConditionalMoveResult::TargetPresent
+                } else {
+                    let Some(source_bucket) = shard.find(source_hash, |(key, _)| key == source_key)
+                    else {
+                        return TtlCacheConditionalMoveResult::SourceChanged;
+                    };
+
+                    let source_matches = unsafe {
+                        let (_, stored) = source_bucket.as_ref();
+                        predicate(stored.get())
+                    };
+                    if !source_matches {
+                        TtlCacheConditionalMoveResult::SourceChanged
+                    } else {
+                        // SAFETY: `source_bucket` came from this write-locked
+                        // RawTable and no mutation has happened since `find`.
+                        let ((_removed_key, removed_value), _) =
+                            unsafe { shard.remove(source_bucket) };
+                        drop(removed_value);
+
+                        shard.insert(
+                            target_hash,
+                            (
+                                target_key,
+                                SharedValue::new(TtlCacheEntry {
+                                    value,
+                                    cache_time_ms,
+                                    expire_at_ms,
+                                    last_access_ms,
+                                    generation: state.next_generation(),
+                                }),
+                            ),
+                            |(key, _)| hash_key(key),
+                        );
+                        TtlCacheConditionalMoveResult::Moved
+                    }
+                }
+            }};
+        }
+
+        macro_rules! commit_distinct_shards {
+            ($source_shard:expr, $target_shard:expr) => {{
+                let source_shard = &mut *$source_shard;
+                let target_shard = &mut *$target_shard;
+
+                if target_shard
+                    .find(target_hash, |(key, _)| key == &target_key)
+                    .is_some()
+                {
+                    TtlCacheConditionalMoveResult::TargetPresent
+                } else {
+                    let Some(source_bucket) =
+                        source_shard.find(source_hash, |(key, _)| key == source_key)
+                    else {
+                        return TtlCacheConditionalMoveResult::SourceChanged;
+                    };
+
+                    let source_matches = unsafe {
+                        let (_, stored) = source_bucket.as_ref();
+                        predicate(stored.get())
+                    };
+                    if !source_matches {
+                        TtlCacheConditionalMoveResult::SourceChanged
+                    } else {
+                        // SAFETY: `source_bucket` belongs to the source shard,
+                        // whose write guard remains held for the full commit.
+                        let ((_removed_key, removed_value), _) =
+                            unsafe { source_shard.remove(source_bucket) };
+                        drop(removed_value);
+
+                        target_shard.insert(
+                            target_hash,
+                            (
+                                target_key,
+                                SharedValue::new(TtlCacheEntry {
+                                    value,
+                                    cache_time_ms,
+                                    expire_at_ms,
+                                    last_access_ms,
+                                    generation: state.next_generation(),
+                                }),
+                            ),
+                            |(key, _)| hash_key(key),
+                        );
+                        TtlCacheConditionalMoveResult::Moved
+                    }
+                }
+            }};
+        }
+
+        if source_shard_index == target_shard_index {
+            let mut shard = shards[source_shard_index].write();
+            commit_same_shard!(shard)
+        } else if source_shard_index < target_shard_index {
+            let mut source_shard = shards[source_shard_index].write();
+            let mut target_shard = shards[target_shard_index].write();
+            commit_distinct_shards!(source_shard, target_shard)
+        } else {
+            // Acquire lower shard index first to make cross-key moves deadlock
+            // free even when two refreshes move keys in opposite directions.
+            let mut target_shard = shards[target_shard_index].write();
+            let mut source_shard = shards[source_shard_index].write();
+            commit_distinct_shards!(source_shard, target_shard)
         }
     }
 
@@ -1194,6 +1362,84 @@ mod tests {
             .expect_err("outstanding reader must postpone reclamation");
         drop(outstanding);
         assert!(retired.try_reclaim().is_ok());
+    }
+
+    fn key_on_same_shard(cache: &TtlCache<u64, u32>, source: u64) -> u64 {
+        let state = cache.state.load();
+        let source_shard = state.map.determine_map(&source);
+        (source + 1..)
+            .find(|candidate| state.map.determine_map(candidate) == source_shard)
+            .expect("a same-shard key should exist")
+    }
+
+    fn key_on_different_shard(cache: &TtlCache<u64, u32>, source: u64) -> u64 {
+        let state = cache.state.load();
+        let source_shard = state.map.determine_map(&source);
+        (source + 1..)
+            .find(|candidate| state.map.determine_map(candidate) != source_shard)
+            .expect("a different-shard key should exist")
+    }
+
+    #[test]
+    fn conditional_move_same_shard_preserves_capacity_accounting() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_same_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+
+        assert_eq!(
+            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
+                entry.value == 10 && entry.cache_time_ms == 10
+            }),
+            TtlCacheConditionalMoveResult::Moved
+        );
+        assert!(cache.get_retained_cloned(&source, 20, 0).is_none());
+        assert_eq!(cache.get_retained_cloned(&target, 20, 0).unwrap().value, 20);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_preserves_existing_target_and_source() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 30, 300, 30);
+
+        assert_eq!(
+            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
+                entry.value == 10 && entry.cache_time_ms == 10
+            }),
+            TtlCacheConditionalMoveResult::TargetPresent
+        );
+        assert_eq!(cache.get_retained_cloned(&source, 20, 0).unwrap().value, 10);
+        assert_eq!(cache.get_retained_cloned(&target, 20, 0).unwrap().value, 99);
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn conditional_move_stays_on_state_captured_before_replacement() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        let replacement = TtlCache::with_capacity(4);
+
+        assert_eq!(
+            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
+                assert_eq!(entry.value, 10);
+                cache.replace_with(&replacement);
+                true
+            }),
+            TtlCacheConditionalMoveResult::Moved
+        );
+
+        // The move completed only against the state captured before the swap;
+        // it cannot repopulate the newly installed generation.
+        assert!(cache.is_empty());
+        assert!(cache.get_retained_cloned(&source, 20, 0).is_none());
+        assert!(cache.get_retained_cloned(&target, 20, 0).is_none());
+        assert_eq!(cache.entry_count(), 0);
     }
 
     #[test]

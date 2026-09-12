@@ -31,7 +31,7 @@ use crate::core::response::{ResponseDisposition, classify_response};
 #[cfg(feature = "api")]
 use crate::infra::cache::ttl::TtlCacheRetiredState;
 use crate::infra::cache::ttl::{
-    TtlCache, TtlCacheInsertIfNotNewerResult, TtlCacheLookup, TtlCachePruneMode,
+    TtlCache, TtlCacheConditionalMoveResult, TtlCacheLookup, TtlCachePruneMode,
 };
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -459,6 +459,13 @@ pub struct CacheItem {
     /// Deadline when the response transitions from fresh to stale.
     fresh_until_ms: u64,
 
+    /// Cache age that predates the current monotonic `cache_time_ms` epoch.
+    ///
+    /// Runtime entries start at zero. Persistence restore uses this offset to
+    /// retain age accumulated before the current process started, so stale
+    /// retention never rejuvenates across dump/restart cycles.
+    cache_age_offset_ms: u64,
+
     /// Whether cache admission or persistence loading has already validated
     /// this response against its query key.
     validation: CacheEntryValidation,
@@ -478,17 +485,34 @@ impl CacheItem {
             resp,
             ttl,
             fresh_until_ms,
+            cache_age_offset_ms: 0,
             validation: CacheEntryValidation::Unknown,
         }
     }
 
     fn new_validated(resp: Message, ttl: u32, fresh_until_ms: u64) -> Self {
+        Self::new_validated_with_age_offset(resp, ttl, fresh_until_ms, 0)
+    }
+
+    fn new_validated_with_age_offset(
+        resp: Message,
+        ttl: u32,
+        fresh_until_ms: u64,
+        cache_age_offset_ms: u64,
+    ) -> Self {
         Self {
             resp,
             ttl,
             fresh_until_ms,
+            cache_age_offset_ms,
             validation: CacheEntryValidation::Validated,
         }
+    }
+
+    #[inline]
+    fn total_cache_age_ms(&self, cache_time_ms: u64, now_elapsed_ms: u64) -> u64 {
+        self.cache_age_offset_ms
+            .saturating_add(now_elapsed_ms.saturating_sub(cache_time_ms))
     }
 
     #[inline]
@@ -1524,7 +1548,6 @@ impl Cache {
         let dirty_since_ms = self.dirty_since_ms.clone();
         let dirty_generation = self.dirty_generation.clone();
         let metrics = self.metrics.clone();
-        let cache_size = self.cache_size;
         let ecs_prefix_hints = self.ecs_prefix_hints.clone();
 
         tokio::spawn(async move {
@@ -1581,7 +1604,6 @@ impl Cache {
                                     && existing.expire_at_ms == refresh_entry.expire_at_ms
                                     && Arc::ptr_eq(&existing.value, &refresh_entry.value)
                             };
-                        let mut stale_removed_at_capacity = false;
                         let inserted = if response_key == cache_key {
                             cache_map.replace_if(
                                 cache_key.clone(),
@@ -1591,42 +1613,19 @@ impl Cache {
                                 now,
                                 matches_stale,
                             )
-                        } else if cache_map.remove_if(&cache_key, matches_stale) {
-                            let inserted = cache_map.try_insert_or_update_with_limit(
-                                response_key,
-                                new_item,
-                                now,
-                                expire_at_ms,
-                                now,
-                                cache_size,
-                            );
-                            if !inserted {
-                                match cache_map.try_insert_if_not_newer_with_limit(
-                                    cache_key,
-                                    refresh_entry.value.clone(),
-                                    refresh_entry.cache_time_ms,
-                                    refresh_entry.expire_at_ms,
-                                    now,
-                                    cache_size,
-                                ) {
-                                    TtlCacheInsertIfNotNewerResult::Inserted
-                                    | TtlCacheInsertIfNotNewerResult::NewerPresent => {}
-                                    TtlCacheInsertIfNotNewerResult::AtCapacity => {
-                                        // Another insertion consumed the slot
-                                        // released by removing the stale ECS
-                                        // key.
-                                        // Do not bypass the hard capacity limit
-                                        // to
-                                        // restore it; record the resulting
-                                        // removal
-                                        // as a real cache mutation instead.
-                                        stale_removed_at_capacity = true;
-                                    }
-                                }
-                            }
-                            inserted
                         } else {
-                            false
+                            matches!(
+                                cache_map.conditional_move_if(
+                                    &cache_key,
+                                    response_key,
+                                    new_item,
+                                    now,
+                                    expire_at_ms,
+                                    now,
+                                    matches_stale,
+                                ),
+                                TtlCacheConditionalMoveResult::Moved
+                            )
                         };
                         if inserted {
                             mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
@@ -1635,9 +1634,6 @@ impl Cache {
                                 .lazy_refresh_success_total
                                 .fetch_add(1, Ordering::Relaxed);
                         } else {
-                            if stale_removed_at_capacity {
-                                mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, 1);
-                            }
                             metrics
                                 .lazy_refresh_failed_total
                                 .fetch_add(1, Ordering::Relaxed);
