@@ -16,6 +16,8 @@ use dashmap::{DashMap, DashSet, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 use tokio::sync::{Semaphore, watch};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 #[cfg(feature = "api")]
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Level, debug, event_enabled, warn};
@@ -765,6 +767,15 @@ pub struct Cache {
     /// Bounds concurrent lazy refreshes across distinct cache keys.
     lazy_refresh_slots: Arc<Semaphore>,
 
+    /// Tracks all detached lazy refresh tasks so plugin teardown can await them.
+    lazy_refresh_tasks: TaskTracker,
+
+    /// Cancels in-flight lazy refreshes during plugin teardown.
+    lazy_refresh_shutdown: CancellationToken,
+
+    /// Serializes refresh admission against teardown closing the task tracker.
+    lazy_refresh_accepting: Mutex<bool>,
+
     /// Coalesces concurrent upstream fetches for the same cache miss key.
     miss_coalescer: MissCoalescer,
 
@@ -1234,10 +1245,6 @@ impl Cache {
             }
         };
 
-        self.metrics()
-            .lazy_refresh_started_total
-            .fetch_add(1, Ordering::Relaxed);
-
         let refresh_guard = LazyRefreshGuard {
             inflight: self.lazy_refresh_inflight.clone(),
             key: cache_key.clone(),
@@ -1255,15 +1262,19 @@ impl Cache {
         let max_negative_ttl = self.max_negative_ttl;
         let negative_ttl_without_soa = self.negative_ttl_without_soa;
         let metrics = self.store.metrics().clone();
+        let shutdown = self.lazy_refresh_shutdown.clone();
 
-        tokio::spawn(async move {
+        let refresh_task = async move {
             let _refresh_guard = refresh_guard;
             let _refresh_permit = refresh_permit;
-            let refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
-                let _ = next.next(&mut sub_ctx).await?;
-                Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
-            })
-            .await;
+            let refresh = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
+                    let _ = next.next(&mut sub_ctx).await?;
+                    Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
+                }) => refresh,
+            };
 
             match refresh {
                 Ok(Ok(Some(response))) if !response.truncated() => {
@@ -1374,7 +1385,20 @@ impl Cache {
                     warn!("lazy cache refresh timed out for {}", request_key.domain);
                 }
             }
-        });
+        };
+
+        let accepting = self
+            .lazy_refresh_accepting
+            .lock()
+            .expect("lazy_refresh_accepting poisoned");
+        if !*accepting {
+            return;
+        }
+        self.metrics()
+            .lazy_refresh_started_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.lazy_refresh_tasks.spawn(refresh_task);
+        drop(accepting);
     }
 }
 
@@ -1459,6 +1483,17 @@ impl Plugin for Cache {
 
     async fn destroy(&self) -> Result<()> {
         unregister_metric_source(&self.tag);
+
+        {
+            let mut accepting = self
+                .lazy_refresh_accepting
+                .lock()
+                .expect("lazy_refresh_accepting poisoned");
+            *accepting = false;
+            self.lazy_refresh_shutdown.cancel();
+            self.lazy_refresh_tasks.close();
+        }
+
         let dump_task_id = self
             .dump_task_id
             .lock()
@@ -1476,6 +1511,12 @@ impl Plugin for Cache {
         if let Some(task_id) = cleanup_task_id {
             task_center::stop_task(task_id).await;
         }
+
+        // No lazy refresh can be admitted after the gate closes above. Waiting
+        // here guarantees the final dump observes every refresh mutation that
+        // completed before shutdown and that no refresh can mutate afterward.
+        self.lazy_refresh_tasks.wait().await;
+
         if let Some(dump_file) = &self.config.dump_file
             && let Err(e) = dump_cache_to_file(self.store.cache_map(), dump_file).await
         {
@@ -1942,6 +1983,9 @@ impl CacheFactory {
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
+            lazy_refresh_tasks: TaskTracker::new(),
+            lazy_refresh_shutdown: CancellationToken::new(),
+            lazy_refresh_accepting: Mutex::new(true),
             miss_coalescer: MissCoalescer::new(),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -2048,6 +2092,9 @@ mod tests {
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
+            lazy_refresh_tasks: TaskTracker::new(),
+            lazy_refresh_shutdown: CancellationToken::new(),
+            lazy_refresh_accepting: Mutex::new(true),
             miss_coalescer: MissCoalescer::new(),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -3816,6 +3863,97 @@ mod tests {
             cache.store.cache_map()
                 .get_retained_handle(&key_b, AppClock::elapsed_millis(), 0)
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_cancels_lazy_refresh_and_closes_admission() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.lazy_refresh_concurrency = Some(1);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        cache.init_for_test().await.expect("cache init should succeed");
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingRefreshExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key.clone(),
+            CacheItem::new(
+                cacheable_response_for_domain("example.com.", 120),
+                120,
+                now.saturating_sub(1_000),
+            ),
+            now.saturating_sub(121_000),
+            now.saturating_add(10_000),
+            now.saturating_sub(100),
+        );
+
+        cache
+            .execute_with_next(&mut context, Some(next.clone()))
+            .await
+            .expect("stale hit should start lazy refresh");
+        wait_until("lazy refresh should start", || {
+            started.load(AtomicOrdering::Relaxed) == 1
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), cache.destroy())
+            .await
+            .expect("cache destroy should not wait for blocked upstream refresh")
+            .expect("cache destroy should succeed");
+
+        assert!(cache.lazy_refresh_inflight.is_empty());
+        assert_eq!(cache.lazy_refresh_slots.available_permits(), 1);
+        assert!(
+            !*cache
+                .lazy_refresh_accepting
+                .lock()
+                .expect("lazy_refresh_accepting poisoned")
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+
+        context.clear_response();
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("stale response should still be served after refresh admission closes");
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(AtomicOrdering::Relaxed), 1);
+        assert!(cache.lazy_refresh_inflight.is_empty());
+
+        release.notify_waiters();
+        let stored = cache.store.cache_map()
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
+            .expect("stale cache entry should remain after refresh cancellation");
+        assert!(
+            stored
+                .value()
+                .resp
+                .has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         );
     }
 
