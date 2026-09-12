@@ -11,7 +11,7 @@
 //! It is designed for plugin-level caches where each plugin keeps its own key
 //! and value types but shares the same cache behavior.
 
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -65,6 +65,14 @@ pub(crate) enum TtlCacheConditionalMoveResult {
     SourceChanged,
     /// The target key was already occupied, so neither entry was modified.
     TargetPresent,
+}
+
+/// Metadata for the entry created by a conditional move.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TtlCacheMoveMetadata {
+    pub(crate) cache_time_ms: u64,
+    pub(crate) expire_at_ms: u64,
+    pub(crate) last_access_ms: u64,
 }
 
 /// Capacity policy for one background cache-pruning pass.
@@ -492,20 +500,14 @@ where
         source_key: &K,
         target_key: K,
         value: V,
-        cache_time_ms: u64,
-        expire_at_ms: u64,
-        last_access_ms: u64,
+        metadata: TtlCacheMoveMetadata,
         predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool,
     ) -> TtlCacheConditionalMoveResult {
         let state = self.state.load();
 
         // Compute the exact 64-bit hashes used by DashMap's underlying
         // RawTable. `hash_usize()` would lose bits on 32-bit targets.
-        let hash_key = |key: &K| {
-            let mut hasher = state.map.hasher().build_hasher();
-            key.hash(&mut hasher);
-            hasher.finish()
-        };
+        let hash_key = |key: &K| state.map.hasher().hash_one(key);
         let source_hash = hash_key(source_key);
         let target_hash = hash_key(&target_key);
         let source_shard_index = state.map.determine_shard(source_hash as usize);
@@ -546,9 +548,9 @@ where
                                 target_key,
                                 SharedValue::new(TtlCacheEntry {
                                     value,
-                                    cache_time_ms,
-                                    expire_at_ms,
-                                    last_access_ms,
+                                    cache_time_ms: metadata.cache_time_ms,
+                                    expire_at_ms: metadata.expire_at_ms,
+                                    last_access_ms: metadata.last_access_ms,
                                     generation: state.next_generation(),
                                 }),
                             ),
@@ -596,9 +598,9 @@ where
                                 target_key,
                                 SharedValue::new(TtlCacheEntry {
                                     value,
-                                    cache_time_ms,
-                                    expire_at_ms,
-                                    last_access_ms,
+                                    cache_time_ms: metadata.cache_time_ms,
+                                    expire_at_ms: metadata.expire_at_ms,
+                                    last_access_ms: metadata.last_access_ms,
                                     generation: state.next_generation(),
                                 }),
                             ),
@@ -1388,9 +1390,17 @@ mod tests {
         cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
 
         assert_eq!(
-            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
-                entry.value == 10 && entry.cache_time_ms == 10
-            }),
+            cache.conditional_move_if(
+                &source,
+                target,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+                |entry| { entry.value == 10 && entry.cache_time_ms == 10 }
+            ),
             TtlCacheConditionalMoveResult::Moved
         );
         assert!(cache.get_retained_cloned(&source, 20, 0).is_none());
@@ -1407,9 +1417,17 @@ mod tests {
         cache.insert_or_update_with_meta(target, 99u32, 30, 300, 30);
 
         assert_eq!(
-            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
-                entry.value == 10 && entry.cache_time_ms == 10
-            }),
+            cache.conditional_move_if(
+                &source,
+                target,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+                |entry| { entry.value == 10 && entry.cache_time_ms == 10 }
+            ),
             TtlCacheConditionalMoveResult::TargetPresent
         );
         assert_eq!(cache.get_retained_cloned(&source, 20, 0).unwrap().value, 10);
@@ -1426,11 +1444,21 @@ mod tests {
         let replacement = TtlCache::with_capacity(4);
 
         assert_eq!(
-            cache.conditional_move_if(&source, target, 20u32, 20, 200, 20, |entry| {
-                assert_eq!(entry.value, 10);
-                cache.replace_with(&replacement);
-                true
-            }),
+            cache.conditional_move_if(
+                &source,
+                target,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+                |entry| {
+                    assert_eq!(entry.value, 10);
+                    cache.replace_with(&replacement);
+                    true
+                }
+            ),
             TtlCacheConditionalMoveResult::Moved
         );
 

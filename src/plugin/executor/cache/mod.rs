@@ -31,7 +31,8 @@ use crate::core::response::{ResponseDisposition, classify_response};
 #[cfg(feature = "api")]
 use crate::infra::cache::ttl::TtlCacheRetiredState;
 use crate::infra::cache::ttl::{
-    TtlCache, TtlCacheConditionalMoveResult, TtlCacheLookup, TtlCachePruneMode,
+    TtlCache, TtlCacheConditionalMoveResult, TtlCacheLookup, TtlCacheMoveMetadata,
+    TtlCachePruneMode,
 };
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -1619,9 +1620,11 @@ impl Cache {
                                     &cache_key,
                                     response_key,
                                     new_item,
-                                    now,
-                                    expire_at_ms,
-                                    now,
+                                    TtlCacheMoveMetadata {
+                                        cache_time_ms: now,
+                                        expire_at_ms,
+                                        last_access_ms: now,
+                                    },
                                     matches_stale,
                                 ),
                                 TtlCacheConditionalMoveResult::Moved
