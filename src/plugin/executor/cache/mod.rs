@@ -459,6 +459,13 @@ pub struct CacheItem {
     /// Deadline when the response transitions from fresh to stale.
     fresh_until_ms: u64,
 
+    /// Cache age that predates the current monotonic `cache_time_ms` epoch.
+    ///
+    /// Runtime entries start at zero. Persistence restore uses this offset to
+    /// retain age accumulated before the current process started, so stale
+    /// retention never rejuvenates across dump/restart cycles.
+    cache_age_offset_ms: u64,
+
     /// Whether cache admission or persistence loading has already validated
     /// this response against its query key.
     validation: CacheEntryValidation,
@@ -478,17 +485,34 @@ impl CacheItem {
             resp,
             ttl,
             fresh_until_ms,
+            cache_age_offset_ms: 0,
             validation: CacheEntryValidation::Unknown,
         }
     }
 
     fn new_validated(resp: Message, ttl: u32, fresh_until_ms: u64) -> Self {
+        Self::new_validated_with_age_offset(resp, ttl, fresh_until_ms, 0)
+    }
+
+    fn new_validated_with_age_offset(
+        resp: Message,
+        ttl: u32,
+        fresh_until_ms: u64,
+        cache_age_offset_ms: u64,
+    ) -> Self {
         Self {
             resp,
             ttl,
             fresh_until_ms,
+            cache_age_offset_ms,
             validation: CacheEntryValidation::Validated,
         }
+    }
+
+    #[inline]
+    fn total_cache_age_ms(&self, cache_time_ms: u64, now_elapsed_ms: u64) -> u64 {
+        self.cache_age_offset_ms
+            .saturating_add(now_elapsed_ms.saturating_sub(cache_time_ms))
     }
 
     #[inline]
