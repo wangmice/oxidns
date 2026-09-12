@@ -745,6 +745,15 @@ mod tests {
     use crate::proto::rdata::{CNAME, SOA};
     use crate::proto::{Name, Question, RData, Record};
 
+    fn first_cache_entry(cache_map: &CacheMap) -> (CacheKey, TtlCacheHandle<CacheItem>) {
+        let mut found = None;
+        cache_map.visit_handles(|key, handle| {
+            found = Some((key.clone(), handle));
+            false
+        });
+        found.expect("cache entry should exist")
+    }
+
     fn make_entry() -> PersistedCacheEntry {
         PersistedCacheEntry {
             domain: "WWW.Example.COM.".to_string(),
@@ -1225,18 +1234,13 @@ mod tests {
         let loaded =
             load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
                 .expect("load should succeed");
-        let stored = cache_map
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should be loaded")
-            .1;
+        let (_, stored) = first_cache_entry(&cache_map);
 
         assert_eq!(loaded, 1);
-        assert_eq!(stored.value.ttl, 5);
+        assert_eq!(stored.value().ttl, 5);
         assert!(
             stored
-                .expire_at_ms
+                .expire_at_ms()
                 .saturating_sub(AppClock::elapsed_millis())
                 <= 3_000
         );
@@ -1276,14 +1280,9 @@ mod tests {
         let loaded =
             load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
                 .expect("load should succeed");
-        let stored = cache_map
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should be loaded")
-            .1;
+        let (_, stored) = first_cache_entry(&cache_map);
         let remaining = stored
-            .expire_at_ms
+            .expire_at_ms()
             .saturating_sub(AppClock::elapsed_millis());
 
         assert_eq!(loaded, 1);
@@ -1311,14 +1310,9 @@ mod tests {
         )
         .expect("first restore should succeed");
 
-        let first = first_cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should be restored")
-            .1;
+        let (_, first) = first_cache_entry(&first_cache);
         let first_fresh_remaining = first
-            .value
+            .value()
             .fresh_until_ms
             .saturating_sub(AppClock::elapsed_millis());
         assert!(
@@ -1337,14 +1331,9 @@ mod tests {
         )
         .expect("second restore should succeed");
 
-        let second = second_cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should survive second restore")
-            .1;
+        let (_, second) = first_cache_entry(&second_cache);
         let second_fresh_remaining = second
-            .value
+            .value()
             .fresh_until_ms
             .saturating_sub(AppClock::elapsed_millis());
 
@@ -1455,13 +1444,9 @@ mod tests {
                 .expect("capped restore should succeed"),
             1
         );
-        let stored = capped_cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("capped entry should be present");
-        assert_eq!(stored.1.value.ttl, 10);
-        assert!(stored.1.value.fresh_until_ms <= AppClock::elapsed_millis() + 10_000);
+        let stored = first_cache_entry(&capped_cache);
+        assert_eq!(stored.1.value().ttl, 10);
+        assert!(stored.1.value().fresh_until_ms <= AppClock::elapsed_millis() + 10_000);
 
         let min_cache = CacheMap::with_capacity(1);
         let min_policy = CacheLoadPolicy {
@@ -1543,15 +1528,11 @@ mod tests {
             1
         );
         let load_finished_at = AppClock::elapsed_millis();
-        let stored = cache_map
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("lazy entry should be present");
-        assert!(stored.1.value.fresh_until_ms >= load_started_at);
-        assert!(stored.1.value.fresh_until_ms <= load_finished_at);
-        assert!(stored.1.expire_at_ms > stored.1.value.fresh_until_ms);
-        assert!(stored.1.expire_at_ms >= load_started_at + 3_400_000);
+        let stored = first_cache_entry(&cache_map);
+        assert!(stored.1.value().fresh_until_ms >= load_started_at);
+        assert!(stored.1.value().fresh_until_ms <= load_finished_at);
+        assert!(stored.1.expire_at_ms() > stored.1.value().fresh_until_ms);
+        assert!(stored.1.expire_at_ms() >= load_started_at + 3_400_000);
     }
 
     #[test]
@@ -1621,11 +1602,7 @@ mod tests {
                 .expect("root domain dump should load"),
             1
         );
-        let (key, _) = cache_map
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("root domain entry should be present");
+        let (key, _) = first_cache_entry(&cache_map);
         assert_eq!(key.domain.as_ref(), ".");
     }
 

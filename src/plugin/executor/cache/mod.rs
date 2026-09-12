@@ -2706,13 +2706,12 @@ mod tests {
             .expect("cache lookup should exist");
         assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
 
-        let stored = cache.store.cache_map()
-            .iter_entries_cloned()
-            .into_iter()
-            .find(|(stored_key, _)| stored_key == &key)
-            .expect("entry should remain cached")
-            .1;
-        assert_eq!(stored.last_access_ms, last_access_ms);
+        let stored = cache
+            .store
+            .cache_map()
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
+            .expect("entry should remain cached");
+        assert_eq!(stored.last_access_ms(), last_access_ms);
     }
 
     #[test]
@@ -3134,7 +3133,7 @@ mod tests {
         assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
         assert!(
             cache.store.cache_map()
-                .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+                .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
                 .is_some()
         );
     }
@@ -3369,7 +3368,7 @@ mod tests {
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
         assert!(
             cache.store.cache_map()
-                .get_retained_cloned(&stored_key, AppClock::elapsed_millis(), 0)
+                .get_retained_handle(&stored_key, AppClock::elapsed_millis(), 0)
                 .is_none()
         );
     }
@@ -3503,20 +3502,20 @@ mod tests {
         );
 
         let stored = cache.store.cache_map()
-            .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
             .expect("entry should be present");
         assert_eq!(
             stored
-                .expire_at_ms
-                .saturating_sub(stored.value.fresh_until_ms)
+                .expire_at_ms()
+                .saturating_sub(stored.value().fresh_until_ms)
                 / 1000,
             0
         );
         assert_eq!(
             stored
-                .value
+                .value()
                 .fresh_until_ms
-                .saturating_sub(stored.cache_time_ms)
+                .saturating_sub(stored.cache_time_ms())
                 / 1000,
             120
         );
@@ -3596,11 +3595,11 @@ mod tests {
         );
         assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
         let stored = cache.store.cache_map()
-            .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
             .expect("entry should exist");
         assert!(
             stored
-                .value
+                .value()
                 .resp
                 .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)))
         );
@@ -3651,11 +3650,11 @@ mod tests {
             1
         );
         let stored = cache.store.cache_map()
-            .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
             .expect("old stale entry should remain present");
         assert!(
             stored
-                .value
+                .value()
                 .resp
                 .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         );
@@ -3782,7 +3781,7 @@ mod tests {
         );
         assert!(
             cache.store.cache_map()
-                .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+                .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
                 .is_none(),
             "low TTL refresh should evict the old stale cache entry"
         );
@@ -3880,11 +3879,11 @@ mod tests {
         .await;
 
         let stored = cache.store.cache_map()
-            .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
             .expect("newer cache entry should remain present");
         assert!(
             stored
-                .value
+                .value()
                 .resp
                 .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
         );

@@ -22,26 +22,6 @@ use rand::RngExt;
 
 const LAST_ACCESS_EVICTING_BIT: u64 = 1 << 63;
 
-/// Snapshot of one cached entry with metadata.
-///
-/// This is intentionally a detached value used by management, persistence,
-/// and compatibility APIs. Request-path lookups should prefer
-/// [`TtlCacheHandle`], which keeps a stable identity without cloning the value
-/// or reacquiring a DashMap write guard.
-#[derive(Debug, Clone)]
-pub struct TtlCacheEntry<V> {
-    /// User data stored in cache.
-    pub value: V,
-    /// Insert/update timestamp in milliseconds.
-    pub cache_time_ms: u64,
-    /// Expiration timestamp in milliseconds.
-    pub expire_at_ms: u64,
-    /// Last access timestamp in milliseconds.
-    pub last_access_ms: u64,
-    /// Monotonic identity assigned whenever this entry is replaced.
-    generation: u64,
-}
-
 /// Immutable cache node stored behind a stable `Arc`.
 ///
 /// Entry replacement always publishes a new node. The only mutable field is
@@ -110,20 +90,6 @@ impl<V> TtlCacheNode<V> {
             )
             .is_ok()
     }
-
-    #[inline]
-    fn snapshot(&self) -> TtlCacheEntry<V>
-    where
-        V: Clone,
-    {
-        TtlCacheEntry {
-            value: self.value.clone(),
-            cache_time_ms: self.cache_time_ms,
-            expire_at_ms: self.expire_at_ms,
-            last_access_ms: self.last_access_ms(),
-            generation: self.generation,
-        }
-    }
 }
 
 /// Stable handle to one concrete cache entry generation.
@@ -169,14 +135,6 @@ impl<V> TtlCacheHandle<V> {
     fn same_node(&self, other: &Arc<TtlCacheNode<V>>) -> bool {
         Arc::ptr_eq(&self.node, other)
     }
-
-    #[inline]
-    fn snapshot(&self) -> TtlCacheEntry<V>
-    where
-        V: Clone,
-    {
-        self.node.snapshot()
-    }
 }
 
 /// Result of a stable-handle retained-entry lookup.
@@ -184,15 +142,6 @@ impl<V> TtlCacheHandle<V> {
 pub enum TtlCacheHandleLookup<V> {
     /// Entry exists and is still retained.
     Hit(TtlCacheHandle<V>),
-    /// Entry existed but expired and was removed.
-    Expired,
-}
-
-/// Result of a detached retained-entry lookup.
-#[derive(Debug, Clone)]
-pub enum TtlCacheLookup<V> {
-    /// Entry exists and is still retained.
-    Hit(TtlCacheEntry<V>),
     /// Entry existed but expired and was removed.
     Expired,
 }
@@ -504,31 +453,6 @@ where
         true
     }
 
-    /// Compatibility helper for callers that still match detached metadata.
-    pub fn replace_if(
-        &self,
-        key: K,
-        value: V,
-        cache_time_ms: u64,
-        expire_at_ms: u64,
-        last_access_ms: u64,
-        predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool,
-    ) -> bool
-    where
-        V: Clone,
-    {
-        let state = self.state.load();
-        let Entry::Occupied(mut entry) = state.map.entry(key) else {
-            return false;
-        };
-        let snapshot = entry.get().snapshot();
-        if !predicate(&snapshot) {
-            return false;
-        }
-        entry.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
-        true
-    }
-
     /// Insert or update an entry unless a newer entry is already present.
     pub fn insert_if_not_newer(
         &self,
@@ -811,48 +735,20 @@ where
         }
     }
 
-    /// Get one retained, non-expired entry as a detached snapshot.
+    /// Get one retained, non-expired stable handle.
+    ///
+    /// This is the common lookup for callers that do not need to distinguish a
+    /// missing key from one that was just removed because it expired.
     #[inline]
-    pub fn get_retained_cloned(
+    pub fn get_retained_handle(
         &self,
         key: &K,
         now_ms: u64,
         touch_interval_ms: u64,
-    ) -> Option<TtlCacheEntry<V>>
-    where
-        V: Clone,
-    {
-        match self.get_retained_cloned_status(key, now_ms, touch_interval_ms) {
-            Some(TtlCacheLookup::Hit(entry)) => Some(entry),
-            Some(TtlCacheLookup::Expired) | None => None,
-        }
-    }
-
-    /// Compatibility lookup returning a detached snapshot while preserving the
-    /// old miss-vs-expired distinction and pre-touch snapshot semantics.
-    #[inline]
-    pub fn get_retained_cloned_status(
-        &self,
-        key: &K,
-        now_ms: u64,
-        touch_interval_ms: u64,
-    ) -> Option<TtlCacheLookup<V>>
-    where
-        V: Clone,
-    {
-        match self.get_retained_handle_status(key, now_ms, 0) {
-            Some(TtlCacheHandleLookup::Hit(handle)) => {
-                let snapshot = handle.snapshot();
-                if touch_interval_ms > 0
-                    && now_ms.saturating_sub(snapshot.last_access_ms) >= touch_interval_ms
-                    && snapshot.last_access_ms < now_ms
-                {
-                    handle.node.touch_last_access(now_ms);
-                }
-                Some(TtlCacheLookup::Hit(snapshot))
-            }
-            Some(TtlCacheHandleLookup::Expired) => Some(TtlCacheLookup::Expired),
-            None => None,
+    ) -> Option<TtlCacheHandle<V>> {
+        match self.get_retained_handle_status(key, now_ms, touch_interval_ms) {
+            Some(TtlCacheHandleLookup::Hit(handle)) => Some(handle),
+            Some(TtlCacheHandleLookup::Expired) | None => None,
         }
     }
 
@@ -889,26 +785,6 @@ where
         let removed = state
             .map
             .remove_if(key, |_, existing| expected.same_node(existing))
-            .is_some();
-        if removed {
-            state.entry_count.fetch_sub(1, Ordering::Release);
-        }
-        removed
-    }
-
-    /// Compatibility helper for callers that still match detached metadata.
-    #[inline]
-    pub fn remove_if(&self, key: &K, predicate: impl FnOnce(&TtlCacheEntry<V>) -> bool) -> bool
-    where
-        V: Clone,
-    {
-        let state = self.state.load();
-        let removed = state
-            .map
-            .remove_if(key, |_, existing| {
-                let snapshot = existing.snapshot();
-                predicate(&snapshot)
-            })
             .is_some();
         if removed {
             state.entry_count.fetch_sub(1, Ordering::Release);
@@ -1010,26 +886,10 @@ where
 
     /// Collect up to `limit` key + last-access pairs for sampled LRU eviction.
     #[inline]
-    pub fn sample_last_access(&self, limit: usize) -> Vec<(K, u64)>
-    where
-        V: Clone,
-    {
-        self.sample_last_access_with_identity(limit)
-            .into_iter()
-            .map(|(key, last_access_ms, _)| (key, last_access_ms))
-            .collect()
-    }
-
-    /// Collect a sample including the entry identity used for conditional
-    /// eviction.
-    #[inline]
-    pub fn sample_last_access_with_identity(&self, limit: usize) -> Vec<(K, u64, V)>
-    where
-        V: Clone,
-    {
+    pub fn sample_last_access(&self, limit: usize) -> Vec<(K, u64)> {
         let state = self.state.load();
         Self::sample_sharded_bounded(&state, limit, |key, entry| {
-            (key.clone(), entry.last_access_ms(), entry.value.clone())
+            (key.clone(), entry.last_access_ms())
         })
     }
 
@@ -1195,22 +1055,8 @@ where
             }
         }
     }
-
-    /// Snapshot all entries (key + metadata + cloned value).
-    #[inline]
-    pub fn iter_entries_cloned(&self) -> Vec<(K, TtlCacheEntry<V>)>
-    where
-        V: Clone,
-    {
-        let state = self.state.load();
-        let mut entries = Vec::with_capacity(state.map.len());
-        for item in state.map.iter() {
-            let value = item.value();
-            entries.push((item.key().clone(), value.snapshot()));
-        }
-        entries
-    }
 }
+
 impl<K, V> TtlCache<K, V>
 where
     K: Eq + Hash + Clone,
@@ -1422,12 +1268,27 @@ mod tests {
         cache.insert_or_update("k", 1u32, 100, 200);
 
         let hit = cache
-            .get_retained_cloned(&"k", 150, 0)
+            .get_retained_handle(&"k", 150, 0)
             .expect("entry should exist");
-        assert_eq!(hit.value, 1);
+        assert_eq!(*hit.value(), 1);
 
         assert!(cache.remove_if_expired(&"k", 250));
-        assert!(cache.get_retained_cloned(&"k", 260, 0).is_none());
+        assert!(cache.get_retained_handle(&"k", 260, 0).is_none());
+    }
+
+    #[test]
+    fn stable_handle_lookup_does_not_require_clone_values() {
+        #[derive(Debug)]
+        struct NonClone(u32);
+
+        let cache = TtlCache::with_capacity(1);
+        cache.insert_or_update_with_meta("k", NonClone(7), 10, 100, 10);
+
+        let handle = cache
+            .get_retained_handle(&"k", 20, 0)
+            .expect("entry should exist");
+        assert_eq!(handle.value().0, 7);
+        assert_eq!(cache.sample_last_access(1), vec![("k", 10)]);
     }
 
     #[test]
@@ -1438,7 +1299,7 @@ mod tests {
         assert!(!cache.try_insert_or_update_with_limit("c", 3u32, 0, 100, 0, 2));
         assert!(cache.try_insert_or_update_with_limit("a", 4u32, 0, 200, 0, 2));
         assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get_retained_cloned(&"a", 1, 0).unwrap().value, 4);
+        assert_eq!(*cache.get_retained_handle(&"a", 1, 0).unwrap().value(), 4);
     }
 
     #[test]
@@ -1466,7 +1327,7 @@ mod tests {
 
         assert!(cache.try_insert_or_update_with_limit("new", 2u32, 0, 100, 0, 1));
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get_retained_cloned(&"new", 1, 0).unwrap().value, 2);
+        assert_eq!(*cache.get_retained_handle(&"new", 1, 0).unwrap().value(), 2);
     }
 
     #[test]
@@ -1479,8 +1340,8 @@ mod tests {
 
         cache.replace_with(&replacement);
 
-        assert!(cache.get_retained_cloned(&"old", 1, 0).is_none());
-        assert_eq!(cache.get_retained_cloned(&"new", 1, 0).unwrap().value, 2);
+        assert!(cache.get_retained_handle(&"old", 1, 0).is_none());
+        assert_eq!(*cache.get_retained_handle(&"new", 1, 0).unwrap().value(), 2);
         assert!(!cache.try_insert_or_update_with_limit("another", 3u32, 0, 100, 0, 1));
     }
 
@@ -1573,8 +1434,8 @@ mod tests {
             ),
             TtlCacheConditionalMoveResult::Moved
         );
-        assert!(cache.get_retained_cloned(&source, 20, 0).is_none());
-        assert_eq!(cache.get_retained_cloned(&target, 20, 0).unwrap().value, 20);
+        assert!(cache.get_retained_handle(&source, 20, 0).is_none());
+        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 20);
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -1601,8 +1462,8 @@ mod tests {
             ),
             TtlCacheConditionalMoveResult::TargetPresent
         );
-        assert_eq!(cache.get_retained_cloned(&source, 20, 0).unwrap().value, 10);
-        assert_eq!(cache.get_retained_cloned(&target, 20, 0).unwrap().value, 99);
+        assert_eq!(*cache.get_retained_handle(&source, 20, 0).unwrap().value(), 10);
+        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
         assert_eq!(cache.entry_count(), 2);
     }
 
@@ -1644,31 +1505,14 @@ mod tests {
 
         cache.insert_or_update_with_meta("k", 2u32, 20, 200, 20);
         assert!(!cache.replace_handle("k", &expected, 3, 30, 300, 30));
-        assert_eq!(cache.get_retained_cloned(&"k", 20, 0).unwrap().value, 2);
+        assert_eq!(*cache.get_retained_handle(&"k", 20, 0).unwrap().value(), 2);
 
         let current = match cache.get_retained_handle_status(&"k", 20, 0) {
             Some(TtlCacheHandleLookup::Hit(handle)) => handle,
             _ => panic!("entry should exist"),
         };
         assert!(cache.replace_handle("k", &current, 3, 30, 300, 30));
-        assert_eq!(cache.get_retained_cloned(&"k", 30, 0).unwrap().value, 3);
-    }
-
-    #[test]
-    fn test_replace_if_preserves_entry_when_identity_changed() {
-        let cache = TtlCache::with_capacity(1);
-        cache.insert_or_update_with_meta("k", 1u32, 10, 100, 10);
-
-        cache.insert_or_update_with_meta("k", 2u32, 20, 200, 20);
-        assert!(!cache.replace_if("k", 3, 30, 300, 30, |entry| {
-            entry.cache_time_ms == 10 && entry.expire_at_ms == 100
-        }));
-        assert_eq!(cache.get_retained_cloned(&"k", 20, 0).unwrap().value, 2);
-
-        assert!(cache.replace_if("k", 3, 30, 300, 30, |entry| {
-            entry.cache_time_ms == 20 && entry.expire_at_ms == 200
-        }));
-        assert_eq!(cache.get_retained_cloned(&"k", 30, 0).unwrap().value, 3);
+        assert_eq!(*cache.get_retained_handle(&"k", 30, 0).unwrap().value(), 3);
     }
 
     #[test]
@@ -1703,64 +1547,53 @@ mod tests {
             cache.insert_or_update_with_meta(key, key, 10, 1_000, u64::from(key));
         }
 
-        let sample = cache.sample_last_access_with_identity(32);
+        let sample = cache.sample_last_access(32);
         assert_eq!(sample.len(), 32);
 
-        let mut keys: Vec<_> = sample.into_iter().map(|(key, _, _)| key).collect();
+        let mut keys: Vec<_> = sample.into_iter().map(|(key, _)| key).collect();
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), 32);
     }
 
     #[test]
-    fn test_get_retained_cloned_refreshes_last_access_after_touch_interval() {
+    fn test_get_retained_handle_refreshes_last_access_after_touch_interval() {
         // Arrange
         let cache = TtlCache::with_capacity(4);
         cache.insert_or_update_with_meta("k", 1u32, 10, 100, 10);
 
         // Act
         let hit = cache
-            .get_retained_cloned(&"k", 25, 10)
+            .get_retained_handle(&"k", 25, 10)
             .expect("entry should exist");
-        let (_, stored) = cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should remain cached");
 
         // Assert
-        assert_eq!(hit.last_access_ms, 10);
-        assert_eq!(stored.last_access_ms, 25);
+        assert_eq!(hit.last_access_ms(), 25);
     }
 
     #[test]
-    fn test_get_retained_cloned_does_not_refresh_last_access_before_touch_interval() {
+    fn test_get_retained_handle_does_not_refresh_last_access_before_touch_interval() {
         // Arrange
         let cache = TtlCache::with_capacity(4);
         cache.insert_or_update_with_meta("k", 1u32, 10, 100, 10);
 
         // Act
-        let _ = cache
-            .get_retained_cloned(&"k", 15, 10)
+        let hit = cache
+            .get_retained_handle(&"k", 15, 10)
             .expect("entry should exist");
-        let (_, stored) = cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
-            .expect("entry should remain cached");
 
         // Assert
-        assert_eq!(stored.last_access_ms, 10);
+        assert_eq!(hit.last_access_ms(), 10);
     }
 
     #[test]
-    fn test_get_retained_cloned_removes_expired_entry() {
+    fn test_get_retained_handle_removes_expired_entry() {
         // Arrange
         let cache = TtlCache::with_capacity(4);
         cache.insert_or_update_with_meta("k", 1u32, 10, 20, 10);
 
         // Act
-        let hit = cache.get_retained_cloned(&"k", 20, 10);
+        let hit = cache.get_retained_handle(&"k", 20, 10);
 
         // Assert
         assert!(hit.is_none());
@@ -1768,13 +1601,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_retained_cloned_status_reports_expired_entry() {
+    fn test_get_retained_handle_status_reports_expired_entry() {
         let cache = TtlCache::with_capacity(4);
         cache.insert_or_update_with_meta("k", 1u32, 10, 20, 10);
 
-        let status = cache.get_retained_cloned_status(&"k", 20, 10);
+        let status = cache.get_retained_handle_status(&"k", 20, 10);
 
-        assert!(matches!(status, Some(TtlCacheLookup::Expired)));
+        assert!(matches!(status, Some(TtlCacheHandleLookup::Expired)));
         assert!(cache.is_empty());
     }
 
@@ -1786,25 +1619,27 @@ mod tests {
 
         // Act
         cache.insert_or_update_with_meta("k", 2u32, 30, 40, 31);
-        let (_, stored) = cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
+        let stored = cache
+            .get_retained_handle(&"k", 31, 0)
             .expect("entry should exist");
 
         // Assert
         assert_eq!(cache.len(), 1);
-        assert_eq!(stored.value, 2);
-        assert_eq!(stored.cache_time_ms, 30);
-        assert_eq!(stored.expire_at_ms, 40);
-        assert_eq!(stored.last_access_ms, 31);
+        assert_eq!(*stored.value(), 2);
+        assert_eq!(stored.cache_time_ms(), 30);
+        assert_eq!(stored.expire_at_ms(), 40);
+        assert_eq!(stored.last_access_ms(), 31);
     }
 
     #[test]
     fn sampled_identity_rejects_same_timestamp_replacement() {
         let cache = TtlCache::with_capacity(1);
         cache.insert_or_update_with_meta("k", 1u32, 10, 100, 10);
-        let sampled = cache.iter_entries_cloned().pop().unwrap().1;
+        let sampled = cache
+            .get_retained_handle(&"k", 10, 0)
+            .expect("entry should exist");
+        let sampled_last_access_ms = sampled.last_access_ms();
+        let sampled_generation = sampled.node.generation;
 
         cache.insert_or_update_with_meta("k", 2u32, 10, 100, 10);
         let state = cache.state.load();
@@ -1812,12 +1647,12 @@ mod tests {
             state
                 .map
                 .remove_if(&"k", |_, existing| {
-                    existing.last_access_ms() == sampled.last_access_ms
-                        && existing.generation == sampled.generation
+                    existing.last_access_ms() == sampled_last_access_ms
+                        && existing.generation == sampled_generation
                 })
                 .is_none()
         );
-        assert_eq!(cache.get_retained_cloned(&"k", 11, 0).unwrap().value, 2);
+        assert_eq!(*cache.get_retained_handle(&"k", 11, 0).unwrap().value(), 2);
     }
 
     #[test]
@@ -1832,10 +1667,10 @@ mod tests {
 
         assert_eq!(evicted, 1);
         assert_eq!(after_len, 3);
-        assert!(cache.get_retained_cloned(&"oldest", 1, 0).is_none());
-        assert!(cache.get_retained_cloned(&"warm", 1, 0).is_some());
-        assert!(cache.get_retained_cloned(&"hot", 1, 0).is_some());
-        assert!(cache.get_retained_cloned(&"hottest", 1, 0).is_some());
+        assert!(cache.get_retained_handle(&"oldest", 1, 0).is_none());
+        assert!(cache.get_retained_handle(&"warm", 1, 0).is_some());
+        assert!(cache.get_retained_handle(&"hot", 1, 0).is_some());
+        assert!(cache.get_retained_handle(&"hottest", 1, 0).is_some());
     }
 
     #[test]
@@ -1880,8 +1715,8 @@ mod tests {
         );
         assert_eq!(
             cache
-                .get_retained_cloned(&"k", 0, 0)
-                .map(|entry| entry.value),
+                .get_retained_handle(&"k", 0, 0)
+                .map(|entry| *entry.value()),
             Some(9)
         );
     }
@@ -1907,13 +1742,11 @@ mod tests {
         cache.insert_or_update_with_meta("k", 1u32, 200, 300, 200);
 
         assert!(!cache.insert_if_not_newer("k", 2u32, 100, 150, 100));
-        let (_, stored) = cache
-            .iter_entries_cloned()
-            .into_iter()
-            .next()
+        let stored = cache
+            .get_retained_handle(&"k", 200, 0)
             .expect("entry should remain");
 
-        assert_eq!(stored.value, 1);
-        assert_eq!(stored.cache_time_ms, 200);
+        assert_eq!(*stored.value(), 1);
+        assert_eq!(stored.cache_time_ms(), 200);
     }
 }
