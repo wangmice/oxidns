@@ -88,101 +88,6 @@ const MAX_DIRTY_AGE_MS: u64 = MAX_DIRTY_AGE_SECS * 1000;
 #[cfg(feature = "api")]
 const MAX_PENDING_CACHE_RECLAIMS: usize = 1;
 
-#[inline]
-fn dirty_timestamp(now_ms: u64) -> u64 {
-    now_ms.max(1)
-}
-
-fn mark_dirty(
-    updated_keys: &AtomicU64,
-    dirty_since_ms: &AtomicU64,
-    dirty_generation: &AtomicU64,
-    changes: u64,
-) {
-    if changes == 0 {
-        return;
-    }
-    let _ = dirty_generation.try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-        Some(generation.saturating_add(1).max(1))
-    });
-    updated_keys.fetch_add(changes, Ordering::Relaxed);
-    // Preserve mutations that happen during the first millisecond of the
-    // process lifetime; zero remains the initial timestamp sentinel.
-    let now = dirty_timestamp(AppClock::elapsed_millis());
-    let _ = dirty_since_ms.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
-}
-
-#[inline]
-fn restore_dirty_since(dirty_since_ms: &AtomicU64, timestamp_ms: u64) {
-    if timestamp_ms == 0 {
-        return;
-    }
-
-    let _ = dirty_since_ms.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        Some(if current == 0 {
-            timestamp_ms
-        } else {
-            current.min(timestamp_ms)
-        })
-    });
-}
-
-#[inline]
-fn begin_dump_watermark(dirty_generation: &AtomicU64, dirty_since_ms: &AtomicU64) -> (u64, u64) {
-    //   Capture the generation represented by this dump.
-    //
-    //   Mutations after this point belong to the next dirty generation and must
-    //   retain their own dirty_since watermark.
-    let dump_generation = dirty_generation.load(Ordering::Acquire);
-
-    //   Hand the existing dirty watermark to this dump.
-    //
-    //   From now on dirty_since_ms=0 means a concurrent/new mutation can
-    // install   a fresh watermark without being blocked by the old
-    // already-being-dumped   timestamp.
-    let previous_dirty_since = dirty_since_ms.swap(0, Ordering::AcqRel);
-
-    let current_generation = dirty_generation.load(Ordering::Acquire);
-    if current_generation == dump_generation {
-        return (dump_generation, previous_dirty_since);
-    }
-
-    let now = dirty_timestamp(AppClock::elapsed_millis());
-
-    let mut current_since = dirty_since_ms.load(Ordering::Acquire);
-    loop {
-        if current_since != 0 && current_since <= now {
-            break;
-        }
-        match dirty_since_ms.compare_exchange_weak(
-            current_since,
-            now,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(actual) => current_since = actual,
-        }
-    }
-    (dump_generation, previous_dirty_since)
-}
-
-fn finish_dump_if_unchanged(
-    dirty_generation: &AtomicU64,
-    persisted_generation: &AtomicU64,
-    dump_generation: u64,
-) -> bool {
-    persisted_generation.store(dump_generation, Ordering::Release);
-    dirty_generation.load(Ordering::Acquire) == dump_generation
-}
-
-#[inline]
-fn dump_age_due(now_ms: u64, dirty_since_ms: u64, check_interval_ms: u64) -> bool {
-    dirty_since_ms != 0
-        && now_ms.saturating_sub(dirty_since_ms)
-            >= MAX_DIRTY_AGE_MS.saturating_sub(check_interval_ms)
-}
-
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct CacheConfig {
@@ -881,47 +786,27 @@ impl Cache {
     fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
         let dump_interval = dump_interval.clamp(1, MAX_DIRTY_AGE_SECS);
         let check_interval_ms = dump_interval.saturating_mul(1000);
-        let mutations = store.mutations().clone();
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
             move || {
                 let store = store.clone();
                 let dump_path = dump_path.clone();
-                let mutations = mutations.clone();
                 async move {
-                    let changed = mutations.updated_keys.swap(0, Ordering::AcqRel);
-                    let now = AppClock::elapsed_millis();
-                    let dirty_since = mutations.dirty_since_ms.load(Ordering::Acquire);
-                    let dirty = mutations.dirty_generation.load(Ordering::Acquire)
-                        != mutations.persisted_generation.load(Ordering::Acquire);
-                    let age_due = dirty && dump_age_due(now, dirty_since, check_interval_ms);
-
-                    // We consumed `changed` with swap(0), but no dump is being
-                    // attempted yet. Restore only the counter; these are not new
-                    // mutations and must not advance the dirty generation.
-                    if changed < MINIMUM_CHANGES_TO_DUMP && !age_due {
-                        mutations.updated_keys.fetch_add(changed, Ordering::Relaxed);
+                    let Some(handoff) = store.begin_dump_if_due(
+                        AppClock::elapsed_millis(),
+                        MINIMUM_CHANGES_TO_DUMP,
+                        MAX_DIRTY_AGE_MS,
+                        check_interval_ms,
+                    ) else {
                         return;
-                    }
-
-                    // Hand the current dirty watermark to this dump. Mutations
-                    // after this point install their own watermark/generation.
-                    let (dump_generation, previous_dirty_since) = begin_dump_watermark(
-                        &mutations.dirty_generation,
-                        &mutations.dirty_since_ms,
-                    );
+                    };
 
                     if let Err(e) = dump_cache_to_file(store.cache_map(), &dump_path).await {
-                        mutations.updated_keys.fetch_add(changed, Ordering::Relaxed);
-                        restore_dirty_since(&mutations.dirty_since_ms, previous_dirty_since);
+                        handoff.abort();
                         warn!("Failed to dump cache to {}: {}", dump_path, e);
                     } else {
-                        let _ = finish_dump_if_unchanged(
-                            &mutations.dirty_generation,
-                            &mutations.persisted_generation,
-                            dump_generation,
-                        );
+                        let _ = handoff.complete();
                     }
                 }
             },
@@ -2365,104 +2250,6 @@ mod tests {
 
     fn make_context(request: Message) -> DnsContext {
         DnsContext::new("127.0.0.1:5300".parse::<SocketAddr>().unwrap(), request)
-    }
-
-    #[test]
-    fn dump_age_due_accounts_for_the_next_scheduler_tick() {
-        assert!(dump_age_due(1, 1, 120_000));
-        assert!(dump_age_due(120_000, 1, 120_000));
-        assert!(!dump_age_due(60_000, 1, 60_000));
-        assert!(dump_age_due(60_001, 1, 60_000));
-    }
-
-    #[test]
-    fn dirty_timestamp_reserves_zero_for_clean_state() {
-        assert_eq!(dirty_timestamp(0), 1);
-        assert_eq!(dirty_timestamp(1), 1);
-        assert_eq!(dirty_timestamp(42), 42);
-    }
-
-    #[test]
-    fn successful_dump_handoff_clears_old_dirty_watermark() {
-        AppClock::start();
-
-        let dirty_since_ms = AtomicU64::new(10);
-
-        let dirty_generation = AtomicU64::new(7);
-
-        let persisted_generation = AtomicU64::new(0);
-
-        let (dump_generation, previous_dirty_since) =
-            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
-
-        assert_eq!(dump_generation, 7);
-        assert_eq!(previous_dirty_since, 10);
-
-        // Old watermark now belongs to the in-progress dump.
-        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
-
-        assert!(finish_dump_if_unchanged(
-            &dirty_generation,
-            &persisted_generation,
-            dump_generation,
-        ));
-
-        assert_eq!(persisted_generation.load(Ordering::Acquire), 7);
-
-        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn dump_handoff_preserves_new_mutation_watermark() {
-        AppClock::start();
-
-        let dirty_since_ms = AtomicU64::new(10);
-
-        let dirty_generation = AtomicU64::new(7);
-
-        let persisted_generation = AtomicU64::new(0);
-
-        let (dump_generation, previous_dirty_since) =
-            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
-
-        assert_eq!(previous_dirty_since, 10);
-        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
-
-        mark_dirty(&AtomicU64::new(0), &dirty_since_ms, &dirty_generation, 1);
-
-        assert_eq!(dirty_generation.load(Ordering::Acquire), 8);
-
-        assert!(dirty_since_ms.load(Ordering::Acquire) != 0);
-
-        assert!(!finish_dump_if_unchanged(
-            &dirty_generation,
-            &persisted_generation,
-            dump_generation,
-        ));
-        assert_eq!(persisted_generation.load(Ordering::Acquire), 7);
-        assert!(dirty_since_ms.load(Ordering::Acquire) != 0);
-    }
-
-    #[test]
-    fn failed_dump_restores_previous_dirty_watermark() {
-        let dirty_since_ms = AtomicU64::new(100);
-
-        let dirty_generation = AtomicU64::new(5);
-
-        let (_dump_generation, previous_dirty_since) =
-            begin_dump_watermark(&dirty_generation, &dirty_since_ms);
-
-        assert_eq!(previous_dirty_since, 100);
-        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 0);
-
-        //  Simulate a newer mutation during failed dump.
-        dirty_since_ms.store(200, Ordering::Release);
-
-        restore_dirty_since(&dirty_since_ms, previous_dirty_since);
-
-        //  The failed dump means the mutation from t=100 is still unsaved,
-        //  therefore it remains the oldest watermark.
-        assert_eq!(dirty_since_ms.load(Ordering::Acquire), 100);
     }
 
     fn make_request_with_query(name: &str, do_bit: bool, cd_bit: bool) -> Message {
