@@ -348,6 +348,8 @@ import Admonition from "@theme/Admonition";
     short_circuit: true
     # 允许在原始 TTL 过期后短时间返回 stale 响应，并异步刷新缓存
     lazy_cache_ttl: 120
+    # 限制不同缓存键同时执行的后台 lazy refresh 数量
+    lazy_refresh_concurrency: 64
     # 开启 NXDOMAIN / NODATA 负缓存
     cache_negative: true
     # 负缓存 TTL 上限
@@ -383,6 +385,16 @@ import Admonition from "@theme/Admonition";
   - `lazy_cache_ttl` 决定 stale 回包 TTL，并允许在原始 TTL 过期后短时间返回 stale 响应。
   - stale 命中会在后台异步刷新缓存。
   - 该配置不会缩短原始 fresh TTL。
+
+#### `lazy_refresh_concurrency`
+
+- 类型：`integer`；必填：否；默认值：`64`
+- 作用：限制不同缓存键同时运行的 lazy refresh 数量。
+- 运行影响：
+  - 同一个缓存键仍通过 per-key 去重避免重复刷新。
+  - 达到并发上限时继续返回 stale 响应，但不会排队或启动新的后台 refresh task。
+  - 被并发上限跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_busy"}`。
+  - 后续 stale 请求可在有空闲槽位时再次尝试刷新。
 
 #### `dump_file`
 

@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use dashmap::{DashMap, DashSet, Entry};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 #[cfg(feature = "api")]
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{
@@ -82,6 +82,7 @@ const MAX_INITIAL_CACHE_CAPACITY: usize = 16_384;
 const EVICT_HIGH_WATERMARK_PERCENT: usize = 95;
 const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
 const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DIRTY_AGE_SECS: u64 = 120;
 const MAX_DIRTY_AGE_MS: u64 = MAX_DIRTY_AGE_SECS * 1000;
@@ -98,6 +99,11 @@ pub struct CacheConfig {
     ///
     /// When set, this replaces computed positive/negative TTL.
     lazy_cache_ttl: Option<u32>,
+
+    /// Maximum number of lazy refreshes allowed to run concurrently.
+    ///
+    /// Default: 64.
+    lazy_refresh_concurrency: Option<usize>,
 
     /// Optional path to persist cache contents.
     dump_file: Option<String>,
@@ -464,6 +470,7 @@ struct CacheMetrics {
     lazy_refresh_started_total: AtomicU64,
     lazy_refresh_success_total: AtomicU64,
     lazy_refresh_failed_total: AtomicU64,
+    lazy_refresh_skipped_busy_total: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -488,6 +495,7 @@ impl CacheMetrics {
             lazy_refresh_started_total: AtomicU64::new(0),
             lazy_refresh_success_total: AtomicU64::new(0),
             lazy_refresh_failed_total: AtomicU64::new(0),
+            lazy_refresh_skipped_busy_total: AtomicU64::new(0),
         }
     }
 
@@ -695,6 +703,18 @@ impl MetricSource for CacheMetricSource {
             &lazy_failed,
             metrics.lazy_refresh_failed_total.load(Ordering::Relaxed),
         ));
+        let lazy_skipped_busy = [
+            MetricLabel::new("plugin_tag", metrics.tag.as_str()),
+            MetricLabel::new("result", "skipped_busy"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_lazy_refresh_total",
+            "Total lazy refresh attempts by result.",
+            &lazy_skipped_busy,
+            metrics
+                .lazy_refresh_skipped_busy_total
+                .load(Ordering::Relaxed),
+        ));
         sink.emit(MetricSample::gauge(
             "cache_entry_count",
             "Current number of cache entries.",
@@ -741,6 +761,9 @@ pub struct Cache {
 
     /// Deduplicates background refreshes for stale lazy cache hits.
     lazy_refresh_inflight: Arc<DashSet<CacheKey>>,
+
+    /// Bounds concurrent lazy refreshes across distinct cache keys.
+    lazy_refresh_slots: Arc<Semaphore>,
 
     /// Coalesces concurrent upstream fetches for the same cache miss key.
     miss_coalescer: MissCoalescer,
@@ -1199,6 +1222,18 @@ impl Cache {
         if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
             return;
         }
+
+        let refresh_permit = match self.lazy_refresh_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.lazy_refresh_inflight.remove(cache_key);
+                self.metrics()
+                    .lazy_refresh_skipped_busy_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
         self.metrics()
             .lazy_refresh_started_total
             .fetch_add(1, Ordering::Relaxed);
@@ -1223,6 +1258,7 @@ impl Cache {
 
         tokio::spawn(async move {
             let _refresh_guard = refresh_guard;
+            let _refresh_permit = refresh_permit;
             let refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
                 let _ = next.next(&mut sub_ctx).await?;
                 Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
@@ -1779,6 +1815,7 @@ fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
     Ok(CacheConfig {
         size: None,
         lazy_cache_ttl: None,
+        lazy_refresh_concurrency: None,
         dump_file: None,
         dump_interval: None,
         short_circuit: None,
@@ -1812,6 +1849,14 @@ fn validate_cache_config(config: &CacheConfig) -> Result<()> {
     {
         return Err(DnsError::plugin(
             "cache lazy_cache_ttl must be greater than 0",
+        ));
+    }
+
+    if let Some(concurrency) = config.lazy_refresh_concurrency
+        && concurrency == 0
+    {
+        return Err(DnsError::plugin(
+            "cache lazy_refresh_concurrency must be greater than 0",
         ));
     }
 
@@ -1876,6 +1921,9 @@ impl PluginFactory for CacheFactory {
 impl CacheFactory {
     fn build_cache(&self, tag: String, cache_config: CacheConfig) -> Result<UninitializedPlugin> {
         let cache_size = cache_config.size.unwrap_or(DEFAULT_CACHE_SIZE);
+        let lazy_refresh_concurrency = cache_config
+            .lazy_refresh_concurrency
+            .unwrap_or(DEFAULT_LAZY_REFRESH_CONCURRENCY);
         let store = Cache::new_store(&tag, cache_size);
         Ok(UninitializedPlugin::Executor(Box::new(Cache {
             store,
@@ -1893,6 +1941,7 @@ impl CacheFactory {
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
+            lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
             miss_coalescer: MissCoalescer::new(),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -1904,6 +1953,7 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
     let mut config = CacheConfig {
         size: None,
         lazy_cache_ttl: None,
+        lazy_refresh_concurrency: None,
         dump_file: None,
         dump_interval: None,
         short_circuit: None,
@@ -1981,6 +2031,9 @@ mod tests {
         let cache_size = config.size.unwrap_or(DEFAULT_CACHE_SIZE);
         let ecs_in_key = config.ecs_in_key.unwrap_or(false);
         let short_circuit = config.short_circuit.unwrap_or(false);
+        let lazy_refresh_concurrency = config
+            .lazy_refresh_concurrency
+            .unwrap_or(DEFAULT_LAZY_REFRESH_CONCURRENCY);
 
         Cache {
             store: Cache::new_store("cache_test", cache_size),
@@ -1994,6 +2047,7 @@ mod tests {
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
+            lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
             miss_coalescer: MissCoalescer::new(),
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
@@ -2004,6 +2058,7 @@ mod tests {
         CacheConfig {
             size: Some(128),
             lazy_cache_ttl: None,
+            lazy_refresh_concurrency: None,
             dump_file: None,
             dump_interval: None,
             short_circuit: Some(false),
@@ -2410,6 +2465,43 @@ mod tests {
             }
             context.set_response(response);
             continue_next!(next, context)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingRefreshExecutor {
+        started: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Plugin for BlockingRefreshExecutor {
+        fn tag(&self) -> &str {
+            "blocking_refresh_executor"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for BlockingRefreshExecutor {
+        async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
+            self.started.fetch_add(1, AtomicOrdering::Relaxed);
+            self.release.notified().await;
+
+            let question = context
+                .request
+                .first_question()
+                .cloned()
+                .expect("refresh request should contain a question");
+            let mut response = Message::new();
+            response.set_rcode(Rcode::NoError);
+            response.add_question(question.clone());
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                55,
+                RData::A(crate::proto::rdata::A(Ipv4Addr::new(9, 9, 9, 9))),
+            ));
+            context.set_response(response);
+            Ok(ExecStep::Next)
         }
     }
 
@@ -3606,6 +3698,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lazy_refresh_concurrency_limit_skips_busy_keys_without_queueing() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.lazy_refresh_concurrency = Some(1);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingRefreshExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context_a = make_context(make_request_with_query("a.example.", false, false));
+        let mut context_b = make_context(make_request_with_query("b.example.", false, false));
+        let key_a = Cache::build_cache_key(&mut context_a, false).unwrap();
+        let key_b = Cache::build_cache_key(&mut context_b, false).unwrap();
+        let now = AppClock::elapsed_millis();
+        for (key, domain) in [
+            (key_a, "a.example."),
+            (key_b.clone(), "b.example."),
+        ] {
+            cache.store.cache_map().insert_or_update_with_meta(
+                key,
+                CacheItem::new(
+                    cacheable_response_for_domain(domain, 120),
+                    120,
+                    now.saturating_sub(1_000),
+                ),
+                now.saturating_sub(121_000),
+                now.saturating_add(10_000),
+                now.saturating_sub(100),
+            );
+        }
+
+        cache
+            .execute_with_next(&mut context_a, Some(next.clone()))
+            .await
+            .expect("first stale hit should be served");
+        wait_until("first lazy refresh should start", || {
+            started.load(AtomicOrdering::Relaxed) == 1
+        })
+        .await;
+
+        cache
+            .execute_with_next(&mut context_b, Some(next.clone()))
+            .await
+            .expect("busy stale hit should still be served");
+
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_started_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_skipped_busy_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(started.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+
+        release.notify_one();
+        wait_until("first lazy refresh should complete", || {
+            cache.store.metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+
+        context_b.clear_response();
+        cache
+            .execute_with_next(&mut context_b, Some(next))
+            .await
+            .expect("second key should retry once capacity is available");
+        wait_until("second lazy refresh should start after permit release", || {
+            started.load(AtomicOrdering::Relaxed) == 2
+        })
+        .await;
+        release.notify_one();
+        wait_until("second lazy refresh should complete", || {
+            cache.store.metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 2
+        })
+        .await;
+
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_started_total
+                .load(AtomicOrdering::Relaxed),
+            2
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_skipped_busy_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert!(
+            cache.store.cache_map()
+                .get_retained_handle(&key_b, AppClock::elapsed_millis(), 0)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn lazy_refresh_does_not_update_address_key_with_cname_only_response() {
         AppClock::start();
         let mut cfg = default_test_config();
@@ -3894,6 +4108,7 @@ mod tests {
         let cfg = CacheConfig {
             size: Some(128),
             lazy_cache_ttl: None,
+            lazy_refresh_concurrency: None,
             dump_file: Some("cache.dump".to_string()),
             dump_interval: Some(0),
             short_circuit: Some(false),
@@ -3904,6 +4119,14 @@ mod tests {
             min_positive_ttl: None,
             ecs_in_key: None,
         };
+
+        assert!(validate_cache_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_lazy_refresh_concurrency() {
+        let mut cfg = default_test_config();
+        cfg.lazy_refresh_concurrency = Some(0);
 
         assert!(validate_cache_config(&cfg).is_err());
     }

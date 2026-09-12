@@ -300,6 +300,8 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
     short_circuit: true
     # Serve stale responses briefly after original TTL expiry and refresh lazily
     lazy_cache_ttl: 120
+    # Bound concurrent background lazy refreshes across distinct cache keys
+    lazy_refresh_concurrency: 64
     # Cache NXDOMAIN / NODATA responses too
     cache_negative: true
     # Upper bound for negative-cache TTL
@@ -334,6 +336,16 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
   - `lazy_cache_ttl` defines the stale reply TTL and keeps entries briefly available after freshness expires.
   - Stale hits trigger an asynchronous background refresh.
   - This setting does not shorten the original fresh TTL.
+
+#### `lazy_refresh_concurrency`
+
+- Type: `integer`; Required: no; Default: `64`
+- Purpose: Bound concurrent lazy refreshes across distinct cache keys.
+- Behavior:
+  - The existing per-key deduplication still prevents duplicate refreshes for the same key.
+  - When all refresh slots are busy, stale responses are still served, but no task is queued or spawned.
+  - Refreshes skipped by the concurrency limit increment `cache_lazy_refresh_total{result="skipped_busy"}`.
+  - A later stale request can retry once a refresh slot becomes available.
 
 #### `dump_file`
 
