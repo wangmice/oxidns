@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
@@ -16,13 +17,20 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::key::{CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_domain_key};
+use super::key::{CacheKey, canonical_ecs_key_digest, normalize_domain_key};
+#[cfg(test)]
+use super::key::EcsPrefixHints;
 #[cfg(test)]
 use super::persistence::dump_cache_to_bytes;
 use super::persistence::{
     CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes,
 };
-use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer, mark_dirty};
+use super::store::DnsCacheStore;
+#[cfg(test)]
+use super::store::CacheMutationState;
+use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer};
+#[cfg(test)]
+use super::CacheMetrics;
 use crate::api::query::{optional_text, parse_usize_param, visit_query_params};
 use crate::api::{ApiHandler, json_error, json_ok, simple_response};
 use crate::infra::cache::ttl::{TtlCacheHandle, TtlCachePruneMode};
@@ -35,40 +43,21 @@ use crate::register_plugin_api;
 const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub(super) struct CacheMutationState {
-    pub(super) updated_keys: Arc<AtomicU64>,
-    pub(super) dirty_since_ms: Arc<AtomicU64>,
-    pub(super) dirty_generation: Arc<AtomicU64>,
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct CacheApiConfig {
     pub(super) ecs_in_key: bool,
-    pub(super) ecs_prefix_hints: Arc<EcsPrefixHints>,
-    pub(super) cache_size: usize,
     pub(super) policy: CacheLoadPolicy,
     pub(super) cache_reclaimer: CacheReclaimer,
-    pub(super) state: CacheMutationState,
 }
 
-pub(super) fn register(tag: &str, cache_map: CacheMap, config: CacheApiConfig) -> Result<()> {
+pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) -> Result<()> {
     let CacheApiConfig {
         ecs_in_key,
-        ecs_prefix_hints,
-        cache_size,
         policy,
         cache_reclaimer,
-        state,
     } = config;
-    let CacheMutationState {
-        updated_keys,
-        dirty_since_ms,
-        dirty_generation,
-    } = state;
+    let cache_map = store.cache_map().clone();
     // The gate is an API-internal implementation detail. All destructive cache
-    // management handlers share this same mutex, while callers of register()
-    // keep the registration call focused on cache configuration and shared
-    // state.
+    // management handlers share this same mutex.
     let mutation_gate = Arc::new(Mutex::new(()));
 
     register_plugin_api!(
@@ -78,36 +67,24 @@ pub(super) fn register(tag: &str, cache_map: CacheMap, config: CacheApiConfig) -
             cache_map: cache_map.clone(),
         },
         DELETE_PREFIX "/entries/" => CacheEntryDeleteHandler {
-            cache_map: cache_map.clone(),
-            updated_keys: updated_keys.clone(),
-            dirty_since_ms: dirty_since_ms.clone(),
-            dirty_generation: dirty_generation.clone(),
+            store: store.clone(),
             mutation_gate: mutation_gate.clone(),
             path_prefix: plugin_api.path("/entries/")?,
         },
         POST "/flush" => CacheFlushHandler {
-            cache_map: cache_map.clone(),
-            cache_size,
+            store: store.clone(),
             cache_reclaimer: cache_reclaimer.clone(),
-            updated_keys: updated_keys.clone(),
-            dirty_since_ms: dirty_since_ms.clone(),
-            dirty_generation: dirty_generation.clone(),
             mutation_gate: mutation_gate.clone(),
         },
         GET "/dump" => CacheDumpHandler {
-            cache_map: cache_map.clone(),
+            cache_map,
             tag: tag.to_string(),
         },
         POST "/load_dump" => CacheLoadDumpHandler {
-            cache_map,
+            store,
             ecs_in_key,
-            ecs_prefix_hints,
-            cache_size,
             policy,
             cache_reclaimer,
-            updated_keys,
-            dirty_since_ms,
-            dirty_generation,
             mutation_gate,
         },
     )?;
@@ -116,12 +93,8 @@ pub(super) fn register(tag: &str, cache_map: CacheMap, config: CacheApiConfig) -
 
 #[derive(Debug)]
 struct CacheFlushHandler {
-    cache_map: CacheMap,
-    cache_size: usize,
+    store: DnsCacheStore,
     cache_reclaimer: CacheReclaimer,
-    updated_keys: Arc<AtomicU64>,
-    dirty_since_ms: Arc<AtomicU64>,
-    dirty_generation: Arc<AtomicU64>,
     mutation_gate: Arc<Mutex<()>>,
 }
 
@@ -151,7 +124,7 @@ impl ApiHandler for CacheFlushHandler {
 
         // Preparing a replacement DashMap can allocate. Keep that work off the
         // async worker just like dump parsing/pruning.
-        let initial_capacity = Cache::initial_cache_capacity(self.cache_size);
+        let initial_capacity = Cache::initial_cache_capacity(self.store.cache_size());
         let replacement =
             match tokio::task::spawn_blocking(move || CacheMap::with_capacity(initial_capacity))
                 .await
@@ -168,14 +141,8 @@ impl ApiHandler for CacheFlushHandler {
             };
 
         let mutation_guard = self.mutation_gate.lock().await;
-        let retired = self.cache_map.swap_retired(&replacement);
+        let retired = self.store.replace_generation(&replacement, 0);
         let cleared_entries = retired.entry_count();
-        mark_dirty(
-            &self.updated_keys,
-            &self.dirty_since_ms,
-            &self.dirty_generation,
-            cleared_entries as u64,
-        );
         drop(mutation_guard);
 
         // The commit is complete. Transfer the retired generation to the
@@ -258,15 +225,10 @@ impl ApiHandler for CacheDumpHandler {
 
 #[derive(Debug)]
 struct CacheLoadDumpHandler {
-    cache_map: CacheMap,
+    store: DnsCacheStore,
     ecs_in_key: bool,
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
-    cache_size: usize,
     policy: CacheLoadPolicy,
     cache_reclaimer: CacheReclaimer,
-    updated_keys: Arc<AtomicU64>,
-    dirty_since_ms: Arc<AtomicU64>,
-    dirty_generation: Arc<AtomicU64>,
     mutation_gate: Arc<Mutex<()>>,
 }
 
@@ -309,14 +271,11 @@ impl ApiHandler for CacheLoadDumpHandler {
 
         let body = request.into_body();
         let ecs_in_key = self.ecs_in_key;
-        let ecs_prefix_hints = self.ecs_prefix_hints.clone();
-        let cache_size = self.cache_size;
+        let cache_size = self.store.cache_size();
         let policy = self.policy;
-        let cache_map = self.cache_map.clone();
+        let store = self.store.clone();
+        let ecs_prefix_hints = store.ecs_prefix_hints().clone();
         let cache_reclaimer = self.cache_reclaimer.clone();
-        let updated_keys = self.updated_keys.clone();
-        let dirty_since_ms = self.dirty_since_ms.clone();
-        let dirty_generation = self.dirty_generation.clone();
 
         // Keep both the mutation guard and reclaim permit owned by the blocking
         // transaction for its entire lifetime. If the async request is
@@ -344,15 +303,11 @@ impl ApiHandler for CacheLoadDumpHandler {
             // Commit while still inside the blocking transaction. The staged
             // cache never crosses back to the async worker, and there is no
             // await/cancellation point between staging and this atomic swap.
-            let retired = cache_map.swap_retired(&staged_cache);
-            let had_entries = retired.entry_count();
             // Dirty accounting describes changes published to the live cache,
             // not transient work performed while building the isolated staged
-            // generation. Entries inserted into the staged cache and pruned
-            // before this swap were never visible, so count only the observed
-            // retired entries plus the entries that actually became live.
-            let changed = (had_entries as u64).saturating_add(after_len as u64);
-            mark_dirty(&updated_keys, &dirty_since_ms, &dirty_generation, changed);
+            // generation. `replace_generation` counts the retired entries plus
+            // the entries that actually became live.
+            let retired = store.replace_generation(&staged_cache, after_len);
 
             // Transfer ownership of the old generation before leaving the
             // blocking transaction. Its final destruction is handled by the
@@ -416,10 +371,7 @@ struct CacheEntriesListHandler {
 
 #[derive(Debug)]
 struct CacheEntryDeleteHandler {
-    cache_map: CacheMap,
-    updated_keys: Arc<AtomicU64>,
-    dirty_since_ms: Arc<AtomicU64>,
-    dirty_generation: Arc<AtomicU64>,
+    store: DnsCacheStore,
     mutation_gate: Arc<Mutex<()>>,
     path_prefix: String,
 }
@@ -673,19 +625,13 @@ impl ApiHandler for CacheEntryDeleteHandler {
                 return json_error(StatusCode::BAD_REQUEST, "invalid_cache_entry_id", err);
             }
         };
-        if !self.cache_map.remove(&key) {
+        if !self.store.remove(&key) {
             return json_error(
                 StatusCode::NOT_FOUND,
                 "cache_entry_not_found",
                 "cache entry does not exist",
             );
         }
-        mark_dirty(
-            &self.updated_keys,
-            &self.dirty_since_ms,
-            &self.dirty_generation,
-            1,
-        );
         json_ok(
             StatusCode::OK,
             &CacheEntryDeleteResponse {
@@ -987,6 +933,27 @@ mod tests {
         CacheReclaimer::new("api-test").expect("cache reclaimer should start")
     }
 
+    fn test_store(cache_map: CacheMap, cache_size: usize) -> DnsCacheStore {
+        let hints = Arc::new(EcsPrefixHints::new());
+        let metrics = Arc::new(CacheMetrics::new(
+            "api-test".to_string(),
+            hints.clone(),
+        ));
+        metrics.set_cache_map(cache_map.clone());
+        DnsCacheStore::new(
+            cache_map,
+            cache_size,
+            hints,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            CacheMutationState {
+                updated_keys: Arc::new(AtomicU64::new(0)),
+                dirty_since_ms: Arc::new(AtomicU64::new(0)),
+                dirty_generation: Arc::new(AtomicU64::new(0)),
+            },
+            metrics,
+        )
+    }
+
     fn test_cache_key(domain: &str) -> CacheKey {
         CacheKey {
             domain: domain.into(),
@@ -1120,15 +1087,10 @@ mod tests {
     async fn invalid_load_dump_returns_bad_request() {
         let cache_map = CacheMap::with_capacity(1);
         let handler = CacheLoadDumpHandler {
-            cache_map,
+            store: test_store(cache_map, 1),
             ecs_in_key: false,
-            ecs_prefix_hints: Arc::new(EcsPrefixHints::new()),
-            cache_size: 1,
             policy: CacheLoadPolicy::default(),
             cache_reclaimer: test_cache_reclaimer(),
-            updated_keys: Arc::new(AtomicU64::new(0)),
-            dirty_since_ms: Arc::new(AtomicU64::new(0)),
-            dirty_generation: Arc::new(AtomicU64::new(0)),
             mutation_gate: Arc::new(Mutex::new(())),
         };
 
@@ -1142,30 +1104,19 @@ mod tests {
     async fn cache_mutation_handlers_serialize_load_and_flush() {
         AppClock::start();
         let cache_map = CacheMap::with_capacity(1);
+        let store = test_store(cache_map.clone(), 1);
         let mutation_gate = Arc::new(Mutex::new(()));
-        let updated_keys = Arc::new(AtomicU64::new(0));
-        let dirty_since_ms = Arc::new(AtomicU64::new(0));
-        let dirty_generation = Arc::new(AtomicU64::new(0));
         let reclaimer = test_cache_reclaimer();
         let flush = Arc::new(CacheFlushHandler {
-            cache_map: cache_map.clone(),
-            cache_size: 1,
+            store: store.clone(),
             cache_reclaimer: reclaimer.clone(),
-            updated_keys: updated_keys.clone(),
-            dirty_since_ms: dirty_since_ms.clone(),
-            dirty_generation: dirty_generation.clone(),
             mutation_gate: mutation_gate.clone(),
         });
         let load = Arc::new(CacheLoadDumpHandler {
-            cache_map: cache_map.clone(),
+            store,
             ecs_in_key: false,
-            ecs_prefix_hints: Arc::new(EcsPrefixHints::new()),
-            cache_size: 1,
             policy: CacheLoadPolicy::default(),
             cache_reclaimer: reclaimer,
-            updated_keys,
-            dirty_since_ms,
-            dirty_generation,
             mutation_gate: mutation_gate.clone(),
         });
         let dump = dump_cache_to_bytes(&cache_map).expect("empty dump should serialize");
