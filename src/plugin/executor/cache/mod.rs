@@ -2446,10 +2446,10 @@ mod tests {
     }
 
     #[test]
-    fn periodic_prune_removes_large_expired_backlog() {
+    fn periodic_prune_bounds_large_expired_backlog_per_pass() {
         let cache_map = CacheMap::with_capacity(16);
         let now = 10_000u64;
-        let expired_count = 8_704; // 8704
+        let expired_count = 8_704;
         for idx in 0..expired_count {
             insert_test_cache_entry(
                 &cache_map,
@@ -2459,17 +2459,47 @@ mod tests {
             );
         }
 
-        // 执行清理
+        // Periodic maintenance samples at most 4096 entries. Even when every
+        // entry is expired, one pressure pass must not turn into a full-table
+        // sweep. Full expiry cleanup is reserved for Exact mode.
         let (expired_removed, evicted, after_len) = cache_map.prune(
             TtlCachePruneMode::Periodic {
                 max_size: expired_count,
-                high_watermark_pct: EVICT_HIGH_WATERMARK_PERCENT,
-                low_watermark_pct: EVICT_LOW_WATERMARK_PERCENT,
+                high_watermark_pct: 100,
+                low_watermark_pct: 100,
             },
             now,
         );
 
-        assert_eq!(expired_removed, expired_count); // 8704 == 8704
+        assert!(expired_removed > 0);
+        assert!(expired_removed <= 4096);
+        assert_eq!(evicted, 0);
+        assert_eq!(after_len, expired_count - expired_removed);
+        assert_eq!(cache_map.len(), after_len);
+    }
+
+    #[test]
+    fn exact_prune_removes_complete_expired_backlog() {
+        let cache_map = CacheMap::with_capacity(16);
+        let now = 10_000u64;
+        let expired_count = 8_704;
+        for idx in 0..expired_count {
+            insert_test_cache_entry(
+                &cache_map,
+                format!("expired-{idx}.example"),
+                now.saturating_sub(1),
+                idx as u64,
+            );
+        }
+
+        let (expired_removed, evicted, after_len) = cache_map.prune(
+            TtlCachePruneMode::Exact {
+                max_size: expired_count,
+            },
+            now,
+        );
+
+        assert_eq!(expired_removed, expired_count);
         assert_eq!(evicted, 0);
         assert_eq!(after_len, 0);
         assert!(cache_map.is_empty());

@@ -21,6 +21,8 @@ use dashmap::{DashMap, Entry, SharedValue};
 use rand::RngExt;
 
 const LAST_ACCESS_EVICTING_BIT: u64 = 1 << 63;
+const PERIODIC_MAINTENANCE_SAMPLE_SIZE: usize = 4096;
+const PERIODIC_EVICTION_SAMPLE_KILL_DIVISOR: usize = 4;
 
 /// Immutable cache node stored behind a stable `Arc`.
 ///
@@ -180,8 +182,8 @@ pub(crate) struct TtlCacheMoveMetadata {
 /// Capacity policy for one background cache-pruning pass.
 #[derive(Debug, Clone, Copy)]
 pub enum TtlCachePruneMode {
-    /// Trim only after crossing a high watermark, then target the low
-    /// watermark.
+    /// Trim only after crossing a high watermark, making bounded progress
+    /// toward the low watermark on each periodic maintenance pass.
     Periodic {
         max_size: usize,
         high_watermark_pct: usize,
@@ -191,13 +193,12 @@ pub enum TtlCachePruneMode {
     Exact { max_size: usize },
 }
 
-impl TtlCachePruneMode {
-    #[inline]
-    fn max_size(self) -> usize {
-        match self {
-            Self::Periodic { max_size, .. } | Self::Exact { max_size } => max_size,
-        }
-    }
+#[derive(Debug)]
+struct TtlCacheMaintenanceCandidate<K> {
+    key: K,
+    expire_at_ms: u64,
+    last_access_ms: u64,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -877,6 +878,34 @@ where
         removed
     }
 
+    /// Remove every expired entry from one detached/live state.
+    ///
+    /// This is intentionally O(N) and is reserved for exact/offline pruning
+    /// where callers require complete expiration cleanup before enforcing a
+    /// hard capacity bound. Periodic request-time maintenance must use bounded
+    /// sampling instead.
+    fn remove_all_expired_from_state(state: &TtlCacheState<K, V>, now_ms: u64) -> usize {
+        let mut expired_keys = Vec::new();
+        for item in state.map.iter() {
+            if item.value().expire_at_ms <= now_ms {
+                expired_keys.push(item.key().clone());
+            }
+        }
+
+        let mut removed = 0usize;
+        for key in expired_keys {
+            if state
+                .map
+                .remove_if(&key, |_, existing| existing.expire_at_ms <= now_ms)
+                .is_some()
+            {
+                state.entry_count.fetch_sub(1, Ordering::Release);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Remove at most `batch` expired entries and return removed count.
     #[inline]
     pub fn remove_expired_batch(&self, now_ms: u64, batch: usize) -> usize {
@@ -1063,76 +1092,170 @@ where
 {
     /// Prune expired entries and evict according to an explicit capacity mode.
     ///
-    /// 返回值：一个三元组 `(expired_removed, evicted,
-    /// after_len)`，用于上层插件打印物理日志。
+    /// `Exact` mode may scan the complete cache because callers require a hard
+    /// capacity guarantee before publishing a prepared generation. `Periodic`
+    /// mode is request-time maintenance and is deliberately bounded: one pass
+    /// samples at most [`PERIODIC_MAINTENANCE_SAMPLE_SIZE`] entries and uses
+    /// that same sample for expired-first cleanup and sampled LRU eviction.
+    ///
+    /// Returns `(expired_removed, evicted, after_len)`.
     pub fn prune(&self, mode: TtlCachePruneMode, now_ms: u64) -> (usize, usize, usize) {
-        let max_size = mode.max_size();
-
-        // 1. Scan the map once and remove at most the bounded number of expired
-        // entries. The previous 2K batching restarted `DashMap::iter()` for
-        // every batch, so a 65K sweep could repeatedly walk the same
-        // large live prefix.
-        let expired_sweep_limit = max_size.clamp(8192, 65536);
         let state = self.state.load();
-        let expired_removed =
-            Self::remove_expired_up_to_from_state(&state, now_ms, expired_sweep_limit);
 
-        let current_size = state.entry_count.load(Ordering::Relaxed);
+        match mode {
+            TtlCachePruneMode::Exact { max_size } => {
+                let expired_removed = Self::remove_all_expired_from_state(&state, now_ms);
+                let current_size = state.entry_count.load(Ordering::Acquire);
+                let evict_target = current_size.saturating_sub(max_size);
 
-        let mut evicted = 0;
+                let mut evicted = Self::evict_lru_sampled_internal(&state, evict_target);
 
-        let evict_target = match mode {
-            TtlCachePruneMode::Exact { .. } => current_size.saturating_sub(max_size),
+                // Exact mode is used for prepared/replacement generations and
+                // must actually enforce the configured capacity. Bounded
+                // sampling can miss every live bucket in a sparse, previously
+                // grown DashMap, so use a deterministic full-scan fallback only
+                // for the remaining excess.
+                let remaining_excess = state
+                    .entry_count
+                    .load(Ordering::Acquire)
+                    .saturating_sub(max_size);
+                if remaining_excess > 0 {
+                    evicted = evicted.saturating_add(Self::evict_lru_exact_fallback(
+                        &state,
+                        remaining_excess,
+                    ));
+                }
+
+                (
+                    expired_removed,
+                    evicted,
+                    state.entry_count.load(Ordering::Acquire),
+                )
+            }
             TtlCachePruneMode::Periodic {
+                max_size,
                 high_watermark_pct,
                 low_watermark_pct,
-                ..
-            } => {
-                let high_watermark = max_size
-                    .saturating_mul(high_watermark_pct)
-                    .saturating_div(100);
-                if current_size <= high_watermark {
-                    0
-                } else {
-                    let low_watermark = max_size
-                        .saturating_mul(low_watermark_pct)
-                        .saturating_div(100);
-                    current_size.saturating_sub(low_watermark.min(current_size))
-                }
+            } => Self::prune_periodic_bounded(
+                &state,
+                now_ms,
+                max_size,
+                high_watermark_pct,
+                low_watermark_pct,
+            ),
+        }
+    }
+
+    fn prune_periodic_bounded(
+        state: &TtlCacheState<K, V>,
+        now_ms: u64,
+        max_size: usize,
+        high_watermark_pct: usize,
+        low_watermark_pct: usize,
+    ) -> (usize, usize, usize) {
+        let current_size = state.entry_count.load(Ordering::Acquire);
+        if current_size == 0 {
+            return (0, 0, 0);
+        }
+
+        // One bounded sample pays for both expiration cleanup and LRU
+        // selection. This avoids an O(N) expiry sweep on every pressure pass
+        // when few or no entries are expired.
+        let sample_limit = PERIODIC_MAINTENANCE_SAMPLE_SIZE.min(current_size);
+        let sample = Self::sample_sharded_bounded(state, sample_limit, |key, entry| {
+            TtlCacheMaintenanceCandidate {
+                key: key.clone(),
+                expire_at_ms: entry.expire_at_ms,
+                last_access_ms: entry.last_access_ms(),
+                generation: entry.generation,
             }
+        });
+
+        if sample.is_empty() {
+            return (0, 0, state.entry_count.load(Ordering::Acquire));
+        }
+
+        let sampled_all_entries = current_size <= PERIODIC_MAINTENANCE_SAMPLE_SIZE
+            && sample.len() == current_size;
+        let mut live_candidates = Vec::with_capacity(sample.len());
+        let mut expired_removed = 0usize;
+
+        for candidate in sample {
+            if candidate.expire_at_ms <= now_ms {
+                let removed = state
+                    .map
+                    .remove_if(&candidate.key, |_, existing| {
+                        existing.generation == candidate.generation
+                            && existing.expire_at_ms <= now_ms
+                    })
+                    .is_some();
+                if removed {
+                    state.entry_count.fetch_sub(1, Ordering::Release);
+                    expired_removed += 1;
+                }
+            } else {
+                live_candidates.push(candidate);
+            }
+        }
+
+        let current_size = state.entry_count.load(Ordering::Acquire);
+        let high_watermark = max_size
+            .saturating_mul(high_watermark_pct)
+            .saturating_div(100);
+        if current_size <= high_watermark || live_candidates.is_empty() {
+            return (
+                expired_removed,
+                0,
+                state.entry_count.load(Ordering::Acquire),
+            );
+        }
+
+        let low_watermark = max_size
+            .saturating_mul(low_watermark_pct)
+            .saturating_div(100);
+        let evict_target = current_size.saturating_sub(low_watermark.min(current_size));
+        if evict_target == 0 {
+            return (
+                expired_removed,
+                0,
+                state.entry_count.load(Ordering::Acquire),
+            );
+        }
+
+        live_candidates.sort_unstable_by_key(|candidate| candidate.last_access_ms);
+
+        // When the entire cache fits in one bounded sample, trimming directly
+        // to the low watermark is still bounded and preserves the old behavior
+        // for small caches. For larger caches, evict only the oldest fraction
+        // of this sample so one maintenance pass has a fixed worst-case cost.
+        let evict_limit = if sampled_all_entries {
+            evict_target.min(live_candidates.len())
+        } else {
+            (live_candidates.len() / PERIODIC_EVICTION_SAMPLE_KILL_DIVISOR)
+                .max(1)
+                .min(evict_target)
         };
-        if evict_target > 0 {
-            let evict_limit = match mode {
-                TtlCachePruneMode::Exact { .. } | TtlCachePruneMode::Periodic { .. }
-                    if max_size <= 100_000 =>
-                {
-                    evict_target
-                }
-                TtlCachePruneMode::Periodic { .. } => evict_target.min(65_536),
-                TtlCachePruneMode::Exact { .. } => evict_target,
-            };
-            evicted = Self::evict_lru_sampled_internal(&state, evict_limit);
-        }
 
-        // Exact mode is used for prepared/replacement generations and must
-        // actually enforce the configured capacity. Bounded sampling can miss
-        // every live bucket in a very sparse, previously-grown DashMap, so use
-        // a deterministic full-scan fallback only for the remaining
-        // excess.
-        if matches!(mode, TtlCachePruneMode::Exact { .. }) {
-            let remaining_excess = state
-                .entry_count
-                .load(Ordering::Acquire)
-                .saturating_sub(max_size);
-            if remaining_excess > 0 {
-                evicted = evicted
-                    .saturating_add(Self::evict_lru_exact_fallback(&state, remaining_excess));
+        let mut evicted = 0usize;
+        for candidate in live_candidates.into_iter().take(evict_limit) {
+            let removed = state
+                .map
+                .remove_if(&candidate.key, |_, existing| {
+                    existing.generation == candidate.generation
+                        && existing.try_claim_eviction(candidate.last_access_ms)
+                })
+                .is_some();
+            if removed {
+                state.entry_count.fetch_sub(1, Ordering::Release);
+                evicted += 1;
             }
         }
 
-        let after_len = state.map.len();
-
-        (expired_removed, evicted, after_len)
+        (
+            expired_removed,
+            evicted,
+            state.entry_count.load(Ordering::Acquire),
+        )
     }
 
     fn evict_lru_exact_fallback(state: &TtlCacheState<K, V>, target_to_kill: usize) -> usize {
@@ -1690,6 +1813,28 @@ mod tests {
 
         assert_eq!(evicted, 0);
         assert_eq!(after_len, 2);
+    }
+
+    #[test]
+    fn periodic_prune_bounds_lru_work_for_large_cache() {
+        let cache = TtlCache::with_capacity(5_000);
+        for idx in 0..5_000u64 {
+            cache.insert_or_update_with_meta(idx, idx, 0, 100_000, idx);
+        }
+
+        let (expired_removed, evicted, after_len) = cache.prune(
+            TtlCachePruneMode::Periodic {
+                max_size: 4_096,
+                high_watermark_pct: 95,
+                low_watermark_pct: 85,
+            },
+            1,
+        );
+
+        assert_eq!(expired_removed, 0);
+        assert!(evicted > 0);
+        assert!(evicted <= PERIODIC_MAINTENANCE_SAMPLE_SIZE / 4);
+        assert_eq!(after_len, 5_000 - evicted);
     }
 
     #[test]
