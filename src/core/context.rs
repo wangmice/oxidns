@@ -81,6 +81,12 @@ impl IngressContext {
 pub struct RuntimeContext {
     marks: AHashSet<u32>,
     extensions: AHashMap<String, Box<dyn Any + Send + Sync>>,
+    /// Opaque tokens for cache-miss leaders on the current execution ancestry.
+    ///
+    /// This is runtime-only control-flow state. Subqueries inherit a snapshot
+    /// so recursive execution can detect that it is about to wait on one of
+    /// its own ancestor leaders, while sibling branches remain independent.
+    miss_leader_ancestry: Arc<[u64]>,
 }
 
 impl Default for RuntimeContext {
@@ -88,6 +94,7 @@ impl Default for RuntimeContext {
         Self {
             marks: AHashSet::new(),
             extensions: AHashMap::new(),
+            miss_leader_ancestry: Arc::<[u64]>::from([]),
         }
     }
 }
@@ -131,6 +138,27 @@ impl RuntimeContext {
             .remove(name)
             .and_then(|value| value.downcast::<T>().ok())
             .map(|boxed| *boxed)
+    }
+
+    #[inline]
+    pub(crate) fn has_miss_leader_ancestor(&self, token: u64) -> bool {
+        self.miss_leader_ancestry.contains(&token)
+    }
+
+    /// Add one miss-leader token to the current execution ancestry and return
+    /// the previous snapshot so callers can restore it after downstream work.
+    pub(crate) fn push_miss_leader_ancestor(&mut self, token: u64) -> Arc<[u64]> {
+        let previous = Arc::clone(&self.miss_leader_ancestry);
+        let mut ancestry = Vec::with_capacity(previous.len().saturating_add(1));
+        ancestry.extend_from_slice(&previous);
+        ancestry.push(token);
+        self.miss_leader_ancestry = ancestry.into();
+        previous
+    }
+
+    #[inline]
+    pub(crate) fn restore_miss_leader_ancestry(&mut self, ancestry: Arc<[u64]>) {
+        self.miss_leader_ancestry = ancestry;
     }
 }
 
@@ -373,6 +401,7 @@ impl DnsContext {
             runtime: RuntimeContext {
                 marks: self.runtime.marks.clone(),
                 extensions: AHashMap::new(),
+                miss_leader_ancestry: Arc::clone(&self.runtime.miss_leader_ancestry),
             },
         }
     }
@@ -525,4 +554,22 @@ mod tests {
             Some("forward")
         );
     }
+    #[test]
+    fn miss_leader_ancestry_is_inherited_by_subqueries_but_not_applied_back() {
+        let mut ctx = make_context();
+        let previous = ctx.runtime.push_miss_leader_ancestor(11);
+        assert!(!previous.contains(&11));
+        assert!(ctx.runtime.has_miss_leader_ancestor(11));
+
+        let mut sub_ctx = ctx.copy_for_subquery();
+        assert!(sub_ctx.runtime.has_miss_leader_ancestor(11));
+        let _ = sub_ctx.runtime.push_miss_leader_ancestor(22);
+        assert!(sub_ctx.runtime.has_miss_leader_ancestor(22));
+        assert!(!ctx.runtime.has_miss_leader_ancestor(22));
+
+        ctx.apply_subquery_result(sub_ctx);
+        assert!(ctx.runtime.has_miss_leader_ancestor(11));
+        assert!(!ctx.runtime.has_miss_leader_ancestor(22));
+    }
+
 }

@@ -87,6 +87,7 @@ const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS: u64 = 30;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_MISS_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 // Soft dirty-age target for low-churn caches. The effective target is never
 // allowed to undercut the user-configured dump interval.
 const DIRTY_DUMP_TARGET_SECS: u64 = 120;
@@ -296,7 +297,13 @@ impl CacheReclaimer {
 
 #[derive(Debug)]
 struct MissCoalescer {
-    inflight: DashMap<CacheKey, Arc<watch::Sender<bool>>>,
+    inflight: DashMap<CacheKey, Arc<MissFlight>>,
+}
+
+#[derive(Debug)]
+struct MissFlight {
+    id: u64,
+    sender: watch::Sender<bool>,
 }
 
 impl MissCoalescer {
@@ -306,31 +313,38 @@ impl MissCoalescer {
         }
     }
 
-    fn register(&self, key: CacheKey) -> MissRole<'_> {
+    fn register(&self, key: CacheKey, context: &DnsContext) -> MissRole<'_> {
         match self.inflight.entry(key.clone()) {
             Entry::Occupied(entry) => {
-                let receiver = entry.get().subscribe();
-                MissRole::Follower(receiver)
+                let flight = entry.get();
+                if context.runtime.has_miss_leader_ancestor(flight.id) {
+                    MissRole::Reentrant
+                } else {
+                    MissRole::Follower(flight.sender.subscribe())
+                }
             }
             Entry::Vacant(entry) => {
                 let (sender, _receiver) = watch::channel(false);
-                let sender = Arc::new(sender);
-                entry.insert(sender.clone());
+                let flight = Arc::new(MissFlight {
+                    id: NEXT_MISS_FLIGHT_ID.fetch_add(1, Ordering::Relaxed),
+                    sender,
+                });
+                entry.insert(flight.clone());
                 MissRole::Leader(MissLeader {
                     coalescer: self,
                     key,
-                    sender,
+                    flight,
                     completed: false,
                 })
             }
         }
     }
 
-    fn complete(&self, key: &CacheKey, sender: &Arc<watch::Sender<bool>>, cached: bool) {
+    fn complete(&self, key: &CacheKey, flight: &Arc<MissFlight>, cached: bool) {
         let _ = self
             .inflight
-            .remove_if(key, |_, current| Arc::ptr_eq(current, sender));
-        let _ = sender.send(cached);
+            .remove_if(key, |_, current| Arc::ptr_eq(current, flight));
+        let _ = flight.sender.send(cached);
     }
 }
 
@@ -338,27 +352,33 @@ impl MissCoalescer {
 enum MissRole<'a> {
     Leader(MissLeader<'a>),
     Follower(watch::Receiver<bool>),
+    Reentrant,
 }
 
 #[derive(Debug)]
 struct MissLeader<'a> {
     coalescer: &'a MissCoalescer,
     key: CacheKey,
-    sender: Arc<watch::Sender<bool>>,
+    flight: Arc<MissFlight>,
     completed: bool,
 }
 
 impl MissLeader<'_> {
+    #[inline]
+    fn token(&self) -> u64 {
+        self.flight.id
+    }
+
     fn complete(mut self, cached: bool) {
         self.completed = true;
-        self.coalescer.complete(&self.key, &self.sender, cached);
+        self.coalescer.complete(&self.key, &self.flight, cached);
     }
 }
 
 impl Drop for MissLeader<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.coalescer.complete(&self.key, &self.sender, false);
+            self.coalescer.complete(&self.key, &self.flight, false);
         }
     }
 }
@@ -509,6 +529,7 @@ struct CacheMetrics {
     miss_total: AtomicU64,
     miss_coalesced_total: AtomicU64,
     miss_coalesce_timeout_total: AtomicU64,
+    miss_coalesce_reentrant_total: AtomicU64,
     expired_total: AtomicU64,
     insert_total: AtomicU64,
     skip_truncated_total: AtomicU64,
@@ -535,6 +556,7 @@ impl CacheMetrics {
             miss_total: AtomicU64::new(0),
             miss_coalesced_total: AtomicU64::new(0),
             miss_coalesce_timeout_total: AtomicU64::new(0),
+            miss_coalesce_reentrant_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
             insert_total: AtomicU64::new(0),
             skip_truncated_total: AtomicU64::new(0),
@@ -670,6 +692,12 @@ impl MetricSource for CacheMetricSource {
             "Total cache miss coalescing waits that timed out.",
             &base,
             metrics.miss_coalesce_timeout_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "cache_miss_coalesce_reentrant_total",
+            "Total recursive cache misses that bypassed waiting on an ancestor leader.",
+            &base,
+            metrics.miss_coalesce_reentrant_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::counter(
             "cache_expired_total",
@@ -1685,7 +1713,7 @@ impl Executor for Cache {
         };
         let key = key.clone();
 
-        match self.miss_coalescer.register(key.clone()) {
+        match self.miss_coalescer.register(key.clone(), context) {
             MissRole::Follower(mut ready) => {
                 self.metrics()
                     .miss_coalesced_total
@@ -1714,8 +1742,25 @@ impl Executor for Cache {
                 // this request directly instead of registering it again.
                 return continue_next!(next, context);
             }
+            MissRole::Reentrant => {
+                self.metrics()
+                    .miss_coalesce_reentrant_total
+                    .fetch_add(1, Ordering::Relaxed);
+                // This control flow is already inside the leader for the same
+                // cache key. Waiting would deadlock until the follower timeout,
+                // because that ancestor leader cannot complete before this
+                // nested execution returns. Resolve downstream directly; the
+                // ancestor leader remains responsible for the eventual cache
+                // write and for waking independent followers.
+                return continue_next!(next, context);
+            }
             MissRole::Leader(leader) => {
-                let next_step = continue_next!(next, context)?;
+                let previous_ancestry = context.runtime.push_miss_leader_ancestor(leader.token());
+                let next_result = continue_next!(next, context);
+                context
+                    .runtime
+                    .restore_miss_leader_ancestry(previous_ancestry);
+                let next_step = next_result?;
                 let cached = if let Some(response) = context.response() {
                     if response.truncated() {
                         self.metrics()
@@ -2245,13 +2290,18 @@ mod tests {
         let coalescer = MissCoalescer::new();
         let key = cache_key_for_domain("example.com");
 
-        let leader = match coalescer.register(key.clone()) {
+        let context = make_context(make_request_with_query("example.com.", false, false));
+        let leader = match coalescer.register(key.clone(), &context) {
             MissRole::Leader(leader) => leader,
-            MissRole::Follower(_) => panic!("first request should become leader"),
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("first request should become leader")
+            }
         };
-        let mut follower = match coalescer.register(key.clone()) {
+        let mut follower = match coalescer.register(key.clone(), &context) {
             MissRole::Follower(receiver) => receiver,
-            MissRole::Leader(_) => panic!("second request should become follower"),
+            MissRole::Leader(_) | MissRole::Reentrant => {
+                panic!("second independent request should become follower")
+            }
         };
 
         leader.complete(true);
@@ -2261,7 +2311,128 @@ mod tests {
             .expect("leader completion should notify follower");
         assert!(*follower.borrow());
 
-        assert!(matches!(coalescer.register(key), MissRole::Leader(_)));
+        assert!(matches!(
+            coalescer.register(key, &context),
+            MissRole::Leader(_)
+        ));
+    }
+
+    #[test]
+    fn miss_coalescer_detects_recursive_wait_on_ancestor_leader() {
+        let coalescer = MissCoalescer::new();
+        let key = cache_key_for_domain("reentrant.example");
+        let mut context = make_context(make_request_with_query(
+            "reentrant.example.",
+            false,
+            false,
+        ));
+
+        let leader = match coalescer.register(key.clone(), &context) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("first request should become leader")
+            }
+        };
+        let previous = context.runtime.push_miss_leader_ancestor(leader.token());
+
+        assert!(matches!(
+            coalescer.register(key.clone(), &context),
+            MissRole::Reentrant
+        ));
+
+        context.runtime.restore_miss_leader_ancestry(previous);
+        assert!(matches!(
+            coalescer.register(key, &context),
+            MissRole::Follower(_)
+        ));
+    }
+
+    #[test]
+    fn miss_coalescer_does_not_treat_sibling_branch_as_reentrant() {
+        let coalescer = MissCoalescer::new();
+        let outer_key = cache_key_for_domain("outer.example");
+        let sibling_key = cache_key_for_domain("sibling.example");
+        let mut parent = make_context(make_request_with_query("outer.example.", false, false));
+
+        let outer_leader = match coalescer.register(outer_key, &parent) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("outer request should become leader")
+            }
+        };
+        let previous = parent
+            .runtime
+            .push_miss_leader_ancestor(outer_leader.token());
+
+        let mut primary = parent.copy_for_subquery();
+        let secondary = parent.copy_for_subquery();
+        let sibling_leader = match coalescer.register(sibling_key.clone(), &primary) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("primary sibling should become leader")
+            }
+        };
+        let _ = primary
+            .runtime
+            .push_miss_leader_ancestor(sibling_leader.token());
+
+        assert!(matches!(
+            coalescer.register(sibling_key, &secondary),
+            MissRole::Follower(_)
+        ));
+
+        parent.runtime.restore_miss_leader_ancestry(previous);
+    }
+
+    #[tokio::test]
+    async fn recursive_cache_miss_bypasses_ancestor_wait_and_caches_once() {
+        AppClock::start();
+        let mut cache = test_cache(default_test_config());
+        let _ = cache.init_for_test().await;
+        let cache = Arc::new(cache);
+
+        let terminal_calls = Arc::new(AtomicUsize::new(0));
+        let terminal_program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+                calls: terminal_calls.clone(),
+            }));
+        let inner_next = ExecutorNext::from_program_for_test(terminal_program, 0);
+        let recursive_program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            RecursiveCacheExecutor {
+                cache: cache.clone(),
+                inner_next,
+            },
+        ));
+        let outer_next = ExecutorNext::from_program_for_test(recursive_program, 0);
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+
+        let step = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.execute_with_next(&mut context, Some(outer_next)),
+        )
+        .await
+        .expect("recursive cache execution must not wait for miss coalescing timeout")
+        .expect("recursive cache execution should succeed");
+
+        assert_eq!(step, ExecStep::Next);
+        assert_eq!(terminal_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.cache_map().len(), 1);
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesce_reentrant_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesce_timeout_total
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -2658,6 +2829,48 @@ mod tests {
             }
             context.set_response(response);
             continue_next!(next, context)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecursiveCacheExecutor {
+        cache: Arc<Cache>,
+        inner_next: ExecutorNext,
+    }
+
+    #[async_trait]
+    impl Plugin for RecursiveCacheExecutor {
+        fn tag(&self) -> &str {
+            "recursive_cache_executor"
+        }
+
+        async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn destroy(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Executor for RecursiveCacheExecutor {
+        fn with_next(&self) -> bool {
+            true
+        }
+
+        async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
+            self.cache
+                .execute_with_next(context, Some(self.inner_next.clone()))
+                .await
+        }
+
+        async fn execute_with_next(
+            &self,
+            context: &mut DnsContext,
+            _next: Option<ExecutorNext>,
+        ) -> Result<ExecStep> {
+            self.execute(context).await
         }
     }
 
