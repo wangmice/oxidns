@@ -15,7 +15,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::key::{CacheKey, canonical_ecs_key_digest, normalize_domain_key};
+use super::key::{
+    CacheKey, canonical_ecs_key_digest, normalize_cache_key_domain, normalize_domain_key,
+};
 #[cfg(test)]
 use super::key::EcsPrefixHints;
 #[cfg(test)]
@@ -886,10 +888,8 @@ fn decode_cache_entry_id(raw: &str) -> std::result::Result<CacheKey, String> {
     let id: CacheEntryId = serde_json::from_slice(&bytes)
         .map_err(|_| "cache entry id is not valid json".to_string())?;
 
-    let domain = normalize_domain_key(&id.domain);
-    if domain.is_empty() {
-        return Err("cache entry id domain is empty".to_string());
-    }
+    let domain = normalize_cache_key_domain(&id.domain)
+        .ok_or_else(|| "cache entry id domain is invalid empty text".to_string())?;
 
     let ecs_scope = match id.ecs_scope {
         Some(ecs) => {
@@ -993,6 +993,47 @@ mod tests {
             "www.example.net",
             "example.com"
         ));
+    }
+
+    #[test]
+    fn cache_entry_id_roundtrips_canonical_root_domain() {
+        let key = test_cache_key(".");
+
+        let encoded = encode_cache_entry_id(&key).expect("root cache id should encode");
+        let decoded = decode_cache_entry_id(&encoded).expect("root cache id should decode");
+
+        assert_eq!(decoded.domain.as_ref(), ".");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn decode_cache_entry_id_rejects_empty_domain() {
+        let id = CacheEntryId {
+            domain: String::new(),
+            record_type: u16::from(RecordType::A),
+            dns_class: u16::from(DNSClass::IN),
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: None,
+        };
+        let raw = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id).unwrap());
+
+        assert!(decode_cache_entry_id(&raw).is_err());
+    }
+
+    #[test]
+    fn decode_cache_entry_id_rejects_whitespace_only_domain() {
+        let id = CacheEntryId {
+            domain: "   ".to_string(),
+            record_type: u16::from(RecordType::A),
+            dns_class: u16::from(DNSClass::IN),
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: None,
+        };
+        let raw = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id).unwrap());
+
+        assert!(decode_cache_entry_id(&raw).is_err());
     }
 
     #[test]

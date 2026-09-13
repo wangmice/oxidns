@@ -24,7 +24,7 @@ use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{
     CacheKey, EcsPrefixHints, build_cache_key as build_cache_key_internal,
-    cache_key_for_response_ecs_scope,
+    cache_domain_matches_name, cache_key_for_response_ecs_scope,
 };
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
 use self::store::{DnsCacheLookup, DnsCacheStore};
@@ -1873,7 +1873,7 @@ fn compute_cache_ttl_with_policy(
 #[inline]
 fn response_disposition_for_cache(response: &Message, key: &CacheKey) -> ResponseDisposition {
     if let Some(question) = response.first_question() {
-        if question.name().normalized() != key.domain.as_ref()
+        if !cache_domain_matches_name(key.domain.as_ref(), question.name())
             || question.qtype() != key.record_type
             || question.qclass() != key.dns_class
         {

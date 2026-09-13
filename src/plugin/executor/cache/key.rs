@@ -113,6 +113,38 @@ pub(super) fn normalize_domain_key(raw: &str) -> String {
     normalized
 }
 
+/// Normalize domain text that is part of a serialized/runtime cache key.
+///
+/// The DNS root has one canonical representation: `.`. Empty or
+/// whitespace-only domain text is invalid.
+#[inline]
+pub(super) fn normalize_cache_key_domain(raw: &str) -> Option<String> {
+    let normalized = normalize_domain_key(raw);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+#[inline]
+fn cache_domain_from_name(name: &Name) -> Arc<str> {
+    if name.is_root() {
+        Arc::<str>::from(".")
+    } else {
+        Arc::<str>::from(name.normalized())
+    }
+}
+
+#[inline]
+pub(super) fn cache_domain_matches_name(domain: &str, name: &Name) -> bool {
+    if name.is_root() {
+        domain == "."
+    } else {
+        name.normalized() == domain
+    }
+}
+
 #[inline]
 fn write_truncated_prefix(src: &[u8], prefix: u8, out: &mut [u8; 16]) -> u8 {
     let max_bits = (src.len() * 8) as u8;
@@ -246,7 +278,7 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
     }
 
     let question = context.request.first_question()?;
-    let domain = Arc::<str>::from(question.name().normalized().to_string());
+    let domain = cache_domain_from_name(question.name());
     let record_type = question.qtype();
     let dns_class = question.qclass();
 
@@ -669,6 +701,23 @@ mod tests {
     fn test_normalize_domain_key_preserves_root_domain() {
         assert_eq!(normalize_domain_key(" . "), ".");
         assert_eq!(normalize_domain_key(""), "");
+    }
+
+    #[test]
+    fn test_normalize_cache_key_domain_requires_canonical_nonempty_text() {
+        assert_eq!(normalize_cache_key_domain(" . "), Some(".".to_string()));
+        assert_eq!(normalize_cache_key_domain(""), None);
+        assert_eq!(normalize_cache_key_domain("   "), None);
+    }
+
+    #[test]
+    fn test_build_cache_key_uses_dot_for_real_root_query() {
+        let mut context = make_context(".");
+
+        let cache_key = build_cache_key(&mut context, false).expect("root cache key should exist");
+
+        assert_eq!(cache_key.domain.as_ref(), ".");
+        assert_eq!(cache_key.question().expect("root question should rebuild").name().to_fqdn(), ".");
     }
 
     #[test]

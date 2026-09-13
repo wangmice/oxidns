@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{
-    CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_domain_key,
+    CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_cache_key_domain,
     persisted_ecs_key_matches_response,
 };
 use super::{
@@ -409,10 +409,8 @@ fn parse_persisted_dump(data: &[u8]) -> Result<PersistedCacheDump> {
 /// `ecs_in_key == false`). Malformed key metadata is an error so a replacement
 /// load can abort before mutating the live cache.
 fn to_cache_key(entry: &PersistedCacheEntry, ecs_in_key: bool) -> Result<Option<CacheKey>> {
-    let domain = normalize_domain_key(&entry.domain);
-    if domain.is_empty() {
-        return Err(invalid_dump("entry contains an empty domain"));
-    }
+    let domain = normalize_cache_key_domain(&entry.domain)
+        .ok_or_else(|| invalid_dump("entry contains an invalid empty domain"))?;
 
     let ecs_scope = match (
         entry.ecs_family,
@@ -1604,6 +1602,97 @@ mod tests {
         );
         let (key, _) = first_cache_entry(&cache_map);
         assert_eq!(key.domain.as_ref(), ".");
+    }
+
+    #[test]
+    fn test_load_cache_rejects_empty_domain_entry() {
+        AppClock::start();
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NXDomain);
+
+        let mut entry = valid_address_entry();
+        entry.domain = String::new();
+        entry.resp_bytes = response.to_bytes().expect("response should encode");
+        entry.ttl = 60;
+        entry.remaining_ttl_ms = 60_000;
+        let data = serialize_current_dump(vec![entry]);
+        let cache_map = CacheMap::with_capacity(1);
+
+        let err = load_cache_from_bytes(
+            &cache_map,
+            &data,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+        )
+        .expect_err("empty domain dump entry must be rejected");
+
+        assert!(err.to_string().contains("invalid empty domain"));
+        assert!(cache_map.is_empty());
+    }
+
+    #[test]
+    fn test_real_root_request_cache_dump_load_roundtrip() {
+        AppClock::start();
+
+        let mut request = Message::new();
+        request.add_question(Question::new(Name::root(), RecordType::A, DNSClass::IN));
+        let mut context = crate::core::context::DnsContext::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5300)),
+            request,
+        );
+        let key = super::super::key::build_cache_key(&mut context, false)
+            .expect("real root request should produce a cache key");
+        assert_eq!(key.domain.as_ref(), ".");
+
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NoError);
+        response.add_question(Question::new(Name::root(), RecordType::A, DNSClass::IN));
+        response.add_answer(Record::from_rdata(
+            Name::root(),
+            60,
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+
+        let now = AppClock::elapsed_millis();
+        let cache_map = CacheMap::with_capacity(1);
+        cache_map.insert_if_not_newer(
+            key,
+            CacheItem::new_validated(response, 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        );
+
+        let dump = dump_cache_to_bytes(&cache_map).expect("root cache should dump");
+        let parsed = parse_persisted_dump(&dump).expect("root dump should parse");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].domain, ".");
+
+        let restored = CacheMap::with_capacity(1);
+        assert_eq!(
+            load_cache_from_bytes(
+                &restored,
+                &dump,
+                false,
+                CacheLoadPolicy::default(),
+                false,
+            )
+            .expect("root dump should restore"),
+            1
+        );
+        let (restored_key, restored_entry) = first_cache_entry(&restored);
+        assert_eq!(restored_key.domain.as_ref(), ".");
+        assert_eq!(
+            restored_entry
+                .value()
+                .resp
+                .first_question()
+                .expect("restored root response should keep its question")
+                .name()
+                .to_fqdn(),
+            "."
+        );
     }
 
     #[test]
