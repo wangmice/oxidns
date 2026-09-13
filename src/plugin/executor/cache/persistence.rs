@@ -17,7 +17,8 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{
-    CacheKey, EcsLookupIndex, canonical_ecs_key_digest, normalize_cache_key_domain, persisted_ecs_key_matches_response,
+    CacheKey, EcsLookupIndex, canonical_ecs_key_digest, normalize_cache_key_domain,
+    persisted_ecs_key_matches_response,
 };
 use super::{
     CacheItem, CacheLoadPolicy, CacheMap, clamp_persisted_cache_ttl, is_cache_disposition_valid,
@@ -173,10 +174,13 @@ pub(super) async fn dump_cache_to_file(cache_map: &CacheMap, dump_path: &str) ->
 }
 
 fn serialized_size_to_usize(size: u64) -> Result<usize> {
-    usize::try_from(size).map_err(|_| DnsError::Runtime("cache dump serialized size exceeds usize".to_string()))
+    usize::try_from(size)
+        .map_err(|_| DnsError::Runtime("cache dump serialized size exceeds usize".to_string()))
 }
 
-fn persisted_entry_serialized_size<const PREALLOCATION_LIMIT: usize>(entry: &PersistedCacheEntry) -> Result<usize> {
+fn persisted_entry_serialized_size<const PREALLOCATION_LIMIT: usize>(
+    entry: &PersistedCacheEntry,
+) -> Result<usize> {
     serialized_size_to_usize(wincode::config::serialized_size(
         entry,
         cache_wincode_config::<PREALLOCATION_LIMIT>(),
@@ -229,7 +233,10 @@ fn prepare_persisted_entry(
     let resp_bytes = match value.resp.to_bytes() {
         Ok(bytes) => bytes,
         Err(err) => {
-            warn!("Failed to encode cached DNS message for {}: {}", key.domain, err);
+            warn!(
+                "Failed to encode cached DNS message for {}: {}",
+                key.domain, err
+            );
             return None;
         }
     };
@@ -311,7 +318,8 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
     // Keep dump construction bounded by the configured wire-size cap. Version
     // 3 frames each entry independently so the reader can deserialize one
     // entry at a time without first allocating Vec<PersistedCacheEntry>.
-    let mut entries: Vec<(PersistedCacheEntry, usize)> = Vec::with_capacity(cache_map.entry_count().min(4096));
+    let mut entries: Vec<(PersistedCacheEntry, usize)> =
+        Vec::with_capacity(cache_map.entry_count().min(4096));
     let mut build_error: Option<DnsError> = None;
     let mut too_large: Option<usize> = None;
 
@@ -329,7 +337,9 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
                 }
             };
 
-            let minimum_size = encoded_size.saturating_add(frame_len_size).saturating_add(entry_size);
+            let minimum_size = encoded_size
+                .saturating_add(frame_len_size)
+                .saturating_add(entry_size);
             if minimum_size > max_bytes {
                 too_large = Some(minimum_size);
                 return false;
@@ -373,7 +383,8 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
             &entry_len,
             cache_wincode_config::<PREALLOCATION_LIMIT>(),
         )?);
-        let frame = wincode::config::serialize(&entry, cache_wincode_config::<PREALLOCATION_LIMIT>())?;
+        let frame =
+            wincode::config::serialize(&entry, cache_wincode_config::<PREALLOCATION_LIMIT>())?;
         debug_assert_eq!(frame.len(), entry_size);
         encoded.extend_from_slice(&frame);
     }
@@ -383,9 +394,15 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
 }
 
 pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
-    match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(cache_map, MAX_PERSISTED_CACHE_DUMP_BYTES)? {
+    match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        cache_map,
+        MAX_PERSISTED_CACHE_DUMP_BYTES,
+    )? {
         CacheDumpOutcome::Complete(bytes) => Ok(bytes),
-        CacheDumpOutcome::TooLarge { limit, minimum_size } => Err(DnsError::Runtime(format!(
+        CacheDumpOutcome::TooLarge {
+            limit,
+            minimum_size,
+        } => Err(DnsError::Runtime(format!(
             "cache dump too large: requires at least {minimum_size} bytes, limit is {limit} bytes"
         ))),
     }
@@ -402,7 +419,9 @@ fn persisted_dump_prefix_size<const PREALLOCATION_LIMIT: usize>() -> Result<usiz
     )?)
 }
 
-fn parse_dump_prefix<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<PersistedCacheDumpPrefix> {
+fn parse_dump_prefix<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDumpPrefix> {
     let prefix_size = persisted_dump_prefix_size::<PREALLOCATION_LIMIT>()?;
     if data.len() < prefix_size {
         return Err(invalid_dump("truncated header"));
@@ -418,7 +437,9 @@ fn parse_dump_prefix<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<Pe
     Ok(prefix)
 }
 
-fn parse_legacy_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<PersistedCacheDump> {
+fn parse_legacy_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDump> {
     let dump = wincode::config::deserialize_exact::<PersistedCacheDump, _>(
         data,
         cache_wincode_config::<PREALLOCATION_LIMIT>(),
@@ -438,7 +459,9 @@ fn parse_legacy_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(data
 }
 
 #[cfg(test)]
-fn parse_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<PersistedCacheDump> {
+fn parse_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDump> {
     let prefix = parse_dump_prefix::<PREALLOCATION_LIMIT>(data)?;
     match prefix.version {
         LEGACY_CACHE_DUMP_VERSION | PREVIOUS_CACHE_DUMP_VERSION => {
@@ -476,7 +499,11 @@ fn to_cache_key(entry: &PersistedCacheEntry, ecs_in_key: bool) -> Result<Option<
         (None, None, None, None) => None,
         (Some(family), Some(source_prefix), Some(scope_prefix), Some(network)) => {
             let canonical = canonical_ecs_key_digest(family, source_prefix, scope_prefix, network)
-                .ok_or_else(|| invalid_dump(format!("entry for {domain} contains noncanonical ECS metadata")))?;
+                .ok_or_else(|| {
+                    invalid_dump(format!(
+                        "entry for {domain} contains noncanonical ECS metadata"
+                    ))
+                })?;
             if !ecs_in_key {
                 // Never merge persisted ECS variants into a shared non-ECS
                 // bucket. Such entries can contain location-dependent answers.
@@ -522,8 +549,12 @@ fn prepare_loaded_entry(
         return Ok(None);
     };
 
-    let resp = Message::from_bytes(&entry.resp_bytes)
-        .map_err(|err| invalid_dump(format!("failed to parse DNS message for {}: {}", entry.domain, err)))?;
+    let resp = Message::from_bytes(&entry.resp_bytes).map_err(|err| {
+        invalid_dump(format!(
+            "failed to parse DNS message for {}: {}",
+            entry.domain, err
+        ))
+    })?;
 
     let disposition = response_disposition_for_cache(&resp, &key);
     if !is_cache_disposition_valid(disposition) {
@@ -544,7 +575,9 @@ fn prepare_loaded_entry(
     // ttl_ms and its real age is unrecoverable. Keep compatible v1 fresh
     // entries, whose age is exact, but conservatively drop ambiguous stale
     // entries instead of potentially reviving them under a new lazy TTL.
-    if dump_version == LEGACY_CACHE_DUMP_VERSION && entry.cache_age_ms >= u64::from(entry.ttl).saturating_mul(1000) {
+    if dump_version == LEGACY_CACHE_DUMP_VERSION
+        && entry.cache_age_ms >= u64::from(entry.ttl).saturating_mul(1000)
+    {
         return Ok(None);
     }
 
@@ -574,7 +607,12 @@ fn prepare_loaded_entry(
 
     Ok(Some(PreparedCacheEntry {
         key,
-        value: CacheItem::new_validated_with_age_offset(resp, ttl, fresh_until_ms, cache_age_offset_ms),
+        value: CacheItem::new_validated_with_age_offset(
+            resp,
+            ttl,
+            fresh_until_ms,
+            cache_age_offset_ms,
+        ),
         cache_time_ms,
         expire_at_ms,
         last_access_ms,
@@ -662,9 +700,10 @@ impl PreparedEntryCollector {
         // This set stores only keys; Message/CacheItem allocations remain
         // bounded by max_entries even when the input contains many entries.
         if let Some(key) = to_cache_key(&persisted, self.ecs_in_key)?
-            && !self.seen_keys.insert(key) {
-                return Err(invalid_dump("duplicate canonical cache key"));
-            }
+            && !self.seen_keys.insert(key)
+        {
+            return Err(invalid_dump("duplicate canonical cache key"));
+        }
 
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -706,7 +745,10 @@ impl PreparedEntryCollector {
     fn finish(self) -> Vec<PreparedCacheEntry> {
         let mut prepared: Vec<_> = self.retained.into_iter().collect();
         prepared.sort_unstable_by_key(|candidate| candidate.sequence);
-        prepared.into_iter().map(|candidate| candidate.entry).collect()
+        prepared
+            .into_iter()
+            .map(|candidate| candidate.entry)
+            .collect()
     }
 }
 
@@ -731,7 +773,9 @@ fn prepare_legacy_persisted_entries_bounded(
     Ok(collector.finish())
 }
 
-fn decode_v3_header<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<(PersistedCacheDumpV3Header, usize)> {
+fn decode_v3_header<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<(PersistedCacheDumpV3Header, usize)> {
     let header_size = v3_header_serialized_size::<PREALLOCATION_LIMIT>()?;
     if data.len() < header_size {
         return Err(invalid_dump("truncated v3 header"));
@@ -762,7 +806,8 @@ where
 {
     let (header, mut cursor) = decode_v3_header::<PREALLOCATION_LIMIT>(data)?;
     let frame_len_size = frame_len_serialized_size::<PREALLOCATION_LIMIT>()?;
-    let entry_count = usize::try_from(header.entry_count).map_err(|_| invalid_dump("entry count exceeds usize"))?;
+    let entry_count = usize::try_from(header.entry_count)
+        .map_err(|_| invalid_dump("entry count exceeds usize"))?;
 
     for _ in 0..entry_count {
         let len_end = cursor
@@ -778,7 +823,8 @@ where
         .map_err(|err| invalid_dump(format!("failed to deserialize entry frame length: {err}")))?;
         cursor = len_end;
 
-        let frame_len = usize::try_from(frame_len).map_err(|_| invalid_dump("entry frame length exceeds usize"))?;
+        let frame_len = usize::try_from(frame_len)
+            .map_err(|_| invalid_dump("entry frame length exceeds usize"))?;
         let frame_end = cursor
             .checked_add(frame_len)
             .ok_or_else(|| invalid_dump("entry frame offset overflow"))?;
@@ -822,7 +868,9 @@ fn prepare_v3_persisted_entries_bounded<const PREALLOCATION_LIMIT: usize>(
 }
 
 #[cfg(test)]
-fn decode_v3_dump_for_test<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Result<PersistedCacheDump> {
+fn decode_v3_dump_for_test<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDump> {
     let mut entries = Vec::new();
     let (header, _) = decode_v3_entry_frames::<PREALLOCATION_LIMIT, _>(data, |entry| {
         entries.push(entry);
@@ -836,7 +884,10 @@ fn decode_v3_dump_for_test<const PREALLOCATION_LIMIT: usize>(data: &[u8]) -> Res
     })
 }
 
-async fn read_cache_dump_file_bounded(dump_path: &str, expected_len: u64) -> Result<Option<Vec<u8>>> {
+async fn read_cache_dump_file_bounded(
+    dump_path: &str,
+    expected_len: u64,
+) -> Result<Option<Vec<u8>>> {
     let max_len = MAX_PERSISTED_CACHE_DUMP_BYTES as u64;
 
     if expected_len > max_len {
@@ -927,7 +978,9 @@ pub(super) async fn load_cache_from_file(
         }
 
         Err(err) => {
-            return Err(DnsError::Runtime(format!("cache load worker failed: {err}")));
+            return Err(DnsError::Runtime(format!(
+                "cache load worker failed: {err}"
+            )));
         }
     };
 
@@ -994,9 +1047,12 @@ fn load_cache_from_bytes_with_index_bounded<const PREALLOCATION_LIMIT: usize>(
             let dump = parse_legacy_persisted_dump_with_limit::<PREALLOCATION_LIMIT>(data)?;
             prepare_legacy_persisted_entries_bounded(dump, ecs_in_key, policy, max_entries)?
         }
-        CACHE_DUMP_VERSION => {
-            prepare_v3_persisted_entries_bounded::<PREALLOCATION_LIMIT>(data, ecs_in_key, policy, max_entries)?
-        }
+        CACHE_DUMP_VERSION => prepare_v3_persisted_entries_bounded::<PREALLOCATION_LIMIT>(
+            data,
+            ecs_in_key,
+            policy,
+            max_entries,
+        )?,
         version => {
             return Err(invalid_dump(format!(
                 "unsupported version {version}, expected {}, {} or {}",
@@ -1091,7 +1147,11 @@ mod tests {
         }
     }
 
-    fn serialize_dump_at_version(version: u32, entries: Vec<PersistedCacheEntry>, dumped_at_unix_ms: u64) -> Vec<u8> {
+    fn serialize_dump_at_version(
+        version: u32,
+        entries: Vec<PersistedCacheEntry>,
+        dumped_at_unix_ms: u64,
+    ) -> Vec<u8> {
         if version != CACHE_DUMP_VERSION {
             return wincode::config::serialize(
                 &PersistedCacheDump {
@@ -1111,15 +1171,24 @@ mod tests {
             dumped_at_unix_ms,
             entry_count: u64::try_from(entries.len()).expect("test entry count should fit u64"),
         };
-        let mut encoded = wincode::config::serialize(&header, cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>())
-            .expect("v3 header should serialize");
+        let mut encoded = wincode::config::serialize(
+            &header,
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("v3 header should serialize");
         for entry in entries {
-            let frame = wincode::config::serialize(&entry, cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>())
-                .expect("v3 entry should serialize");
+            let frame = wincode::config::serialize(
+                &entry,
+                cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+            )
+            .expect("v3 entry should serialize");
             let frame_len = u64::try_from(frame.len()).expect("test frame length should fit u64");
             encoded.extend_from_slice(
-                &wincode::config::serialize(&frame_len, cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>())
-                    .expect("frame length should serialize"),
+                &wincode::config::serialize(
+                    &frame_len,
+                    cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+                )
+                .expect("frame length should serialize"),
             );
             encoded.extend_from_slice(&frame);
         }
@@ -1144,9 +1213,11 @@ mod tests {
         };
 
         let legacy_bytes = wincode::serialize(&dump).expect("default config should serialize");
-        let configured_bytes =
-            wincode::config::serialize(&dump, cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>())
-                .expect("explicit config should serialize");
+        let configured_bytes = wincode::config::serialize(
+            &dump,
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("explicit config should serialize");
 
         assert_eq!(configured_bytes, legacy_bytes);
     }
@@ -1183,7 +1254,9 @@ mod tests {
         response.add_answer(Record::from_rdata(
             Name::from_ascii(domain.as_ref()).expect("test domain should parse"),
             120,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
         ));
 
         cache_map.insert_if_not_newer(
@@ -1205,7 +1278,8 @@ mod tests {
         let mut parsed = parse_persisted_dump(&dumped).expect("dump should parse");
         let duplicate = parsed.entries[0].clone();
         parsed.entries.push(duplicate);
-        let duplicate_dump = serialize_dump_at_version(CACHE_DUMP_VERSION, parsed.entries, parsed.dumped_at_unix_ms);
+        let duplicate_dump =
+            serialize_dump_at_version(CACHE_DUMP_VERSION, parsed.entries, parsed.dumped_at_unix_ms);
 
         let destination = CacheMap::with_capacity(4);
         let index = EcsLookupIndex::new();
@@ -1354,7 +1428,9 @@ mod tests {
         response.add_answer(Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             ttl,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
         ));
 
         response
@@ -1386,7 +1462,9 @@ mod tests {
         response.add_answer(Record::from_rdata(
             name,
             120,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
         ));
 
         let mut entry = valid_address_entry();
@@ -1460,7 +1538,10 @@ mod tests {
         corrupt.ecs_family = Some(1);
         // Partial ECS metadata is structurally invalid and must reject the
         // entire transaction even though the retained candidate set is full.
-        let data = serialize_current_dump(vec![positive_entry_for_domain("good.example.com.", 100), corrupt]);
+        let data = serialize_current_dump(vec![
+            positive_entry_for_domain("good.example.com.", 100),
+            corrupt,
+        ]);
         let cache_map = CacheMap::with_capacity(1);
         let index = EcsLookupIndex::new();
 
@@ -1503,7 +1584,11 @@ mod tests {
         entry.cache_age_ms = 10_000;
         entry.remaining_ttl_ms = 50_000;
         entry.resp_bytes = positive_response_bytes(60);
-        let data = serialize_dump_at_version(PREVIOUS_CACHE_DUMP_VERSION, vec![entry], AppClock::now_timestamp());
+        let data = serialize_dump_at_version(
+            PREVIOUS_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
 
         let cache_map = CacheMap::with_capacity(1);
         assert_eq!(
@@ -1523,8 +1608,9 @@ mod tests {
         data.push(0xA5);
 
         let cache_map = CacheMap::with_capacity(1);
-        let err = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect_err("trailing bytes must reject framed dump");
+        let err =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect_err("trailing bytes must reject framed dump");
         assert!(err.to_string().contains("trailing bytes"));
         assert!(cache_map.is_empty());
     }
@@ -1537,7 +1623,11 @@ mod tests {
         entry.cache_age_ms = 30_000;
         entry.remaining_ttl_ms = 30_000;
         entry.resp_bytes = positive_response_bytes(60);
-        let data = serialize_dump_at_version(LEGACY_CACHE_DUMP_VERSION, vec![entry], AppClock::now_timestamp());
+        let data = serialize_dump_at_version(
+            LEGACY_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
 
         let cache_map = CacheMap::with_capacity(1);
         assert_eq!(
@@ -1556,7 +1646,11 @@ mod tests {
         entry.cache_age_ms = 60_000;
         entry.remaining_ttl_ms = 3_540_000;
         entry.resp_bytes = positive_response_bytes(60);
-        let data = serialize_dump_at_version(LEGACY_CACHE_DUMP_VERSION, vec![entry], AppClock::now_timestamp());
+        let data = serialize_dump_at_version(
+            LEGACY_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
 
         let cache_map = CacheMap::with_capacity(1);
         let policy = CacheLoadPolicy {
@@ -1670,8 +1764,9 @@ mod tests {
         entry.resp_bytes = cname_only_response_bytes();
 
         let data = serialize_current_dump(vec![entry]);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
 
         assert_eq!(loaded, 0);
         assert_eq!(cache_map.len(), 0);
@@ -1684,8 +1779,9 @@ mod tests {
         let entry = valid_address_entry();
 
         let data = serialize_current_dump(vec![entry]);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
 
         assert_eq!(loaded, 1);
         assert_eq!(cache_map.len(), 1);
@@ -1699,8 +1795,9 @@ mod tests {
         entry.domain = "other.example.com.".to_string();
 
         let data = serialize_current_dump(vec![entry]);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
 
         assert_eq!(loaded, 0);
         assert_eq!(cache_map.len(), 0);
@@ -1717,13 +1814,19 @@ mod tests {
         entry.resp_bytes = cname_nodata_response_bytes_with_ttls(5, 30);
 
         let data = serialize_current_dump(vec![entry]);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
         let (_, stored) = first_cache_entry(&cache_map);
 
         assert_eq!(loaded, 1);
         assert_eq!(stored.value().ttl, 5);
-        assert!(stored.expire_at_ms().saturating_sub(AppClock::elapsed_millis()) <= 3_000);
+        assert!(
+            stored
+                .expire_at_ms()
+                .saturating_sub(AppClock::elapsed_millis())
+                <= 3_000
+        );
     }
 
     #[test]
@@ -1737,8 +1840,9 @@ mod tests {
         entry.resp_bytes = cname_nodata_response_bytes_with_ttls(5, 30);
 
         let data = serialize_current_dump(vec![entry]);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
 
         assert_eq!(loaded, 0);
         assert_eq!(cache_map.len(), 0);
@@ -1756,10 +1860,13 @@ mod tests {
 
         let dumped_at = AppClock::now_timestamp().saturating_sub(10_000);
         let data = serialize_dump_at(vec![entry], dumped_at);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
         let (_, stored) = first_cache_entry(&cache_map);
-        let remaining = stored.expire_at_ms().saturating_sub(AppClock::elapsed_millis());
+        let remaining = stored
+            .expire_at_ms()
+            .saturating_sub(AppClock::elapsed_millis());
 
         assert_eq!(loaded, 1);
         assert!(remaining <= 20_000, "remaining={remaining}");
@@ -1777,20 +1884,41 @@ mod tests {
 
         let dumped_at = AppClock::now_timestamp().saturating_sub(5_000);
         let data = serialize_dump_at(vec![entry], dumped_at);
-        load_cache_from_bytes(&first_cache, &data, false, CacheLoadPolicy::default(), false)
-            .expect("first restore should succeed");
+        load_cache_from_bytes(
+            &first_cache,
+            &data,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+        )
+        .expect("first restore should succeed");
 
         let (_, first) = first_cache_entry(&first_cache);
-        let first_fresh_remaining = first.value().fresh_until_ms.saturating_sub(AppClock::elapsed_millis());
-        assert!(first_fresh_remaining <= 5_000, "fresh={first_fresh_remaining}");
+        let first_fresh_remaining = first
+            .value()
+            .fresh_until_ms
+            .saturating_sub(AppClock::elapsed_millis());
+        assert!(
+            first_fresh_remaining <= 5_000,
+            "fresh={first_fresh_remaining}"
+        );
 
         let redump = dump_cache_to_bytes(&first_cache).expect("redump should serialize");
         let second_cache = CacheMap::with_capacity(1);
-        load_cache_from_bytes(&second_cache, &redump, false, CacheLoadPolicy::default(), false)
-            .expect("second restore should succeed");
+        load_cache_from_bytes(
+            &second_cache,
+            &redump,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+        )
+        .expect("second restore should succeed");
 
         let (_, second) = first_cache_entry(&second_cache);
-        let second_fresh_remaining = second.value().fresh_until_ms.saturating_sub(AppClock::elapsed_millis());
+        let second_fresh_remaining = second
+            .value()
+            .fresh_until_ms
+            .saturating_sub(AppClock::elapsed_millis());
 
         assert!(
             second_fresh_remaining <= first_fresh_remaining.saturating_add(50),
@@ -1807,8 +1935,9 @@ mod tests {
 
         let dumped_at = AppClock::now_timestamp().saturating_sub(10_000);
         let data = serialize_dump_at(vec![entry], dumped_at);
-        let loaded = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect("load should succeed");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect("load should succeed");
 
         assert_eq!(loaded, 0);
         assert_eq!(cache_map.len(), 0);
@@ -1821,8 +1950,14 @@ mod tests {
 
         let initial = serialize_current_dump(vec![valid_address_entry()]);
         assert_eq!(
-            load_cache_from_bytes(&cache_map, &initial, false, CacheLoadPolicy::default(), false)
-                .expect("initial load should succeed"),
+            load_cache_from_bytes(
+                &cache_map,
+                &initial,
+                false,
+                CacheLoadPolicy::default(),
+                false
+            )
+            .expect("initial load should succeed"),
             1
         );
         assert_eq!(cache_map.len(), 1);
@@ -1832,7 +1967,13 @@ mod tests {
         corrupt.resp_bytes = vec![0, 1, 2];
         let corrupt_dump = serialize_current_dump(vec![corrupt]);
 
-        let result = load_cache_from_bytes(&cache_map, &corrupt_dump, false, CacheLoadPolicy::default(), true);
+        let result = load_cache_from_bytes(
+            &cache_map,
+            &corrupt_dump,
+            false,
+            CacheLoadPolicy::default(),
+            true,
+        );
         assert!(result.is_err());
         assert_eq!(
             cache_map.len(),
@@ -1846,11 +1987,23 @@ mod tests {
         AppClock::start();
         let cache_map = CacheMap::with_capacity(2);
         let initial = serialize_current_dump(vec![valid_address_entry()]);
-        load_cache_from_bytes(&cache_map, &initial, false, CacheLoadPolicy::default(), false)
-            .expect("initial load should succeed");
+        load_cache_from_bytes(
+            &cache_map,
+            &initial,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+        )
+        .expect("initial load should succeed");
         assert_eq!(cache_map.len(), 1);
 
-        let result = load_cache_from_bytes(&cache_map, b"not a dump", false, CacheLoadPolicy::default(), true);
+        let result = load_cache_from_bytes(
+            &cache_map,
+            b"not a dump",
+            false,
+            CacheLoadPolicy::default(),
+            true,
+        );
         assert!(result.is_err());
         assert_eq!(cache_map.len(), 1);
     }
@@ -1953,7 +2106,8 @@ mod tests {
         let load_started_at = AppClock::elapsed_millis();
 
         assert_eq!(
-            load_cache_from_bytes(&cache_map, &data, false, policy, false).expect("lazy restore should succeed"),
+            load_cache_from_bytes(&cache_map, &data, false, policy, false)
+                .expect("lazy restore should succeed"),
             1
         );
         let load_finished_at = AppClock::elapsed_millis();
@@ -1988,7 +2142,11 @@ mod tests {
         let redump = dump_cache_to_bytes(&first_cache).expect("redump should serialize");
         let parsed = parse_persisted_dump(&redump).expect("redump should parse");
         assert_eq!(parsed.version, CACHE_DUMP_VERSION);
-        let redumped = parsed.entries.into_iter().next().expect("entry should be dumped");
+        let redumped = parsed
+            .entries
+            .into_iter()
+            .next()
+            .expect("entry should be dumped");
         assert!(
             redumped.cache_age_ms >= 600_000,
             "stale cache age was rejuvenated to {}ms",
@@ -2045,8 +2203,9 @@ mod tests {
         let data = serialize_current_dump(vec![entry]);
         let cache_map = CacheMap::with_capacity(1);
 
-        let err = load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
-            .expect_err("empty domain dump entry must be rejected");
+        let err =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect_err("empty domain dump entry must be rejected");
 
         assert!(err.to_string().contains("invalid DNS domain text"));
         assert!(cache_map.is_empty());
@@ -2058,8 +2217,10 @@ mod tests {
 
         let mut request = Message::new();
         request.add_question(Question::new(Name::root(), RecordType::A, DNSClass::IN));
-        let mut context =
-            crate::core::context::DnsContext::new(std::net::SocketAddr::from(([127, 0, 0, 1], 5300)), request);
+        let mut context = crate::core::context::DnsContext::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5300)),
+            request,
+        );
         let key = super::super::key::build_cache_key(&mut context, false)
             .expect("real root request should produce a cache key");
         assert_eq!(key.domain.as_ref(), ".");
@@ -2070,7 +2231,9 @@ mod tests {
         response.add_answer(Record::from_rdata(
             Name::root(),
             60,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
         ));
 
         let now = AppClock::elapsed_millis();
@@ -2116,20 +2279,32 @@ mod tests {
         assert_eq!(escaped_name.normalized(), r"foo\.");
 
         let mut request = Message::new();
-        request.add_question(Question::new(escaped_name.clone(), RecordType::A, DNSClass::IN));
-        let mut context =
-            crate::core::context::DnsContext::new(std::net::SocketAddr::from(([127, 0, 0, 1], 5300)), request);
+        request.add_question(Question::new(
+            escaped_name.clone(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        let mut context = crate::core::context::DnsContext::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5300)),
+            request,
+        );
         let key = super::super::key::build_cache_key(&mut context, false)
             .expect("escaped-dot request should produce a cache key");
         assert_eq!(key.domain.as_ref(), r"foo\.");
 
         let mut response = Message::new();
         response.set_rcode(crate::proto::Rcode::NoError);
-        response.add_question(Question::new(escaped_name.clone(), RecordType::A, DNSClass::IN));
+        response.add_question(Question::new(
+            escaped_name.clone(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
         response.add_answer(Record::from_rdata(
             escaped_name,
             60,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 2))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 2,
+            ))),
         ));
 
         let now = AppClock::elapsed_millis();
@@ -2181,30 +2356,30 @@ mod tests {
         ));
 
         let mut request_edns = crate::proto::Edns::new();
-        request_edns.insert(crate::proto::EdnsOption::Subnet(crate::proto::ClientSubnet::new(
-            std::net::IpAddr::from([203, 0, 113, 199]),
-            24,
-            0,
-        )));
+        request_edns.insert(crate::proto::EdnsOption::Subnet(
+            crate::proto::ClientSubnet::new(std::net::IpAddr::from([203, 0, 113, 199]), 24, 0),
+        ));
         request.set_edns(request_edns);
 
-        let mut context =
-            crate::core::context::DnsContext::new(std::net::SocketAddr::from(([127, 0, 0, 1], 5300)), request);
+        let mut context = crate::core::context::DnsContext::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5300)),
+            request,
+        );
 
-        let request_key = super::super::key::build_cache_key(&mut context, true).expect("request key should exist");
+        let request_key = super::super::key::build_cache_key(&mut context, true)
+            .expect("request key should exist");
 
         let mut response = positive_response_message(120);
 
         let mut response_edns = crate::proto::Edns::new();
-        response_edns.insert(crate::proto::EdnsOption::Subnet(crate::proto::ClientSubnet::new(
-            std::net::IpAddr::from([203, 0, 113, 0]),
-            24,
-            0,
-        )));
+        response_edns.insert(crate::proto::EdnsOption::Subnet(
+            crate::proto::ClientSubnet::new(std::net::IpAddr::from([203, 0, 113, 0]), 24, 0),
+        ));
         response.set_edns(response_edns);
 
-        let stored_key = super::super::key::cache_key_for_response_ecs_scope(&request_key, &response)
-            .expect("ECS response should be cacheable");
+        let stored_key =
+            super::super::key::cache_key_for_response_ecs_scope(&request_key, &response)
+                .expect("ECS response should be cacheable");
 
         let now = AppClock::elapsed_millis();
 
@@ -2252,7 +2427,11 @@ mod tests {
         };
         cache_map.insert_if_not_newer(
             key,
-            CacheItem::new_validated(positive_response_message(120), 120, now.saturating_add(120_000)),
+            CacheItem::new_validated(
+                positive_response_message(120),
+                120,
+                now.saturating_add(120_000),
+            ),
             now,
             now.saturating_add(120_000),
             now,
@@ -2261,18 +2440,27 @@ mod tests {
         let full = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
         let exact_limit = full.len();
 
-        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(&cache_map, exact_limit)
-            .expect("exact-limit dump should succeed")
+        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            exact_limit,
+        )
+        .expect("exact-limit dump should succeed")
         {
             CacheDumpOutcome::Complete(bytes) => assert_eq!(bytes.len(), exact_limit),
             CacheDumpOutcome::TooLarge { .. } => panic!("exact limit must be accepted"),
         }
 
-        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(&cache_map, exact_limit - 1)
-            .expect("bounded dump should report size overflow")
+        match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            exact_limit - 1,
+        )
+        .expect("bounded dump should report size overflow")
         {
             CacheDumpOutcome::Complete(_) => panic!("one-byte-short limit must be rejected"),
-            CacheDumpOutcome::TooLarge { limit, minimum_size } => {
+            CacheDumpOutcome::TooLarge {
+                limit,
+                minimum_size,
+            } => {
                 assert_eq!(limit, exact_limit - 1);
                 assert!(minimum_size > limit);
             }

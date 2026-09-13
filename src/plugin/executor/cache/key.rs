@@ -14,7 +14,8 @@ use dashmap::mapref::entry::Entry;
 
 use crate::core::context::DnsContext;
 use crate::proto::{
-    ClientSubnet, DNSClass, EdnsCode, EdnsOption, Message, MessageType, Name, Opcode, Question, RecordType,
+    ClientSubnet, DNSClass, EdnsCode, EdnsOption, Message, MessageType, Name, Opcode, Question,
+    RecordType,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -57,8 +58,11 @@ impl CacheKey {
         let scope_prefix = scope_prefix.min(ecs.source_prefix);
 
         let mut network = [0u8; 16];
-        let network_len =
-            write_truncated_prefix(&ecs.network[..usize::from(ecs.network_len)], scope_prefix, &mut network);
+        let network_len = write_truncated_prefix(
+            &ecs.network[..usize::from(ecs.network_len)],
+            scope_prefix,
+            &mut network,
+        );
 
         Self {
             domain: self.domain.clone(),
@@ -170,7 +174,10 @@ pub(super) fn canonical_ecs_key_digest(
         2 => 128,
         _ => return None,
     };
-    if source_prefix > max_prefix || scope_prefix > max_prefix || (scope_prefix != 0 && scope_prefix != source_prefix) {
+    if source_prefix > max_prefix
+        || scope_prefix > max_prefix
+        || (scope_prefix != 0 && scope_prefix != source_prefix)
+    {
         return None;
     }
 
@@ -231,11 +238,13 @@ fn build_ecs_scope_digest(subnet: &ClientSubnet) -> EcsScopeDigest {
     let mut network = [0u8; 16];
     let (family, max_prefix, network_len) = match subnet.addr() {
         IpAddr::V4(v4) => {
-            let len = write_truncated_prefix(&v4.octets(), subnet.source_prefix().min(32), &mut network);
+            let len =
+                write_truncated_prefix(&v4.octets(), subnet.source_prefix().min(32), &mut network);
             (1u16, 32u8, len)
         }
         IpAddr::V6(v6) => {
-            let len = write_truncated_prefix(&v6.octets(), subnet.source_prefix().min(128), &mut network);
+            let len =
+                write_truncated_prefix(&v6.octets(), subnet.source_prefix().min(128), &mut network);
             (2u16, 128u8, len)
         }
     };
@@ -305,7 +314,10 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
 ///   safely construct the narrower scope. In that case retain the original
 ///   request-specific key instead of widening/clamping it to SOURCE.
 #[inline]
-pub(super) fn cache_key_for_response_ecs_scope(key: &CacheKey, response: &Message) -> Option<CacheKey> {
+pub(super) fn cache_key_for_response_ecs_scope(
+    key: &CacheKey,
+    response: &Message,
+) -> Option<CacheKey> {
     let response_subnet = extract_ecs(response);
 
     let Some(request_ecs) = &key.ecs_scope else {
@@ -677,8 +689,10 @@ impl EcsLookupIndex {
         // rebuilt map. The exclusive gate only covers revision validation and
         // this pointer swap, never the full cache/index scan.
         self.entries.store(rebuilt.entries.load_full());
-        self.indexed_base_keys
-            .store(rebuilt.indexed_base_keys.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.indexed_base_keys.store(
+            rebuilt.indexed_base_keys.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.observed_ipv4_prefixes.store(
             rebuilt.observed_ipv4_prefixes.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -687,7 +701,8 @@ impl EcsLookupIndex {
             rebuilt.observed_ipv6_prefixes.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        self.rebuilt_revision.store(stale_revision, Ordering::Release);
+        self.rebuilt_revision
+            .store(stale_revision, Ordering::Release);
         true
     }
 
@@ -793,7 +808,10 @@ impl<'a> Iterator for CacheLookupKeys<'a> {
 }
 
 #[inline]
-pub(super) fn cache_lookup_keys<'a>(key: &'a CacheKey, index: &EcsLookupIndex) -> CacheLookupKeys<'a> {
+pub(super) fn cache_lookup_keys<'a>(
+    key: &'a CacheKey,
+    index: &EcsLookupIndex,
+) -> CacheLookupKeys<'a> {
     CacheLookupKeys::new(key, index)
 }
 
@@ -869,9 +887,18 @@ mod tests {
 
     #[test]
     fn test_normalize_cache_key_domain_parses_dns_escapes() {
-        assert_eq!(normalize_cache_key_domain(r"Foo\."), Some(r"foo\.".to_string()));
-        assert_eq!(normalize_cache_key_domain(r"foo\.."), Some(r"foo\.".to_string()));
-        assert_eq!(normalize_cache_key_domain(r"foo\046"), Some(r"foo\.".to_string()));
+        assert_eq!(
+            normalize_cache_key_domain(r"Foo\."),
+            Some(r"foo\.".to_string())
+        );
+        assert_eq!(
+            normalize_cache_key_domain(r"foo\.."),
+            Some(r"foo\.".to_string())
+        );
+        assert_eq!(
+            normalize_cache_key_domain(r"foo\046"),
+            Some(r"foo\.".to_string())
+        );
         assert_eq!(normalize_cache_key_domain("foo\\"), None);
     }
 
@@ -998,7 +1025,10 @@ mod tests {
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
 
-        assert_eq!(candidates.first(), Some(&request_key.with_ecs_scope_prefix(24)));
+        assert_eq!(
+            candidates.first(),
+            Some(&request_key.with_ecs_scope_prefix(24))
+        );
         assert_eq!(candidates.last(), Some(&request_key));
         assert_eq!(candidates.len(), 26);
     }
@@ -1025,7 +1055,11 @@ mod tests {
                 if candidate.as_ref() == &request_key {
                     None
                 } else {
-                    candidate.as_ref().ecs_scope.as_ref().map(|ecs| ecs.scope_prefix)
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .map(|ecs| ecs.scope_prefix)
                 }
             })
             .collect::<Vec<_>>();
@@ -1060,7 +1094,10 @@ mod tests {
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].ecs_scope.as_ref().map(|ecs| ecs.scope_prefix), Some(56));
+        assert_eq!(
+            candidates[0].ecs_scope.as_ref().map(|ecs| ecs.scope_prefix),
+            Some(56)
+        );
         assert_eq!(candidates[1], request_key);
     }
 
@@ -1115,7 +1152,9 @@ mod tests {
         // rebuild snapshot started but before it attempted to commit.
         index.mark_publication();
 
-        assert!(!index.commit_rebuild_if_unchanged(&rebuilt, stale_revision, publication_revision,));
+        assert!(
+            !index.commit_rebuild_if_unchanged(&rebuilt, stale_revision, publication_revision,)
+        );
         assert!(index.needs_rebuild());
         assert_eq!(index.observed_ipv4_prefixes(), 1);
     }
@@ -1210,7 +1249,10 @@ mod tests {
 
         let remaining = lookup_keys.collect::<Vec<_>>();
         assert!(matches!(remaining.last(), Some(Cow::Borrowed(_))));
-        assert_eq!(remaining.last().map(|candidate| candidate.as_ref()), Some(&request_key));
+        assert_eq!(
+            remaining.last().map(|candidate| candidate.as_ref()),
+            Some(&request_key)
+        );
     }
 
     #[test]
@@ -1297,9 +1339,13 @@ mod tests {
             20,
         )));
         response.set_edns(response_edns);
-        let scoped_key = cache_key_for_response_ecs_scope(&request_key, &response).expect("ECS should match");
+        let scoped_key =
+            cache_key_for_response_ecs_scope(&request_key, &response).expect("ECS should match");
 
-        let ecs = scoped_key.ecs_scope.as_ref().expect("scope should be present");
+        let ecs = scoped_key
+            .ecs_scope
+            .as_ref()
+            .expect("scope should be present");
         assert_eq!(ecs.source_prefix, 20);
         assert_eq!(ecs.scope_prefix, 20);
         assert_eq!(&ecs.network[..3], &[203, 0, 112]);
@@ -1312,7 +1358,8 @@ mod tests {
             0,
         )));
         other_request.request.set_edns(other_edns);
-        let other_key = build_cache_key(&mut other_request, true).expect("request key should exist");
+        let other_key =
+            build_cache_key(&mut other_request, true).expect("request key should exist");
 
         assert!(
             cache_lookup_keys(&other_key, &exhaustive_index_for(&other_key))
@@ -1374,7 +1421,9 @@ mod tests {
 
         let mut context = make_context("example.com.");
         let mut edns = Edns::new();
-        edns.insert(EdnsOption::Cookie(crate::proto::EdnsCookie::new(vec![1, 2])));
+        edns.insert(EdnsOption::Cookie(crate::proto::EdnsCookie::new(vec![
+            1, 2,
+        ])));
         context.request.set_edns(edns);
         assert!(!is_cacheable_request(&context.request));
     }
@@ -1406,8 +1455,8 @@ mod tests {
 
         response.set_edns(response_edns);
 
-        let scoped_key =
-            cache_key_for_response_ecs_scope(&request_key, &response).expect("ECS response should be accepted");
+        let scoped_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("ECS response should be accepted");
 
         // SCOPE > SOURCE must remain request-specific.
         assert_eq!(scoped_key, request_key);
@@ -1424,7 +1473,8 @@ mod tests {
         )));
         other_request.request.set_edns(other_edns);
 
-        let other_key = build_cache_key(&mut other_request, true).expect("other request key should exist");
+        let other_key =
+            build_cache_key(&mut other_request, true).expect("other request key should exist");
 
         assert!(
             !cache_lookup_keys(&other_key, &exhaustive_index_for(&other_key))
@@ -1436,14 +1486,22 @@ mod tests {
     fn test_response_ecs_source_zero_with_positive_scope_is_not_cached() {
         let mut request = make_context("example.com.");
         let mut request_edns = Edns::new();
-        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(IpAddr::from([0, 0, 0, 0]), 0, 0)));
+        request_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0, 0, 0, 0]),
+            0,
+            0,
+        )));
         request.request.set_edns(request_edns);
 
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
         let mut response = Message::new();
         let mut response_edns = Edns::new();
-        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(IpAddr::from([0, 0, 0, 0]), 0, 24)));
+        response_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0, 0, 0, 0]),
+            0,
+            24,
+        )));
         response.set_edns(response_edns);
 
         assert!(cache_key_for_response_ecs_scope(&request_key, &response).is_none());
@@ -1512,7 +1570,10 @@ mod tests {
             20,
         )));
         mismatched_response.set_edns(mismatched_edns);
-        assert!(!persisted_ecs_key_matches_response(&stored_key, &mismatched_response));
+        assert!(!persisted_ecs_key_matches_response(
+            &stored_key,
+            &mismatched_response
+        ));
     }
 
     #[test]
@@ -1540,10 +1601,13 @@ mod tests {
 
         response.set_edns(response_edns);
 
-        let stored_key =
-            cache_key_for_response_ecs_scope(&request_key, &response).expect("response ECS should be accepted");
+        let stored_key = cache_key_for_response_ecs_scope(&request_key, &response)
+            .expect("response ECS should be accepted");
 
-        let ecs = stored_key.ecs_scope.as_ref().expect("stored key should contain ECS");
+        let ecs = stored_key
+            .ecs_scope
+            .as_ref()
+            .expect("stored key should contain ECS");
 
         assert_eq!(ecs.source_prefix, 0);
         assert_eq!(ecs.scope_prefix, 0);
