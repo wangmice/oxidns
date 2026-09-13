@@ -49,8 +49,8 @@ unit-scripts = "packaging"
 [dependencies]
 # Core async runtime and shared infrastructure
 async-trait = "0.1"
-futures = "0.3.31"
-socket2 = "0.6.4"
+futures = "0.3.34"
+socket2 = "0.6.5"
 tokio = { version = "1", features = [
     "fs",
     "io-util",
@@ -62,7 +62,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
 
 # Configuration, CLI, and observability
 jiff = "0.2"
@@ -78,9 +78,9 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # Core data structures and utility crates
 ahash = "0.8.12"
-arc-swap = "1.9.1"
-bytes = "1.11"
-crossbeam-queue = "0.3.12"
+arc-swap = "1.9.2"
+bytes = "1.12"
+crossbeam-queue = "0.3.14"
 dashmap =  { version = "6", features = ["raw-api"] }
 inventory = "0.3"
 lazy_static = "1.5"
@@ -108,21 +108,21 @@ tar = { version = "0.4", optional = true }
 # their respective pieces; `quinn` / `h3` / `h3-quinn` are reached through
 # `server-doq` / `server-doh3` and the shared `_dns-client-*` features.
 h2 = { version = "0.4", optional = true }
-quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"], optional = true }
+quinn = { version = "0.11.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"], optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23.44", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
-webpki-roots = { version = "1.0.2", optional = true }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
+webpki-roots = { version = "1.0.9", optional = true }
 
 # HTTP stack for DoH server/client paths, the management API, and the
 # download executor.
 base64 = "0.23"
-http = { version = "1.4", optional = true }
-http-body-util = { version = "0.1.3", optional = true }
-hyper = { version = "1.10.1", features = ["server", "client", "http1", "http2"], optional = true }
-hyper-rustls = { version = "0.27.8", default-features = false, features = ["http1", "http2", "logging", "ring", "tls12", "webpki-tokio"], optional = true }
+http = { version = "1.5", optional = true }
+http-body-util = { version = "0.1.5", optional = true }
+hyper = { version = "1.11.1", features = ["server", "client", "http1", "http2"], optional = true }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "logging", "ring", "tls12", "webpki-tokio"], optional = true }
 hyper-util = { version = "0.1.20", features = ["server", "client", "client-legacy", "http1", "http2", "tokio"], optional = true }
 tower-service = { version = "0.3", optional = true }
 
@@ -130,15 +130,15 @@ tower-service = { version = "0.3", optional = true }
 # `prost` is pulled in by `provider-protobuf` (geoip + geosite + v2ray_dat).
 # `aho-corasick` is kept always-on because it backs `core::rule_matcher::domain`
 # in addition to the `hosts` / `redirect` executors.
-aho-corasick = "1.1.4"
+aho-corasick = "1.1.5"
 prost = { version = "0.14", optional = true }
-regex = "1.12.2"
+regex = "1.13.1"
 
 # Executor plugin dependencies, each gated by its own feature.
-cronexpr = { version = "1.5.0", optional = true }
+cronexpr = { version = "1.7.0", optional = true }
 fast-socks5 = "1.0.0"
 mikrotik-rs = { package = "oxidns-mikrotik-rs", version = "0.8.1", optional = true }
-rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/zoneparser", optional = true }
 
 # Service management
@@ -394,12 +394,12 @@ hotpath-alloc = ["hotpath/hotpath-alloc"]
 
 [dev-dependencies]
 criterion = "0.8.2"
-tempfile = "3.23.0"
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 # Integration tests use hyper to spin up mock HTTP servers regardless of
 # which library features are enabled, so we re-declare them as dev deps.
-http-body-util = "0.1.3"
-hyper = { version = "1.9.0", features = ["server", "http1"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["server", "tokio"] }
 
 [[bench]]
