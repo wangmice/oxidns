@@ -1803,8 +1803,10 @@ impl Executor for Cache {
                         // only when the original DNS request is otherwise
                         // identical (transaction ID may differ).
                         if dns_requests_equal_except_id(&request, &context.request) {
-                            let mut response = (*response).clone();
-                            response.set_id(context.request.id());
+                            let response = restore_shared_miss_response(
+                                &context.request,
+                                (*response).clone(),
+                            );
                             context.set_response(response);
                             return Ok(step);
                         }
@@ -1967,6 +1969,19 @@ fn compute_cache_ttl_with_policy(
         ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
     };
     (decision, disposition)
+}
+
+#[inline]
+fn restore_shared_miss_response(request: &Message, mut response: Message) -> Message {
+    // DNS names compare case-insensitively, so a coalesced follower may have
+    // different 0x20/caps-for-ID casing from the leader. Preserve the shared
+    // response body, but echo the current request's Question section exactly.
+    response.questions_mut().clear();
+    response
+        .questions_mut()
+        .extend(request.questions().iter().cloned());
+    response.set_id(request.id());
+    response
 }
 
 #[inline]
@@ -2570,10 +2585,16 @@ mod tests {
         ));
         let next = ExecutorNext::from_program_for_test(program, 0);
 
-        let mut request_a = make_request_with_query("example.com.", false, false);
+        let mut request_a = make_request_with_query("ExAmPlE.com.", false, false);
         request_a.set_id(101);
-        let mut request_b = make_request_with_query("example.com.", false, false);
+        let mut request_b = make_request_with_query("eXaMpLe.COM.", false, false);
         request_b.set_id(202);
+        let request_a_qname_wire = first_question_qname_wire(&request_a);
+        let request_b_qname_wire = first_question_qname_wire(&request_b);
+        assert_ne!(
+            request_a_qname_wire, request_b_qname_wire,
+            "test requests must differ in original QNAME casing",
+        );
         let mut context_a = make_context(request_a);
         let mut context_b = make_context(request_b);
 
@@ -2622,6 +2643,16 @@ mod tests {
         assert_eq!(second_context.response().expect("second response").id(), 202);
         assert_eq!(first_context.response().unwrap().answers()[0].ttl(), 3);
         assert_eq!(second_context.response().unwrap().answers()[0].ttl(), 3);
+        assert_eq!(
+            first_question_qname_wire(first_context.response().unwrap()),
+            request_a_qname_wire,
+            "leader response must echo the leader's original QNAME casing",
+        );
+        assert_eq!(
+            first_question_qname_wire(second_context.response().unwrap()),
+            request_b_qname_wire,
+            "shared follower response must echo the follower's original QNAME casing",
+        );
     }
 
     #[test]
@@ -2696,6 +2727,34 @@ mod tests {
             TOUCH_CRITICAL_INTERVAL_MS
         );
         assert_eq!(cache.current_touch_interval_ms(11_000), 0);
+    }
+
+    fn first_question_qname_wire(message: &Message) -> Vec<u8> {
+        let wire = message
+            .to_bytes()
+            .expect("test DNS message should serialize");
+        let mut offset = 12; // DNS header
+        let mut qname = Vec::new();
+
+        loop {
+            let len = usize::from(
+                *wire
+                    .get(offset)
+                    .expect("first Question QNAME should be present"),
+            );
+            assert!(len <= 63, "first Question QNAME must not be compressed");
+            let end = offset + 1 + len;
+            qname.extend_from_slice(
+                wire.get(offset..end)
+                    .expect("first Question QNAME label should fit in the packet"),
+            );
+            offset = end;
+            if len == 0 {
+                break;
+            }
+        }
+
+        qname
     }
 
     fn make_context(request: Message) -> DnsContext {
