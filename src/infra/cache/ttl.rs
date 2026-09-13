@@ -23,6 +23,7 @@ use rand::RngExt;
 const LAST_ACCESS_EVICTING_BIT: u64 = 1 << 63;
 const PERIODIC_MAINTENANCE_SAMPLE_SIZE: usize = 4096;
 const PERIODIC_EVICTION_SAMPLE_KILL_DIVISOR: usize = 4;
+const EXACT_COMPACT_CAPACITY_RATIO: usize = 2;
 
 /// Immutable cache node stored behind a stable `Arc`.
 ///
@@ -906,6 +907,29 @@ where
         removed
     }
 
+    /// Compact an exact-pruned state when its backing hash table is much
+    /// larger than the live population.
+    ///
+    /// Exact pruning is used for startup/API-import generations where doing
+    /// one O(N) rehash off the request path is acceptable. Keeping a sparse
+    /// table here would make later bounded bucket sampling unreliable because
+    /// a small probe window could repeatedly miss every live bucket.
+    fn compact_exact_state_if_sparse(state: &TtlCacheState<K, V>) -> bool {
+        let live_entries = state.entry_count.load(Ordering::Acquire);
+        let capacity = state.map.capacity();
+        let compact_threshold = live_entries.saturating_mul(EXACT_COMPACT_CAPACITY_RATIO);
+
+        if capacity == 0 || (live_entries > 0 && capacity <= compact_threshold) {
+            return false;
+        }
+
+        // No DashMap guard/reference is alive here. `shrink_to_fit()` takes
+        // shard write locks internally and may deadlock if called while a map
+        // reference is held.
+        state.map.shrink_to_fit();
+        true
+    }
+
     /// Remove at most `batch` expired entries and return removed count.
     #[inline]
     pub fn remove_expired_batch(&self, now_ms: u64, batch: usize) -> usize {
@@ -1125,6 +1149,14 @@ where
                         remaining_excess,
                     ));
                 }
+
+                // Prepared/imported generations can temporarily grow far
+                // beyond the configured size. Exact pruning removes entries
+                // but hashbrown retains its bucket allocation, which can leave
+                // the published map extremely sparse and make later bounded
+                // periodic sampling miss live entries repeatedly. Compact only
+                // when capacity is clearly disproportionate to the live set.
+                Self::compact_exact_state_if_sparse(&state);
 
                 (
                     expired_removed,
@@ -1867,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_prune_enforces_capacity_after_sparse_growth() {
+    fn test_exact_prune_compacts_sparse_backing_table() {
         let cache = TtlCache::with_capacity(32_768);
         for key in 0u32..20_000 {
             cache.insert_or_update_with_meta(key, key, 0, 100_000, u64::from(key));
@@ -1876,9 +1908,52 @@ mod tests {
             assert!(cache.remove(&key));
         }
 
+        let before_capacity = cache.state.load().map.capacity();
+        assert!(before_capacity > cache.entry_count().saturating_mul(2));
+
         let (_, _, after_len) = cache.prune(TtlCachePruneMode::Exact { max_size: 10 }, 1);
+        let after_capacity = cache.state.load().map.capacity();
+
         assert!(after_len <= 10, "Exact prune left {after_len} entries");
         assert!(cache.entry_count() <= 10);
+        assert!(
+            after_capacity < before_capacity,
+            "Exact prune did not compact sparse table: before={before_capacity}, after={after_capacity}"
+        );
+    }
+
+    #[test]
+    fn periodic_prune_makes_progress_after_exact_compaction() {
+        let cache = TtlCache::with_capacity(32_768);
+        for key in 0u32..10_000 {
+            cache.insert_or_update_with_meta(key, key, 0, 100_000, u64::from(key));
+        }
+        for key in 0u32..9_990 {
+            assert!(cache.remove(&key));
+        }
+
+        let sparse_capacity = cache.state.load().map.capacity();
+        cache.prune(TtlCachePruneMode::Exact { max_size: 10 }, 1);
+        let compact_capacity = cache.state.load().map.capacity();
+        assert!(compact_capacity < sparse_capacity);
+
+        for key in 10_000u32..10_110 {
+            cache.insert_or_update_with_meta(key, key, 0, 100_000, u64::from(key));
+        }
+        let before_len = cache.entry_count();
+
+        let (expired_removed, evicted, after_len) = cache.prune(
+            TtlCachePruneMode::Periodic {
+                max_size: 100,
+                high_watermark_pct: 95,
+                low_watermark_pct: 85,
+            },
+            1,
+        );
+
+        assert_eq!(expired_removed, 0);
+        assert!(evicted > 0, "periodic prune made no progress after compaction");
+        assert_eq!(after_len, before_len - evicted);
     }
 
     #[test]
