@@ -557,7 +557,7 @@ impl DnsCacheStore {
         replaced
     }
 
-    /// Re-key a stale ECS entry as one atomic conditional mutation.
+    /// Re-key a stale ECS entry as one atomic freshness-aware mutation.
     pub(super) fn conditional_move_handle(
         &self,
         source_key: &CacheKey,
@@ -570,9 +570,15 @@ impl DnsCacheStore {
         let _index_publication =
             tracks_target_prefix.then(|| self.ecs_lookup_index.publication_guard());
         self.ecs_lookup_index.observe_cache_key(&target_key);
-        let result = self
-            .cache_map
-            .conditional_move_handle(source_key, target_key, expected, item, metadata);
+        let refresh_time_ms = metadata.cache_time_ms;
+        let result = self.cache_map.conditional_move_handle_if(
+            source_key,
+            target_key,
+            expected,
+            item,
+            metadata,
+            move |target, _expire_at_ms| target.fresh_until_ms <= refresh_time_ms,
+        );
         if tracks_target_prefix && !matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
             self.ecs_lookup_index.mark_publication();
         }
@@ -584,7 +590,7 @@ impl DnsCacheStore {
             TtlCacheConditionalMoveResult::Consolidated => {
                 self.mutations.mark_dirty(1);
             }
-            TtlCacheConditionalMoveResult::ReplacedExpiredTarget => {
+            TtlCacheConditionalMoveResult::ReplacedTarget => {
                 self.mutations.mark_dirty(1);
                 self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
             }
@@ -818,6 +824,150 @@ mod tests {
             mutations.inner.dirty_generation.load(Ordering::Acquire),
             before_dirty.saturating_add(1)
         );
+        assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
+    }
+
+    #[test]
+    fn conditional_move_replaces_stale_retained_target() {
+        AppClock::start();
+        let (store, _mutations, metrics) = test_store(4);
+        let now = AppClock::elapsed_millis();
+        let commit_time = now.saturating_add(2_000);
+        let source = test_ecs_key("stale-merge.example", 24);
+        let target = test_ecs_key("stale-merge.example", 20);
+
+        assert!(store.insert_or_update(
+            source.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(1_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        ));
+        assert!(store.insert_or_update(
+            target.clone(),
+            CacheItem::new_validated(Message::new(), 120, now.saturating_add(1_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        ));
+        let expected = store
+            .cache_map()
+            .get_retained_handle(&source, now, 0)
+            .expect("source should remain retained");
+        let before_inserts = metrics.insert_total.load(Ordering::Relaxed);
+
+        assert_eq!(
+            store.conditional_move_handle(
+                &source,
+                target.clone(),
+                &expected,
+                CacheItem::new_validated(
+                    Message::new(),
+                    30,
+                    commit_time.saturating_add(30_000),
+                ),
+                TtlCacheMoveMetadata {
+                    cache_time_ms: commit_time,
+                    expire_at_ms: commit_time.saturating_add(60_000),
+                    last_access_ms: commit_time,
+                },
+            ),
+            TtlCacheConditionalMoveResult::ReplacedTarget
+        );
+
+        assert!(
+            store
+                .cache_map()
+                .get_retained_handle(&source, commit_time, 0)
+                .is_none()
+        );
+        let target_entry = store
+            .cache_map()
+            .get_retained_handle(&target, commit_time, 0)
+            .expect("stale retained target should be replaced by refresh");
+        assert_eq!(target_entry.value().ttl, 30);
+        assert_eq!(store.cache_map().entry_count(), 1);
+        assert_eq!(
+            metrics.insert_total.load(Ordering::Relaxed),
+            before_inserts.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn conditional_move_preserves_target_refreshed_before_commit() {
+        AppClock::start();
+        let (store, _mutations, metrics) = test_store(4);
+        let now = AppClock::elapsed_millis();
+        let commit_time = now.saturating_add(2_000);
+        let source = test_ecs_key("race-merge.example", 24);
+        let target = test_ecs_key("race-merge.example", 20);
+
+        assert!(store.insert_or_update(
+            source.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(1_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        ));
+        assert!(store.insert_or_update(
+            target.clone(),
+            CacheItem::new_validated(Message::new(), 120, now.saturating_add(1_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        ));
+        let expected = store
+            .cache_map()
+            .get_retained_handle(&source, now, 0)
+            .expect("source should remain retained");
+
+        // Model another refresh publishing a fresh target while this source
+        // refresh is in flight. The conditional move must inspect the target
+        // generation present at commit time and preserve it.
+        assert!(store.insert_or_update(
+            target.clone(),
+            CacheItem::new_validated(
+                Message::new(),
+                240,
+                commit_time.saturating_add(240_000),
+            ),
+            commit_time.saturating_sub(1),
+            commit_time.saturating_add(300_000),
+            commit_time.saturating_sub(1),
+        ));
+        let before_inserts = metrics.insert_total.load(Ordering::Relaxed);
+
+        assert_eq!(
+            store.conditional_move_handle(
+                &source,
+                target.clone(),
+                &expected,
+                CacheItem::new_validated(
+                    Message::new(),
+                    30,
+                    commit_time.saturating_add(30_000),
+                ),
+                TtlCacheMoveMetadata {
+                    cache_time_ms: commit_time,
+                    expire_at_ms: commit_time.saturating_add(60_000),
+                    last_access_ms: commit_time,
+                },
+            ),
+            TtlCacheConditionalMoveResult::Consolidated
+        );
+
+        assert!(
+            store
+                .cache_map()
+                .get_retained_handle(&source, commit_time, 0)
+                .is_none()
+        );
+        let target_entry = store
+            .cache_map()
+            .get_retained_handle(&target, commit_time, 0)
+            .expect("concurrently refreshed target should be preserved");
+        assert_eq!(target_entry.value().ttl, 240);
+        assert_eq!(store.cache_map().entry_count(), 1);
         assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
     }
 

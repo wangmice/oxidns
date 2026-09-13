@@ -169,10 +169,10 @@ pub(crate) enum TtlCacheConditionalMoveResult {
     /// The source still matched and was removed because the target key already
     /// contained a retained entry. The existing target entry was preserved.
     Consolidated,
-    /// The source still matched and the target existed but was already expired.
-    /// Both old entries were removed and the refreshed value replaced the
-    /// target.
-    ReplacedExpiredTarget,
+    /// The source still matched and the current target satisfied the caller's
+    /// replacement predicate. Both old entries were removed and the supplied
+    /// value replaced the target atomically.
+    ReplacedTarget,
     /// The source entry was missing or no longer matched the supplied identity.
     SourceChanged,
 }
@@ -554,23 +554,10 @@ where
     /// Move one existing entry to a different key only when the source is still
     /// the exact generation represented by `expected`.
     ///
-    /// If the target is vacant, the source is moved to the target with the
-    /// supplied value and metadata. If the target already exists and is still
-    /// retained, the matching source is removed atomically and the existing
-    /// target is preserved. If that target is already expired, both old entries
-    /// are removed and the refreshed value replaces the target atomically.
-    ///
-    /// The operation is bound to one cache state loaded at entry, so a
-    /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
-    /// a refresh that started on an old generation write into the
-    /// replacement generation. Source and target shards are write-locked in
-    /// stable shard order, making the identity check, target-vacancy check,
-    /// removal, and insertion one conditional commit with respect to both
-    /// keys.
-    ///
-    /// Moving an existing entry preserves cache cardinality, so capacity
-    /// accounting does not need a release/reacquire cycle and concurrent
-    /// bounded insertions cannot steal the source entry's slot mid-move.
+    /// This default form replaces an existing target only when its retention
+    /// deadline has expired at `metadata.cache_time_ms`. Callers with a
+    /// stronger target-validity concept (for example fresh vs. stale) should
+    /// use [`Self::conditional_move_handle_if`].
     pub(crate) fn conditional_move_handle(
         &self,
         source_key: &K,
@@ -579,6 +566,55 @@ where
         value: V,
         metadata: TtlCacheMoveMetadata,
     ) -> TtlCacheConditionalMoveResult {
+        let now_ms = metadata.cache_time_ms;
+        self.conditional_move_handle_if(
+            source_key,
+            target_key,
+            expected,
+            value,
+            metadata,
+            move |_target, expire_at_ms| expire_at_ms <= now_ms,
+        )
+    }
+
+    /// Move one existing entry to another key as one conditional commit.
+    ///
+    /// The source must still be the exact generation represented by
+    /// `expected`. If the target is vacant, the refreshed value is moved there.
+    /// If a target exists, `should_replace_target` is evaluated against the
+    /// *current* target while the target shard write lock is held. Returning
+    /// `true` atomically replaces that target; returning `false` preserves it
+    /// and removes only the matching source.
+    ///
+    /// Evaluating the predicate under the same write lock as the subsequent
+    /// remove/insert is intentional: a target that was stale when refresh
+    /// started may have been replaced by a fresh generation while the upstream
+    /// request was in flight. The decision therefore observes the generation
+    /// that is actually present at commit time and cannot overwrite a later
+    /// concurrent target update based on an earlier snapshot.
+    ///
+    /// The operation is bound to one cache state loaded at entry, so a
+    /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
+    /// a refresh that started on an old generation write into the replacement
+    /// generation. Source and target shards are write-locked in stable shard
+    /// order, making the source identity check, target predicate, removals, and
+    /// insertion one conditional commit with respect to both keys.
+    ///
+    /// Moving an existing entry preserves cache cardinality, so capacity
+    /// accounting does not need a release/reacquire cycle and concurrent
+    /// bounded insertions cannot steal the source entry's slot mid-move.
+    pub(crate) fn conditional_move_handle_if<F>(
+        &self,
+        source_key: &K,
+        target_key: K,
+        expected: &TtlCacheHandle<V>,
+        value: V,
+        metadata: TtlCacheMoveMetadata,
+        should_replace_target: F,
+    ) -> TtlCacheConditionalMoveResult
+    where
+        F: Fn(&V, u64) -> bool,
+    {
         let state = self.state.load();
 
         if source_key == &target_key {
@@ -610,11 +646,12 @@ where
                 if !source_matches {
                     TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let target_expired = shard
+                    let replace_target = shard
                         .find(target_hash, |(key, _)| key == &target_key)
                         .map(|bucket| unsafe {
                             let (_, stored) = bucket.as_ref();
-                            stored.get().expire_at_ms <= metadata.cache_time_ms
+                            let target = stored.get();
+                            should_replace_target(&target.value, target.expire_at_ms)
                         });
 
                     // SAFETY: `source_bucket` came from this write-locked
@@ -622,7 +659,7 @@ where
                     let ((_removed_key, removed_value), _) = unsafe { shard.remove(source_bucket) };
                     drop(removed_value);
 
-                    match target_expired {
+                    match replace_target {
                         Some(false) => {
                             state.entry_count.fetch_sub(1, Ordering::Release);
                             TtlCacheConditionalMoveResult::Consolidated
@@ -650,7 +687,7 @@ where
                                 |(key, _)| hash_key(key),
                             );
                             state.entry_count.fetch_sub(1, Ordering::Release);
-                            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+                            TtlCacheConditionalMoveResult::ReplacedTarget
                         }
                         None => {
                             shard.insert(
@@ -691,11 +728,12 @@ where
                 if !source_matches {
                     TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let target_expired = target_shard
+                    let replace_target = target_shard
                         .find(target_hash, |(key, _)| key == &target_key)
                         .map(|bucket| unsafe {
                             let (_, stored) = bucket.as_ref();
-                            stored.get().expire_at_ms <= metadata.cache_time_ms
+                            let target = stored.get();
+                            should_replace_target(&target.value, target.expire_at_ms)
                         });
 
                     // SAFETY: `source_bucket` belongs to the source shard,
@@ -704,7 +742,7 @@ where
                         unsafe { source_shard.remove(source_bucket) };
                     drop(removed_value);
 
-                    match target_expired {
+                    match replace_target {
                         Some(false) => {
                             state.entry_count.fetch_sub(1, Ordering::Release);
                             TtlCacheConditionalMoveResult::Consolidated
@@ -732,7 +770,7 @@ where
                                 |(key, _)| hash_key(key),
                             );
                             state.entry_count.fetch_sub(1, Ordering::Release);
-                            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+                            TtlCacheConditionalMoveResult::ReplacedTarget
                         }
                         None => {
                             target_shard.insert(
@@ -1735,6 +1773,108 @@ mod tests {
     }
 
     #[test]
+    fn conditional_move_if_replaces_matching_retained_target_across_shards() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 500, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 10, 300, 10);
+        let expected = retained_handle(&cache, &source, 20);
+
+        assert_eq!(
+            cache.conditional_move_handle_if(
+                &source,
+                target,
+                &expected,
+                77u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 30,
+                    expire_at_ms: 300,
+                    last_access_ms: 30,
+                },
+                |target, _expire_at_ms| *target == 99,
+            ),
+            TtlCacheConditionalMoveResult::ReplacedTarget
+        );
+        assert!(cache.get_retained_handle(&source, 30, 0).is_none());
+        assert_eq!(
+            *cache.get_retained_handle(&target, 30, 0).unwrap().value(),
+            77
+        );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_if_replaces_matching_retained_target_on_same_shard() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_same_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 500, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 10, 300, 10);
+        let expected = retained_handle(&cache, &source, 20);
+
+        assert_eq!(
+            cache.conditional_move_handle_if(
+                &source,
+                target,
+                &expected,
+                77u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 30,
+                    expire_at_ms: 300,
+                    last_access_ms: 30,
+                },
+                |target, _expire_at_ms| *target == 99,
+            ),
+            TtlCacheConditionalMoveResult::ReplacedTarget
+        );
+        assert!(cache.get_retained_handle(&source, 30, 0).is_none());
+        assert_eq!(
+            *cache.get_retained_handle(&target, 30, 0).unwrap().value(),
+            77
+        );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_if_observes_current_target_generation_at_commit() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 500, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 10, 300, 10);
+        let expected = retained_handle(&cache, &source, 20);
+
+        // Model a concurrent target refresh that wins before this move reaches
+        // its atomic commit window. The predicate must inspect this current
+        // generation rather than the stale target that existed when refresh
+        // started.
+        cache.insert_or_update_with_meta(target, 100u32, 25, 400, 25);
+
+        assert_eq!(
+            cache.conditional_move_handle_if(
+                &source,
+                target,
+                &expected,
+                77u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 30,
+                    expire_at_ms: 300,
+                    last_access_ms: 30,
+                },
+                |target, _expire_at_ms| *target == 99,
+            ),
+            TtlCacheConditionalMoveResult::Consolidated
+        );
+        assert!(cache.get_retained_handle(&source, 30, 0).is_none());
+        assert_eq!(
+            *cache.get_retained_handle(&target, 30, 0).unwrap().value(),
+            100
+        );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
     fn conditional_move_replaces_expired_target_across_shards() {
         let cache = TtlCache::with_capacity(4);
         let source = 1u64;
@@ -1755,7 +1895,7 @@ mod tests {
                     last_access_ms: 30,
                 },
             ),
-            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+            TtlCacheConditionalMoveResult::ReplacedTarget
         );
         assert!(cache.get_retained_handle(&source, 30, 0).is_none());
         let target_entry = cache
@@ -1787,7 +1927,7 @@ mod tests {
                     last_access_ms: 30,
                 },
             ),
-            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+            TtlCacheConditionalMoveResult::ReplacedTarget
         );
         assert!(cache.get_retained_handle(&source, 30, 0).is_none());
         let target_entry = cache

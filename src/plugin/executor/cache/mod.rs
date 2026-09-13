@@ -1620,7 +1620,7 @@ impl Cache {
                                 ),
                                 TtlCacheConditionalMoveResult::Moved
                                     | TtlCacheConditionalMoveResult::Consolidated
-                                    | TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+                                    | TtlCacheConditionalMoveResult::ReplacedTarget
                             )
                         };
                         if inserted {
@@ -5296,6 +5296,130 @@ mod tests {
             }
             other => panic!("expected fresh consolidated target, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ecs_lazy_refresh_replaces_stale_retained_wider_target() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(3_600);
+        cfg.ecs_in_key = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let mut request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut request, "203.0.113.199/24");
+        let mut context = make_context(request);
+        let request_key = Cache::build_cache_key(&mut context, true).unwrap();
+
+        let mut source_response = cacheable_response_for_domain("example.com.", 120);
+        let mut source_edns = Edns::new();
+        source_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            20,
+        )));
+        source_response.set_edns(source_edns);
+        let source_key = cache_key_for_response_ecs_scope(&request_key, &source_response)
+            .expect("source response should produce a /20 cache key");
+
+        let mut target_response = cacheable_response_for_domain("example.com.", 222);
+        let mut target_edns = Edns::new();
+        target_edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            16,
+        )));
+        target_response.set_edns(target_edns);
+        let target_key = cache_key_for_response_ecs_scope(&request_key, &target_response)
+            .expect("target response should produce a /16 cache key");
+        assert_ne!(source_key, target_key);
+
+        let now = AppClock::elapsed_millis();
+        cache
+            .store
+            .ecs_lookup_index()
+            .observe_cache_key(&source_key);
+        cache
+            .store
+            .ecs_lookup_index()
+            .observe_cache_key(&target_key);
+        cache.store.cache_map().insert_or_update_with_meta(
+            source_key.clone(),
+            CacheItem::new_validated(source_response, 120, now.saturating_sub(1)),
+            now.saturating_sub(121_000),
+            now.saturating_add(3_000_000),
+            now,
+        );
+        cache.store.cache_map().insert_or_update_with_meta(
+            target_key.clone(),
+            CacheItem::new_validated(target_response, 222, now.saturating_sub(1)),
+            now.saturating_sub(223_000),
+            now.saturating_add(3_000_000),
+            now,
+        );
+        assert_eq!(cache.store.cache_map().entry_count(), 2);
+
+        let lookup = cache
+            .try_cache_hit(&mut context, &cache.store)
+            .expect("cache lookup should exist");
+        assert!(matches!(lookup, DnsCacheLookup::Stale { ref key, .. } if key == &source_key));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+                calls,
+            }));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("stale ECS refresh should start");
+
+        wait_until(
+            "ECS lazy refresh should replace stale retained wider target",
+            || {
+                cache
+                    .store
+                    .metrics()
+                    .lazy_refresh_success_total
+                    .load(AtomicOrdering::Relaxed)
+                    == 1
+            },
+        )
+        .await;
+
+        assert!(
+            cache
+                .store
+                .cache_map()
+                .get_retained_handle(&source_key, AppClock::elapsed_millis(), 0)
+                .is_none(),
+            "stale narrower source must be removed after replacement"
+        );
+        let target = cache
+            .store
+            .cache_map()
+            .get_retained_handle(&target_key, AppClock::elapsed_millis(), 0)
+            .expect("stale retained wider target should be replaced");
+        assert_eq!(
+            target.value().ttl,
+            55,
+            "successful refresh must replace the stale retained target",
+        );
+        assert!(
+            target.value().fresh_until_ms > AppClock::elapsed_millis(),
+            "replacement target must be fresh",
+        );
+        assert_eq!(cache.store.cache_map().entry_count(), 1);
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
