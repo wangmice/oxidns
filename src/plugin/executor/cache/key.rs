@@ -280,12 +280,18 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
     let cd_bit = context.request.checking_disabled();
 
     let request_ecs = extract_ecs(&context.request);
-    if request_ecs.is_some_and(|subnet| !request_ecs_is_valid(subnet)) {
-        return None;
-    }
 
     let ecs_scope = if ecs_in_key {
-        request_ecs.map(build_ecs_scope_digest)
+        match request_ecs {
+            Some(subnet) => {
+                if !request_ecs_is_valid(subnet) {
+                    return None;
+                }
+
+                Some(build_ecs_scope_digest(subnet))
+            }
+            None => None,
+        }
     } else {
         None
     };
