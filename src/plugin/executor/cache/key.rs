@@ -678,36 +678,42 @@ impl EcsLookupIndex {
         stale_revision: u64,
         publication_revision: u64,
     ) -> bool {
-        let _guard = self
-            .rebuild_gate
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retired = {
+            let _guard = self
+                .rebuild_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if self.stale_revision.load(Ordering::Acquire) != stale_revision
-            || self.publication_revision.load(Ordering::Acquire) != publication_revision
-        {
-            return false;
-        }
+            if self.stale_revision.load(Ordering::Acquire) != stale_revision
+                || self.publication_revision.load(Ordering::Acquire) != publication_revision
+            {
+                return false;
+            }
 
-        // O(1) publication: readers that already loaded the old Arc keep a
-        // valid conservative snapshot, while new readers immediately see the
-        // rebuilt map. The exclusive gate only covers revision validation and
-        // this pointer swap, never the full cache/index scan.
-        self.entries.store(rebuilt.entries.load_full());
-        self.indexed_base_keys.store(
-            rebuilt.indexed_base_keys.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.observed_ipv4_prefixes.store(
-            rebuilt.observed_ipv4_prefixes.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.observed_ipv6_prefixes.store(
-            rebuilt.observed_ipv6_prefixes.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.rebuilt_revision
-            .store(stale_revision, Ordering::Release);
+            // O(1) publication: readers that already loaded the old Arc keep a
+            // valid conservative snapshot, while new readers immediately see
+            // the rebuilt map. Keep the retired snapshot alive until after the
+            // exclusive gate is released so a last-reference drop cannot
+            // synchronously destruct the old index while publications wait.
+            let retired = self.entries.swap(rebuilt.entries.load_full());
+            self.indexed_base_keys.store(
+                rebuilt.indexed_base_keys.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.observed_ipv4_prefixes.store(
+                rebuilt.observed_ipv4_prefixes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.observed_ipv6_prefixes.store(
+                rebuilt.observed_ipv6_prefixes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.rebuilt_revision
+                .store(stale_revision, Ordering::Release);
+            retired
+        };
+
+        drop(retired);
         true
     }
 

@@ -499,15 +499,17 @@ impl DnsCacheStore {
         let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
         let _index_publication =
             tracks_ecs_prefix.then(|| self.ecs_lookup_index.publication_guard());
-        self.ecs_lookup_index.observe_cache_key(&key);
-        let inserted = self.cache_map.try_insert_or_update_with_limit(
-            key,
-            item,
-            cache_time_ms,
-            expire_at_ms,
-            last_access_ms,
-            self.cache_size,
-        );
+        let inserted = self
+            .cache_map
+            .try_insert_or_update_with_limit_before_publish(
+                key,
+                item,
+                cache_time_ms,
+                expire_at_ms,
+                last_access_ms,
+                self.cache_size,
+                |published_key| self.ecs_lookup_index.observe_cache_key(published_key),
+            );
         if inserted {
             if tracks_ecs_prefix {
                 self.ecs_lookup_index.mark_publication();
@@ -515,9 +517,6 @@ impl DnsCacheStore {
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
         } else {
-            if tracks_ecs_prefix {
-                self.ecs_lookup_index.mark_rebuild_needed();
-            }
             self.pressure_requested.store(true, Ordering::Release);
         }
         inserted
@@ -1008,6 +1007,40 @@ mod tests {
         assert!(!store.ecs_lookup_index_needs_rebuild());
         assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
         assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 1);
+    }
+
+    #[test]
+    fn rejected_ecs_admission_does_not_publish_index_hints() {
+        AppClock::start();
+        let (store, _mutations, _metrics) = test_store(1);
+        let now = AppClock::elapsed_millis();
+
+        assert!(store.insert_or_update(
+            test_ecs_key("resident.example", 24),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        ));
+        assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 1);
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
+        assert!(!store.ecs_lookup_index_needs_rebuild());
+
+        for attempt in 0..128 {
+            assert!(!store.insert_or_update(
+                test_ecs_key(&format!("rejected-{attempt}.example"), 16),
+                CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+                now,
+                now.saturating_add(60_000),
+                now,
+            ));
+        }
+
+        assert_eq!(store.cache_map().entry_count(), 1);
+        assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 1);
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
+        assert!(!store.ecs_lookup_index_needs_rebuild());
+        assert!(store.take_pressure_requested());
     }
 
     #[test]

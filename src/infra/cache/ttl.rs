@@ -381,6 +381,7 @@ where
 
     /// Insert or update one entry while atomically rejecting new entries after
     /// `max_entries` has been reached. Existing keys are always updateable.
+    #[inline]
     pub fn try_insert_or_update_with_limit(
         &self,
         key: K,
@@ -390,10 +391,43 @@ where
         last_access_ms: u64,
         max_entries: usize,
     ) -> bool {
+        self.try_insert_or_update_with_limit_before_publish(
+            key,
+            value,
+            cache_time_ms,
+            expire_at_ms,
+            last_access_ms,
+            max_entries,
+            |_| {},
+        )
+    }
+
+    /// Insert or update one entry while running `before_publish` only after the
+    /// mutation is guaranteed not to fail because of the capacity limit, but
+    /// before the new cache generation becomes visible in the map.
+    ///
+    /// This is intended for conservative side indexes that must be published
+    /// before the authoritative entry without leaving speculative state behind
+    /// when admission is rejected.
+    pub fn try_insert_or_update_with_limit_before_publish<F>(
+        &self,
+        key: K,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+        max_entries: usize,
+        before_publish: F,
+    ) -> bool
+    where
+        F: FnOnce(&K),
+    {
         let state = self.state.load();
         match state.map.entry(key) {
             Entry::Occupied(mut e) => {
-                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
+                let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
+                before_publish(e.key());
+                e.insert(node);
                 true
             }
             Entry::Vacant(e) => {
@@ -432,7 +466,9 @@ where
                     success: false,
                 };
 
-                e.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
+                let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
+                before_publish(e.key());
+                e.insert(node);
                 guard.success = true;
                 true
             }
@@ -1568,6 +1604,58 @@ mod tests {
         assert!(cache.try_insert_or_update_with_limit("a", 4u32, 0, 200, 0, 2));
         assert_eq!(cache.len(), 2);
         assert_eq!(*cache.get_retained_handle(&"a", 1, 0).unwrap().value(), 4);
+    }
+
+    #[test]
+    fn pre_publish_hook_runs_only_for_admitted_mutations() {
+        let cache = TtlCache::with_capacity(1);
+        let publications = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(cache.try_insert_or_update_with_limit_before_publish(
+            "resident",
+            1u32,
+            0,
+            100,
+            0,
+            1,
+            |_| {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert_eq!(publications.load(Ordering::Relaxed), 1);
+
+        assert!(!cache.try_insert_or_update_with_limit_before_publish(
+            "rejected",
+            2u32,
+            0,
+            100,
+            0,
+            1,
+            |_| {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert_eq!(publications.load(Ordering::Relaxed), 1);
+
+        assert!(cache.try_insert_or_update_with_limit_before_publish(
+            "resident",
+            3u32,
+            0,
+            200,
+            0,
+            1,
+            |_| {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert_eq!(publications.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *cache
+                .get_retained_handle(&"resident", 1, 0)
+                .unwrap()
+                .value(),
+            3
+        );
     }
 
     #[test]
