@@ -661,11 +661,10 @@ impl PreparedEntryCollector {
         // Reject duplicate canonical cache keys before bounded retention.
         // This set stores only keys; Message/CacheItem allocations remain
         // bounded by max_entries even when the input contains many entries.
-        if let Some(key) = to_cache_key(&persisted, self.ecs_in_key)? {
-            if !self.seen_keys.insert(key) {
+        if let Some(key) = to_cache_key(&persisted, self.ecs_in_key)?
+            && !self.seen_keys.insert(key) {
                 return Err(invalid_dump("duplicate canonical cache key"));
             }
-        }
 
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
