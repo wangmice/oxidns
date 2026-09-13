@@ -166,10 +166,11 @@ pub enum TtlCacheInsertIfNotNewerResult {
 pub(crate) enum TtlCacheConditionalMoveResult {
     /// The source still matched, the target was vacant, and the move committed.
     Moved,
+    /// The source still matched and was removed because the target key already
+    /// contained an entry. The existing target entry was preserved.
+    Consolidated,
     /// The source entry was missing or no longer matched the supplied identity.
     SourceChanged,
-    /// The target key was already occupied, so neither entry was modified.
-    TargetPresent,
 }
 
 /// Metadata for the entry created by a conditional move.
@@ -546,7 +547,13 @@ where
     }
 
     /// Move one existing entry to a different key only when the source is still
-    /// the exact generation represented by `expected` and the target is vacant.
+    /// the exact generation represented by `expected`.
+    ///
+    /// If the target is vacant, the source is moved to the target with the
+    /// supplied value and metadata. If the target already exists, the matching
+    /// source is removed atomically and the existing target is preserved. This
+    /// consolidation prevents a more-specific stale alias from continuing to
+    /// shadow an already-present canonical target.
     ///
     /// The operation is bound to one cache state loaded at entry, so a
     /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
@@ -570,6 +577,10 @@ where
     ) -> TtlCacheConditionalMoveResult {
         let state = self.state.load();
 
+        if source_key == &target_key {
+            return TtlCacheConditionalMoveResult::SourceChanged;
+        }
+
         // Compute the exact 64-bit hashes used by DashMap's underlying
         // RawTable. `hash_usize()` would lose bits on 32-bit targets.
         let hash_key = |key: &K| state.map.hasher().hash_one(key);
@@ -583,30 +594,32 @@ where
             ($shard:expr) => {{
                 let shard = &mut *$shard;
 
-                if shard
-                    .find(target_hash, |(key, _)| key == &target_key)
-                    .is_some()
-                {
-                    TtlCacheConditionalMoveResult::TargetPresent
+                let Some(source_bucket) = shard.find(source_hash, |(key, _)| key == source_key)
+                else {
+                    return TtlCacheConditionalMoveResult::SourceChanged;
+                };
+
+                let source_matches = unsafe {
+                    let (_, stored) = source_bucket.as_ref();
+                    expected.same_node(stored.get())
+                };
+                if !source_matches {
+                    TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let Some(source_bucket) = shard.find(source_hash, |(key, _)| key == source_key)
-                    else {
-                        return TtlCacheConditionalMoveResult::SourceChanged;
-                    };
+                    let target_present = shard
+                        .find(target_hash, |(key, _)| key == &target_key)
+                        .is_some();
 
-                    let source_matches = unsafe {
-                        let (_, stored) = source_bucket.as_ref();
-                        expected.same_node(stored.get())
-                    };
-                    if !source_matches {
-                        TtlCacheConditionalMoveResult::SourceChanged
+                    // SAFETY: `source_bucket` came from this write-locked
+                    // RawTable and no mutation has happened since `find`.
+                    let ((_removed_key, removed_value), _) =
+                        unsafe { shard.remove(source_bucket) };
+                    drop(removed_value);
+
+                    if target_present {
+                        state.entry_count.fetch_sub(1, Ordering::Release);
+                        TtlCacheConditionalMoveResult::Consolidated
                     } else {
-                        // SAFETY: `source_bucket` came from this write-locked
-                        // RawTable and no mutation has happened since `find`.
-                        let ((_removed_key, removed_value), _) =
-                            unsafe { shard.remove(source_bucket) };
-                        drop(removed_value);
-
                         shard.insert(
                             target_hash,
                             (
@@ -631,31 +644,33 @@ where
                 let source_shard = &mut *$source_shard;
                 let target_shard = &mut *$target_shard;
 
-                if target_shard
-                    .find(target_hash, |(key, _)| key == &target_key)
-                    .is_some()
-                {
-                    TtlCacheConditionalMoveResult::TargetPresent
+                let Some(source_bucket) =
+                    source_shard.find(source_hash, |(key, _)| key == source_key)
+                else {
+                    return TtlCacheConditionalMoveResult::SourceChanged;
+                };
+
+                let source_matches = unsafe {
+                    let (_, stored) = source_bucket.as_ref();
+                    expected.same_node(stored.get())
+                };
+                if !source_matches {
+                    TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let Some(source_bucket) =
-                        source_shard.find(source_hash, |(key, _)| key == source_key)
-                    else {
-                        return TtlCacheConditionalMoveResult::SourceChanged;
-                    };
+                    let target_present = target_shard
+                        .find(target_hash, |(key, _)| key == &target_key)
+                        .is_some();
 
-                    let source_matches = unsafe {
-                        let (_, stored) = source_bucket.as_ref();
-                        expected.same_node(stored.get())
-                    };
-                    if !source_matches {
-                        TtlCacheConditionalMoveResult::SourceChanged
+                    // SAFETY: `source_bucket` belongs to the source shard,
+                    // whose write guard remains held for the full commit.
+                    let ((_removed_key, removed_value), _) =
+                        unsafe { source_shard.remove(source_bucket) };
+                    drop(removed_value);
+
+                    if target_present {
+                        state.entry_count.fetch_sub(1, Ordering::Release);
+                        TtlCacheConditionalMoveResult::Consolidated
                     } else {
-                        // SAFETY: `source_bucket` belongs to the source shard,
-                        // whose write guard remains held for the full commit.
-                        let ((_removed_key, removed_value), _) =
-                            unsafe { source_shard.remove(source_bucket) };
-                        drop(removed_value);
-
                         target_shard.insert(
                             target_hash,
                             (
@@ -1595,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_move_preserves_existing_target_and_source() {
+    fn conditional_move_consolidates_existing_target_across_shards() {
         let cache = TtlCache::with_capacity(4);
         let source = 1u64;
         let target = key_on_different_shard(&cache, source);
@@ -1615,10 +1630,67 @@ mod tests {
                     last_access_ms: 20,
                 },
             ),
-            TtlCacheConditionalMoveResult::TargetPresent
+            TtlCacheConditionalMoveResult::Consolidated
         );
-        assert_eq!(*cache.get_retained_handle(&source, 20, 0).unwrap().value(), 10);
+        assert!(cache.get_retained_handle(&source, 20, 0).is_none());
         assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_consolidates_existing_target_on_same_shard() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_same_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 30, 300, 30);
+        let expected = retained_handle(&cache, &source, 20);
+
+        assert_eq!(
+            cache.conditional_move_handle(
+                &source,
+                target,
+                &expected,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+            ),
+            TtlCacheConditionalMoveResult::Consolidated
+        );
+        assert!(cache.get_retained_handle(&source, 20, 0).is_none());
+        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_does_not_consolidate_when_source_changed() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 100, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 30, 300, 30);
+        let expected = retained_handle(&cache, &source, 20);
+        cache.insert_or_update_with_meta(source, 11u32, 40, 400, 40);
+
+        assert_eq!(
+            cache.conditional_move_handle(
+                &source,
+                target,
+                &expected,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+            ),
+            TtlCacheConditionalMoveResult::SourceChanged
+        );
+        assert_eq!(*cache.get_retained_handle(&source, 40, 0).unwrap().value(), 11);
+        assert_eq!(*cache.get_retained_handle(&target, 40, 0).unwrap().value(), 99);
         assert_eq!(cache.entry_count(), 2);
     }
 

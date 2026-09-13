@@ -567,9 +567,18 @@ impl DnsCacheStore {
             item,
             metadata,
         );
-        if result == TtlCacheConditionalMoveResult::Moved {
-            self.mutations.mark_dirty(1);
-            self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+        match result {
+            TtlCacheConditionalMoveResult::Moved => {
+                self.mutations.mark_dirty(1);
+                self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+            }
+            TtlCacheConditionalMoveResult::Consolidated => {
+                // Consolidation removes the stale source while preserving the
+                // already-present target, so persistence must observe a cache
+                // mutation even though no new entry was inserted.
+                self.mutations.mark_dirty(1);
+            }
+            TtlCacheConditionalMoveResult::SourceChanged => {}
         }
         result
     }
@@ -682,6 +691,64 @@ mod tests {
         assert!(store.remove(&key));
         assert_eq!(mutations.inner.updated_keys.load(Ordering::Relaxed), 2);
         assert_eq!(mutations.inner.dirty_generation.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn conditional_move_consolidation_marks_cache_dirty_without_counting_insert() {
+        AppClock::start();
+        let (store, mutations, metrics) = test_store(4);
+        let now = AppClock::elapsed_millis();
+        let source = test_key("source.example");
+        let target = test_key("target.example");
+
+        assert!(store.insert_or_update(
+            source.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        ));
+        assert!(store.insert_or_update(
+            target.clone(),
+            CacheItem::new_validated(Message::new(), 120, now.saturating_add(120_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        ));
+        let expected = store
+            .cache_map()
+            .get_retained_handle(&source, now, 0)
+            .expect("source should exist");
+        let before_dirty = mutations.inner.dirty_generation.load(Ordering::Acquire);
+        let before_inserts = metrics.insert_total.load(Ordering::Relaxed);
+
+        assert_eq!(
+            store.conditional_move_handle(
+                &source,
+                target.clone(),
+                &expected,
+                CacheItem::new_validated(Message::new(), 30, now.saturating_add(30_000)),
+                TtlCacheMoveMetadata {
+                    cache_time_ms: now,
+                    expire_at_ms: now.saturating_add(30_000),
+                    last_access_ms: now,
+                },
+            ),
+            TtlCacheConditionalMoveResult::Consolidated
+        );
+
+        assert!(store.cache_map().get_retained_handle(&source, now, 0).is_none());
+        let target_entry = store
+            .cache_map()
+            .get_retained_handle(&target, now, 0)
+            .expect("existing target should remain");
+        assert_eq!(target_entry.value().ttl, 120);
+        assert_eq!(store.cache_map().entry_count(), 1);
+        assert_eq!(
+            mutations.inner.dirty_generation.load(Ordering::Acquire),
+            before_dirty.saturating_add(1)
+        );
+        assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
     }
 
     #[test]
