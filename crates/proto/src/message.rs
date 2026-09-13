@@ -191,6 +191,35 @@ impl Message {
         }
     }
 
+    /// Clone this message with a replacement ID while aging cached record TTLs.
+    ///
+    /// Each answer, authority, and additional record is aged independently by
+    /// `age_secs`, then capped by `max_ttl`. Records whose original TTL has
+    /// fully elapsed are omitted instead of being served past their cache
+    /// lifetime. EDNS metadata and detached signature records are preserved as
+    /// stored.
+    pub fn clone_with_id_and_aged_record_ttls(
+        &self,
+        id: u16,
+        age_secs: u32,
+        max_ttl: u32,
+    ) -> Self {
+        Self {
+            header: {
+                let mut header = self.header;
+                header.set_id(id);
+                header
+            },
+            compress: self.compress,
+            questions: self.questions.clone(),
+            answers: clone_records_with_aged_ttl(&self.answers, age_secs, max_ttl),
+            authorities: clone_records_with_aged_ttl(&self.authorities, age_secs, max_ttl),
+            additionals: clone_records_with_aged_ttl(&self.additionals, age_secs, max_ttl),
+            signature: self.signature.clone(),
+            edns: self.edns.clone(),
+        }
+    }
+
     /// Rewrite TTLs in answer, authority, and additional records in place.
     pub fn rewrite_record_ttls(&mut self, mut policy: impl FnMut(u32) -> u32) {
         for record in &mut self.answers {
@@ -826,6 +855,15 @@ fn clone_records_with_ttl(records: &[Record], ttl: u32) -> Vec<Record> {
     cloned
 }
 
+fn clone_records_with_aged_ttl(records: &[Record], age_secs: u32, max_ttl: u32) -> Vec<Record> {
+    let mut cloned = Vec::with_capacity(records.len());
+    cloned.extend(records.iter().filter_map(|record| {
+        let aged_ttl = record.ttl().saturating_sub(age_secs);
+        (aged_ttl != 0).then(|| record.clone_with_ttl(aged_ttl.min(max_ttl)))
+    }));
+    cloned
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TruncationLens {
     /// Total length after encoding the header and all questions.
@@ -908,6 +946,31 @@ mod tests {
         let edns = cloned.edns().as_ref().expect("edns should be preserved");
         assert_eq!(edns.udp_payload_size(), 1232);
         assert!(edns.flags().dnssec_ok);
+    }
+
+    #[test]
+    fn clone_with_id_and_aged_record_ttls_preserves_individual_lifetimes() {
+        let message = message_with_record_sections();
+
+        let cloned = message.clone_with_id_and_aged_record_ttls(77, 100, 150);
+
+        assert_eq!(cloned.id(), 77);
+        assert_eq!(cloned.answers()[0].ttl(), 150);
+        assert_eq!(cloned.authorities()[0].ttl(), 100);
+        assert!(cloned.additionals().is_empty());
+        assert_eq!(cloned.signature()[0].ttl(), 999);
+        assert_eq!(message.answers()[0].ttl(), 300);
+    }
+
+    #[test]
+    fn clone_with_id_and_aged_record_ttls_keeps_live_records_at_zero_cap() {
+        let message = message_with_record_sections();
+
+        let cloned = message.clone_with_id_and_aged_record_ttls(77, 99, 0);
+
+        assert_eq!(cloned.answers()[0].ttl(), 0);
+        assert_eq!(cloned.authorities()[0].ttl(), 0);
+        assert_eq!(cloned.additionals()[0].ttl(), 0);
     }
 
     #[test]

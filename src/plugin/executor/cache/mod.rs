@@ -1072,10 +1072,11 @@ impl Cache {
     }
 
     #[inline]
-    fn restore_cached_message(item: &CacheItem, request: &Message, remaining_ttl: u32) -> Message {
-        let mut response = item
-            .resp
-            .clone_with_id_and_record_ttl(request.id(), remaining_ttl);
+    fn restore_cached_message(
+        item: &CacheItem,
+        request: &Message,
+        mut response: Message,
+    ) -> Message {
         response.questions_mut().clear();
         response.add_question(
             request
@@ -1116,6 +1117,36 @@ impl Cache {
             response.edns_mut().take();
         }
         response
+    }
+
+    #[inline]
+    fn restore_fresh_cached_message(
+        item: &CacheItem,
+        request: &Message,
+        cache_age_ms: u64,
+        remaining_ttl: u32,
+    ) -> Message {
+        let cache_age_secs = cache_age_ms
+            .saturating_div(1000)
+            .min(u64::from(u32::MAX)) as u32;
+        let response = item.resp.clone_with_id_and_aged_record_ttls(
+            request.id(),
+            cache_age_secs,
+            remaining_ttl,
+        );
+        Self::restore_cached_message(item, request, response)
+    }
+
+    #[inline]
+    fn restore_stale_cached_message(
+        item: &CacheItem,
+        request: &Message,
+        stale_ttl: u32,
+    ) -> Message {
+        let response = item
+            .resp
+            .clone_with_id_and_record_ttl(request.id(), stale_ttl);
+        Self::restore_cached_message(item, request, response)
     }
 
     #[inline]
@@ -1162,16 +1193,19 @@ impl Cache {
                 entry,
                 remaining_ttl,
             } => {
-                let resp = Self::restore_cached_message(
-                    entry.value(),
+                let value = entry.value();
+                let cache_age_ms = value.total_cache_age_ms(entry.cache_time_ms(), now);
+                let resp = Self::restore_fresh_cached_message(
+                    value,
                     &context.request,
+                    cache_age_ms,
                     *remaining_ttl,
                 );
                 context.set_response(resp);
             }
             DnsCacheLookup::Stale { entry, .. } => {
                 let value = entry.value();
-                let mut resp = Self::restore_cached_message(
+                let mut resp = Self::restore_stale_cached_message(
                     value,
                     &context.request,
                     self.stale_reply_ttl(value),
@@ -1342,20 +1376,28 @@ impl Cache {
             return;
         }
 
-        if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
-            return;
-        }
-
         let refresh_permit = match self.lazy_refresh_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                self.lazy_refresh_inflight.remove(cache_key);
-                self.metrics()
-                    .lazy_refresh_skipped_busy_total
-                    .fetch_add(1, Ordering::Relaxed);
+                // Preserve per-key dedup semantics without mutating the
+                // DashSet on the saturated fast path. If this key already has
+                // a refresh in flight, it is a duplicate rather than a
+                // global-concurrency rejection and should not count as busy.
+                if !self.lazy_refresh_inflight.contains(cache_key) {
+                    self.metrics()
+                        .lazy_refresh_skipped_busy_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
         };
+
+        // A duplicate can race with permit acquisition when global capacity
+        // is still available. In that case the owned permit is released by
+        // RAII immediately and only the existing per-key refresh continues.
+        if !self.lazy_refresh_inflight.insert(cache_key.clone()) {
+            return;
+        }
 
         let refresh_guard = LazyRefreshGuard {
             inflight: self.lazy_refresh_inflight.clone(),
@@ -3712,6 +3754,74 @@ mod tests {
         assert_eq!(cache.store.metrics().insert_total.load(AtomicOrdering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn fresh_cache_hit_ages_record_ttls_independently() {
+        AppClock::start();
+        let cache = test_cache(default_test_config());
+
+        let request = make_request_with_query("example.com.", false, false);
+        let mut context = make_context(request);
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+
+        let mut response = Message::new();
+        response.set_rcode(Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
+        ));
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("ns.example.com.").unwrap(),
+            120,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(2, 2, 2, 2))),
+        ));
+        response.add_additional(Record::from_rdata(
+            Name::from_ascii("glue.example.com.").unwrap(),
+            30,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(3, 3, 3, 3))),
+        ));
+
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key,
+            CacheItem::new_validated_with_age_offset(
+                response,
+                300,
+                now.saturating_add(240_000),
+                60_000,
+            ),
+            now,
+            now.saturating_add(240_000),
+            now,
+        );
+
+        let lookup = cache
+            .try_cache_hit(&mut context, &cache.store)
+            .expect("cache lookup should exist");
+        assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
+
+        let restored = context.response().expect("fresh hit should populate response");
+        assert_eq!(restored.answers().len(), 1);
+        assert!(
+            (239..=240).contains(&restored.answers()[0].ttl()),
+            "answer TTL should reflect both record age and the fresh-entry TTL cap"
+        );
+        assert_eq!(restored.authorities().len(), 1);
+        assert!(
+            (59..=60).contains(&restored.authorities()[0].ttl()),
+            "authority TTL should age from its own original TTL"
+        );
+        assert!(
+            restored.additionals().is_empty(),
+            "expired additional data must not survive a fresh cache hit"
+        );
+    }
+
     #[test]
     fn restore_cached_message_preserves_response_ecs_scope_only() {
         let mut request = make_request_with_query("example.com.", false, false);
@@ -3737,7 +3847,10 @@ mod tests {
         cached_response.set_edns(response_edns);
         let item = CacheItem::new(cached_response, 120, 120_000);
 
-        let restored = Cache::restore_cached_message(&item, &request, 60);
+        let response = item
+            .resp
+            .clone_with_id_and_record_ttl(request.id(), 60);
+        let restored = Cache::restore_cached_message(&item, &request, response);
         let edns = restored
             .edns()
             .as_ref()
@@ -4235,6 +4348,83 @@ mod tests {
                 .get_retained_handle(&key_b, AppClock::elapsed_millis(), 0)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn lazy_refresh_same_key_dedup_does_not_count_as_busy_when_saturated() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.lazy_refresh_concurrency = Some(1);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingRefreshExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context = make_context(make_request_with_query("same.example.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key.clone(),
+            CacheItem::new(
+                cacheable_response_for_domain("same.example.", 120),
+                120,
+                now.saturating_sub(1_000),
+            ),
+            now.saturating_sub(121_000),
+            now.saturating_add(10_000),
+            now.saturating_sub(100),
+        );
+
+        cache
+            .execute_with_next(&mut context, Some(next.clone()))
+            .await
+            .expect("first stale hit should start refresh");
+        wait_until("first same-key refresh should start", || {
+            started.load(AtomicOrdering::Relaxed) == 1
+        })
+        .await;
+
+        context.clear_response();
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("duplicate stale hit should still be served");
+
+        assert_eq!(started.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_started_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(
+            cache.store.metrics()
+                .lazy_refresh_skipped_busy_total
+                .load(AtomicOrdering::Relaxed),
+            0,
+            "same-key deduplication must not be reported as global busy"
+        );
+        assert!(cache.lazy_refresh_inflight.contains(&key));
+        assert_eq!(cache.lazy_refresh_inflight.len(), 1);
+
+        release.notify_one();
+        wait_until("same-key refresh should complete", || {
+            cache.store.metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
     }
 
     #[tokio::test]
