@@ -1171,11 +1171,16 @@ impl Cache {
             }
             DnsCacheLookup::Stale { entry, .. } => {
                 let value = entry.value();
-                let resp = Self::restore_cached_message(
+                let mut resp = Self::restore_cached_message(
                     value,
                     &context.request,
                     self.stale_reply_ttl(value),
                 );
+                // AD reflects DNSSEC validation state at the time the response
+                // was cached. Once an entry is stale, that assertion can no
+                // longer be safely preserved (for example, its RRSIG may have
+                // expired), so never serve stale data with AD set.
+                resp.set_authentic_data(false);
                 context.set_response(resp);
             }
             DnsCacheLookup::Miss { .. } => {}
@@ -3658,6 +3663,7 @@ mod tests {
 
         let mut response = Message::new();
         response.set_rcode(Rcode::NoError);
+        response.set_authentic_data(true);
         response.add_question(Question::new(
             Name::from_ascii("example.com.").unwrap(),
             RecordType::A,
@@ -3690,6 +3696,7 @@ mod tests {
         assert_eq!(response.first_question(), request.first_question());
         assert!(response.recursion_desired());
         assert!(response.checking_disabled());
+        assert!(response.authentic_data(), "fresh cache hit should preserve AD");
         assert!(response.edns().as_ref().unwrap().flags().dnssec_ok);
         assert_eq!(response.edns().as_ref().unwrap().udp_payload_size(), 4096);
         assert!(response.edns().as_ref().unwrap().options().is_empty());
@@ -3763,6 +3770,7 @@ mod tests {
 
         let mut response = Message::new();
         response.set_rcode(Rcode::NoError);
+        response.set_authentic_data(true);
         response.add_question(Question::new(
             Name::from_ascii("example.com.").unwrap(),
             RecordType::A,
@@ -3792,6 +3800,10 @@ mod tests {
             .expect("stale cache hit should populate response");
         assert_eq!(response.id(), 9);
         assert_eq!(response.answers()[0].ttl(), 30);
+        assert!(
+            !response.authentic_data(),
+            "stale cache hit must clear AD because cached validation state may no longer be valid"
+        );
         assert_eq!(cache.store.metrics().lookup_total.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(
             cache.store.metrics().stale_hit_total.load(AtomicOrdering::Relaxed),
