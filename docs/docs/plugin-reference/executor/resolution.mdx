@@ -469,6 +469,7 @@ import Admonition from "@theme/Admonition";
 - 作用：控制 ECS scope 是否参与缓存键计算。
 - `false`：客户端请求中的 ECS 仍会原样传递给后续上游插件，但缓存键忽略 ECS。上游响应中的 ECS 会在 cache 返回响应和写入缓存前剥离，因此带不同 ECS 或不带 ECS 的客户端共享同一个普通缓存项。该模式属于 first-writer-wins：首次成功写入的 ECS 调度结果可能被其它 ECS 客户端复用。
 - `true`：ECS 参与 scope-aware 缓存键与查找，按 RFC 7871 的 FAMILY、SOURCE PREFIX-LENGTH、ADDRESS 与响应 SCOPE PREFIX-LENGTH 隔离和复用缓存结果。
+- 无论取值为何，非法请求 ECS（例如非零 SCOPE PREFIX-LENGTH 或超出地址族范围的前缀）不会进入缓存，而是旁路 cache 继续执行后续链路。
 
 ### quick setup
 

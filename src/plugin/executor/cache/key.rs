@@ -279,17 +279,13 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
 
     let cd_bit = context.request.checking_disabled();
 
-    let ecs_scope = if ecs_in_key {
-        match extract_ecs(&context.request) {
-            Some(subnet) => {
-                if !request_ecs_is_valid(subnet) {
-                    return None;
-                }
+    let request_ecs = extract_ecs(&context.request);
+    if request_ecs.is_some_and(|subnet| !request_ecs_is_valid(subnet)) {
+        return None;
+    }
 
-                Some(build_ecs_scope_digest(subnet))
-            }
-            None => None,
-        }
+    let ecs_scope = if ecs_in_key {
+        request_ecs.map(build_ecs_scope_digest)
     } else {
         None
     };
@@ -996,6 +992,31 @@ mod tests {
         context.request.set_edns(edns);
 
         assert!(build_cache_key(&mut context, true).is_none());
+    }
+
+    #[test]
+    fn test_build_cache_key_rejects_invalid_ecs_even_when_keying_is_disabled() {
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            20,
+            24,
+        )));
+        context.request.set_edns(edns);
+
+        assert!(build_cache_key(&mut context, false).is_none());
+
+        let mut context = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            33,
+            0,
+        )));
+        context.request.set_edns(edns);
+
+        assert!(build_cache_key(&mut context, false).is_none());
     }
 
     #[test]

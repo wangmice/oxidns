@@ -1150,6 +1150,26 @@ impl Cache {
         build_cache_key_internal(context, ecs_in_key)
     }
 
+    async fn continue_miss_downstream(
+        &self,
+        next: Option<&ExecutorNext>,
+        context: &mut DnsContext,
+    ) -> Result<ExecStep> {
+        let result = if let Some(next) = next {
+            next.next(context).await
+        } else {
+            Ok(ExecStep::Next)
+        };
+
+        if !self.ecs_in_key
+            && let Some(response) = context.response_mut()
+        {
+            strip_ecs_from_message(response);
+        }
+
+        result
+    }
+
     #[inline]
     fn restore_cached_message(
         item: &CacheItem,
@@ -1874,7 +1894,7 @@ impl Executor for Cache {
                         // A timeout means the current leader is still running.
                         // Keep the existing escape hatch here rather than
                         // replacing a live flight and creating two leaders.
-                        return continue_next!(next, context);
+                        return self.continue_miss_downstream(next.as_ref(), context).await;
                     }
 
                     let outcome = ready.borrow().clone();
@@ -1899,7 +1919,7 @@ impl Executor for Cache {
                             // The leader completed normally, but its response was
                             // not cacheable. Re-run this request's downstream path
                             // directly so all DnsContext side effects are preserved.
-                            return continue_next!(next, context);
+                            return self.continue_miss_downstream(next.as_ref(), context).await;
                         }
                         MissFlightOutcome::Retry => {}
                     }
@@ -1933,21 +1953,18 @@ impl Executor for Cache {
                     // the ancestor leader remains
                     // responsible for the eventual cache
                     // write and for waking independent followers.
-                    return continue_next!(next, context);
+                    return self.continue_miss_downstream(next.as_ref(), context).await;
                 }
                 MissRole::Leader(leader) => {
                     let previous_ancestry =
                         context.runtime.push_miss_leader_ancestor(leader.token());
-                    let next_result = continue_next!(next, context);
+                    let next_result = self
+                        .continue_miss_downstream(next.as_ref(), context)
+                        .await;
                     context
                         .runtime
                         .restore_miss_leader_ancestry(previous_ancestry);
                     let next_step = next_result?;
-                    if !self.ecs_in_key
-                        && let Some(response) = context.response_mut()
-                    {
-                        strip_ecs_from_message(response);
-                    }
                     let cached = if let Some(response) = context.response() {
                         if response.truncated() {
                             self.metrics()
@@ -2705,16 +2722,18 @@ mod tests {
                 release: release.clone(),
                 rcode: Rcode::NoError,
                 answer: Some(Ipv4Addr::new(9, 9, 9, 9)),
+                echo_ecs: true,
             },
         ));
         let next = ExecutorNext::from_program_for_test(program, 0);
 
-        let run_request = |id, name: &'static str| {
+        let run_request = |id, name: &'static str, ecs: &'static str| {
             let cache = cache.clone();
             let next = next.clone();
             async move {
                 let mut request = make_request_with_query(name, false, false);
                 request.set_id(id);
+                add_ecs(&mut request, ecs);
                 let qname_wire = first_question_qname_wire(&request);
                 let mut context = make_context(request);
 
@@ -2725,9 +2744,9 @@ mod tests {
             }
         };
 
-        let first = run_request(101, "ExAmPlE.com.");
-        let second = run_request(202, "eXaMpLe.COM.");
-        let third = run_request(303, "EXAMPLE.com.");
+        let first = run_request(101, "ExAmPlE.com.", "203.0.113.1/24");
+        let second = run_request(202, "eXaMpLe.COM.", "198.51.100.2/24");
+        let third = run_request(303, "EXAMPLE.com.", "192.0.2.3/24");
         let drive = async {
             wait_until("one miss should reach downstream", || {
                 calls.load(AtomicOrdering::Relaxed) == 1
@@ -2776,6 +2795,14 @@ mod tests {
             let response = context.response().expect("uncacheable response");
             assert_eq!(response.id(), expected_id);
             assert_eq!(response.answers()[0].ttl(), 3);
+            assert!(
+                response
+                    .edns()
+                    .as_ref()
+                    .and_then(|edns| edns.option(EdnsCode::Subnet))
+                    .is_none(),
+                "all uncacheable miss paths must strip upstream ECS when ecs_in_key is false",
+            );
             assert_eq!(
                 first_question_qname_wire(response),
                 qname_wire,
@@ -2804,6 +2831,7 @@ mod tests {
                 release: release_a.clone(),
                 rcode: Rcode::ServFail,
                 answer: None,
+                echo_ecs: false,
             },
         ));
         let program_b = ChainProgram::single_with_next_executor_for_test(Arc::new(
@@ -2812,6 +2840,7 @@ mod tests {
                 release: release_b.clone(),
                 rcode: Rcode::NoError,
                 answer: Some(Ipv4Addr::new(2, 2, 2, 2)),
+                echo_ecs: false,
             },
         ));
         let next_a = ExecutorNext::from_program_for_test(program_a, 0);
@@ -3571,6 +3600,7 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
         rcode: Rcode,
         answer: Option<Ipv4Addr>,
+        echo_ecs: bool,
     }
 
     #[async_trait]
@@ -3614,6 +3644,21 @@ mod tests {
                     3,
                     RData::A(crate::proto::rdata::A(answer)),
                 ));
+            }
+            if self.echo_ecs
+                && let Some(EdnsOption::Subnet(request_subnet)) = context
+                    .request
+                    .edns()
+                    .as_ref()
+                    .and_then(|edns| edns.option(EdnsCode::Subnet))
+            {
+                let mut edns = Edns::new();
+                edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+                    request_subnet.addr(),
+                    request_subnet.source_prefix(),
+                    16,
+                )));
+                response.set_edns(edns);
             }
             context.set_response(response);
             continue_next!(next, context)
