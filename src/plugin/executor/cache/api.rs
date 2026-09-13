@@ -19,7 +19,7 @@ use super::key::{
     CacheKey, canonical_ecs_key_digest, normalize_cache_key_domain, normalize_domain_key,
 };
 #[cfg(test)]
-use super::key::EcsPrefixHints;
+use super::key::EcsLookupIndex;
 #[cfg(test)]
 use super::persistence::dump_cache_to_bytes;
 use super::persistence::{
@@ -274,7 +274,7 @@ impl ApiHandler for CacheLoadDumpHandler {
         let cache_size = self.store.cache_size();
         let policy = self.policy;
         let store = self.store.clone();
-        let ecs_prefix_hints = store.ecs_prefix_hints().clone();
+        let ecs_lookup_index = store.ecs_lookup_index().clone();
         let cache_reclaimer = self.cache_reclaimer.clone();
 
         // Keep both the mutation guard and reclaim permit owned by the blocking
@@ -285,12 +285,17 @@ impl ApiHandler for CacheLoadDumpHandler {
         // can bypass the memory backpressure.
         let result = tokio::task::spawn_blocking(move || {
             let _mutation_guard = mutation_guard;
+            // Keep the per-key ECS index publication-stable from staged entry
+            // observation through the generation swap. Rebuilds may clear old
+            // false-positive memberships, but must not erase memberships for
+            // entries that are about to become live.
+            let _ecs_index_publication = ecs_lookup_index.publication_guard();
 
-            let (staged_cache, loaded_entries) = stage_cache_from_bytes::<MAX_CACHE_DUMP_BODY>(
+            let staged_cache = stage_cache_from_bytes::<MAX_CACHE_DUMP_BODY>(
                 &body,
                 ecs_in_key,
                 policy,
-                &ecs_prefix_hints,
+                &ecs_lookup_index,
                 Cache::initial_cache_capacity(cache_size),
                 cache_size,
             )?;
@@ -316,7 +321,6 @@ impl ApiHandler for CacheLoadDumpHandler {
             cache_reclaimer.submit(retired, reclaim_permit);
 
             Ok::<_, crate::infra::error::DnsError>((
-                loaded_entries,
                 expired_removed,
                 evicted,
                 after_len,
@@ -325,7 +329,7 @@ impl ApiHandler for CacheLoadDumpHandler {
         .await;
 
         match result {
-            Ok(Ok((loaded_entries, expired_removed, evicted, after_len))) => {
+            Ok(Ok((expired_removed, evicted, after_len))) => {
                 let total_removed = expired_removed.saturating_add(evicted);
                 if total_removed > 0 {
                     let before_len = after_len.saturating_add(total_removed);
@@ -341,7 +345,7 @@ impl ApiHandler for CacheLoadDumpHandler {
                     StatusCode::OK,
                     &CacheLoadDumpResponse {
                         ok: true,
-                        loaded_entries,
+                        loaded_entries: after_len,
                     },
                 )
             }
@@ -933,7 +937,7 @@ mod tests {
     }
 
     fn test_store(cache_map: CacheMap, cache_size: usize) -> DnsCacheStore {
-        let hints = Arc::new(EcsPrefixHints::new());
+        let hints = Arc::new(EcsLookupIndex::new());
         let metrics = Arc::new(CacheMetrics::new("api-test".to_string()));
         DnsCacheStore::new(cache_map, cache_size, hints, metrics)
     }

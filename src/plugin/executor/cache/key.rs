@@ -6,6 +6,11 @@
 use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
+
+use arc_swap::ArcSwap;
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::context::DnsContext;
@@ -32,26 +37,6 @@ pub(super) struct CacheKey {
     pub(super) cd_bit: bool,
     pub(super) ecs_scope: Option<EcsScopeDigest>,
 }
-
-// #[derive(Debug, Default)]
-// pub(super) struct EcsLookupIndex;
-
-// impl EcsLookupIndex {
-//     /// Compatibility no-op while callers are migrated away from the old
-//     /// advisory ECS index. Cache correctness must not depend on this index.
-//     #[inline]
-//     pub(super) fn insert(&self, _key: &CacheKey) {}
-
-//     #[inline]
-//     pub(super) fn remove(&self, _key: &CacheKey) {}
-
-//     #[inline]
-//     pub(super) fn rebuild<I>(&self, _keys: I)
-//     where
-//         I: IntoIterator<Item = CacheKey>,
-//     {
-//     }
-// }
 
 impl CacheKey {
     #[inline]
@@ -468,72 +453,61 @@ fn ecs_network_prefix_matches(left: &EcsScopeDigest, right: &EcsScopeDigest, pre
             == (right.network[full_bytes] & (0xFFu8 << (8 - remaining_bits)))
 }
 
-/// Monotonic advisory index of reusable ECS scope prefixes observed by this
-/// cache plugin instance.
-///
-/// The main cache map remains authoritative. Bits are set before a reusable ECS
-/// key is published and are intentionally never cleared, so stale bits can only
-/// cause harmless extra lookups; eviction/expiration/flush never risks hiding a
-/// still-live cache entry by clearing a shared prefix bit.
-#[derive(Debug)]
-pub(super) struct EcsPrefixHints {
-    ipv4: AtomicU64,
-    ipv6: [AtomicU64; 3],
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct EcsBaseKey {
+    domain: Arc<str>,
+    record_type: RecordType,
+    dns_class: DNSClass,
+    do_bit: bool,
+    cd_bit: bool,
 }
 
-impl Default for EcsPrefixHints {
-    fn default() -> Self {
+impl EcsBaseKey {
+    #[inline]
+    fn from_cache_key(key: &CacheKey) -> Self {
         Self {
-            ipv4: AtomicU64::new(0),
-            ipv6: std::array::from_fn(|_| AtomicU64::new(0)),
+            domain: key.domain.clone(),
+            record_type: key.record_type,
+            dns_class: key.dns_class,
+            do_bit: key.do_bit,
+            cd_bit: key.cd_bit,
         }
     }
 }
 
-impl EcsPrefixHints {
-    #[inline]
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
+#[derive(Debug, Clone, Copy, Default)]
+struct EcsPrefixBitmap {
+    ipv4: u64,
+    ipv6: [u64; 3],
+}
 
+impl EcsPrefixBitmap {
     #[inline]
-    fn observe_prefix(&self, family: u16, prefix: u8) {
+    fn observe(&mut self, family: u16, prefix: u8) -> bool {
         match family {
             1 if prefix <= 32 => {
-                self.ipv4.fetch_or(1u64 << prefix, Ordering::Release);
+                let bit = 1u64 << prefix;
+                let inserted = self.ipv4 & bit == 0;
+                self.ipv4 |= bit;
+                inserted
             }
             2 if prefix <= 128 => {
                 let word = usize::from(prefix / 64);
                 let bit = prefix % 64;
-                self.ipv6[word].fetch_or(1u64 << bit, Ordering::Release);
+                let mask = 1u64 << bit;
+                let inserted = self.ipv6[word] & mask == 0;
+                self.ipv6[word] |= mask;
+                inserted
             }
-            _ => {}
-        }
-    }
-
-    /// Record a key only when it is reusable by ECS scope.
-    ///
-    /// Request-specific keys have `scope_prefix == 0` while
-    /// `source_prefix > 0`, so they intentionally do not create lookup hints.
-    #[inline]
-    pub(super) fn observe_cache_key(&self, key: &CacheKey) {
-        let Some(ecs) = &key.ecs_scope else {
-            return;
-        };
-        if ecs.source_prefix == ecs.scope_prefix {
-            self.observe_prefix(ecs.family, ecs.scope_prefix);
+            _ => false,
         }
     }
 
     #[inline]
-    fn snapshot_for(&self, family: u16, max_prefix: u8) -> EcsPrefixMask {
+    fn snapshot_for(self, family: u16, max_prefix: u8) -> EcsPrefixMask {
         let mut words = match family {
-            1 => [self.ipv4.load(Ordering::Acquire), 0, 0],
-            2 => [
-                self.ipv6[0].load(Ordering::Acquire),
-                self.ipv6[1].load(Ordering::Acquire),
-                self.ipv6[2].load(Ordering::Acquire),
-            ],
+            1 => [self.ipv4, 0, 0],
+            2 => self.ipv6,
             _ => [0; 3],
         };
 
@@ -553,18 +527,215 @@ impl EcsPrefixHints {
 
         EcsPrefixMask { words }
     }
+}
 
+/// Advisory reusable-ECS prefix index partitioned by the non-ECS cache key.
+///
+/// Each base DNS key owns its own IPv4/IPv6 prefix bitmap, so an ECS lookup is
+/// never forced to probe prefixes that were observed only for unrelated names,
+/// record types, classes, or DNSSEC flags. The main cache map remains
+/// authoritative. Publications take a shared rebuild guard while setting the
+/// per-key bit and publishing the cache entry. Maintenance builds a replacement
+/// snapshot without that gate, then takes the exclusive guard only long enough
+/// to validate publication/stale revisions and atomically swap the rebuilt map.
+/// This avoids false-negative hints without blocking ECS publications for the
+/// full authoritative-cache scan.
+#[derive(Debug)]
+pub(super) struct EcsLookupIndex {
+    entries: ArcSwap<DashMap<EcsBaseKey, EcsPrefixBitmap>>,
+    rebuild_gate: RwLock<()>,
+    publication_revision: AtomicU64,
+    stale_revision: AtomicU64,
+    rebuilt_revision: AtomicU64,
+    indexed_base_keys: AtomicU64,
+    observed_ipv4_prefixes: AtomicU64,
+    observed_ipv6_prefixes: AtomicU64,
+}
+
+impl Default for EcsLookupIndex {
+    fn default() -> Self {
+        Self {
+            entries: ArcSwap::from_pointee(DashMap::new()),
+            rebuild_gate: RwLock::new(()),
+            publication_revision: AtomicU64::new(0),
+            stale_revision: AtomicU64::new(0),
+            rebuilt_revision: AtomicU64::new(0),
+            indexed_base_keys: AtomicU64::new(0),
+            observed_ipv4_prefixes: AtomicU64::new(0),
+            observed_ipv6_prefixes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl EcsLookupIndex {
     #[inline]
-    pub(super) fn observed_ipv4_prefixes(&self) -> u32 {
-        self.ipv4.load(Ordering::Relaxed).count_ones()
+    pub(super) fn new() -> Self {
+        Self::default()
     }
 
     #[inline]
-    pub(super) fn observed_ipv6_prefixes(&self) -> u32 {
-        self.ipv6
-            .iter()
-            .map(|word| word.load(Ordering::Relaxed).count_ones())
-            .sum()
+    pub(super) fn tracks_cache_key(key: &CacheKey) -> bool {
+        key.ecs_scope
+            .as_ref()
+            .is_some_and(|ecs| ecs.source_prefix == ecs.scope_prefix)
+    }
+
+    #[inline]
+    pub(super) fn publication_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.rebuild_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[inline]
+    fn observe_prefix_for_key(&self, key: &CacheKey, family: u16, prefix: u8) {
+        let base = EcsBaseKey::from_cache_key(key);
+        let entries = self.entries.load();
+        let inserted_prefix = match entries.entry(base) {
+            Entry::Occupied(mut entry) => entry.get_mut().observe(family, prefix),
+            Entry::Vacant(entry) => {
+                let mut bitmap = EcsPrefixBitmap::default();
+                let inserted = bitmap.observe(family, prefix);
+                if inserted {
+                    entry.insert(bitmap);
+                    self.indexed_base_keys.fetch_add(1, Ordering::Relaxed);
+                }
+                inserted
+            }
+        };
+
+        if inserted_prefix {
+            match family {
+                1 => {
+                    self.observed_ipv4_prefixes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                2 => {
+                    self.observed_ipv6_prefixes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Record a key only when it is reusable by ECS scope.
+    #[inline]
+    pub(super) fn observe_cache_key(&self, key: &CacheKey) {
+        let Some(ecs) = &key.ecs_scope else {
+            return;
+        };
+        if ecs.source_prefix == ecs.scope_prefix {
+            self.observe_prefix_for_key(key, ecs.family, ecs.scope_prefix);
+        }
+    }
+
+    #[inline]
+    pub(super) fn mark_cache_key_maybe_stale(&self, key: &CacheKey) {
+        if Self::tracks_cache_key(key) {
+            self.mark_rebuild_needed();
+        }
+    }
+
+    #[inline]
+    pub(super) fn mark_publication(&self) {
+        self.publication_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub(super) fn publication_revision(&self) -> u64 {
+        self.publication_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn mark_rebuild_needed(&self) {
+        self.stale_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub(super) fn needs_rebuild(&self) -> bool {
+        self.stale_revision.load(Ordering::Acquire)
+            != self.rebuilt_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn stale_revision(&self) -> u64 {
+        self.stale_revision.load(Ordering::Acquire)
+    }
+
+    /// Commit a rebuilt snapshot only if neither authoritative ECS publication
+    /// nor stale-state revision changed while the caller scanned the cache map.
+    ///
+    /// The expensive map scan happens before this method. Taking the exclusive
+    /// gate here waits for any in-flight publication to finish, then the two
+    /// revisions prove that the snapshot did not miss a newly published ECS
+    /// key and did not race another stale-producing mutation. The write lock is
+    /// therefore held only for the final index replacement.
+    pub(super) fn commit_rebuild_if_unchanged(
+        &self,
+        rebuilt: &Self,
+        stale_revision: u64,
+        publication_revision: u64,
+    ) -> bool {
+        let _guard = self
+            .rebuild_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if self.stale_revision.load(Ordering::Acquire) != stale_revision
+            || self.publication_revision.load(Ordering::Acquire) != publication_revision
+        {
+            return false;
+        }
+
+        // O(1) publication: readers that already loaded the old Arc keep a
+        // valid conservative snapshot, while new readers immediately see the
+        // rebuilt map. The exclusive gate only covers revision validation and
+        // this pointer swap, never the full cache/index scan.
+        self.entries.store(rebuilt.entries.load_full());
+        self.indexed_base_keys.store(
+            rebuilt.indexed_base_keys.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.observed_ipv4_prefixes.store(
+            rebuilt.observed_ipv4_prefixes.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.observed_ipv6_prefixes.store(
+            rebuilt.observed_ipv6_prefixes.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.rebuilt_revision
+            .store(stale_revision, Ordering::Release);
+        true
+    }
+
+    #[inline]
+    fn snapshot_for(&self, key: &CacheKey) -> EcsPrefixMask {
+        let Some(ecs) = key.ecs_scope.as_ref() else {
+            return EcsPrefixMask { words: [0; 3] };
+        };
+        let base = EcsBaseKey::from_cache_key(key);
+        let entries = self.entries.load();
+        entries
+            .get(&base)
+            .map(|bitmap| (*bitmap).snapshot_for(ecs.family, ecs.source_prefix))
+            .unwrap_or(EcsPrefixMask { words: [0; 3] })
+    }
+
+    #[inline]
+    pub(super) fn indexed_base_keys(&self) -> u64 {
+        self.indexed_base_keys.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv4_prefixes(&self) -> u64 {
+        self.observed_ipv4_prefixes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(super) fn observed_ipv6_prefixes(&self) -> u64 {
+        self.observed_ipv6_prefixes.load(Ordering::Relaxed)
     }
 }
 
@@ -592,7 +763,7 @@ impl EcsPrefixMask {
 /// Lazily return cache lookup candidates in RFC 7871 order.
 ///
 /// For ECS requests, only reusable scope prefixes present in the advisory hint
-/// bitmap are materialized, longest-prefix first. The exact-SOURCE
+/// per-base-key bitmap are materialized, longest-prefix first. The exact-SOURCE
 /// request-specific key is always yielded last. For non-ECS requests, only the
 /// ordinary request key is returned.
 pub(super) struct CacheLookupKeys<'a> {
@@ -603,12 +774,8 @@ pub(super) struct CacheLookupKeys<'a> {
 
 impl<'a> CacheLookupKeys<'a> {
     #[inline]
-    fn new(key: &'a CacheKey, hints: &EcsPrefixHints) -> Self {
-        let reusable_prefixes = key
-            .ecs_scope
-            .as_ref()
-            .map(|ecs| hints.snapshot_for(ecs.family, ecs.source_prefix))
-            .unwrap_or(EcsPrefixMask { words: [0; 3] });
+    fn new(key: &'a CacheKey, index: &EcsLookupIndex) -> Self {
+        let reusable_prefixes = index.snapshot_for(key);
         Self {
             key,
             reusable_prefixes,
@@ -647,9 +814,9 @@ impl<'a> Iterator for CacheLookupKeys<'a> {
 #[inline]
 pub(super) fn cache_lookup_keys<'a>(
     key: &'a CacheKey,
-    hints: &EcsPrefixHints,
+    index: &EcsLookupIndex,
 ) -> CacheLookupKeys<'a> {
-    CacheLookupKeys::new(key, hints)
+    CacheLookupKeys::new(key, index)
 }
 
 /// Only cache ordinary unsigned single-question DNS queries.
@@ -672,14 +839,14 @@ pub(super) fn is_cacheable_request(request: &Message) -> bool {
 mod tests {
     use std::net::SocketAddr;
 
-    fn exhaustive_hints_for(key: &CacheKey) -> EcsPrefixHints {
-        let hints = EcsPrefixHints::new();
+    fn exhaustive_index_for(key: &CacheKey) -> EcsLookupIndex {
+        let index = EcsLookupIndex::new();
         if let Some(ecs) = &key.ecs_scope {
             for prefix in 0..=ecs.source_prefix {
-                hints.observe_prefix(ecs.family, prefix);
+                index.observe_cache_key(&key.with_ecs_scope_prefix(prefix));
             }
         }
-        hints
+        index
     }
 
     use super::*;
@@ -851,7 +1018,7 @@ mod tests {
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
-        let candidates = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+        let candidates = cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key))
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
 
@@ -875,13 +1042,12 @@ mod tests {
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
-        let hints = EcsPrefixHints::new();
-        let family = request_key.ecs_scope.as_ref().expect("ECS key").family;
+        let index = EcsLookupIndex::new();
         for prefix in [0, 32, 48, 56, 64] {
-            hints.observe_prefix(family, prefix);
+            index.observe_cache_key(&request_key.with_ecs_scope_prefix(prefix));
         }
 
-        let prefixes = cache_lookup_keys(&request_key, &hints)
+        let prefixes = cache_lookup_keys(&request_key, &index)
             .filter_map(|candidate| {
                 if candidate.as_ref() == &request_key {
                     None
@@ -899,6 +1065,146 @@ mod tests {
     }
 
     #[test]
+    fn test_ecs_lookup_index_is_partitioned_by_base_cache_key() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 1]),
+            128,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let index = EcsLookupIndex::new();
+        let mut unrelated_key = request_key.with_ecs_scope_prefix(64);
+        unrelated_key.domain = Arc::<str>::from("unrelated.example");
+        index.observe_cache_key(&unrelated_key);
+
+        let unrelated_candidates = cache_lookup_keys(&request_key, &index)
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(unrelated_candidates, vec![request_key.clone()]);
+
+        index.observe_cache_key(&request_key.with_ecs_scope_prefix(56));
+        let candidates = cache_lookup_keys(&request_key, &index)
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].ecs_scope.as_ref().map(|ecs| ecs.scope_prefix),
+            Some(56)
+        );
+        assert_eq!(candidates[1], request_key);
+    }
+
+    #[test]
+    fn test_ecs_lookup_index_metrics_count_unique_memberships() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let index = EcsLookupIndex::new();
+        let prefix_24 = request_key.with_ecs_scope_prefix(24);
+        index.observe_cache_key(&prefix_24);
+        index.observe_cache_key(&prefix_24);
+        index.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
+
+        let mut unrelated = request_key.with_ecs_scope_prefix(24);
+        unrelated.domain = Arc::<str>::from("unrelated.example");
+        index.observe_cache_key(&unrelated);
+
+        assert_eq!(index.indexed_base_keys(), 2);
+        assert_eq!(index.observed_ipv4_prefixes(), 3);
+        assert_eq!(index.observed_ipv6_prefixes(), 0);
+    }
+
+    #[test]
+    fn test_ecs_rebuild_commit_rejects_concurrent_publication_revision() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let index = EcsLookupIndex::new();
+        index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
+        index.mark_rebuild_needed();
+
+        let stale_revision = index.stale_revision();
+        let publication_revision = index.publication_revision();
+        let rebuilt = EcsLookupIndex::new();
+
+        // Model a reusable ECS cache publication that completed after the
+        // rebuild snapshot started but before it attempted to commit.
+        index.mark_publication();
+
+        assert!(!index.commit_rebuild_if_unchanged(
+            &rebuilt,
+            stale_revision,
+            publication_revision,
+        ));
+        assert!(index.needs_rebuild());
+        assert_eq!(index.observed_ipv4_prefixes(), 1);
+    }
+
+    #[test]
+    fn test_ecs_rebuild_commit_swaps_snapshot_when_revisions_are_stable() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let index = EcsLookupIndex::new();
+        index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
+        index.mark_rebuild_needed();
+
+        let rebuilt = EcsLookupIndex::new();
+        rebuilt.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
+        let stale_revision = index.stale_revision();
+        let publication_revision = index.publication_revision();
+
+        assert!(index.commit_rebuild_if_unchanged(
+            &rebuilt,
+            stale_revision,
+            publication_revision,
+        ));
+        assert!(!index.needs_rebuild());
+        assert_eq!(index.indexed_base_keys(), 1);
+        assert_eq!(index.observed_ipv4_prefixes(), 1);
+        assert_eq!(index.observed_ipv6_prefixes(), 0);
+
+        let prefixes = cache_lookup_keys(&request_key, &index)
+            .filter_map(|candidate| {
+                (candidate.as_ref() != &request_key).then(|| {
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .expect("candidate should carry ECS")
+                        .scope_prefix
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes, vec![16]);
+    }
+
+    #[test]
     fn test_request_specific_ecs_key_does_not_create_hint() {
         let mut request = make_context("example.com.");
         let mut edns = Edns::new();
@@ -910,10 +1216,10 @@ mod tests {
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
-        let hints = EcsPrefixHints::new();
-        hints.observe_cache_key(&request_key);
+        let index = EcsLookupIndex::new();
+        index.observe_cache_key(&request_key);
 
-        let candidates = cache_lookup_keys(&request_key, &hints)
+        let candidates = cache_lookup_keys(&request_key, &index)
             .map(Cow::into_owned)
             .collect::<Vec<_>>();
         assert_eq!(candidates, vec![request_key]);
@@ -923,7 +1229,7 @@ mod tests {
     fn test_non_ecs_lookup_borrows_request_key_without_candidates() {
         let mut request = make_context("example.com.");
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
-        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key));
 
         assert!(matches!(lookup_keys.next(), Some(Cow::Borrowed(key)) if key == &request_key));
         assert!(lookup_keys.next().is_none());
@@ -940,7 +1246,7 @@ mod tests {
         )));
         request.request.set_edns(edns);
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
-        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key));
+        let mut lookup_keys = cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key));
 
         assert!(matches!(lookup_keys.next(), Some(Cow::Owned(_))));
 
@@ -969,7 +1275,7 @@ mod tests {
         // Both a reusable covering /20 entry and an exact-SOURCE fallback
         // entry exist. RFC 7871 longest-prefix matching must choose /20 first.
         let cached = [request_key.clone(), scoped_key.clone()];
-        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key))
             .find(|candidate| cached.contains(candidate.as_ref()))
             .map(Cow::into_owned);
 
@@ -989,7 +1295,7 @@ mod tests {
 
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
         let cached = [request_key.clone()];
-        let first_hit = cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+        let first_hit = cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key))
             .find(|candidate| cached.contains(candidate.as_ref()))
             .map(Cow::into_owned);
 
@@ -1009,7 +1315,7 @@ mod tests {
         let request_key = build_cache_key(&mut request, true).expect("request key should exist");
 
         assert_eq!(
-            cache_lookup_keys(&request_key, &exhaustive_hints_for(&request_key))
+            cache_lookup_keys(&request_key, &exhaustive_index_for(&request_key))
                 .map(Cow::into_owned)
                 .collect::<Vec<_>>(),
             vec![request_key]
@@ -1059,7 +1365,7 @@ mod tests {
             build_cache_key(&mut other_request, true).expect("request key should exist");
 
         assert!(
-            cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+            cache_lookup_keys(&other_key, &exhaustive_index_for(&other_key))
                 .any(|candidate| candidate.as_ref() == &scoped_key)
         );
     }
@@ -1174,7 +1480,7 @@ mod tests {
             build_cache_key(&mut other_request, true).expect("other request key should exist");
 
         assert!(
-            !cache_lookup_keys(&other_key, &exhaustive_hints_for(&other_key))
+            !cache_lookup_keys(&other_key, &exhaustive_index_for(&other_key))
                 .any(|candidate| candidate.as_ref() == &scoped_key)
         );
     }

@@ -4,7 +4,7 @@
 //! Cache persistence helpers.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{
-    CacheKey, EcsPrefixHints, canonical_ecs_key_digest, normalize_cache_key_domain,
+    CacheKey, EcsLookupIndex, canonical_ecs_key_digest, normalize_cache_key_domain,
     persisted_ecs_key_matches_response,
 };
 use super::{
@@ -68,7 +68,7 @@ struct PersistedCacheDump {
     entries: Vec<PersistedCacheEntry>,
 }
 
-#[derive(Debug, SchemaRead, SchemaWrite)]
+#[derive(Debug, Clone, SchemaRead, SchemaWrite)]
 struct PersistedCacheEntry {
     domain: String,
     record_type: u16,
@@ -599,9 +599,23 @@ fn prepare_persisted_entries_bounded(
     // expiry still uses AppClock's monotonic elapsed time.
     let downtime_ms = now_unix_ms.saturating_sub(dump.dumped_at_unix_ms);
     let dump_version = dump.version;
-    let mut retained = BinaryHeap::with_capacity(max_entries.min(dump.entries.len()));
+    let entry_count = dump.entries.len();
+    let mut retained = BinaryHeap::with_capacity(max_entries.min(entry_count));
+    let mut seen_keys = HashSet::with_capacity(max_entries.min(entry_count));
 
     for (sequence, persisted) in dump.entries.into_iter().enumerate() {
+        // Reject duplicate canonical cache keys before bounded retention.
+        // Otherwise duplicate entries can consume multiple top-N slots and
+        // leave the restored cache underfilled even though distinct entries
+        // were present later in the dump. Keep only CacheKey values here; the
+        // expensive decoded Message/CacheItem objects remain bounded by
+        // `max_entries`.
+        if let Some(key) = to_cache_key(&persisted, ecs_in_key)? {
+            if !seen_keys.insert(key) {
+                return Err(invalid_dump("duplicate canonical cache key"));
+            }
+        }
+
         let Some(entry) = prepare_loaded_entry(
             persisted,
             ecs_in_key,
@@ -693,7 +707,7 @@ pub(super) async fn load_cache_from_file(
     cache_map: &CacheMap,
     dump_path: &str,
     ecs_in_key: bool,
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
+    ecs_lookup_index: Arc<EcsLookupIndex>,
     policy: CacheLoadPolicy,
     max_entries: usize,
 ) -> Result<()> {
@@ -715,13 +729,13 @@ pub(super) async fn load_cache_from_file(
     let cache_map = cache_map.clone();
 
     let loaded = match tokio::task::spawn_blocking(move || {
-        load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        load_cache_from_bytes_with_index_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
             ecs_in_key,
             policy,
             false,
-            &ecs_prefix_hints,
+            &ecs_lookup_index,
             max_entries,
         )
     })
@@ -763,40 +777,41 @@ pub(super) fn load_cache_from_bytes(
     replace: bool,
 ) -> Result<usize> {
     // Keep the test/utility entry point self-contained. Runtime startup and API
-    // staging use `load_cache_from_bytes_with_hints` so their plugin-level
-    // advisory prefix bitmap is populated before entries become visible.
-    let hints = EcsPrefixHints::new();
-    load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
-        cache_map, data, ecs_in_key, policy, replace, &hints,
+    // staging use `load_cache_from_bytes_with_index` so their plugin-level
+    // per-key ECS lookup index is populated before entries become visible.
+    let index = EcsLookupIndex::new();
+    load_cache_from_bytes_with_index::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        cache_map, data, ecs_in_key, policy, replace, &index,
     )
 }
 
-fn load_cache_from_bytes_with_hints<const PREALLOCATION_LIMIT: usize>(
+#[cfg(test)]
+fn load_cache_from_bytes_with_index<const PREALLOCATION_LIMIT: usize>(
     cache_map: &CacheMap,
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
     replace: bool,
-    ecs_prefix_hints: &EcsPrefixHints,
+    ecs_lookup_index: &EcsLookupIndex,
 ) -> Result<usize> {
-    load_cache_from_bytes_with_hints_bounded::<PREALLOCATION_LIMIT>(
+    load_cache_from_bytes_with_index_bounded::<PREALLOCATION_LIMIT>(
         cache_map,
         data,
         ecs_in_key,
         policy,
         replace,
-        ecs_prefix_hints,
+        ecs_lookup_index,
         usize::MAX,
     )
 }
 
-fn load_cache_from_bytes_with_hints_bounded<const PREALLOCATION_LIMIT: usize>(
+fn load_cache_from_bytes_with_index_bounded<const PREALLOCATION_LIMIT: usize>(
     cache_map: &CacheMap,
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
     replace: bool,
-    ecs_prefix_hints: &EcsPrefixHints,
+    ecs_lookup_index: &EcsLookupIndex,
     max_entries: usize,
 ) -> Result<usize> {
     // Transaction boundary: deserialize and validate the entire dump before
@@ -812,10 +827,10 @@ fn load_cache_from_bytes_with_hints_bounded<const PREALLOCATION_LIMIT: usize>(
 
     let mut loaded = 0usize;
     for entry in prepared {
-        // Set the advisory bit before publishing a reusable ECS key. Bits are
-        // intentionally monotonic, so an insert rejected as older can only
-        // leave a harmless false-positive hint.
-        ecs_prefix_hints.observe_cache_key(&entry.key);
+        // Publish the per-base-key ECS prefix membership before the cache entry.
+        // A rejected/older insert may leave a harmless false-positive membership,
+        // which maintenance later reconciles from the authoritative cache map.
+        ecs_lookup_index.observe_cache_key(&entry.key);
         let inserted = cache_map.insert_if_not_newer(
             entry.key,
             entry.value,
@@ -840,21 +855,21 @@ pub(super) fn stage_cache_from_bytes<const PREALLOCATION_LIMIT: usize>(
     data: &[u8],
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
-    ecs_prefix_hints: &EcsPrefixHints,
+    ecs_lookup_index: &EcsLookupIndex,
     capacity: usize,
     max_entries: usize,
-) -> Result<(CacheMap, usize)> {
+) -> Result<CacheMap> {
     let staged = CacheMap::with_capacity(capacity);
-    let loaded = load_cache_from_bytes_with_hints_bounded::<PREALLOCATION_LIMIT>(
+    load_cache_from_bytes_with_index_bounded::<PREALLOCATION_LIMIT>(
         &staged,
         data,
         ecs_in_key,
         policy,
         false,
-        ecs_prefix_hints,
+        ecs_lookup_index,
         max_entries,
     )?;
-    Ok((staged, loaded))
+    Ok(staged)
 }
 
 #[cfg(test)]
@@ -961,6 +976,68 @@ mod tests {
     }
 
     #[test]
+    fn test_load_rejects_duplicate_canonical_cache_keys_before_bounded_retention() {
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(4);
+        let now = AppClock::elapsed_millis();
+
+        let domain = Arc::<str>::from("duplicate.example.com");
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii(domain.as_ref()).expect("test domain should parse"),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii(domain.as_ref()).expect("test domain should parse"),
+            120,
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+
+        cache_map.insert_if_not_newer(
+            CacheKey {
+                domain,
+                record_type: RecordType::A,
+                dns_class: DNSClass::IN,
+                do_bit: false,
+                cd_bit: false,
+                ecs_scope: None,
+            },
+            CacheItem::new_validated(response, 120, now.saturating_add(120_000)),
+            now,
+            now.saturating_add(120_000),
+            now,
+        );
+
+        let dumped = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
+        let mut parsed = parse_persisted_dump(&dumped).expect("dump should parse");
+        let duplicate = parsed.entries[0].clone();
+        parsed.entries.push(duplicate);
+        let duplicate_dump = wincode::config::serialize(
+            &parsed,
+            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+        )
+        .expect("duplicate dump should serialize");
+
+        let destination = CacheMap::with_capacity(4);
+        let index = EcsLookupIndex::new();
+        let err = load_cache_from_bytes_with_index_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &destination,
+            &duplicate_dump,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+            &index,
+            1,
+        )
+        .expect_err("duplicate canonical keys must reject the whole dump");
+
+        assert!(err.to_string().contains("duplicate canonical cache key"));
+        assert_eq!(destination.len(), 0, "load must remain transactional");
+    }
+
+    #[test]
     fn test_dump_and_load_use_the_same_preallocation_budget() {
         const TEST_BUDGET: usize = 64 * 1024;
         const ENTRY_COUNT: usize = 128;
@@ -1013,14 +1090,14 @@ mod tests {
         };
 
         let restored = CacheMap::with_capacity(256);
-        let hints = EcsPrefixHints::new();
-        let loaded = load_cache_from_bytes_with_hints::<TEST_BUDGET>(
+        let index = EcsLookupIndex::new();
+        let loaded = load_cache_from_bytes_with_index::<TEST_BUDGET>(
             &restored,
             &bytes,
             false,
             CacheLoadPolicy::default(),
             false,
-            &hints,
+            &index,
         )
         .expect("a dump emitted with a budget must load with the same budget");
 
@@ -1166,15 +1243,15 @@ mod tests {
         ];
         let data = serialize_current_dump(entries);
         let cache_map = CacheMap::with_capacity(2);
-        let hints = EcsPrefixHints::new();
+        let index = EcsLookupIndex::new();
 
-        let loaded = load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        let loaded = load_cache_from_bytes_with_index_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
             false,
             CacheLoadPolicy::default(),
             false,
-            &hints,
+            &index,
             2,
         )
         .expect("bounded dump should load");
@@ -1205,15 +1282,15 @@ mod tests {
             corrupt,
         ]);
         let cache_map = CacheMap::with_capacity(1);
-        let hints = EcsPrefixHints::new();
+        let index = EcsLookupIndex::new();
 
-        let err = load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        let err = load_cache_from_bytes_with_index_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
             false,
             CacheLoadPolicy::default(),
             false,
-            &hints,
+            &index,
             1,
         )
         .expect_err("trailing invalid entry must reject the bounded load");
@@ -2021,21 +2098,21 @@ mod tests {
         let dump = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
 
         let restored = CacheMap::with_capacity(4);
-        let hints = EcsPrefixHints::new();
+        let index = EcsLookupIndex::new();
 
-        let loaded = load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        let loaded = load_cache_from_bytes_with_index::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &restored,
             &dump,
             true,
             CacheLoadPolicy::default(),
             false,
-            &hints,
+            &index,
         )
         .expect("SCOPE=0 dump should load");
 
         assert_eq!(loaded, 1);
         assert_eq!(restored.len(), 1);
-        assert_eq!(hints.observed_ipv4_prefixes(), 1);
+        assert_eq!(index.observed_ipv4_prefixes(), 1);
     }
 
     #[test]

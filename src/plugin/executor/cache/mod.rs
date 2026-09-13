@@ -23,7 +23,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{Level, debug, event_enabled, warn};
 
 use self::key::{
-    CacheKey, EcsPrefixHints, build_cache_key as build_cache_key_internal,
+    CacheKey, EcsLookupIndex, build_cache_key as build_cache_key_internal,
     cache_domain_matches_name, cache_key_for_response_ecs_scope,
 };
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
@@ -44,6 +44,7 @@ use crate::infra::observability::metrics::{
     unregister_metric_source,
 };
 use crate::infra::task as task_center;
+use crate::plugin::executor::sequence::chain::ExecutorNextIdentity;
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
 use crate::proto::{ClientSubnet, Edns, EdnsCode, EdnsOption, Message, MessageType, Opcode, RData};
@@ -58,8 +59,9 @@ mod store;
 // Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
 // Default cleanup interval (seconds).
-const DEFAULT_CLEANUP_INTERVAL: u64 = 60;
-const PRESSURE_CHECK_INTERVAL: u64 = 1;
+const DEFAULT_CLEANUP_INTERVAL: u64 = 120;
+const PRESSURE_CHECK_INTERVAL: u64 = 5;
+const ECS_INDEX_REBUILD_CHECK_INTERVAL: u64 = 30;
 // Default dump interval (seconds).
 const DEFAULT_DUMP_INTERVAL: u64 = 600;
 // Minimum key updates required to trigger periodic dump.
@@ -296,20 +298,31 @@ impl CacheReclaimer {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct MissCoalesceKey {
+    cache_key: CacheKey,
+    downstream: Option<ExecutorNextIdentity>,
+}
+
+impl MissCoalesceKey {
+    #[inline]
+    fn new(cache_key: CacheKey, downstream: Option<ExecutorNextIdentity>) -> Self {
+        Self {
+            cache_key,
+            downstream,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MissCoalescer {
-    inflight: DashMap<CacheKey, Arc<MissFlight>>,
+    inflight: DashMap<MissCoalesceKey, Arc<MissFlight>>,
 }
 
 #[derive(Debug, Clone)]
 enum MissFlightOutcome {
     Pending,
     Cached,
-    SharedResponse {
-        request: Arc<Message>,
-        response: Arc<Message>,
-        step: ExecStep,
-    },
     Retry,
 }
 
@@ -326,7 +339,7 @@ impl MissCoalescer {
         }
     }
 
-    fn register(&self, key: CacheKey, context: &DnsContext) -> MissRole<'_> {
+    fn register(&self, key: MissCoalesceKey, context: &DnsContext) -> MissRole<'_> {
         match self.inflight.entry(key.clone()) {
             Entry::Occupied(entry) => {
                 let flight = entry.get();
@@ -355,7 +368,7 @@ impl MissCoalescer {
 
     fn complete(
         &self,
-        key: &CacheKey,
+        key: &MissCoalesceKey,
         flight: &Arc<MissFlight>,
         outcome: MissFlightOutcome,
     ) {
@@ -376,7 +389,7 @@ enum MissRole<'a> {
 #[derive(Debug)]
 struct MissLeader<'a> {
     coalescer: &'a MissCoalescer,
-    key: CacheKey,
+    key: MissCoalesceKey,
     flight: Arc<MissFlight>,
     completed: bool,
 }
@@ -641,7 +654,7 @@ impl MetricSource for CacheMetricSource {
         ));
         sink.emit(MetricSample::counter(
             "cache_ecs_lookup_candidates_total",
-            "Total ECS cache key candidates probed after prefix-hint filtering.",
+            "Total ECS cache key candidates probed after per-key prefix-index filtering.",
             &base,
             metrics.ecs_lookup_candidates_total.load(Ordering::Relaxed),
         ));
@@ -659,9 +672,9 @@ impl MetricSource for CacheMetricSource {
         ];
         sink.emit(MetricSample::gauge(
             "cache_ecs_prefix_hint_count",
-            "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
+            "Number of reusable ECS scope-prefix memberships in the per-key lookup index.",
             &ecs_v4,
-            u64::from(self.store.ecs_prefix_hints().observed_ipv4_prefixes()),
+            self.store.ecs_lookup_index().observed_ipv4_prefixes(),
         ));
         let ecs_v6 = [
             MetricLabel::new("plugin_tag", metrics.tag.as_str()),
@@ -669,9 +682,15 @@ impl MetricSource for CacheMetricSource {
         ];
         sink.emit(MetricSample::gauge(
             "cache_ecs_prefix_hint_count",
-            "Number of reusable ECS scope prefixes observed by the monotonic hint bitmap.",
+            "Number of reusable ECS scope-prefix memberships in the per-key lookup index.",
             &ecs_v6,
-            u64::from(self.store.ecs_prefix_hints().observed_ipv6_prefixes()),
+            self.store.ecs_lookup_index().observed_ipv6_prefixes(),
+        ));
+        sink.emit(MetricSample::gauge(
+            "cache_ecs_lookup_index_base_keys",
+            "Number of non-ECS base keys represented in the ECS lookup index.",
+            &base,
+            self.store.ecs_lookup_index().indexed_base_keys(),
         ));
         let fresh = [
             MetricLabel::new("plugin_tag", metrics.tag.as_str()),
@@ -869,6 +888,9 @@ pub struct Cache {
     /// Periodic cleanup task id.
     cleanup_task_id: Mutex<Option<u64>>,
 
+    /// Periodic ECS lookup-index maintenance task id.
+    ecs_index_task_id: Mutex<Option<u64>>,
+
     /// Deduplicates background refreshes for stale lazy cache hits.
     lazy_refresh_inflight: Arc<DashSet<CacheKey>>,
 
@@ -1012,6 +1034,28 @@ impl Cache {
         )
     }
 
+    fn spawn_ecs_index_maintenance_task(&self, store: DnsCacheStore) -> u64 {
+        task_center::spawn_fixed(
+            format!("cache:{}:ecs-index", self.tag),
+            Duration::from_secs(ECS_INDEX_REBUILD_CHECK_INTERVAL),
+            move || {
+                let store = store.clone();
+                async move {
+                    if !store.ecs_lookup_index_needs_rebuild() {
+                        return;
+                    }
+                    let rebuilt = tokio::task::spawn_blocking(move || {
+                        store.rebuild_ecs_lookup_index_if_needed();
+                    })
+                    .await;
+                    if rebuilt.is_err() {
+                        warn!("Cache ECS lookup-index rebuild worker failed");
+                    }
+                }
+            },
+        )
+    }
+
     #[inline]
     fn initial_cache_capacity(cache_size: usize) -> usize {
         cache_size.clamp(1, MAX_INITIAL_CACHE_CAPACITY)
@@ -1019,9 +1063,9 @@ impl Cache {
 
     fn new_store(tag: &str, cache_size: usize) -> DnsCacheStore {
         let cache_map = CacheMap::with_capacity(Self::initial_cache_capacity(cache_size));
-        let ecs_prefix_hints = Arc::new(EcsPrefixHints::new());
+        let ecs_lookup_index = Arc::new(EcsLookupIndex::new());
         let metrics = Arc::new(CacheMetrics::new(tag.to_string()));
-        DnsCacheStore::new(cache_map, cache_size, ecs_prefix_hints, metrics)
+        DnsCacheStore::new(cache_map, cache_size, ecs_lookup_index, metrics)
     }
 
     #[inline]
@@ -1515,6 +1559,7 @@ impl Cache {
                                 ),
                                 TtlCacheConditionalMoveResult::Moved
                                     | TtlCacheConditionalMoveResult::Consolidated
+                                    | TtlCacheConditionalMoveResult::ReplacedExpiredTarget
                             )
                         };
                         if inserted {
@@ -1609,7 +1654,7 @@ impl Plugin for Cache {
                 self.store.cache_map(),
                 dump_file,
                 self.ecs_in_key,
-                self.store.ecs_prefix_hints().clone(),
+                self.store.ecs_lookup_index().clone(),
                 self.cache_load_policy(),
                 self.store.cache_size(),
             )
@@ -1674,6 +1719,12 @@ impl Plugin for Cache {
             .cleanup_task_id
             .lock()
             .expect("cleanup_task_id poisoned") = Some(cleanup_task_id);
+
+        let ecs_index_task_id = self.spawn_ecs_index_maintenance_task(self.store.clone());
+        *self
+            .ecs_index_task_id
+            .lock()
+            .expect("ecs_index_task_id poisoned") = Some(ecs_index_task_id);
         Ok(())
     }
 
@@ -1700,11 +1751,19 @@ impl Plugin for Cache {
             .lock()
             .expect("cleanup_task_id poisoned")
             .take();
+        let ecs_index_task_id = self
+            .ecs_index_task_id
+            .lock()
+            .expect("ecs_index_task_id poisoned")
+            .take();
 
         if let Some(task_id) = dump_task_id {
             task_center::stop_task(task_id).await;
         }
         if let Some(task_id) = cleanup_task_id {
+            task_center::stop_task(task_id).await;
+        }
+        if let Some(task_id) = ecs_index_task_id {
             task_center::stop_task(task_id).await;
         }
 
@@ -1766,10 +1825,14 @@ impl Executor for Cache {
             return continue_next!(next, context);
         };
         let key = key.clone();
+        let miss_key = MissCoalesceKey::new(
+            key.clone(),
+            next.as_ref().map(ExecutorNext::coalesce_identity),
+        );
 
         let mut retry_generations = 0usize;
         loop {
-            match self.miss_coalescer.register(key.clone(), context) {
+            match self.miss_coalescer.register(miss_key.clone(), context) {
                 MissRole::Follower(mut ready) => {
                     self.metrics()
                         .miss_coalesced_total
@@ -1798,24 +1861,6 @@ impl Executor for Cache {
                                     return Ok(ExecStep::Stop);
                                 }
                                 return continue_next!(next, context);
-                            }
-                        }
-                        MissFlightOutcome::SharedResponse {
-                            request,
-                            response,
-                            step,
-                        } => {
-                            // CacheKey intentionally ignores some request fields.
-                            // A transient, uncacheable response is safe to reuse
-                            // only when the original DNS request is otherwise
-                            // identical (transaction ID may differ).
-                            if dns_requests_equal_except_id(&request, &context.request) {
-                                let response = restore_shared_miss_response(
-                                    &context.request,
-                                    (*response).clone(),
-                                );
-                                context.set_response(response);
-                                return Ok(step);
                             }
                         }
                         MissFlightOutcome::Pending => {
@@ -1860,17 +1905,6 @@ impl Executor for Cache {
                         .runtime
                         .restore_miss_leader_ancestry(previous_ancestry);
                     let next_step = next_result?;
-                    let shareable_response = if self.short_circuit {
-                        context.response().and_then(|response| {
-                            (!response.truncated()
-                                && response.signature().is_empty()
-                                && response_question_matches_cache_key(response, &key))
-                            .then(|| Arc::new(response.clone()))
-                        })
-                    } else {
-                        None
-                    };
-
                     let cached = if let Some(response) = context.response() {
                         if response.truncated() {
                             self.metrics()
@@ -1901,13 +1935,10 @@ impl Executor for Cache {
 
                     let outcome = if cached {
                         MissFlightOutcome::Cached
-                    } else if let Some(response) = shareable_response {
-                        MissFlightOutcome::SharedResponse {
-                            request: Arc::new(context.request.clone()),
-                            response,
-                            step: next_step,
-                        }
                     } else {
+                        // A transient downstream result is not sufficient to
+                        // reproduce the follower's DnsContext side effects.
+                        // Serialize one retry instead of sharing the response.
                         MissFlightOutcome::Retry
                     };
                     leader.complete(outcome);
@@ -1993,40 +2024,6 @@ fn compute_cache_ttl_with_policy(
         ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
     };
     (decision, disposition)
-}
-
-#[inline]
-fn restore_shared_miss_response(request: &Message, mut response: Message) -> Message {
-    // DNS names compare case-insensitively, so a coalesced follower may have
-    // different 0x20/caps-for-ID casing from the leader. Preserve the shared
-    // response body, but echo the current request's Question section exactly.
-    response.questions_mut().clear();
-    response
-        .questions_mut()
-        .extend(request.questions().iter().cloned());
-    response.set_id(request.id());
-    response
-}
-
-#[inline]
-fn dns_requests_equal_except_id(left: &Message, right: &Message) -> bool {
-    if left.id() == right.id() {
-        return left == right;
-    }
-    let mut left = left.clone();
-    let mut right = right.clone();
-    left.set_id(0);
-    right.set_id(0);
-    left == right
-}
-
-#[inline]
-fn response_question_matches_cache_key(response: &Message, key: &CacheKey) -> bool {
-    response.first_question().is_some_and(|question| {
-        cache_domain_matches_name(key.domain.as_ref(), question.name())
-            && question.qtype() == key.record_type
-            && question.qclass() == key.dns_class
-    })
 }
 
 #[inline]
@@ -2299,6 +2296,7 @@ impl CacheFactory {
             config: cache_config,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
+            ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
             lazy_refresh_tasks: TaskTracker::new(),
@@ -2409,6 +2407,7 @@ mod tests {
             config,
             dump_task_id: Mutex::new(None),
             cleanup_task_id: Mutex::new(None),
+            ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
             lazy_refresh_slots: Arc::new(Semaphore::new(lazy_refresh_concurrency)),
             lazy_refresh_tasks: TaskTracker::new(),
@@ -2450,18 +2449,19 @@ mod tests {
         let key = cache_key_for_domain("example.com");
 
         let context = make_context(make_request_with_query("example.com.", false, false));
-        let leader = match coalescer.register(key.clone(), &context) {
+        let leader = match coalescer.register(MissCoalesceKey::new(key.clone(), None), &context) {
             MissRole::Leader(leader) => leader,
             MissRole::Follower(_) | MissRole::Reentrant => {
                 panic!("first request should become leader")
             }
         };
-        let mut follower = match coalescer.register(key.clone(), &context) {
-            MissRole::Follower(receiver) => receiver,
-            MissRole::Leader(_) | MissRole::Reentrant => {
-                panic!("second independent request should become follower")
-            }
-        };
+        let mut follower =
+            match coalescer.register(MissCoalesceKey::new(key.clone(), None), &context) {
+                MissRole::Follower(receiver) => receiver,
+                MissRole::Leader(_) | MissRole::Reentrant => {
+                    panic!("second independent request should become follower")
+                }
+            };
 
         leader.complete(MissFlightOutcome::Cached);
         follower
@@ -2471,7 +2471,57 @@ mod tests {
         assert!(matches!(&*follower.borrow(), MissFlightOutcome::Cached));
 
         assert!(matches!(
-            coalescer.register(key, &context),
+            coalescer.register(MissCoalesceKey::new(key, None), &context),
+            MissRole::Leader(_)
+        ));
+    }
+
+    #[test]
+    fn miss_coalescer_separates_downstream_continuations() {
+        let coalescer = MissCoalescer::new();
+        let key = cache_key_for_domain("scope.example");
+        let context = make_context(make_request_with_query("scope.example.", false, false));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let program_a = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            StubRefreshExecutor {
+                calls: calls.clone(),
+            },
+        ));
+        let program_b = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            StubRefreshExecutor {
+                calls: calls.clone(),
+            },
+        ));
+        let next_a = ExecutorNext::from_program_for_test(program_a.clone(), 0);
+        let next_a_same = ExecutorNext::from_program_for_test(program_a.clone(), 0);
+        let next_a_other_pc = ExecutorNext::from_program_for_test(program_a, 1);
+        let next_b = ExecutorNext::from_program_for_test(program_b, 0);
+
+        let key_a = MissCoalesceKey::new(key.clone(), Some(next_a.coalesce_identity()));
+        let key_a_same =
+            MissCoalesceKey::new(key.clone(), Some(next_a_same.coalesce_identity()));
+        let key_a_other_pc =
+            MissCoalesceKey::new(key.clone(), Some(next_a_other_pc.coalesce_identity()));
+        let key_b = MissCoalesceKey::new(key, Some(next_b.coalesce_identity()));
+
+        let _leader_a = match coalescer.register(key_a, &context) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("first continuation should become leader")
+            }
+        };
+
+        assert!(matches!(
+            coalescer.register(key_a_same, &context),
+            MissRole::Follower(_)
+        ));
+        assert!(matches!(
+            coalescer.register(key_a_other_pc, &context),
+            MissRole::Leader(_)
+        ));
+        assert!(matches!(
+            coalescer.register(key_b, &context),
             MissRole::Leader(_)
         ));
     }
@@ -2482,7 +2532,7 @@ mod tests {
         let key = cache_key_for_domain("reentrant.example");
         let mut context = make_context(make_request_with_query("reentrant.example.", false, false));
 
-        let leader = match coalescer.register(key.clone(), &context) {
+        let leader = match coalescer.register(MissCoalesceKey::new(key.clone(), None), &context) {
             MissRole::Leader(leader) => leader,
             MissRole::Follower(_) | MissRole::Reentrant => {
                 panic!("first request should become leader")
@@ -2491,13 +2541,13 @@ mod tests {
         let previous = context.runtime.push_miss_leader_ancestor(leader.token());
 
         assert!(matches!(
-            coalescer.register(key.clone(), &context),
+            coalescer.register(MissCoalesceKey::new(key.clone(), None), &context),
             MissRole::Reentrant
         ));
 
         context.runtime.restore_miss_leader_ancestry(previous);
         assert!(matches!(
-            coalescer.register(key, &context),
+            coalescer.register(MissCoalesceKey::new(key, None), &context),
             MissRole::Follower(_)
         ));
     }
@@ -2509,19 +2559,23 @@ mod tests {
         let sibling_key = cache_key_for_domain("sibling.example");
         let mut parent = make_context(make_request_with_query("outer.example.", false, false));
 
-        let outer_leader = match coalescer.register(outer_key, &parent) {
-            MissRole::Leader(leader) => leader,
-            MissRole::Follower(_) | MissRole::Reentrant => {
-                panic!("outer request should become leader")
-            }
-        };
+        let outer_leader =
+            match coalescer.register(MissCoalesceKey::new(outer_key, None), &parent) {
+                MissRole::Leader(leader) => leader,
+                MissRole::Follower(_) | MissRole::Reentrant => {
+                    panic!("outer request should become leader")
+                }
+            };
         let previous = parent
             .runtime
             .push_miss_leader_ancestor(outer_leader.token());
 
         let mut primary = parent.copy_for_subquery();
         let secondary = parent.copy_for_subquery();
-        let sibling_leader = match coalescer.register(sibling_key.clone(), &primary) {
+        let sibling_leader = match coalescer.register(
+            MissCoalesceKey::new(sibling_key.clone(), None),
+            &primary,
+        ) {
             MissRole::Leader(leader) => leader,
             MissRole::Follower(_) | MissRole::Reentrant => {
                 panic!("primary sibling should become leader")
@@ -2532,7 +2586,7 @@ mod tests {
             .push_miss_leader_ancestor(sibling_leader.token());
 
         assert!(matches!(
-            coalescer.register(sibling_key, &secondary),
+            coalescer.register(MissCoalesceKey::new(sibling_key, None), &secondary),
             MissRole::Follower(_)
         ));
 
@@ -2590,7 +2644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn miss_coalescer_shares_uncacheable_response_without_upstream_fanout() {
+    async fn miss_coalescer_serializes_uncacheable_responses_without_skipping_downstream() {
         AppClock::start();
         let mut config = default_test_config();
         config.short_circuit = Some(true);
@@ -2605,6 +2659,8 @@ mod tests {
             BlockingUncacheableMissExecutor {
                 calls: calls.clone(),
                 release: release.clone(),
+                rcode: Rcode::NoError,
+                answer: Some(Ipv4Addr::new(9, 9, 9, 9)),
             },
         ));
         let next = ExecutorNext::from_program_for_test(program, 0);
@@ -2653,6 +2709,15 @@ mod tests {
             })
             .await;
             release.notify_waiters();
+
+            // The first uncacheable result must not be copied to the follower.
+            // After Retry, exactly one waiter is promoted and executes the same
+            // downstream continuation itself.
+            wait_until("coalesced follower should become retry leader", || {
+                calls.load(AtomicOrdering::Relaxed) == 2
+            })
+            .await;
+            release.notify_waiters();
         };
 
         let (first, second, ()) = tokio::join!(first, second, release_when_coalesced);
@@ -2661,8 +2726,14 @@ mod tests {
 
         assert_eq!(first_step, ExecStep::Next);
         assert_eq!(second_step, ExecStep::Next);
-        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
-        assert_eq!(cache.store.cache_map().len(), 0, "low TTL response must remain uncached");
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            cache.store.cache_map().len(),
+            0,
+            "low TTL response must remain uncached",
+        );
+        assert!(first_context.marks().contains(&77));
+        assert!(second_context.marks().contains(&77));
         assert_eq!(first_context.response().expect("first response").id(), 101);
         assert_eq!(second_context.response().expect("second response").id(), 202);
         assert_eq!(first_context.response().unwrap().answers()[0].ttl(), 3);
@@ -2675,8 +2746,97 @@ mod tests {
         assert_eq!(
             first_question_qname_wire(second_context.response().unwrap()),
             request_b_qname_wire,
-            "shared follower response must echo the follower's original QNAME casing",
+            "retry follower response must echo its own original QNAME casing",
         );
+    }
+
+    #[tokio::test]
+    async fn miss_coalescer_does_not_share_transient_results_across_programs() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.short_circuit = Some(true);
+        config.min_positive_ttl = Some(10);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+        let cache = Arc::new(cache);
+
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let release_a = Arc::new(tokio::sync::Notify::new());
+        let release_b = Arc::new(tokio::sync::Notify::new());
+        let program_a = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingUncacheableMissExecutor {
+                calls: calls_a.clone(),
+                release: release_a.clone(),
+                rcode: Rcode::ServFail,
+                answer: None,
+            },
+        ));
+        let program_b = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingUncacheableMissExecutor {
+                calls: calls_b.clone(),
+                release: release_b.clone(),
+                rcode: Rcode::NoError,
+                answer: Some(Ipv4Addr::new(2, 2, 2, 2)),
+            },
+        ));
+        let next_a = ExecutorNext::from_program_for_test(program_a, 0);
+        let next_b = ExecutorNext::from_program_for_test(program_b, 0);
+
+        let run_request = |id, next: ExecutorNext| {
+            let cache = cache.clone();
+            async move {
+                let mut request = make_request_with_query("example.com.", false, false);
+                request.set_id(id);
+                let mut context = make_context(request);
+                let result = cache.execute_with_next(&mut context, Some(next)).await;
+                (result, context)
+            }
+        };
+
+        let first = run_request(101, next_a);
+        let second = run_request(202, next_b);
+        let release_when_both_started = async {
+            wait_until("program A miss should reach its downstream", || {
+                calls_a.load(AtomicOrdering::Relaxed) == 1
+            })
+            .await;
+            wait_until("program B miss should reach its own downstream", || {
+                calls_b.load(AtomicOrdering::Relaxed) == 1
+            })
+            .await;
+            release_a.notify_waiters();
+            release_b.notify_waiters();
+        };
+
+        let (first, second, ()) = tokio::join!(first, second, release_when_both_started);
+        let (first_result, first_context) = first;
+        let (second_result, second_context) = second;
+
+        assert_eq!(first_result.expect("program A miss should succeed"), ExecStep::Next);
+        assert_eq!(second_result.expect("program B miss should succeed"), ExecStep::Next);
+        assert_eq!(calls_a.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(calls_b.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesced_total
+                .load(AtomicOrdering::Relaxed),
+            0,
+            "different continuation programs must not share a miss flight",
+        );
+        assert_eq!(cache.store.cache_map().len(), 0);
+
+        let response_a = first_context.response().expect("program A response");
+        let response_b = second_context.response().expect("program B response");
+        assert_eq!(response_a.rcode(), Rcode::ServFail);
+        assert!(response_a.answers().is_empty());
+        assert_eq!(response_b.rcode(), Rcode::NoError);
+        assert!(matches!(
+            response_b.answers()[0].data(),
+            RData::A(address) if address.0 == Ipv4Addr::new(2, 2, 2, 2)
+        ));
     }
 
     #[tokio::test]
@@ -3367,6 +3527,8 @@ mod tests {
     struct BlockingUncacheableMissExecutor {
         calls: Arc<AtomicUsize>,
         release: Arc<tokio::sync::Notify>,
+        rcode: Rcode,
+        answer: Option<Ipv4Addr>,
     }
 
     #[async_trait]
@@ -3393,6 +3555,7 @@ mod tests {
         ) -> Result<ExecStep> {
             self.calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.release.notified().await;
+            context.marks_mut().insert(77);
 
             let question = context
                 .request
@@ -3401,13 +3564,15 @@ mod tests {
                 .expect("miss request should contain a question");
             let mut response = Message::new();
             response.set_id(context.request.id());
-            response.set_rcode(Rcode::NoError);
+            response.set_rcode(self.rcode);
             response.add_question(question.clone());
-            response.add_answer(Record::from_rdata(
-                question.name().clone(),
-                3,
-                RData::A(crate::proto::rdata::A(Ipv4Addr::new(9, 9, 9, 9))),
-            ));
+            if let Some(answer) = self.answer {
+                response.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    3,
+                    RData::A(crate::proto::rdata::A(answer)),
+                ));
+            }
             context.set_response(response);
             continue_next!(next, context)
         }
@@ -4395,10 +4560,7 @@ mod tests {
             .expect("initial ECS response should produce a scoped cache key");
         let now = AppClock::elapsed_millis();
 
-        cache
-            .store
-            .ecs_prefix_hints()
-            .observe_cache_key(&stored_key);
+        cache.store.ecs_lookup_index().observe_cache_key(&stored_key);
         cache.store.cache_map().insert_or_update_with_meta(
             stored_key.clone(),
             CacheItem::new_validated(response, 120, now.saturating_sub(1)),
@@ -4487,14 +4649,8 @@ mod tests {
         assert_ne!(source_key, target_key);
 
         let now = AppClock::elapsed_millis();
-        cache
-            .store
-            .ecs_prefix_hints()
-            .observe_cache_key(&source_key);
-        cache
-            .store
-            .ecs_prefix_hints()
-            .observe_cache_key(&target_key);
+        cache.store.ecs_lookup_index().observe_cache_key(&source_key);
+        cache.store.ecs_lookup_index().observe_cache_key(&target_key);
         cache.store.cache_map().insert_or_update_with_meta(
             source_key.clone(),
             CacheItem::new_validated(source_response, 120, now.saturating_sub(1)),

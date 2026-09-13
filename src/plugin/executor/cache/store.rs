@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::debug;
 
-use super::key::{cache_lookup_keys, CacheKey, EcsPrefixHints};
+use super::key::{cache_lookup_keys, CacheKey, EcsLookupIndex};
 use super::{
     cache_skip_reason_for_disposition, is_cache_disposition_valid,
     response_disposition_for_cache, CacheEntryHandle, CacheItem, CacheMap, CacheMetrics,
@@ -273,7 +273,7 @@ impl DnsCacheLookup {
 pub(super) struct DnsCacheStore {
     cache_map: CacheMap,
     cache_size: usize,
-    ecs_prefix_hints: Arc<EcsPrefixHints>,
+    ecs_lookup_index: Arc<EcsLookupIndex>,
     pressure_requested: Arc<AtomicBool>,
     mutations: CacheMutationState,
     metrics: Arc<CacheMetrics>,
@@ -283,13 +283,13 @@ impl DnsCacheStore {
     pub(super) fn new(
         cache_map: CacheMap,
         cache_size: usize,
-        ecs_prefix_hints: Arc<EcsPrefixHints>,
+        ecs_lookup_index: Arc<EcsLookupIndex>,
         metrics: Arc<CacheMetrics>,
     ) -> Self {
         Self {
             cache_map,
             cache_size,
-            ecs_prefix_hints,
+            ecs_lookup_index,
             pressure_requested: Arc::new(AtomicBool::new(false)),
             mutations: CacheMutationState::new(),
             metrics,
@@ -307,8 +307,8 @@ impl DnsCacheStore {
     }
 
     #[inline]
-    pub(super) fn ecs_prefix_hints(&self) -> &Arc<EcsPrefixHints> {
-        &self.ecs_prefix_hints
+    pub(super) fn ecs_lookup_index(&self) -> &Arc<EcsLookupIndex> {
+        &self.ecs_lookup_index
     }
 
     #[inline]
@@ -361,7 +361,7 @@ impl DnsCacheStore {
         }
 
         let mut expired = false;
-        for candidate in cache_lookup_keys(&request_key, &self.ecs_prefix_hints) {
+        for candidate in cache_lookup_keys(&request_key, &self.ecs_lookup_index) {
             if ecs_lookup {
                 self.metrics
                     .ecs_lookup_candidates_total
@@ -448,6 +448,7 @@ impl DnsCacheStore {
                     }
                 }
                 Some(TtlCacheHandleLookup::Expired) => {
+                    self.ecs_lookup_index.mark_cache_key_maybe_stale(key);
                     self.mutations.mark_dirty(1);
                     self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
                     expired = true;
@@ -504,9 +505,10 @@ impl DnsCacheStore {
         expire_at_ms: u64,
         last_access_ms: u64,
     ) -> bool {
-        // Publish the advisory prefix first. Hints are monotonic, so a failed
-        // admission can only leave a harmless false-positive lookup bit.
-        self.ecs_prefix_hints.observe_cache_key(&key);
+        let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
+        let _index_publication = tracks_ecs_prefix
+            .then(|| self.ecs_lookup_index.publication_guard());
+        self.ecs_lookup_index.observe_cache_key(&key);
         let inserted = self.cache_map.try_insert_or_update_with_limit(
             key,
             item,
@@ -516,9 +518,15 @@ impl DnsCacheStore {
             self.cache_size,
         );
         if inserted {
+            if tracks_ecs_prefix {
+                self.ecs_lookup_index.mark_publication();
+            }
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
         } else {
+            if tracks_ecs_prefix {
+                self.ecs_lookup_index.mark_rebuild_needed();
+            }
             self.pressure_requested.store(true, Ordering::Release);
         }
         inserted
@@ -534,7 +542,10 @@ impl DnsCacheStore {
         expire_at_ms: u64,
         last_access_ms: u64,
     ) -> bool {
-        self.ecs_prefix_hints.observe_cache_key(&key);
+        let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
+        let _index_publication = tracks_ecs_prefix
+            .then(|| self.ecs_lookup_index.publication_guard());
+        self.ecs_lookup_index.observe_cache_key(&key);
         let replaced = self.cache_map.replace_handle(
             key,
             expected,
@@ -544,8 +555,13 @@ impl DnsCacheStore {
             last_access_ms,
         );
         if replaced {
+            if tracks_ecs_prefix {
+                self.ecs_lookup_index.mark_publication();
+            }
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+        } else if tracks_ecs_prefix {
+            self.ecs_lookup_index.mark_rebuild_needed();
         }
         replaced
     }
@@ -559,7 +575,10 @@ impl DnsCacheStore {
         item: CacheItem,
         metadata: TtlCacheMoveMetadata,
     ) -> TtlCacheConditionalMoveResult {
-        self.ecs_prefix_hints.observe_cache_key(&target_key);
+        let tracks_target_prefix = EcsLookupIndex::tracks_cache_key(&target_key);
+        let _index_publication = tracks_target_prefix
+            .then(|| self.ecs_lookup_index.publication_guard());
+        self.ecs_lookup_index.observe_cache_key(&target_key);
         let result = self.cache_map.conditional_move_handle(
             source_key,
             target_key,
@@ -567,18 +586,31 @@ impl DnsCacheStore {
             item,
             metadata,
         );
+        if tracks_target_prefix
+            && !matches!(result, TtlCacheConditionalMoveResult::SourceChanged)
+        {
+            self.ecs_lookup_index.mark_publication();
+        }
         match result {
             TtlCacheConditionalMoveResult::Moved => {
                 self.mutations.mark_dirty(1);
                 self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
             }
             TtlCacheConditionalMoveResult::Consolidated => {
-                // Consolidation removes the stale source while preserving the
-                // already-present target, so persistence must observe a cache
-                // mutation even though no new entry was inserted.
                 self.mutations.mark_dirty(1);
             }
+            TtlCacheConditionalMoveResult::ReplacedExpiredTarget => {
+                self.mutations.mark_dirty(1);
+                self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+            }
             TtlCacheConditionalMoveResult::SourceChanged => {}
+        }
+        if matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
+            if tracks_target_prefix {
+                self.ecs_lookup_index.mark_rebuild_needed();
+            }
+        } else {
+            self.ecs_lookup_index.mark_cache_key_maybe_stale(source_key);
         }
         result
     }
@@ -588,6 +620,7 @@ impl DnsCacheStore {
     pub(super) fn remove_handle(&self, key: &CacheKey, expected: &CacheEntryHandle) -> bool {
         let removed = self.cache_map.remove_handle(key, expected);
         if removed {
+            self.ecs_lookup_index.mark_cache_key_maybe_stale(key);
             self.mutations.mark_dirty(1);
         }
         removed
@@ -599,6 +632,7 @@ impl DnsCacheStore {
     fn remove_if_expired(&self, key: &CacheKey, now_ms: u64) -> bool {
         let removed = self.cache_map.remove_if_expired(key, now_ms);
         if removed {
+            self.ecs_lookup_index.mark_cache_key_maybe_stale(key);
             self.mutations.mark_dirty(1);
             self.metrics.expired_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -610,9 +644,38 @@ impl DnsCacheStore {
     pub(super) fn remove(&self, key: &CacheKey) -> bool {
         let removed = self.cache_map.remove(key);
         if removed {
+            self.ecs_lookup_index.mark_cache_key_maybe_stale(key);
             self.mutations.mark_dirty(1);
         }
         removed
+    }
+
+    #[inline]
+    pub(super) fn ecs_lookup_index_needs_rebuild(&self) -> bool {
+        self.ecs_lookup_index.needs_rebuild()
+    }
+
+    pub(super) fn rebuild_ecs_lookup_index_if_needed(&self) {
+        if !self.ecs_lookup_index.needs_rebuild() {
+            return;
+        }
+
+        // Scan the authoritative cache without holding the ECS publication
+        // write gate. Publications record an epoch before releasing their
+        // shared gate; the final short commit aborts if either that epoch or
+        // the stale revision changed while this snapshot was being built.
+        let stale_revision = self.ecs_lookup_index.stale_revision();
+        let publication_revision = self.ecs_lookup_index.publication_revision();
+        let rebuilt = EcsLookupIndex::new();
+        self.cache_map.visit_handles(|key, _entry| {
+            rebuilt.observe_cache_key(key);
+            true
+        });
+        let _ = self.ecs_lookup_index.commit_rebuild_if_unchanged(
+            &rebuilt,
+            stale_revision,
+            publication_revision,
+        );
     }
 
     /// Prune the published cache and account for every removed entry exactly
@@ -625,6 +688,9 @@ impl DnsCacheStore {
         let result = self.cache_map.prune(mode, now_ms);
         let removed = result.0.saturating_add(result.1);
         self.mutations.mark_dirty(removed as u64);
+        if removed > 0 {
+            self.ecs_lookup_index.mark_rebuild_needed();
+        }
         result
     }
 
@@ -637,6 +703,11 @@ impl DnsCacheStore {
         published_entries: usize,
     ) -> crate::infra::cache::ttl::TtlCacheRetiredState<CacheKey, CacheItem> {
         let retired = self.cache_map.swap_retired(replacement);
+        // New-generation ECS memberships must be observed before the swap by
+        // the staging path. Old memberships are only false positives, so defer
+        // their removal to maintenance instead of creating a publication gap.
+        self.ecs_lookup_index.mark_publication();
+        self.ecs_lookup_index.mark_rebuild_needed();
         let changed = (retired.entry_count() as u64).saturating_add(published_entries as u64);
         self.mutations.mark_dirty(changed);
         retired
@@ -660,11 +731,30 @@ mod tests {
         }
     }
 
+    fn test_ecs_key(domain: &str, prefix: u8) -> CacheKey {
+        let mut network = [0u8; 16];
+        network[..4].copy_from_slice(&[203, 0, 113, 0]);
+        CacheKey {
+            domain: domain.into(),
+            record_type: RecordType::A,
+            dns_class: DNSClass::IN,
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: Some(super::super::key::EcsScopeDigest {
+                family: 1,
+                source_prefix: prefix,
+                scope_prefix: prefix,
+                network_len: prefix.saturating_add(7) / 8,
+                network,
+            }),
+        }
+    }
+
     fn test_store(cache_size: usize) -> (DnsCacheStore, CacheMutationState, Arc<CacheMetrics>) {
         let cache_map = CacheMap::with_capacity(cache_size.max(1));
-        let hints = Arc::new(EcsPrefixHints::new());
+        let index = Arc::new(EcsLookupIndex::new());
         let metrics = Arc::new(CacheMetrics::new("store-test".to_string()));
-        let store = DnsCacheStore::new(cache_map, cache_size, hints, metrics.clone());
+        let store = DnsCacheStore::new(cache_map, cache_size, index, metrics.clone());
         let mutations = store.mutations.clone();
         (store, mutations, metrics)
     }
@@ -749,6 +839,48 @@ mod tests {
             before_dirty.saturating_add(1)
         );
         assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
+    }
+
+    #[test]
+    fn prune_marks_ecs_lookup_index_for_deferred_rebuild() {
+        AppClock::start();
+        let (store, _mutations, _metrics) = test_store(4);
+        let now = AppClock::elapsed_millis().saturating_add(100);
+        let expired = test_ecs_key("expired.example", 24);
+        let live = test_ecs_key("live.example", 16);
+
+        assert!(store.insert_or_update(
+            expired,
+            CacheItem::new_validated(Message::new(), 1, now),
+            now.saturating_sub(1_000),
+            now,
+            now.saturating_sub(1_000),
+        ));
+        assert!(store.insert_or_update(
+            live,
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        ));
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 2);
+        assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 2);
+
+        let (expired_removed, _, _) = store.prune(
+            TtlCachePruneMode::Exact { max_size: 4 },
+            now,
+        );
+
+        assert_eq!(expired_removed, 1);
+        assert!(store.ecs_lookup_index_needs_rebuild());
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 2);
+        assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 2);
+
+        store.rebuild_ecs_lookup_index_if_needed();
+
+        assert!(!store.ecs_lookup_index_needs_rebuild());
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
+        assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 1);
     }
 
     #[test]

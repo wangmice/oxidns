@@ -167,8 +167,11 @@ pub(crate) enum TtlCacheConditionalMoveResult {
     /// The source still matched, the target was vacant, and the move committed.
     Moved,
     /// The source still matched and was removed because the target key already
-    /// contained an entry. The existing target entry was preserved.
+    /// contained a retained entry. The existing target entry was preserved.
     Consolidated,
+    /// The source still matched and the target existed but was already expired.
+    /// Both old entries were removed and the refreshed value replaced the target.
+    ReplacedExpiredTarget,
     /// The source entry was missing or no longer matched the supplied identity.
     SourceChanged,
 }
@@ -550,10 +553,10 @@ where
     /// the exact generation represented by `expected`.
     ///
     /// If the target is vacant, the source is moved to the target with the
-    /// supplied value and metadata. If the target already exists, the matching
-    /// source is removed atomically and the existing target is preserved. This
-    /// consolidation prevents a more-specific stale alias from continuing to
-    /// shadow an already-present canonical target.
+    /// supplied value and metadata. If the target already exists and is still
+    /// retained, the matching source is removed atomically and the existing
+    /// target is preserved. If that target is already expired, both old entries
+    /// are removed and the refreshed value replaces the target atomically.
     ///
     /// The operation is bound to one cache state loaded at entry, so a
     /// concurrent [`Self::replace_with`] or [`Self::swap_retired`] cannot make
@@ -606,9 +609,12 @@ where
                 if !source_matches {
                     TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let target_present = shard
+                    let target_expired = shard
                         .find(target_hash, |(key, _)| key == &target_key)
-                        .is_some();
+                        .map(|bucket| unsafe {
+                            let (_, stored) = bucket.as_ref();
+                            stored.get().expire_at_ms <= metadata.cache_time_ms
+                        });
 
                     // SAFETY: `source_bucket` came from this write-locked
                     // RawTable and no mutation has happened since `find`.
@@ -616,24 +622,52 @@ where
                         unsafe { shard.remove(source_bucket) };
                     drop(removed_value);
 
-                    if target_present {
-                        state.entry_count.fetch_sub(1, Ordering::Release);
-                        TtlCacheConditionalMoveResult::Consolidated
-                    } else {
-                        shard.insert(
-                            target_hash,
-                            (
-                                target_key,
-                                SharedValue::new(state.new_node(
-                                    value,
-                                    metadata.cache_time_ms,
-                                    metadata.expire_at_ms,
-                                    metadata.last_access_ms,
-                                )),
-                            ),
-                            |(key, _)| hash_key(key),
-                        );
-                        TtlCacheConditionalMoveResult::Moved
+                    match target_expired {
+                        Some(false) => {
+                            state.entry_count.fetch_sub(1, Ordering::Release);
+                            TtlCacheConditionalMoveResult::Consolidated
+                        }
+                        Some(true) => {
+                            let target_bucket = shard
+                                .find(target_hash, |(key, _)| key == &target_key)
+                                .expect("write-locked target disappeared during conditional move");
+                            // SAFETY: the target bucket was found in this same
+                            // write-locked table and no mutation followed `find`.
+                            let ((_removed_key, removed_value), _) =
+                                unsafe { shard.remove(target_bucket) };
+                            drop(removed_value);
+                            shard.insert(
+                                target_hash,
+                                (
+                                    target_key,
+                                    SharedValue::new(state.new_node(
+                                        value,
+                                        metadata.cache_time_ms,
+                                        metadata.expire_at_ms,
+                                        metadata.last_access_ms,
+                                    )),
+                                ),
+                                |(key, _)| hash_key(key),
+                            );
+                            state.entry_count.fetch_sub(1, Ordering::Release);
+                            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+                        }
+                        None => {
+                            shard.insert(
+                                target_hash,
+                                (
+                                    target_key,
+                                    SharedValue::new(state.new_node(
+                                        value,
+                                        metadata.cache_time_ms,
+                                        metadata.expire_at_ms,
+                                        metadata.last_access_ms,
+                                    )),
+                                ),
+                                |(key, _)| hash_key(key),
+                            );
+                            TtlCacheConditionalMoveResult::Moved
+                        }
                     }
                 }
             }};
@@ -657,9 +691,12 @@ where
                 if !source_matches {
                     TtlCacheConditionalMoveResult::SourceChanged
                 } else {
-                    let target_present = target_shard
+                    let target_expired = target_shard
                         .find(target_hash, |(key, _)| key == &target_key)
-                        .is_some();
+                        .map(|bucket| unsafe {
+                            let (_, stored) = bucket.as_ref();
+                            stored.get().expire_at_ms <= metadata.cache_time_ms
+                        });
 
                     // SAFETY: `source_bucket` belongs to the source shard,
                     // whose write guard remains held for the full commit.
@@ -667,24 +704,52 @@ where
                         unsafe { source_shard.remove(source_bucket) };
                     drop(removed_value);
 
-                    if target_present {
-                        state.entry_count.fetch_sub(1, Ordering::Release);
-                        TtlCacheConditionalMoveResult::Consolidated
-                    } else {
-                        target_shard.insert(
-                            target_hash,
-                            (
-                                target_key,
-                                SharedValue::new(state.new_node(
-                                    value,
-                                    metadata.cache_time_ms,
-                                    metadata.expire_at_ms,
-                                    metadata.last_access_ms,
-                                )),
-                            ),
-                            |(key, _)| hash_key(key),
-                        );
-                        TtlCacheConditionalMoveResult::Moved
+                    match target_expired {
+                        Some(false) => {
+                            state.entry_count.fetch_sub(1, Ordering::Release);
+                            TtlCacheConditionalMoveResult::Consolidated
+                        }
+                        Some(true) => {
+                            let target_bucket = target_shard
+                                .find(target_hash, |(key, _)| key == &target_key)
+                                .expect("write-locked target disappeared during conditional move");
+                            // SAFETY: the target bucket belongs to the target
+                            // shard, whose write guard remains held.
+                            let ((_removed_key, removed_value), _) =
+                                unsafe { target_shard.remove(target_bucket) };
+                            drop(removed_value);
+                            target_shard.insert(
+                                target_hash,
+                                (
+                                    target_key,
+                                    SharedValue::new(state.new_node(
+                                        value,
+                                        metadata.cache_time_ms,
+                                        metadata.expire_at_ms,
+                                        metadata.last_access_ms,
+                                    )),
+                                ),
+                                |(key, _)| hash_key(key),
+                            );
+                            state.entry_count.fetch_sub(1, Ordering::Release);
+                            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+                        }
+                        None => {
+                            target_shard.insert(
+                                target_hash,
+                                (
+                                    target_key,
+                                    SharedValue::new(state.new_node(
+                                        value,
+                                        metadata.cache_time_ms,
+                                        metadata.expire_at_ms,
+                                        metadata.last_access_ms,
+                                    )),
+                                ),
+                                |(key, _)| hash_key(key),
+                            );
+                            TtlCacheConditionalMoveResult::Moved
+                        }
                     }
                 }
             }};
@@ -1662,6 +1727,70 @@ mod tests {
         );
         assert!(cache.get_retained_handle(&source, 20, 0).is_none());
         assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_replaces_expired_target_across_shards() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 500, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 10, 20, 10);
+        let expected = retained_handle(&cache, &source, 15);
+
+        assert_eq!(
+            cache.conditional_move_handle(
+                &source,
+                target,
+                &expected,
+                77u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 30,
+                    expire_at_ms: 300,
+                    last_access_ms: 30,
+                },
+            ),
+            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+        );
+        assert!(cache.get_retained_handle(&source, 30, 0).is_none());
+        let target_entry = cache
+            .get_retained_handle(&target, 30, 0)
+            .expect("refreshed target should replace expired target");
+        assert_eq!(*target_entry.value(), 77);
+        assert_eq!(target_entry.expire_at_ms(), 300);
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_replaces_expired_target_on_same_shard() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_same_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 10, 500, 10);
+        cache.insert_or_update_with_meta(target, 99u32, 10, 20, 10);
+        let expected = retained_handle(&cache, &source, 15);
+
+        assert_eq!(
+            cache.conditional_move_handle(
+                &source,
+                target,
+                &expected,
+                77u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 30,
+                    expire_at_ms: 300,
+                    last_access_ms: 30,
+                },
+            ),
+            TtlCacheConditionalMoveResult::ReplacedExpiredTarget
+        );
+        assert!(cache.get_retained_handle(&source, 30, 0).is_none());
+        let target_entry = cache
+            .get_retained_handle(&target, 30, 0)
+            .expect("refreshed target should replace expired target");
+        assert_eq!(*target_entry.value(), 77);
+        assert_eq!(target_entry.expire_at_ms(), 300);
         assert_eq!(cache.entry_count(), 1);
     }
 
