@@ -102,29 +102,34 @@ impl CacheKey {
 }
 
 #[inline]
+fn canonical_domain_from_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let name = Name::from_ascii(trimmed).ok()?;
+    if name.is_root() {
+        Some(".".to_string())
+    } else {
+        Some(name.normalized().to_string())
+    }
+}
+
+#[inline]
 pub(super) fn normalize_domain_key(raw: &str) -> String {
-    let mut normalized = raw.trim().to_ascii_lowercase();
-    if normalized == "." {
-        return normalized;
-    }
-    if normalized.ends_with('.') {
-        normalized.pop();
-    }
-    normalized
+    canonical_domain_from_text(raw).unwrap_or_else(|| raw.trim().to_ascii_lowercase())
 }
 
 /// Normalize domain text that is part of a serialized/runtime cache key.
 ///
-/// The DNS root has one canonical representation: `.`. Empty or
-/// whitespace-only domain text is invalid.
+/// Cache-key domains use DNS presentation syntax, so escaped label bytes such
+/// as the literal dot in `foo\.` must be parsed before canonicalization. The
+/// DNS root has one canonical representation: `.`. Empty, whitespace-only, or
+/// malformed DNS presentation text is invalid.
 #[inline]
 pub(super) fn normalize_cache_key_domain(raw: &str) -> Option<String> {
-    let normalized = normalize_domain_key(raw);
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    canonical_domain_from_text(raw)
 }
 
 #[inline]
@@ -704,10 +709,34 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_cache_key_domain_requires_canonical_nonempty_text() {
+    fn test_normalize_domain_key_preserves_escaped_terminal_dot() {
+        assert_eq!(normalize_domain_key(r"foo\."), r"foo\.");
+        assert_eq!(normalize_domain_key(r"foo\.."), r"foo\.");
+        assert_eq!(normalize_domain_key(r"foo\046"), r"foo\.");
+    }
+
+    #[test]
+    fn test_normalize_cache_key_domain_requires_valid_nonempty_dns_text() {
         assert_eq!(normalize_cache_key_domain(" . "), Some(".".to_string()));
         assert_eq!(normalize_cache_key_domain(""), None);
         assert_eq!(normalize_cache_key_domain("   "), None);
+    }
+
+    #[test]
+    fn test_normalize_cache_key_domain_parses_dns_escapes() {
+        assert_eq!(
+            normalize_cache_key_domain(r"Foo\."),
+            Some(r"foo\.".to_string())
+        );
+        assert_eq!(
+            normalize_cache_key_domain(r"foo\.."),
+            Some(r"foo\.".to_string())
+        );
+        assert_eq!(
+            normalize_cache_key_domain(r"foo\046"),
+            Some(r"foo\.".to_string())
+        );
+        assert_eq!(normalize_cache_key_domain("foo\\"), None);
     }
 
     #[test]

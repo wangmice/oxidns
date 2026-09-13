@@ -890,7 +890,7 @@ fn decode_cache_entry_id(raw: &str) -> std::result::Result<CacheKey, String> {
         .map_err(|_| "cache entry id is not valid json".to_string())?;
 
     let domain = normalize_cache_key_domain(&id.domain)
-        .ok_or_else(|| "cache entry id domain is invalid empty text".to_string())?;
+        .ok_or_else(|| "cache entry id domain is invalid DNS text".to_string())?;
 
     let ecs_scope = match id.ecs_scope {
         Some(ecs) => {
@@ -967,6 +967,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_cache_entries_query_preserves_escaped_terminal_dot() {
+        let query = parse_cache_entries_query(Some(r"qname=foo%5C.")).expect("query should parse");
+
+        assert_eq!(query.qname.as_deref(), Some(r"foo\."));
+        assert!(cache_entry_matches_query(&test_cache_key(r"foo\."), &query));
+    }
+
+    #[test]
     fn cache_entry_matches_query_filters_qname_case_insensitively() {
         let query = CacheEntriesQuery {
             limit: 100,
@@ -1004,6 +1012,17 @@ mod tests {
         let decoded = decode_cache_entry_id(&encoded).expect("root cache id should decode");
 
         assert_eq!(decoded.domain.as_ref(), ".");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn cache_entry_id_roundtrips_escaped_terminal_dot() {
+        let key = test_cache_key(r"foo\.");
+
+        let encoded = encode_cache_entry_id(&key).expect("escaped-dot cache id should encode");
+        let decoded = decode_cache_entry_id(&encoded).expect("escaped-dot cache id should decode");
+
+        assert_eq!(decoded.domain.as_ref(), r"foo\.");
         assert_eq!(decoded, key);
     }
 

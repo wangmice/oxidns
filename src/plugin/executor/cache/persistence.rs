@@ -414,7 +414,7 @@ fn parse_persisted_dump(data: &[u8]) -> Result<PersistedCacheDump> {
 /// load can abort before mutating the live cache.
 fn to_cache_key(entry: &PersistedCacheEntry, ecs_in_key: bool) -> Result<Option<CacheKey>> {
     let domain = normalize_cache_key_domain(&entry.domain)
-        .ok_or_else(|| invalid_dump("entry contains an invalid empty domain"))?;
+        .ok_or_else(|| invalid_dump("entry contains invalid DNS domain text"))?;
 
     let ecs_scope = match (
         entry.ecs_family,
@@ -1830,7 +1830,7 @@ mod tests {
             load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
                 .expect_err("empty domain dump entry must be rejected");
 
-        assert!(err.to_string().contains("invalid empty domain"));
+        assert!(err.to_string().contains("invalid DNS domain text"));
         assert!(cache_map.is_empty());
     }
 
@@ -1891,6 +1891,81 @@ mod tests {
                 .name()
                 .to_fqdn(),
             "."
+        );
+    }
+
+    #[test]
+    fn test_escaped_terminal_dot_request_cache_dump_load_roundtrip() {
+        AppClock::start();
+
+        let escaped_name = Name::from_ascii(r"foo\.").expect("escaped-dot name should parse");
+        assert_eq!(escaped_name.normalized(), r"foo\.");
+
+        let mut request = Message::new();
+        request.add_question(Question::new(
+            escaped_name.clone(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        let mut context = crate::core::context::DnsContext::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 5300)),
+            request,
+        );
+        let key = super::super::key::build_cache_key(&mut context, false)
+            .expect("escaped-dot request should produce a cache key");
+        assert_eq!(key.domain.as_ref(), r"foo\.");
+
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NoError);
+        response.add_question(Question::new(
+            escaped_name.clone(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            escaped_name,
+            60,
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 2))),
+        ));
+
+        let now = AppClock::elapsed_millis();
+        let cache_map = CacheMap::with_capacity(1);
+        cache_map.insert_if_not_newer(
+            key,
+            CacheItem::new_validated(response, 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        );
+
+        let dump = dump_cache_to_bytes(&cache_map).expect("escaped-dot cache should dump");
+        let parsed = parse_persisted_dump(&dump).expect("escaped-dot dump should parse");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].domain, r"foo\.");
+
+        let restored = CacheMap::with_capacity(1);
+        assert_eq!(
+            load_cache_from_bytes(
+                &restored,
+                &dump,
+                false,
+                CacheLoadPolicy::default(),
+                false,
+            )
+            .expect("escaped-dot dump should restore"),
+            1
+        );
+        let (restored_key, restored_entry) = first_cache_entry(&restored);
+        assert_eq!(restored_key.domain.as_ref(), r"foo\.");
+        assert_eq!(
+            restored_entry
+                .value()
+                .resp
+                .first_question()
+                .expect("restored escaped-dot response should keep its question")
+                .name()
+                .normalized(),
+            r"foo\."
         );
     }
 
