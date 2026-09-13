@@ -150,8 +150,20 @@ pub struct CacheConfig {
 
     /// Whether ECS scope is part of cache key.
     ///
+    /// When disabled, request ECS is still forwarded downstream, but it is
+    /// ignored for cache keying. Responses are normalized by removing ECS
+    /// before being cached or returned from the cache stage, so all ECS and
+    /// non-ECS clients share the same ordinary cache entry.
+    ///
     /// Default: false.
     ecs_in_key: Option<bool>,
+}
+
+#[inline]
+fn strip_ecs_from_message(message: &mut Message) {
+    if let Some(edns) = message.edns_mut() {
+        edns.remove(EdnsCode::Subnet);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1260,12 +1272,15 @@ impl Cache {
             } => {
                 let value = entry.value();
                 let cache_age_ms = value.total_cache_age_ms(entry.cache_time_ms(), now);
-                let resp = Self::restore_fresh_cached_message(
+                let mut resp = Self::restore_fresh_cached_message(
                     value,
                     &context.request,
                     cache_age_ms,
                     *remaining_ttl,
                 );
+                if !self.ecs_in_key {
+                    strip_ecs_from_message(&mut resp);
+                }
                 context.set_response(resp);
             }
             DnsCacheLookup::Stale { entry, .. } => {
@@ -1280,6 +1295,9 @@ impl Cache {
                 // longer be safely preserved (for example, its RRSIG may have
                 // expired), so never serve stale data with AD set.
                 resp.set_authentic_data(false);
+                if !self.ecs_in_key {
+                    strip_ecs_from_message(&mut resp);
+                }
                 context.set_response(resp);
             }
             DnsCacheLookup::Miss { .. } => {}
@@ -1480,6 +1498,7 @@ impl Cache {
         let cache_negative = self.cache_negative;
         let max_negative_ttl = self.max_negative_ttl;
         let negative_ttl_without_soa = self.negative_ttl_without_soa;
+        let ecs_in_key = self.ecs_in_key;
         let metrics = self.store.metrics().clone();
         let shutdown = self.lazy_refresh_shutdown.clone();
         let failure_cooldown_ms = self
@@ -1501,7 +1520,10 @@ impl Cache {
             };
 
             match refresh {
-                Ok(Ok(Some(response))) if !response.truncated() => {
+                Ok(Ok(Some(mut response))) if !response.truncated() => {
+                    if !ecs_in_key {
+                        strip_ecs_from_message(&mut response);
+                    }
                     let (ttl, disposition) = compute_cache_ttl_with_policy(
                         &response,
                         &request_key,
@@ -1921,6 +1943,11 @@ impl Executor for Cache {
                         .runtime
                         .restore_miss_leader_ancestry(previous_ancestry);
                     let next_step = next_result?;
+                    if !self.ecs_in_key
+                        && let Some(response) = context.response_mut()
+                    {
+                        strip_ecs_from_message(response);
+                    }
                     let cached = if let Some(response) = context.response() {
                         if response.truncated() {
                             self.metrics()
@@ -3664,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_rejects_ecs_when_disabled() {
+    fn cache_key_ignores_ecs_when_disabled() {
         let mut req_ecs_a = make_request_with_query("example.com.", false, false);
         add_ecs(&mut req_ecs_a, "192.0.2.0/24");
 
@@ -3674,8 +3701,127 @@ mod tests {
         let mut ctx_ecs_a = make_context(req_ecs_a);
         let mut ctx_ecs_b = make_context(req_ecs_b);
 
-        assert!(Cache::build_cache_key(&mut ctx_ecs_a, false).is_none());
-        assert!(Cache::build_cache_key(&mut ctx_ecs_b, false).is_none());
+        let key_a = Cache::build_cache_key(&mut ctx_ecs_a, false).unwrap();
+        let key_b = Cache::build_cache_key(&mut ctx_ecs_b, false).unwrap();
+
+        assert_eq!(key_a, key_b);
+        assert!(key_a.ecs_scope.is_none());
+        assert!(
+            ctx_ecs_a
+                .request
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_some(),
+            "ignoring ECS for cache keying must not strip it from the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecs_disabled_for_keying_forwards_ecs_but_shares_ordinary_cache() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(false);
+        config.short_circuit = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+                calls: calls.clone(),
+            }));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut first_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut first_request, "203.0.113.199/24");
+        let mut first_context = make_context(first_request);
+
+        let first_step = cache
+            .execute_with_next(&mut first_context, Some(next.clone()))
+            .await
+            .expect("first ECS request should succeed");
+        assert_eq!(first_step, ExecStep::Next);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.cache_map().len(), 1);
+        assert!(
+            first_context
+                .response()
+                .and_then(|response| response.edns().as_ref())
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "the miss response returned by cache should have ECS stripped"
+        );
+
+        let mut second_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut second_request, "198.51.100.45/24");
+        let mut second_context = make_context(second_request);
+
+        let second_step = cache
+            .execute_with_next(&mut second_context, Some(next))
+            .await
+            .expect("second ECS request should succeed from shared cache");
+        assert_eq!(second_step, ExecStep::Stop);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            second_context
+                .response()
+                .and_then(|response| response.edns().as_ref())
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "shared ordinary cache hits must not expose the first client's ECS"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecs_disabled_for_keying_strips_unsolicited_response_ecs() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(false);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let request = make_request_with_query("example.com.", false, false);
+        let mut context = make_context(request);
+        let mut response = cacheable_response_for_domain("example.com.", 120);
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 0]),
+            24,
+            16,
+        )));
+        response.set_edns(edns);
+        context.set_response(response);
+
+        cache
+            .execute_with_next(&mut context, None)
+            .await
+            .expect("ordinary cache write should succeed");
+
+        assert_eq!(cache.store.cache_map().len(), 1);
+        assert!(
+            context
+                .response()
+                .and_then(|response| response.edns().as_ref())
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "unsolicited upstream ECS must be stripped before returning"
+        );
+
+        let mut hit_context =
+            make_context(make_request_with_query("example.com.", false, false));
+        let lookup = cache
+            .try_cache_hit(&mut hit_context, &cache.store)
+            .expect("ordinary cache lookup should exist");
+        assert!(matches!(lookup, DnsCacheLookup::Fresh { .. }));
+        assert!(
+            hit_context
+                .response()
+                .and_then(|response| response.edns().as_ref())
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "ordinary cache entries must not retain upstream ECS"
+        );
     }
 
     #[tokio::test]

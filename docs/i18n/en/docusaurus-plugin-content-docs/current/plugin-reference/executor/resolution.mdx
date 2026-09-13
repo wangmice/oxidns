@@ -412,7 +412,9 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `ecs_in_key`
 
 - Type: `boolean`; Required: no; Default: `false`
-- Purpose: Include ECS information in the cache key.
+- Purpose: Control whether ECS participates in cache keying.
+- `false`: ECS from the client request is still forwarded unchanged to downstream/upstream plugins, but the cache key ignores ECS. ECS is stripped from the upstream response before the cache stage returns or stores it, so clients with different ECS values (or no ECS) share the same ordinary cache entry. This is a first-writer-wins policy: the first successfully cached ECS-steered answer may be reused by other ECS clients.
+- `true`: ECS participates in scope-aware cache keying and lookup. Cache isolation and reuse follow RFC 7871 FAMILY, SOURCE PREFIX-LENGTH, ADDRESS, and response SCOPE PREFIX-LENGTH semantics.
 
 ### quick setup
 

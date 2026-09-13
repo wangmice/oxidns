@@ -279,16 +279,19 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
 
     let cd_bit = context.request.checking_disabled();
 
-    let ecs_scope = match extract_ecs(&context.request) {
-        Some(subnet) => {
-            if !ecs_in_key || !request_ecs_is_valid(subnet) {
-                return None;
+    let ecs_scope = if ecs_in_key {
+        match extract_ecs(&context.request) {
+            Some(subnet) => {
+                if !request_ecs_is_valid(subnet) {
+                    return None;
+                }
+
+                Some(build_ecs_scope_digest(subnet))
             }
-
-            Some(build_ecs_scope_digest(subnet))
+            None => None,
         }
-
-        None => None,
+    } else {
+        None
     };
 
     Some(CacheKey {
@@ -996,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cache_key_rejects_ecs_when_keying_is_disabled() {
+    fn test_build_cache_key_ignores_ecs_when_keying_is_disabled() {
         let mut context = make_context("example.com.");
         let mut edns = Edns::new();
         edns.insert(EdnsOption::Subnet(ClientSubnet::new(
@@ -1006,7 +1009,8 @@ mod tests {
         )));
         context.request.set_edns(edns);
 
-        assert!(build_cache_key(&mut context, false).is_none());
+        let cache_key = build_cache_key(&mut context, false).expect("cache key should exist");
+        assert_eq!(cache_key.ecs_scope, None);
     }
 
     #[test]
