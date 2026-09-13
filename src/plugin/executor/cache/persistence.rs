@@ -35,7 +35,8 @@ use crate::proto::{DNSClass, Message, RecordType};
 const CACHE_DUMP_MAGIC: u64 = 0x3145_4843_4143_5344;
 const LEGACY_CACHE_DUMP_VERSION: u32 = 1;
 const PREVIOUS_CACHE_DUMP_VERSION: u32 = 2;
-const CACHE_DUMP_VERSION: u32 = 3;
+const PREVIOUS_FRAMED_CACHE_DUMP_VERSION: u32 = 3;
+const CACHE_DUMP_VERSION: u32 = 4;
 /// Maximum cache dump size accepted/written by file persistence.
 ///
 /// The API has its own smaller request-body limit. Disk persistence is allowed
@@ -81,6 +82,15 @@ struct PersistedCacheDumpV3Header {
     version: u32,
     dumped_at_unix_ms: u64,
     entry_count: u64,
+}
+
+#[derive(Debug, SchemaRead, SchemaWrite)]
+struct PersistedCacheDumpV4Header {
+    magic: u64,
+    version: u32,
+    dumped_at_unix_ms: u64,
+    entry_count: u64,
+    ecs_in_key: bool,
 }
 
 #[derive(Debug, Clone, SchemaRead, SchemaWrite)]
@@ -136,11 +146,16 @@ async fn sync_parent_directory(_path: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn dump_cache_to_file(cache_map: &CacheMap, dump_path: &str) -> Result<()> {
+pub(super) async fn dump_cache_to_file(
+    cache_map: &CacheMap,
+    dump_path: &str,
+    ecs_in_key: bool,
+) -> Result<()> {
     let cache_map = cache_map.clone();
-    let encoded = tokio::task::spawn_blocking(move || dump_cache_to_bytes(&cache_map))
-        .await
-        .map_err(|err| DnsError::Runtime(format!("cache dump worker failed: {err}")))??;
+    let encoded =
+        tokio::task::spawn_blocking(move || dump_cache_to_bytes_for_mode(&cache_map, ecs_in_key))
+            .await
+            .map_err(|err| DnsError::Runtime(format!("cache dump worker failed: {err}")))??;
 
     if encoded.len() > MAX_PERSISTED_CACHE_DUMP_BYTES {
         return Err(DnsError::Runtime(format!(
@@ -190,9 +205,23 @@ fn persisted_entry_serialized_size<const PREALLOCATION_LIMIT: usize>(
 fn v3_header_serialized_size<const PREALLOCATION_LIMIT: usize>() -> Result<usize> {
     let header = PersistedCacheDumpV3Header {
         magic: CACHE_DUMP_MAGIC,
+        version: PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
+        dumped_at_unix_ms: 0,
+        entry_count: 0,
+    };
+    serialized_size_to_usize(wincode::config::serialized_size(
+        &header,
+        cache_wincode_config::<PREALLOCATION_LIMIT>(),
+    )?)
+}
+
+fn v4_header_serialized_size<const PREALLOCATION_LIMIT: usize>() -> Result<usize> {
+    let header = PersistedCacheDumpV4Header {
+        magic: CACHE_DUMP_MAGIC,
         version: CACHE_DUMP_VERSION,
         dumped_at_unix_ms: 0,
         entry_count: 0,
+        ecs_in_key: false,
     };
     serialized_size_to_usize(wincode::config::serialized_size(
         &header,
@@ -298,13 +327,14 @@ fn prepare_persisted_entry(
 /// preallocation budget that the corresponding reader will use. Keeping the
 /// writer and reader on the same `PREALLOCATION_LIMIT` prevents the API from
 /// emitting a dump that its own bounded loader would reject.
-pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
+pub(super) fn dump_cache_to_bytes_with_limit_for_mode<const PREALLOCATION_LIMIT: usize>(
     cache_map: &CacheMap,
     max_bytes: usize,
+    ecs_in_key: bool,
 ) -> Result<CacheDumpOutcome> {
     let now_elapsed_ms = AppClock::elapsed_millis();
     let dumped_at_unix_ms = AppClock::now_timestamp();
-    let header_size = v3_header_serialized_size::<PREALLOCATION_LIMIT>()?;
+    let header_size = v4_header_serialized_size::<PREALLOCATION_LIMIT>()?;
     let frame_len_size = frame_len_serialized_size::<PREALLOCATION_LIMIT>()?;
     let mut encoded_size = header_size;
 
@@ -316,7 +346,7 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
     }
 
     // Keep dump construction bounded by the configured wire-size cap. Version
-    // 3 frames each entry independently so the reader can deserialize one
+    // 4 frames each entry independently so the reader can deserialize one
     // entry at a time without first allocating Vec<PersistedCacheEntry>.
     let mut entries: Vec<(PersistedCacheEntry, usize)> =
         Vec::with_capacity(cache_map.entry_count().min(4096));
@@ -363,11 +393,12 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
 
     let entry_count = u64::try_from(entries.len())
         .map_err(|_| DnsError::Runtime("cache dump entry count exceeds u64".to_string()))?;
-    let header = PersistedCacheDumpV3Header {
+    let header = PersistedCacheDumpV4Header {
         magic: CACHE_DUMP_MAGIC,
         version: CACHE_DUMP_VERSION,
         dumped_at_unix_ms,
         entry_count,
+        ecs_in_key,
     };
 
     let mut encoded = Vec::with_capacity(encoded_size);
@@ -393,10 +424,22 @@ pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
     Ok(CacheDumpOutcome::Complete(encoded))
 }
 
-pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
-    match dump_cache_to_bytes_with_limit::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+#[cfg(test)]
+pub(super) fn dump_cache_to_bytes_with_limit<const PREALLOCATION_LIMIT: usize>(
+    cache_map: &CacheMap,
+    max_bytes: usize,
+) -> Result<CacheDumpOutcome> {
+    dump_cache_to_bytes_with_limit_for_mode::<PREALLOCATION_LIMIT>(cache_map, max_bytes, false)
+}
+
+pub(super) fn dump_cache_to_bytes_for_mode(
+    cache_map: &CacheMap,
+    ecs_in_key: bool,
+) -> Result<Vec<u8>> {
+    match dump_cache_to_bytes_with_limit_for_mode::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
         cache_map,
         MAX_PERSISTED_CACHE_DUMP_BYTES,
+        ecs_in_key,
     )? {
         CacheDumpOutcome::Complete(bytes) => Ok(bytes),
         CacheDumpOutcome::TooLarge {
@@ -406,6 +449,11 @@ pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
             "cache dump too large: requires at least {minimum_size} bytes, limit is {limit} bytes"
         ))),
     }
+}
+
+#[cfg(test)]
+pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
+    dump_cache_to_bytes_for_mode(cache_map, false)
 }
 
 fn persisted_dump_prefix_size<const PREALLOCATION_LIMIT: usize>() -> Result<usize> {
@@ -467,10 +515,14 @@ fn parse_persisted_dump_with_limit<const PREALLOCATION_LIMIT: usize>(
         LEGACY_CACHE_DUMP_VERSION | PREVIOUS_CACHE_DUMP_VERSION => {
             parse_legacy_persisted_dump_with_limit::<PREALLOCATION_LIMIT>(data)
         }
-        CACHE_DUMP_VERSION => decode_v3_dump_for_test::<PREALLOCATION_LIMIT>(data),
+        PREVIOUS_FRAMED_CACHE_DUMP_VERSION => decode_v3_dump_for_test::<PREALLOCATION_LIMIT>(data),
+        CACHE_DUMP_VERSION => decode_v4_dump_for_test::<PREALLOCATION_LIMIT>(data),
         version => Err(invalid_dump(format!(
-            "unsupported version {version}, expected {}, {} or {}",
-            LEGACY_CACHE_DUMP_VERSION, PREVIOUS_CACHE_DUMP_VERSION, CACHE_DUMP_VERSION
+            "unsupported version {version}, expected {}, {}, {} or {}",
+            LEGACY_CACHE_DUMP_VERSION,
+            PREVIOUS_CACHE_DUMP_VERSION,
+            PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
+            CACHE_DUMP_VERSION
         ))),
     }
 }
@@ -788,10 +840,10 @@ fn decode_v3_header<const PREALLOCATION_LIMIT: usize>(
     if header.magic != CACHE_DUMP_MAGIC {
         return Err(invalid_dump("bad magic"));
     }
-    if header.version != CACHE_DUMP_VERSION {
+    if header.version != PREVIOUS_FRAMED_CACHE_DUMP_VERSION {
         return Err(invalid_dump(format!(
-            "invalid framed dump version {}, expected {}",
-            header.version, CACHE_DUMP_VERSION
+            "invalid v3 framed dump version {}, expected {}",
+            header.version, PREVIOUS_FRAMED_CACHE_DUMP_VERSION
         )));
     }
     Ok((header, header_size))
@@ -858,7 +910,7 @@ fn prepare_v3_persisted_entries_bounded<const PREALLOCATION_LIMIT: usize>(
     let mut collector = PreparedEntryCollector::new(
         ecs_in_key,
         policy,
-        CACHE_DUMP_VERSION,
+        PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
         header.dumped_at_unix_ms,
         max_entries,
         entry_count_hint,
@@ -873,6 +925,140 @@ fn decode_v3_dump_for_test<const PREALLOCATION_LIMIT: usize>(
 ) -> Result<PersistedCacheDump> {
     let mut entries = Vec::new();
     let (header, _) = decode_v3_entry_frames::<PREALLOCATION_LIMIT, _>(data, |entry| {
+        entries.push(entry);
+        Ok(())
+    })?;
+    Ok(PersistedCacheDump {
+        magic: header.magic,
+        version: header.version,
+        dumped_at_unix_ms: header.dumped_at_unix_ms,
+        entries,
+    })
+}
+
+fn decode_v4_header<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<(PersistedCacheDumpV4Header, usize)> {
+    let header_size = v4_header_serialized_size::<PREALLOCATION_LIMIT>()?;
+    if data.len() < header_size {
+        return Err(invalid_dump("truncated v4 header"));
+    }
+    let header = wincode::config::deserialize_exact::<PersistedCacheDumpV4Header, _>(
+        &data[..header_size],
+        cache_wincode_config::<PREALLOCATION_LIMIT>(),
+    )
+    .map_err(|err| invalid_dump(format!("failed to deserialize v4 header: {err}")))?;
+    if header.magic != CACHE_DUMP_MAGIC {
+        return Err(invalid_dump("bad magic"));
+    }
+    if header.version != CACHE_DUMP_VERSION {
+        return Err(invalid_dump(format!(
+            "invalid v4 framed dump version {}, expected {}",
+            header.version, CACHE_DUMP_VERSION
+        )));
+    }
+    Ok((header, header_size))
+}
+
+fn decode_v4_entry_frames<const PREALLOCATION_LIMIT: usize, F>(
+    data: &[u8],
+    mut on_entry: F,
+) -> Result<(PersistedCacheDumpV4Header, usize)>
+where
+    F: FnMut(PersistedCacheEntry) -> Result<()>,
+{
+    let (header, mut cursor) = decode_v4_header::<PREALLOCATION_LIMIT>(data)?;
+    let frame_len_size = frame_len_serialized_size::<PREALLOCATION_LIMIT>()?;
+    let entry_count = usize::try_from(header.entry_count)
+        .map_err(|_| invalid_dump("entry count exceeds usize"))?;
+
+    for _ in 0..entry_count {
+        let len_end = cursor
+            .checked_add(frame_len_size)
+            .ok_or_else(|| invalid_dump("entry frame length offset overflow"))?;
+        if len_end > data.len() {
+            return Err(invalid_dump("truncated entry frame length"));
+        }
+        let frame_len = wincode::config::deserialize_exact::<u64, _>(
+            &data[cursor..len_end],
+            cache_wincode_config::<PREALLOCATION_LIMIT>(),
+        )
+        .map_err(|err| invalid_dump(format!("failed to deserialize entry frame length: {err}")))?;
+        cursor = len_end;
+
+        let frame_len = usize::try_from(frame_len)
+            .map_err(|_| invalid_dump("entry frame length exceeds usize"))?;
+        let frame_end = cursor
+            .checked_add(frame_len)
+            .ok_or_else(|| invalid_dump("entry frame offset overflow"))?;
+        if frame_end > data.len() {
+            return Err(invalid_dump("truncated entry frame"));
+        }
+
+        let entry = wincode::config::deserialize_exact::<PersistedCacheEntry, _>(
+            &data[cursor..frame_end],
+            cache_wincode_config::<PREALLOCATION_LIMIT>(),
+        )
+        .map_err(|err| invalid_dump(format!("failed to deserialize entry frame: {err}")))?;
+        on_entry(entry)?;
+        cursor = frame_end;
+    }
+
+    if cursor != data.len() {
+        return Err(invalid_dump("trailing bytes after final entry frame"));
+    }
+    Ok((header, entry_count))
+}
+
+#[inline]
+fn validate_dump_ecs_mode(
+    dump_version: u32,
+    dump_ecs_in_key: Option<bool>,
+    runtime_ecs_in_key: bool,
+) -> Result<()> {
+    if !runtime_ecs_in_key {
+        return Ok(());
+    }
+
+    match dump_ecs_in_key {
+        Some(true) => Ok(()),
+        Some(false) => Err(invalid_dump(
+            "cache dump was created with ecs_in_key=false and cannot be loaded with ecs_in_key=true",
+        )),
+        None => Err(invalid_dump(format!(
+            "cache dump version {dump_version} does not record ecs_in_key; refusing to load it with ecs_in_key=true"
+        ))),
+    }
+}
+
+fn prepare_v4_persisted_entries_bounded<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+    ecs_in_key: bool,
+    policy: CacheLoadPolicy,
+    max_entries: usize,
+) -> Result<Vec<PreparedCacheEntry>> {
+    let (header, _) = decode_v4_header::<PREALLOCATION_LIMIT>(data)?;
+    validate_dump_ecs_mode(CACHE_DUMP_VERSION, Some(header.ecs_in_key), ecs_in_key)?;
+
+    let entry_count_hint = usize::try_from(header.entry_count).unwrap_or(max_entries);
+    let mut collector = PreparedEntryCollector::new(
+        ecs_in_key,
+        policy,
+        CACHE_DUMP_VERSION,
+        header.dumped_at_unix_ms,
+        max_entries,
+        entry_count_hint,
+    );
+    decode_v4_entry_frames::<PREALLOCATION_LIMIT, _>(data, |entry| collector.push(entry))?;
+    Ok(collector.finish())
+}
+
+#[cfg(test)]
+fn decode_v4_dump_for_test<const PREALLOCATION_LIMIT: usize>(
+    data: &[u8],
+) -> Result<PersistedCacheDump> {
+    let mut entries = Vec::new();
+    let (header, _) = decode_v4_entry_frames::<PREALLOCATION_LIMIT, _>(data, |entry| {
         entries.push(entry);
         Ok(())
     })?;
@@ -1038,16 +1224,26 @@ fn load_cache_from_bytes_with_index_bounded<const PREALLOCATION_LIMIT: usize>(
     max_entries: usize,
 ) -> Result<usize> {
     // Transaction boundary: validate the entire dump before touching the
-    // destination cache. Version 3 decodes one framed entry at a time, so it
-    // never materializes Vec<PersistedCacheEntry>; only the retained top-N
+    // destination cache. Framed versions decode one entry at a time, so they
+    // never materialize Vec<PersistedCacheEntry>; only the retained top-N
     // cache objects plus duplicate-key metadata scale with input entry count.
     let prefix = parse_dump_prefix::<PREALLOCATION_LIMIT>(data)?;
     let prepared = match prefix.version {
         LEGACY_CACHE_DUMP_VERSION | PREVIOUS_CACHE_DUMP_VERSION => {
+            validate_dump_ecs_mode(prefix.version, None, ecs_in_key)?;
             let dump = parse_legacy_persisted_dump_with_limit::<PREALLOCATION_LIMIT>(data)?;
             prepare_legacy_persisted_entries_bounded(dump, ecs_in_key, policy, max_entries)?
         }
-        CACHE_DUMP_VERSION => prepare_v3_persisted_entries_bounded::<PREALLOCATION_LIMIT>(
+        PREVIOUS_FRAMED_CACHE_DUMP_VERSION => {
+            validate_dump_ecs_mode(prefix.version, None, ecs_in_key)?;
+            prepare_v3_persisted_entries_bounded::<PREALLOCATION_LIMIT>(
+                data,
+                ecs_in_key,
+                policy,
+                max_entries,
+            )?
+        }
+        CACHE_DUMP_VERSION => prepare_v4_persisted_entries_bounded::<PREALLOCATION_LIMIT>(
             data,
             ecs_in_key,
             policy,
@@ -1055,8 +1251,11 @@ fn load_cache_from_bytes_with_index_bounded<const PREALLOCATION_LIMIT: usize>(
         )?,
         version => {
             return Err(invalid_dump(format!(
-                "unsupported version {version}, expected {}, {} or {}",
-                LEGACY_CACHE_DUMP_VERSION, PREVIOUS_CACHE_DUMP_VERSION, CACHE_DUMP_VERSION
+                "unsupported version {version}, expected {}, {}, {} or {}",
+                LEGACY_CACHE_DUMP_VERSION,
+                PREVIOUS_CACHE_DUMP_VERSION,
+                PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
+                CACHE_DUMP_VERSION
             )));
         }
     };
@@ -1147,12 +1346,13 @@ mod tests {
         }
     }
 
-    fn serialize_dump_at_version(
+    fn serialize_dump_at_version_with_ecs_mode(
         version: u32,
         entries: Vec<PersistedCacheEntry>,
         dumped_at_unix_ms: u64,
+        ecs_in_key: bool,
     ) -> Vec<u8> {
-        if version != CACHE_DUMP_VERSION {
+        if version == LEGACY_CACHE_DUMP_VERSION || version == PREVIOUS_CACHE_DUMP_VERSION {
             return wincode::config::serialize(
                 &PersistedCacheDump {
                     magic: CACHE_DUMP_MAGIC,
@@ -1165,23 +1365,40 @@ mod tests {
             .expect("legacy dump should serialize");
         }
 
-        let header = PersistedCacheDumpV3Header {
-            magic: CACHE_DUMP_MAGIC,
-            version,
-            dumped_at_unix_ms,
-            entry_count: u64::try_from(entries.len()).expect("test entry count should fit u64"),
+        let entry_count = u64::try_from(entries.len()).expect("test entry count should fit u64");
+        let mut encoded = if version == PREVIOUS_FRAMED_CACHE_DUMP_VERSION {
+            wincode::config::serialize(
+                &PersistedCacheDumpV3Header {
+                    magic: CACHE_DUMP_MAGIC,
+                    version,
+                    dumped_at_unix_ms,
+                    entry_count,
+                },
+                cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+            )
+            .expect("v3 header should serialize")
+        } else if version == CACHE_DUMP_VERSION {
+            wincode::config::serialize(
+                &PersistedCacheDumpV4Header {
+                    magic: CACHE_DUMP_MAGIC,
+                    version,
+                    dumped_at_unix_ms,
+                    entry_count,
+                    ecs_in_key,
+                },
+                cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
+            )
+            .expect("v4 header should serialize")
+        } else {
+            panic!("unsupported test dump version {version}");
         };
-        let mut encoded = wincode::config::serialize(
-            &header,
-            cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
-        )
-        .expect("v3 header should serialize");
+
         for entry in entries {
             let frame = wincode::config::serialize(
                 &entry,
                 cache_wincode_config::<MAX_PERSISTED_CACHE_DUMP_BYTES>(),
             )
-            .expect("v3 entry should serialize");
+            .expect("framed entry should serialize");
             let frame_len = u64::try_from(frame.len()).expect("test frame length should fit u64");
             encoded.extend_from_slice(
                 &wincode::config::serialize(
@@ -1193,6 +1410,14 @@ mod tests {
             encoded.extend_from_slice(&frame);
         }
         encoded
+    }
+
+    fn serialize_dump_at_version(
+        version: u32,
+        entries: Vec<PersistedCacheEntry>,
+        dumped_at_unix_ms: u64,
+    ) -> Vec<u8> {
+        serialize_dump_at_version_with_ecs_mode(version, entries, dumped_at_unix_ms, false)
     }
 
     fn serialize_dump_at(entries: Vec<PersistedCacheEntry>, dumped_at_unix_ms: u64) -> Vec<u8> {
@@ -1577,6 +1802,119 @@ mod tests {
     }
 
     #[test]
+    fn test_v4_dump_records_ecs_in_key_mode() {
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(1);
+
+        let shared = dump_cache_to_bytes_for_mode(&cache_map, false)
+            .expect("shared-mode dump should serialize");
+        let (shared_header, _) = decode_v4_header::<MAX_PERSISTED_CACHE_DUMP_BYTES>(&shared)
+            .expect("shared-mode v4 header should decode");
+        assert!(!shared_header.ecs_in_key);
+
+        let scope_aware = dump_cache_to_bytes_for_mode(&cache_map, true)
+            .expect("scope-aware dump should serialize");
+        let (scope_header, _) = decode_v4_header::<MAX_PERSISTED_CACHE_DUMP_BYTES>(&scope_aware)
+            .expect("scope-aware v4 header should decode");
+        assert!(scope_header.ecs_in_key);
+    }
+
+    #[test]
+    fn test_scope_aware_load_rejects_shared_v4_dump() {
+        AppClock::start();
+        let source = CacheMap::with_capacity(1);
+        let data = dump_cache_to_bytes_for_mode(&source, false)
+            .expect("shared-mode dump should serialize");
+        let destination = CacheMap::with_capacity(1);
+
+        let err =
+            load_cache_from_bytes(&destination, &data, true, CacheLoadPolicy::default(), false)
+                .expect_err("shared-mode dump must not load into scope-aware cache mode");
+
+        assert!(err.to_string().contains("ecs_in_key=false"));
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn test_scope_aware_load_rejects_v3_dump_without_mode_metadata() {
+        AppClock::start();
+        let data = serialize_dump_at_version(
+            PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
+            Vec::new(),
+            AppClock::now_timestamp(),
+        );
+        let destination = CacheMap::with_capacity(1);
+
+        let err =
+            load_cache_from_bytes(&destination, &data, true, CacheLoadPolicy::default(), false)
+                .expect_err("pre-mode dump must not load into scope-aware cache mode");
+
+        assert!(err.to_string().contains("does not record ecs_in_key"));
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn test_shared_load_accepts_scope_aware_v4_ordinary_entry() {
+        AppClock::start();
+        let mut entry = valid_address_entry();
+        entry.ecs_family = None;
+        entry.ecs_source_prefix = None;
+        entry.ecs_scope_prefix = None;
+        entry.ecs_network = None;
+        entry.resp_bytes = positive_response_bytes(60);
+        let data = serialize_dump_at_version_with_ecs_mode(
+            CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+            true,
+        );
+        let destination = CacheMap::with_capacity(1);
+
+        assert_eq!(
+            load_cache_from_bytes(
+                &destination,
+                &data,
+                false,
+                CacheLoadPolicy::default(),
+                false,
+            )
+            .expect("scope-aware dump ordinary entry should load in shared mode"),
+            1
+        );
+        assert_eq!(destination.len(), 1);
+    }
+
+    #[test]
+    fn test_shared_load_accepts_v3_dump_for_backward_compatibility() {
+        AppClock::start();
+        let mut entry = valid_address_entry();
+        entry.ecs_family = None;
+        entry.ecs_source_prefix = None;
+        entry.ecs_scope_prefix = None;
+        entry.ecs_network = None;
+        entry.resp_bytes = positive_response_bytes(60);
+        let data = serialize_dump_at_version(
+            PREVIOUS_FRAMED_CACHE_DUMP_VERSION,
+            vec![entry],
+            AppClock::now_timestamp(),
+        );
+        let destination = CacheMap::with_capacity(1);
+
+        assert_eq!(
+            load_cache_from_bytes(
+                &destination,
+                &data,
+                false,
+                CacheLoadPolicy::default(),
+                false,
+            )
+            .expect("v3 shared restore should remain supported"),
+            1
+        );
+        assert_eq!(destination.len(), 1);
+    }
+
+    #[test]
     fn test_load_cache_accepts_v2_dump() {
         AppClock::start();
         let mut entry = valid_address_entry();
@@ -1600,7 +1938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_streaming_decoder_rejects_trailing_bytes_transactionally() {
+    fn test_framed_decoder_rejects_trailing_bytes_transactionally() {
         AppClock::start();
         let mut entry = valid_address_entry();
         entry.resp_bytes = positive_response_bytes(60);

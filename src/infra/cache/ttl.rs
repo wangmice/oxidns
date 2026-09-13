@@ -594,6 +594,7 @@ where
     /// deadline has expired at `metadata.cache_time_ms`. Callers with a
     /// stronger target-validity concept (for example fresh vs. stale) should
     /// use [`Self::conditional_move_handle_if`].
+    #[cfg(test)]
     pub(crate) fn conditional_move_handle(
         &self,
         source_key: &K,
@@ -1216,6 +1217,45 @@ where
         }
     }
 
+    /// Visit cache keys one shard at a time without holding the shard lock while
+    /// the caller performs additional work.
+    ///
+    /// Only keys are cloned while the shard read lock is held. This is intended
+    /// for maintenance paths such as secondary-index rebuilds that do not need
+    /// value handles and may allocate or acquire unrelated locks per key.
+    pub(crate) fn visit_keys_cloned_by_shard(&self, mut visitor: impl FnMut(Vec<K>) -> bool)
+    where
+        K: Clone,
+    {
+        let state = self.state.load();
+
+        for shard_lock in state.map.shards() {
+            let shard = shard_lock.read();
+            let shard_len = shard.len();
+            if shard_len == 0 {
+                continue;
+            }
+
+            let mut keys = Vec::with_capacity(shard_len);
+            let bucket_count = shard.buckets();
+            for bucket_index in 0..bucket_count {
+                // SAFETY: `bucket_index < bucket_count`; the shard read guard
+                // remains held while checking and reading the bucket.
+                if unsafe { !shard.is_bucket_full(bucket_index) } {
+                    continue;
+                }
+
+                let (key, _shared_entry) = unsafe { shard.bucket(bucket_index).as_ref() };
+                keys.push(key.clone());
+            }
+            drop(shard);
+
+            if !keys.is_empty() && !visitor(keys) {
+                break;
+            }
+        }
+    }
+
     /// Visit cache entries one shard at a time using stable handles.
     ///
     /// Only keys and `Arc` handles are cloned while the shard lock is held;
@@ -1593,6 +1633,25 @@ mod tests {
             .expect("entry should exist");
         assert_eq!(handle.value().0, 7);
         assert_eq!(cache.sample_last_access(1), vec![("k", 10)]);
+    }
+
+    #[test]
+    fn visit_keys_cloned_by_shard_releases_shard_before_callback() {
+        let cache = TtlCache::with_capacity(4);
+        cache.insert_or_update("a", 1u32, 0, 100);
+        cache.insert_or_update("b", 2u32, 0, 100);
+
+        let mut visited = 0usize;
+        cache.visit_keys_cloned_by_shard(|keys| {
+            for key in keys {
+                visited = visited.saturating_add(1);
+                assert!(cache.remove(&key));
+            }
+            true
+        });
+
+        assert_eq!(visited, 2);
+        assert!(cache.is_empty());
     }
 
     #[test]

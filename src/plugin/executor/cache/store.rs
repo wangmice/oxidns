@@ -649,8 +649,10 @@ impl DnsCacheStore {
         let Some((rebuilt, stale_revision)) = self.ecs_lookup_index.begin_rebuild() else {
             return;
         };
-        self.cache_map.visit_handles(|key, _entry| {
-            rebuilt.observe_cache_key(key);
+        self.cache_map.visit_keys_cloned_by_shard(|keys| {
+            for key in keys {
+                rebuilt.observe_cache_key(&key);
+            }
             true
         });
         let _ = self
@@ -849,11 +851,7 @@ mod tests {
                 &source,
                 target.clone(),
                 &expected,
-                CacheItem::new_validated(
-                    Message::new(),
-                    30,
-                    commit_time.saturating_add(30_000),
-                ),
+                CacheItem::new_validated(Message::new(), 30, commit_time.saturating_add(30_000),),
                 TtlCacheMoveMetadata {
                     cache_time_ms: commit_time,
                     expire_at_ms: commit_time.saturating_add(60_000),
@@ -914,11 +912,7 @@ mod tests {
         // generation present at commit time and preserve it.
         assert!(store.insert_or_update(
             target.clone(),
-            CacheItem::new_validated(
-                Message::new(),
-                240,
-                commit_time.saturating_add(240_000),
-            ),
+            CacheItem::new_validated(Message::new(), 240, commit_time.saturating_add(240_000),),
             commit_time.saturating_sub(1),
             commit_time.saturating_add(300_000),
             commit_time.saturating_sub(1),
@@ -930,11 +924,7 @@ mod tests {
                 &source,
                 target.clone(),
                 &expected,
-                CacheItem::new_validated(
-                    Message::new(),
-                    30,
-                    commit_time.saturating_add(30_000),
-                ),
+                CacheItem::new_validated(Message::new(), 30, commit_time.saturating_add(30_000),),
                 TtlCacheMoveMetadata {
                     cache_time_ms: commit_time,
                     expire_at_ms: commit_time.saturating_add(60_000),

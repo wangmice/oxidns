@@ -25,7 +25,7 @@ use super::key::{
 #[cfg(test)]
 use super::persistence::dump_cache_to_bytes;
 use super::persistence::{
-    CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes,
+    CacheDumpOutcome, dump_cache_to_bytes_with_limit_for_mode, stage_cache_from_bytes,
 };
 use super::store::DnsCacheStore;
 use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer};
@@ -76,6 +76,7 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
         GET "/dump" => CacheDumpHandler {
             store: store.clone(),
             tag: tag.to_string(),
+            ecs_in_key,
         },
         POST "/load_dump" => CacheLoadDumpHandler {
             store,
@@ -161,16 +162,19 @@ impl ApiHandler for CacheFlushHandler {
 struct CacheDumpHandler {
     store: DnsCacheStore,
     tag: String,
+    ecs_in_key: bool,
 }
 
 #[async_trait]
 impl ApiHandler for CacheDumpHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
         let store = self.store.clone();
+        let ecs_in_key = self.ecs_in_key;
         match tokio::task::spawn_blocking(move || {
-            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(
+            dump_cache_to_bytes_with_limit_for_mode::<MAX_CACHE_DUMP_BODY>(
                 store.cache_map(),
                 MAX_CACHE_DUMP_BODY,
+                ecs_in_key,
             )
         })
         .await

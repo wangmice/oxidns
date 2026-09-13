@@ -965,6 +965,7 @@ impl Cache {
     fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
         let (dump_interval, check_interval_ms, dirty_age_target_ms) =
             Self::dump_schedule(dump_interval);
+        let ecs_in_key = self.ecs_in_key;
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
@@ -981,7 +982,9 @@ impl Cache {
                         return;
                     };
 
-                    if let Err(e) = dump_cache_to_file(store.cache_map(), &dump_path).await {
+                    if let Err(e) =
+                        dump_cache_to_file(store.cache_map(), &dump_path, ecs_in_key).await
+                    {
                         handoff.abort();
                         warn!("Failed to dump cache to {}: {}", dump_path, e);
                     } else {
@@ -1834,7 +1837,8 @@ impl Plugin for Cache {
         self.lazy_refresh_tasks.wait().await;
 
         if let Some(dump_file) = &self.config.dump_file
-            && let Err(e) = dump_cache_to_file(self.store.cache_map(), dump_file).await
+            && let Err(e) =
+                dump_cache_to_file(self.store.cache_map(), dump_file, self.ecs_in_key).await
         {
             warn!("Failed to dump cache to {}: {}", dump_file, e);
         }
@@ -1972,9 +1976,7 @@ impl Executor for Cache {
                 MissRole::Leader(leader) => {
                     let previous_ancestry =
                         context.runtime.push_miss_leader_ancestor(leader.token());
-                    let next_result = self
-                        .continue_miss_downstream(next.as_ref(), context)
-                        .await;
+                    let next_result = self.continue_miss_downstream(next.as_ref(), context).await;
                     context
                         .runtime
                         .restore_miss_leader_ancestry(previous_ancestry);
@@ -2869,7 +2871,9 @@ mod tests {
             1,
         );
         assert_eq!(cache.store.cache_map().len(), 0);
-        let response = context.response().expect("timeout bypass should return response");
+        let response = context
+            .response()
+            .expect("timeout bypass should return response");
         assert!(response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))));
         assert!(
             response
@@ -2927,7 +2931,9 @@ mod tests {
             1,
         );
         assert_eq!(cache.store.cache_map().len(), 0);
-        let response = context.response().expect("reentrant bypass should return response");
+        let response = context
+            .response()
+            .expect("reentrant bypass should return response");
         assert!(response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 2))));
         assert!(
             response
@@ -3591,9 +3597,7 @@ mod tests {
                     _ => None,
                 });
             let answer = match request_subnet.map(|subnet| subnet.addr()) {
-                Some(IpAddr::V4(addr)) if addr.octets()[0] == 203 => {
-                    Ipv4Addr::new(9, 9, 9, 1)
-                }
+                Some(IpAddr::V4(addr)) if addr.octets()[0] == 203 => Ipv4Addr::new(9, 9, 9, 1),
                 Some(IpAddr::V4(_)) => Ipv4Addr::new(9, 9, 9, 2),
                 Some(IpAddr::V6(_)) => Ipv4Addr::new(9, 9, 9, 3),
                 None => Ipv4Addr::new(9, 9, 9, 4),
@@ -3993,11 +3997,8 @@ mod tests {
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(cache.store.cache_map().len(), 1);
         assert!(
-            first_context
-                .response()
-                .is_some_and(|response| response.has_answer_ip(|ip| {
-                    ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))
-                })),
+            first_context.response().is_some_and(|response| response
+                .has_answer_ip(|ip| { ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1)) })),
             "the first ECS request should determine the shared cached answer",
         );
         assert!(
@@ -4075,8 +4076,7 @@ mod tests {
             "unsolicited upstream ECS must be stripped before returning"
         );
 
-        let mut hit_context =
-            make_context(make_request_with_query("example.com.", false, false));
+        let mut hit_context = make_context(make_request_with_query("example.com.", false, false));
         let lookup = cache
             .try_cache_hit(&mut hit_context, &cache.store)
             .expect("ordinary cache lookup should exist");
@@ -4133,11 +4133,8 @@ mod tests {
             .expect("stale shared hit should start lazy refresh");
         assert_eq!(step, ExecStep::Stop);
         assert!(
-            stale_context
-                .response()
-                .is_some_and(|response| response.has_answer_ip(|ip| {
-                    ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
-                })),
+            stale_context.response().is_some_and(|response| response
+                .has_answer_ip(|ip| { ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)) })),
             "the stale answer should be served before refresh completes",
         );
         assert!(

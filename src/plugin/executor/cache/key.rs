@@ -279,10 +279,8 @@ pub(super) fn build_cache_key(context: &mut DnsContext, ecs_in_key: bool) -> Opt
 
     let cd_bit = context.request.checking_disabled();
 
-    let request_ecs = extract_ecs(&context.request);
-
     let ecs_scope = if ecs_in_key {
-        match request_ecs {
+        match extract_ecs(&context.request) {
             Some(subnet) => {
                 if !request_ecs_is_valid(subnet) {
                     return None;
@@ -661,11 +659,6 @@ impl EcsLookupIndex {
         self.stale_revision.load(Ordering::Acquire) != self.rebuilt_revision.load(Ordering::Acquire)
     }
 
-    #[inline]
-    pub(super) fn stale_revision(&self) -> u64 {
-        self.stale_revision.load(Ordering::Acquire)
-    }
-
     /// Start a rebuild generation without blocking ECS publications for the
     /// authoritative-cache scan.
     ///
@@ -1039,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cache_key_rejects_invalid_ecs_even_when_keying_is_disabled() {
+    fn test_build_cache_key_ignores_ecs_when_keying_is_disabled() {
         let mut context = make_context("example.com.");
         let mut edns = Edns::new();
         edns.insert(EdnsOption::Subnet(ClientSubnet::new(
@@ -1049,32 +1042,8 @@ mod tests {
         )));
         context.request.set_edns(edns);
 
-        assert!(build_cache_key(&mut context, false).is_none());
-
-        let mut context = make_context("example.com.");
-        let mut edns = Edns::new();
-        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
-            IpAddr::from([203, 0, 113, 199]),
-            33,
-            0,
-        )));
-        context.request.set_edns(edns);
-
-        assert!(build_cache_key(&mut context, false).is_none());
-    }
-
-    #[test]
-    fn test_build_cache_key_ignores_ecs_when_keying_is_disabled() {
-        let mut context = make_context("example.com.");
-        let mut edns = Edns::new();
-        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
-            IpAddr::from([203, 0, 113, 199]),
-            20,
-            0,
-        )));
-        context.request.set_edns(edns);
-
         let cache_key = build_cache_key(&mut context, false).expect("cache key should exist");
+
         assert_eq!(cache_key.ecs_scope, None);
     }
 
