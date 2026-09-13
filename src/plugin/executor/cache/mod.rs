@@ -87,6 +87,7 @@ const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS: u64 = 30;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MISS_COALESCE_RETRY_GENERATIONS: usize = 1;
 static NEXT_MISS_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 // Soft dirty-age target for low-churn caches. The effective target is never
 // allowed to undercut the user-configured dump interval.
@@ -1766,129 +1767,152 @@ impl Executor for Cache {
         };
         let key = key.clone();
 
-        match self.miss_coalescer.register(key.clone(), context) {
-            MissRole::Follower(mut ready) => {
-                self.metrics()
-                    .miss_coalesced_total
-                    .fetch_add(1, Ordering::Relaxed);
-                if tokio::time::timeout(DEFAULT_MISS_COALESCE_TIMEOUT, ready.changed())
-                    .await
-                    .is_err()
-                {
+        let mut retry_generations = 0usize;
+        loop {
+            match self.miss_coalescer.register(key.clone(), context) {
+                MissRole::Follower(mut ready) => {
                     self.metrics()
-                        .miss_coalesce_timeout_total
+                        .miss_coalesced_total
                         .fetch_add(1, Ordering::Relaxed);
-                }
-
-                let outcome = ready.borrow().clone();
-                match outcome {
-                    MissFlightOutcome::Cached => {
-                        if self
-                            .try_cache_hit(context, store)
-                            .is_some_and(|lookup| lookup.is_hit())
-                        {
-                            if self.should_short_circuit(true) {
-                                return Ok(ExecStep::Stop);
-                            }
-                            return continue_next!(next, context);
-                        }
-                    }
-                    MissFlightOutcome::SharedResponse {
-                        request,
-                        response,
-                        step,
-                    } => {
-                        // CacheKey intentionally ignores some request fields.
-                        // A transient, uncacheable response is safe to reuse
-                        // only when the original DNS request is otherwise
-                        // identical (transaction ID may differ).
-                        if dns_requests_equal_except_id(&request, &context.request) {
-                            let response = restore_shared_miss_response(
-                                &context.request,
-                                (*response).clone(),
-                            );
-                            context.set_response(response);
-                            return Ok(step);
-                        }
-                    }
-                    MissFlightOutcome::Pending | MissFlightOutcome::Retry => {}
-                }
-
-                // The leader failed before producing a safely shareable DNS
-                // response, or a cached result disappeared before this follower
-                // could consume it. Resolve this request directly without
-                // registering it again.
-                return continue_next!(next, context);
-            }
-            MissRole::Reentrant => {
-                self.metrics()
-                    .miss_coalesce_reentrant_total
-                    .fetch_add(1, Ordering::Relaxed);
-                // This control flow is already inside the leader for the same
-                // cache key. Waiting would deadlock until the follower timeout,
-                // because that ancestor leader cannot complete before this
-                // nested execution returns. Resolve downstream directly; the
-                // ancestor leader remains responsible for the eventual cache
-                // write and for waking independent followers.
-                return continue_next!(next, context);
-            }
-            MissRole::Leader(leader) => {
-                let previous_ancestry = context.runtime.push_miss_leader_ancestor(leader.token());
-                let next_result = continue_next!(next, context);
-                context
-                    .runtime
-                    .restore_miss_leader_ancestry(previous_ancestry);
-                let next_step = next_result?;
-                let shareable_response = if self.short_circuit {
-                    context.response().and_then(|response| {
-                        (!response.truncated()
-                            && response.signature().is_empty()
-                            && response_question_matches_cache_key(response, &key))
-                        .then(|| Arc::new(response.clone()))
-                    })
-                } else {
-                    None
-                };
-
-                let cached = if let Some(response) = context.response() {
-                    if response.truncated() {
+                    if tokio::time::timeout(DEFAULT_MISS_COALESCE_TIMEOUT, ready.changed())
+                        .await
+                        .is_err()
+                    {
                         self.metrics()
-                            .skip_truncated_total
+                            .miss_coalesce_timeout_total
                             .fetch_add(1, Ordering::Relaxed);
-                        false
-                    } else {
-                        let disposition = response_disposition_for_cache(response, &key);
-                        match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
-                            CacheTtlDecision::Cache(ttl) => self.update_cache_entry(
-                                store,
-                                key,
-                                response.clone(),
-                                ttl,
-                                disposition,
-                            ),
-                            CacheTtlDecision::Skip(reason) => {
-                                self.metrics().record_skip(reason);
-                                false
+                        // A timeout means the current leader is still running.
+                        // Keep the existing escape hatch here rather than
+                        // replacing a live flight and creating two leaders.
+                        return continue_next!(next, context);
+                    }
+
+                    let outcome = ready.borrow().clone();
+                    match outcome {
+                        MissFlightOutcome::Cached => {
+                            if self
+                                .try_cache_hit(context, store)
+                                .is_some_and(|lookup| lookup.is_hit())
+                            {
+                                if self.should_short_circuit(true) {
+                                    return Ok(ExecStep::Stop);
+                                }
+                                return continue_next!(next, context);
                             }
                         }
+                        MissFlightOutcome::SharedResponse {
+                            request,
+                            response,
+                            step,
+                        } => {
+                            // CacheKey intentionally ignores some request fields.
+                            // A transient, uncacheable response is safe to reuse
+                            // only when the original DNS request is otherwise
+                            // identical (transaction ID may differ).
+                            if dns_requests_equal_except_id(&request, &context.request) {
+                                let response = restore_shared_miss_response(
+                                    &context.request,
+                                    (*response).clone(),
+                                );
+                                context.set_response(response);
+                                return Ok(step);
+                            }
+                        }
+                        MissFlightOutcome::Pending => {
+                            // `changed()` only returns Ok after observing a new
+                            // value, so Pending here can only be a defensive
+                            // fallback for an unexpected sender lifecycle.
+                        }
+                        MissFlightOutcome::Retry => {}
                     }
-                } else {
-                    false
-                };
 
-                let outcome = if cached {
-                    MissFlightOutcome::Cached
-                } else if let Some(response) = shareable_response {
-                    MissFlightOutcome::SharedResponse {
-                        request: Arc::new(context.request.clone()),
-                        response,
-                        step: next_step,
+                    // The completed flight did not leave a usable result. Re-enter
+                    // registration instead of letting every follower hit upstream:
+                    // after the old flight is removed, exactly one waiter wins the
+                    // vacant entry and becomes the next leader while the rest attach
+                    // to that replacement flight. Bound this promotion so persistent
+                    // upstream failures cannot make one request wait through an
+                    // arbitrary number of serialized attempts.
+                    if retry_generations >= MAX_MISS_COALESCE_RETRY_GENERATIONS {
+                        return Err(DnsError::runtime(
+                            "cache miss coalesced retry limit exceeded",
+                        ));
                     }
-                } else {
-                    MissFlightOutcome::Retry
-                };
-                leader.complete(outcome);
-                return Ok(next_step);
+                    retry_generations += 1;
+                }
+                MissRole::Reentrant => {
+                    self.metrics()
+                        .miss_coalesce_reentrant_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    // This control flow is already inside the leader for the same
+                    // cache key. Waiting would deadlock until the follower timeout,
+                    // because that ancestor leader cannot complete before this
+                    // nested execution returns. Resolve downstream directly; the
+                    // ancestor leader remains responsible for the eventual cache
+                    // write and for waking independent followers.
+                    return continue_next!(next, context);
+                }
+                MissRole::Leader(leader) => {
+                    let previous_ancestry =
+                        context.runtime.push_miss_leader_ancestor(leader.token());
+                    let next_result = continue_next!(next, context);
+                    context
+                        .runtime
+                        .restore_miss_leader_ancestry(previous_ancestry);
+                    let next_step = next_result?;
+                    let shareable_response = if self.short_circuit {
+                        context.response().and_then(|response| {
+                            (!response.truncated()
+                                && response.signature().is_empty()
+                                && response_question_matches_cache_key(response, &key))
+                            .then(|| Arc::new(response.clone()))
+                        })
+                    } else {
+                        None
+                    };
+
+                    let cached = if let Some(response) = context.response() {
+                        if response.truncated() {
+                            self.metrics()
+                                .skip_truncated_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            false
+                        } else {
+                            let disposition = response_disposition_for_cache(response, &key);
+                            match self
+                                .compute_cache_ttl_for_disposition(response, &key, disposition)
+                            {
+                                CacheTtlDecision::Cache(ttl) => self.update_cache_entry(
+                                    store,
+                                    key.clone(),
+                                    response.clone(),
+                                    ttl,
+                                    disposition,
+                                ),
+                                CacheTtlDecision::Skip(reason) => {
+                                    self.metrics().record_skip(reason);
+                                    false
+                                }
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    let outcome = if cached {
+                        MissFlightOutcome::Cached
+                    } else if let Some(response) = shareable_response {
+                        MissFlightOutcome::SharedResponse {
+                            request: Arc::new(context.request.clone()),
+                            response,
+                            step: next_step,
+                        }
+                    } else {
+                        MissFlightOutcome::Retry
+                    };
+                    leader.complete(outcome);
+                    return Ok(next_step);
+                }
             }
         }
     }
@@ -2655,6 +2679,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn miss_coalescer_serializes_retry_after_leader_failure() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.short_circuit = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+        let cache = Arc::new(cache);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let release_second = Arc::new(tokio::sync::Notify::new());
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingFailingMissExecutor {
+                calls: calls.clone(),
+                release_first: release_first.clone(),
+                release_second: release_second.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let run_request = |id| {
+            let cache = cache.clone();
+            let next = next.clone();
+            async move {
+                let mut request = make_request_with_query("example.com.", false, false);
+                request.set_id(id);
+                let mut context = make_context(request);
+                let result = cache.execute_with_next(&mut context, Some(next)).await;
+                (result, context)
+            }
+        };
+
+        let first = run_request(101);
+        let second = run_request(202);
+        let third = run_request(303);
+        let drive_failures = async {
+            wait_until("first miss should reach downstream", || {
+                calls.load(AtomicOrdering::Relaxed) == 1
+            })
+            .await;
+            wait_until("two requests should follow the first leader", || {
+                cache
+                    .store
+                    .metrics()
+                    .miss_coalesced_total
+                    .load(AtomicOrdering::Relaxed)
+                    >= 2
+            })
+            .await;
+            release_first.notify_waiters();
+
+            wait_until("one follower should be promoted to retry leader", || {
+                calls.load(AtomicOrdering::Relaxed) == 2
+            })
+            .await;
+            wait_until("remaining follower should attach to retry leader", || {
+                cache
+                    .store
+                    .metrics()
+                    .miss_coalesced_total
+                    .load(AtomicOrdering::Relaxed)
+                    >= 3
+            })
+            .await;
+            release_second.notify_waiters();
+        };
+
+        let (first, second, third, ()) =
+            tokio::join!(first, second, third, drive_failures);
+        let results = [first.0, second.0, third.0];
+
+        assert!(results.iter().all(|result| result.is_err()));
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            2,
+            "two failed generations must not fan out into a third upstream call",
+        );
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesce_timeout_total
+                .load(AtomicOrdering::Relaxed),
+            0,
+        );
+    }
+
     #[test]
     fn initial_cache_capacity_is_bounded_for_large_limits() {
         assert_eq!(Cache::initial_cache_capacity(0), 1);
@@ -3221,6 +3333,33 @@ mod tests {
         async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
             context.set_response(cname_only_response_for_domain("example.com.", 60));
             Ok(ExecStep::Next)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingFailingMissExecutor {
+        calls: Arc<AtomicUsize>,
+        release_first: Arc<tokio::sync::Notify>,
+        release_second: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Plugin for BlockingFailingMissExecutor {
+        fn tag(&self) -> &str {
+            "blocking_failing_miss_executor"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for BlockingFailingMissExecutor {
+        async fn execute(&self, _context: &mut DnsContext) -> Result<ExecStep> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            match call {
+                0 => self.release_first.notified().await,
+                1 => self.release_second.notified().await,
+                _ => {}
+            }
+            Err(DnsError::plugin(format!("miss failed on call {}", call + 1)))
         }
     }
 
