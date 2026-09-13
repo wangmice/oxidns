@@ -511,9 +511,6 @@ impl DnsCacheStore {
                 |published_key| self.ecs_lookup_index.observe_cache_key(published_key),
             );
         if inserted {
-            if tracks_ecs_prefix {
-                self.ecs_lookup_index.mark_publication();
-            }
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -545,9 +542,6 @@ impl DnsCacheStore {
             last_access_ms,
         );
         if replaced {
-            if tracks_ecs_prefix {
-                self.ecs_lookup_index.mark_publication();
-            }
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
         } else if tracks_ecs_prefix {
@@ -578,9 +572,6 @@ impl DnsCacheStore {
             metadata,
             move |target, _expire_at_ms| target.fresh_until_ms <= refresh_time_ms,
         );
-        if tracks_target_prefix && !matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
-            self.ecs_lookup_index.mark_publication();
-        }
         match result {
             TtlCacheConditionalMoveResult::Moved => {
                 self.mutations.mark_dirty(1);
@@ -650,22 +641,21 @@ impl DnsCacheStore {
             return;
         }
 
-        // Scan the authoritative cache without holding the ECS publication
-        // write gate. Publications record an epoch before releasing their
-        // shared gate; the final short commit aborts if either that epoch or
-        // the stale revision changed while this snapshot was being built.
-        let stale_revision = self.ecs_lookup_index.stale_revision();
-        let publication_revision = self.ecs_lookup_index.publication_revision();
-        let rebuilt = EcsLookupIndex::new();
+        // Install a shadow generation under the short publication write gate,
+        // then scan without holding it. Successful ECS publications are mirrored
+        // into the shadow while the scan runs, so sustained write traffic cannot
+        // starve rebuild progress. Concurrent removals may leave conservative
+        // false positives; their newer stale revision schedules another pass.
+        let Some((rebuilt, stale_revision)) = self.ecs_lookup_index.begin_rebuild() else {
+            return;
+        };
         self.cache_map.visit_handles(|key, _entry| {
             rebuilt.observe_cache_key(key);
             true
         });
-        let _ = self.ecs_lookup_index.commit_rebuild_if_unchanged(
-            &rebuilt,
-            stale_revision,
-            publication_revision,
-        );
+        let _ = self
+            .ecs_lookup_index
+            .commit_rebuild(&rebuilt, stale_revision);
     }
 
     /// Prune the published cache and account for every removed entry exactly
@@ -692,7 +682,6 @@ impl DnsCacheStore {
         // New-generation ECS memberships must be observed before the swap by
         // the staging path. Old memberships are only false positives, so defer
         // their removal to maintenance instead of creating a publication gap.
-        self.ecs_lookup_index.mark_publication();
         self.ecs_lookup_index.mark_rebuild_needed();
         let changed = (retired.entry_count() as u64).saturating_add(published_entries as u64);
         self.mutations.mark_dirty(changed);

@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
@@ -539,16 +539,16 @@ impl EcsPrefixBitmap {
 /// never forced to probe prefixes that were observed only for unrelated names,
 /// record types, classes, or DNSSEC flags. The main cache map remains
 /// authoritative. Publications take a shared rebuild guard while setting the
-/// per-key bit and publishing the cache entry. Maintenance builds a replacement
-/// snapshot without that gate, then takes the exclusive guard only long enough
-/// to validate publication/stale revisions and atomically swap the rebuilt map.
-/// This avoids false-negative hints without blocking ECS publications for the
-/// full authoritative-cache scan.
+/// per-key bit and publishing the cache entry. Maintenance installs a shadow
+/// generation under the exclusive gate, scans the authoritative cache without
+/// that gate, and mirrors concurrent publications into the shadow. The final
+/// exclusive section only swaps the completed generation. Concurrent removals
+/// may leave conservative false positives and schedule a later cleanup pass.
 #[derive(Debug)]
 pub(super) struct EcsLookupIndex {
     entries: ArcSwap<DashMap<EcsBaseKey, EcsPrefixBitmap>>,
     rebuild_gate: RwLock<()>,
-    publication_revision: AtomicU64,
+    rebuild_shadow: ArcSwapOption<EcsLookupIndex>,
     stale_revision: AtomicU64,
     rebuilt_revision: AtomicU64,
     indexed_base_keys: AtomicU64,
@@ -561,7 +561,7 @@ impl Default for EcsLookupIndex {
         Self {
             entries: ArcSwap::from_pointee(DashMap::new()),
             rebuild_gate: RwLock::new(()),
-            publication_revision: AtomicU64::new(0),
+            rebuild_shadow: ArcSwapOption::empty(),
             stale_revision: AtomicU64::new(0),
             rebuilt_revision: AtomicU64::new(0),
             indexed_base_keys: AtomicU64::new(0),
@@ -592,7 +592,7 @@ impl EcsLookupIndex {
     }
 
     #[inline]
-    fn observe_prefix_for_key(&self, key: &CacheKey, family: u16, prefix: u8) {
+    fn observe_prefix_for_key_local(&self, key: &CacheKey, family: u16, prefix: u8) {
         let base = EcsBaseKey::from_cache_key(key);
         let entries = self.entries.load();
         let inserted_prefix = match entries.entry(base) {
@@ -622,13 +622,25 @@ impl EcsLookupIndex {
     }
 
     /// Record a key only when it is reusable by ECS scope.
+    ///
+    /// While a rebuild is active, publications are mirrored into its shadow
+    /// snapshot. Callers that publish authoritative cache entries hold the
+    /// shared `publication_guard`, so rebuild commit cannot detach the shadow
+    /// between this observation and publication of the corresponding cache
+    /// generation.
     #[inline]
     pub(super) fn observe_cache_key(&self, key: &CacheKey) {
         let Some(ecs) = &key.ecs_scope else {
             return;
         };
-        if ecs.source_prefix == ecs.scope_prefix {
-            self.observe_prefix_for_key(key, ecs.family, ecs.scope_prefix);
+        if ecs.source_prefix != ecs.scope_prefix {
+            return;
+        }
+
+        self.observe_prefix_for_key_local(key, ecs.family, ecs.scope_prefix);
+
+        if let Some(shadow) = self.rebuild_shadow.load().as_ref() {
+            shadow.observe_prefix_for_key_local(key, ecs.family, ecs.scope_prefix);
         }
     }
 
@@ -637,16 +649,6 @@ impl EcsLookupIndex {
         if Self::tracks_cache_key(key) {
             self.mark_rebuild_needed();
         }
-    }
-
-    #[inline]
-    pub(super) fn mark_publication(&self) {
-        self.publication_revision.fetch_add(1, Ordering::AcqRel);
-    }
-
-    #[inline]
-    pub(super) fn publication_revision(&self) -> u64 {
-        self.publication_revision.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -664,38 +666,59 @@ impl EcsLookupIndex {
         self.stale_revision.load(Ordering::Acquire)
     }
 
-    /// Commit a rebuilt snapshot only if neither authoritative ECS publication
-    /// nor stale-state revision changed while the caller scanned the cache map.
+    /// Start a rebuild generation without blocking ECS publications for the
+    /// authoritative-cache scan.
     ///
-    /// The expensive map scan happens before this method. Taking the exclusive
-    /// gate here waits for any in-flight publication to finish, then the two
-    /// revisions prove that the snapshot did not miss a newly published ECS
-    /// key and did not race another stale-producing mutation. The write lock is
-    /// therefore held only for the final index replacement.
-    pub(super) fn commit_rebuild_if_unchanged(
-        &self,
-        rebuilt: &Self,
-        stale_revision: u64,
-        publication_revision: u64,
-    ) -> bool {
-        let retired = {
+    /// The shadow is installed while holding the exclusive publication gate.
+    /// Subsequent successful ECS publications mirror their hints into both the
+    /// live index and this shadow until commit detaches it. This means normal
+    /// publications no longer invalidate an in-progress rebuild.
+    pub(super) fn begin_rebuild(&self) -> Option<(Arc<Self>, u64)> {
+        let _guard = self
+            .rebuild_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if self.rebuild_shadow.load().is_some() {
+            return None;
+        }
+
+        let stale_revision = self.stale_revision.load(Ordering::Acquire);
+        if stale_revision == self.rebuilt_revision.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let shadow = Arc::new(Self::new());
+        self.rebuild_shadow.store(Some(shadow.clone()));
+        Some((shadow, stale_revision))
+    }
+
+    /// Publish an active rebuild shadow.
+    ///
+    /// Deletions or evictions racing the scan are allowed to leave conservative
+    /// false-positive hints in this generation. Their stale revision remains
+    /// newer than `rebuilt_revision`, which schedules another cleanup pass. A
+    /// successful publication cannot be missed because it is mirrored into the
+    /// active shadow while holding the shared publication gate.
+    pub(super) fn commit_rebuild(&self, rebuilt: &Arc<Self>, stale_revision: u64) -> bool {
+        let (retired_entries, retired_shadow) = {
             let _guard = self
                 .rebuild_gate
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if self.stale_revision.load(Ordering::Acquire) != stale_revision
-                || self.publication_revision.load(Ordering::Acquire) != publication_revision
+            let active = self.rebuild_shadow.load_full();
+            if active
+                .as_ref()
+                .is_none_or(|active| !Arc::ptr_eq(active, rebuilt))
             {
                 return false;
             }
 
-            // O(1) publication: readers that already loaded the old Arc keep a
-            // valid conservative snapshot, while new readers immediately see
-            // the rebuilt map. Keep the retired snapshot alive until after the
-            // exclusive gate is released so a last-reference drop cannot
-            // synchronously destruct the old index while publications wait.
-            let retired = self.entries.swap(rebuilt.entries.load_full());
+            // The write gate waits for every in-flight publication that could
+            // still be mirroring into the shadow. Once acquired, both the
+            // rebuilt entries and their counters are stable for this commit.
+            let retired_entries = self.entries.swap(rebuilt.entries.load_full());
             self.indexed_base_keys.store(
                 rebuilt.indexed_base_keys.load(Ordering::Relaxed),
                 Ordering::Relaxed,
@@ -708,12 +731,21 @@ impl EcsLookupIndex {
                 rebuilt.observed_ipv6_prefixes.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+
+            // Only acknowledge stale work that existed when this generation
+            // started. If a removal raced the scan, needs_rebuild() remains
+            // true and a later pass cleans up any false-positive hint.
             self.rebuilt_revision
                 .store(stale_revision, Ordering::Release);
-            retired
+
+            let retired_shadow = self.rebuild_shadow.swap(None);
+            (retired_entries, retired_shadow)
         };
 
-        drop(retired);
+        // Neither a potentially large old index nor the rebuild wrapper is
+        // destroyed while ECS publications are waiting on rebuild_gate.
+        drop(retired_entries);
+        drop(retired_shadow);
         true
     }
 
@@ -1166,7 +1198,57 @@ mod tests {
     }
 
     #[test]
-    fn test_ecs_rebuild_commit_rejects_concurrent_publication_revision() {
+    fn test_ecs_rebuild_mirrors_concurrent_publication_and_commits() {
+        let mut request = make_context("example.com.");
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::from([203, 0, 113, 199]),
+            24,
+            0,
+        )));
+        request.request.set_edns(edns);
+        let request_key = build_cache_key(&mut request, true).expect("request key should exist");
+
+        let index = EcsLookupIndex::new();
+        let prefix_24 = request_key.with_ecs_scope_prefix(24);
+        index.observe_cache_key(&prefix_24);
+        index.mark_rebuild_needed();
+
+        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
+        // Model the authoritative scan observing the entry that existed when
+        // the rebuild started.
+        rebuilt.observe_cache_key(&prefix_24);
+
+        // Model a successful reusable-ECS publication racing the scan. The
+        // publication guard makes the live+shadow hint update atomic with
+        // respect to rebuild commit.
+        {
+            let _guard = index.publication_guard();
+            index.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
+        }
+
+        assert!(index.commit_rebuild(&rebuilt, stale_revision));
+        assert!(!index.needs_rebuild());
+        assert_eq!(index.indexed_base_keys(), 1);
+        assert_eq!(index.observed_ipv4_prefixes(), 2);
+
+        let prefixes = cache_lookup_keys(&request_key, &index)
+            .filter_map(|candidate| {
+                (candidate.as_ref() != &request_key).then(|| {
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .expect("candidate should carry ECS")
+                        .scope_prefix
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes, vec![24, 16]);
+    }
+
+    #[test]
+    fn test_ecs_rebuild_commits_with_concurrent_stale_revision_and_schedules_cleanup() {
         let mut request = make_context("example.com.");
         let mut edns = Edns::new();
         edns.insert(EdnsOption::Subnet(ClientSubnet::new(
@@ -1181,23 +1263,20 @@ mod tests {
         index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
         index.mark_rebuild_needed();
 
-        let stale_revision = index.stale_revision();
-        let publication_revision = index.publication_revision();
-        let rebuilt = EcsLookupIndex::new();
+        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
+        rebuilt.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
 
-        // Model a reusable ECS cache publication that completed after the
-        // rebuild snapshot started but before it attempted to commit.
-        index.mark_publication();
+        // A removal/eviction racing the scan may make this snapshot
+        // conservatively stale, but must not prevent this pass from committing.
+        index.mark_rebuild_needed();
 
-        assert!(
-            !index.commit_rebuild_if_unchanged(&rebuilt, stale_revision, publication_revision,)
-        );
+        assert!(index.commit_rebuild(&rebuilt, stale_revision));
         assert!(index.needs_rebuild());
         assert_eq!(index.observed_ipv4_prefixes(), 1);
     }
 
     #[test]
-    fn test_ecs_rebuild_commit_swaps_snapshot_when_revisions_are_stable() {
+    fn test_ecs_rebuild_commit_swaps_shadow_when_no_new_stale_work_arrives() {
         let mut request = make_context("example.com.");
         let mut edns = Edns::new();
         edns.insert(EdnsOption::Subnet(ClientSubnet::new(
@@ -1212,12 +1291,10 @@ mod tests {
         index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
         index.mark_rebuild_needed();
 
-        let rebuilt = EcsLookupIndex::new();
+        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
         rebuilt.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
-        let stale_revision = index.stale_revision();
-        let publication_revision = index.publication_revision();
 
-        assert!(index.commit_rebuild_if_unchanged(&rebuilt, stale_revision, publication_revision,));
+        assert!(index.commit_rebuild(&rebuilt, stale_revision));
         assert!(!index.needs_rebuild());
         assert_eq!(index.indexed_base_keys(), 1);
         assert_eq!(index.observed_ipv4_prefixes(), 1);
