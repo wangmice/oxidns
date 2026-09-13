@@ -198,12 +198,7 @@ impl Message {
     /// fully elapsed are omitted instead of being served past their cache
     /// lifetime. EDNS metadata and detached signature records are preserved as
     /// stored.
-    pub fn clone_with_id_and_aged_record_ttls(
-        &self,
-        id: u16,
-        age_secs: u32,
-        max_ttl: u32,
-    ) -> Self {
+    pub fn clone_with_id_and_aged_record_ttls(&self, id: u16, age_secs: u32, max_ttl: u32) -> Self {
         Self {
             header: {
                 let mut header = self.header;
