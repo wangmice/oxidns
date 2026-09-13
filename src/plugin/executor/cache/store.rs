@@ -13,14 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::debug;
 
-use super::key::{cache_lookup_keys, CacheKey, EcsLookupIndex};
+use super::key::{CacheKey, EcsLookupIndex, cache_lookup_keys};
 use super::{
-    cache_skip_reason_for_disposition, is_cache_disposition_valid,
-    response_disposition_for_cache, CacheEntryHandle, CacheItem, CacheMap, CacheMetrics,
+    CacheEntryHandle, CacheItem, CacheMap, CacheMetrics, cache_skip_reason_for_disposition, is_cache_disposition_valid,
+    response_disposition_for_cache,
 };
 use crate::infra::cache::ttl::{
-    TtlCacheConditionalMoveResult, TtlCacheHandleLookup, TtlCacheMoveMetadata,
-    TtlCachePruneMode,
+    TtlCacheConditionalMoveResult, TtlCacheHandleLookup, TtlCacheMoveMetadata, TtlCachePruneMode,
 };
 
 /// Cancellation-safe guard for one in-progress persistence dump.
@@ -61,12 +60,8 @@ impl CacheDumpHandoff {
         if self.resolved {
             return;
         }
-        self.state
-            .inner
-            .updated_keys
-            .fetch_add(self.changed, Ordering::Relaxed);
-        self.state
-            .restore_dirty_since(self.previous_dirty_since_ms);
+        self.state.inner.updated_keys.fetch_add(self.changed, Ordering::Relaxed);
+        self.state.restore_dirty_since(self.previous_dirty_since_ms);
         self.resolved = true;
     }
 }
@@ -130,12 +125,10 @@ impl CacheMutationState {
         // Preserve mutations that happen during the first millisecond of the
         // process lifetime; zero remains the initial timestamp sentinel.
         let now = Self::dirty_timestamp(crate::infra::clock::AppClock::elapsed_millis());
-        let _ = self.inner.dirty_since_ms.compare_exchange(
-            0,
-            now,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .inner
+            .dirty_since_ms
+            .compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     #[inline]
@@ -157,15 +150,9 @@ impl CacheMutationState {
     }
 
     #[inline]
-    fn dump_age_due(
-        now_ms: u64,
-        dirty_since_ms: u64,
-        max_dirty_age_ms: u64,
-        check_interval_ms: u64,
-    ) -> bool {
+    fn dump_age_due(now_ms: u64, dirty_since_ms: u64, max_dirty_age_ms: u64, check_interval_ms: u64) -> bool {
         dirty_since_ms != 0
-            && now_ms.saturating_sub(dirty_since_ms)
-                >= max_dirty_age_ms.saturating_sub(check_interval_ms)
+            && now_ms.saturating_sub(dirty_since_ms) >= max_dirty_age_ms.saturating_sub(check_interval_ms)
     }
 
     /// Begin one dump if either enough mutations accumulated or the oldest
@@ -184,13 +171,7 @@ impl CacheMutationState {
         let dirty_since = self.inner.dirty_since_ms.load(Ordering::Acquire);
         let dirty = self.inner.dirty_generation.load(Ordering::Acquire)
             != self.inner.persisted_generation.load(Ordering::Acquire);
-        let age_due = dirty
-            && Self::dump_age_due(
-                now_ms,
-                dirty_since,
-                max_dirty_age_ms,
-                check_interval_ms,
-            );
+        let age_due = dirty && Self::dump_age_due(now_ms, dirty_since, max_dirty_age_ms, check_interval_ms);
 
         if changed < minimum_changes && !age_due {
             // These are already-accounted mutations, so restoring the counter
@@ -324,12 +305,8 @@ impl DnsCacheStore {
         max_dirty_age_ms: u64,
         check_interval_ms: u64,
     ) -> Option<CacheDumpHandoff> {
-        self.mutations.begin_dump_if_due(
-            now_ms,
-            minimum_changes,
-            max_dirty_age_ms,
-            check_interval_ms,
-        )
+        self.mutations
+            .begin_dump_if_due(now_ms, minimum_changes, max_dirty_age_ms, check_interval_ms)
     }
 
     #[inline]
@@ -355,17 +332,13 @@ impl DnsCacheStore {
 
         let ecs_lookup = request_key.ecs_scope.is_some();
         if ecs_lookup {
-            self.metrics
-                .ecs_lookup_requests_total
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.ecs_lookup_requests_total.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut expired = false;
         for candidate in cache_lookup_keys(&request_key, &self.ecs_lookup_index) {
             if ecs_lookup {
-                self.metrics
-                    .ecs_lookup_candidates_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.ecs_lookup_candidates_total.fetch_add(1, Ordering::Relaxed);
                 if candidate.as_ref() == &request_key {
                     self.metrics
                         .ecs_lookup_exact_fallback_total
@@ -389,8 +362,7 @@ impl DnsCacheStore {
 
                     if let Some(disposition) = invalid_disposition {
                         if self.remove_handle(key, &entry) {
-                            self.metrics
-                                .record_skip(cache_skip_reason_for_disposition(disposition));
+                            self.metrics.record_skip(cache_skip_reason_for_disposition(disposition));
                             debug!(
                                 "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
                                 key.domain,
@@ -405,13 +377,8 @@ impl DnsCacheStore {
                     }
 
                     if now_ms < value.fresh_until_ms {
-                        self.metrics
-                            .fresh_hit_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        let remaining_ttl = value
-                            .fresh_until_ms
-                            .saturating_sub(now_ms)
-                            .saturating_div(1000) as u32;
+                        self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
+                        let remaining_ttl = value.fresh_until_ms.saturating_sub(now_ms).saturating_div(1000) as u32;
                         debug!(
                             "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=fresh",
                             key.domain,
@@ -421,16 +388,11 @@ impl DnsCacheStore {
                             key.cd_bit,
                             key.ecs_scope.is_some()
                         );
-                        return DnsCacheLookup::Fresh {
-                            entry,
-                            remaining_ttl,
-                        };
+                        return DnsCacheLookup::Fresh { entry, remaining_ttl };
                     }
 
                     if allow_stale && now_ms < entry.expire_at_ms() {
-                        self.metrics
-                            .stale_hit_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             "cache hit: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}, kind=stale",
                             key.domain,
@@ -506,8 +468,7 @@ impl DnsCacheStore {
         last_access_ms: u64,
     ) -> bool {
         let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
-        let _index_publication = tracks_ecs_prefix
-            .then(|| self.ecs_lookup_index.publication_guard());
+        let _index_publication = tracks_ecs_prefix.then(|| self.ecs_lookup_index.publication_guard());
         self.ecs_lookup_index.observe_cache_key(&key);
         let inserted = self.cache_map.try_insert_or_update_with_limit(
             key,
@@ -543,17 +504,11 @@ impl DnsCacheStore {
         last_access_ms: u64,
     ) -> bool {
         let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
-        let _index_publication = tracks_ecs_prefix
-            .then(|| self.ecs_lookup_index.publication_guard());
+        let _index_publication = tracks_ecs_prefix.then(|| self.ecs_lookup_index.publication_guard());
         self.ecs_lookup_index.observe_cache_key(&key);
-        let replaced = self.cache_map.replace_handle(
-            key,
-            expected,
-            item,
-            cache_time_ms,
-            expire_at_ms,
-            last_access_ms,
-        );
+        let replaced = self
+            .cache_map
+            .replace_handle(key, expected, item, cache_time_ms, expire_at_ms, last_access_ms);
         if replaced {
             if tracks_ecs_prefix {
                 self.ecs_lookup_index.mark_publication();
@@ -576,19 +531,12 @@ impl DnsCacheStore {
         metadata: TtlCacheMoveMetadata,
     ) -> TtlCacheConditionalMoveResult {
         let tracks_target_prefix = EcsLookupIndex::tracks_cache_key(&target_key);
-        let _index_publication = tracks_target_prefix
-            .then(|| self.ecs_lookup_index.publication_guard());
+        let _index_publication = tracks_target_prefix.then(|| self.ecs_lookup_index.publication_guard());
         self.ecs_lookup_index.observe_cache_key(&target_key);
-        let result = self.cache_map.conditional_move_handle(
-            source_key,
-            target_key,
-            expected,
-            item,
-            metadata,
-        );
-        if tracks_target_prefix
-            && !matches!(result, TtlCacheConditionalMoveResult::SourceChanged)
-        {
+        let result = self
+            .cache_map
+            .conditional_move_handle(source_key, target_key, expected, item, metadata);
+        if tracks_target_prefix && !matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
             self.ecs_lookup_index.mark_publication();
         }
         match result {
@@ -671,20 +619,14 @@ impl DnsCacheStore {
             rebuilt.observe_cache_key(key);
             true
         });
-        let _ = self.ecs_lookup_index.commit_rebuild_if_unchanged(
-            &rebuilt,
-            stale_revision,
-            publication_revision,
-        );
+        let _ = self
+            .ecs_lookup_index
+            .commit_rebuild_if_unchanged(&rebuilt, stale_revision, publication_revision);
     }
 
     /// Prune the published cache and account for every removed entry exactly
     /// once. The returned tuple matches `TtlCache::prune`.
-    pub(super) fn prune(
-        &self,
-        mode: TtlCachePruneMode,
-        now_ms: u64,
-    ) -> (usize, usize, usize) {
+    pub(super) fn prune(&self, mode: TtlCachePruneMode, now_ms: u64) -> (usize, usize, usize) {
         let result = self.cache_map.prune(mode, now_ms);
         let removed = result.0.saturating_add(result.1);
         self.mutations.mark_dirty(removed as u64);
@@ -767,13 +709,7 @@ mod tests {
         let key = test_key("example.com");
         let item = CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000));
 
-        assert!(store.insert_or_update(
-            key.clone(),
-            item,
-            now,
-            now.saturating_add(60_000),
-            now,
-        ));
+        assert!(store.insert_or_update(key.clone(), item, now, now.saturating_add(60_000), now,));
         assert_eq!(mutations.inner.updated_keys.load(Ordering::Relaxed), 1);
         assert_eq!(mutations.inner.dirty_generation.load(Ordering::Acquire), 1);
         assert_eq!(metrics.insert_total.load(Ordering::Relaxed), 1);
@@ -866,10 +802,7 @@ mod tests {
         assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 2);
         assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 2);
 
-        let (expired_removed, _, _) = store.prune(
-            TtlCachePruneMode::Exact { max_size: 4 },
-            now,
-        );
+        let (expired_removed, _, _) = store.prune(TtlCachePruneMode::Exact { max_size: 4 }, now);
 
         assert_eq!(expired_removed, 1);
         assert!(store.ecs_lookup_index_needs_rebuild());
@@ -926,13 +859,7 @@ mod tests {
             now,
         ));
         let fresh = store.lookup(fresh_key, now, 0, false);
-        assert!(matches!(
-            fresh,
-            DnsCacheLookup::Fresh {
-                remaining_ttl: 60,
-                ..
-            }
-        ));
+        assert!(matches!(fresh, DnsCacheLookup::Fresh { remaining_ttl: 60, .. }));
 
         let stale_key = test_key("stale.example");
         assert!(store.insert_or_update(
@@ -992,19 +919,13 @@ mod tests {
         let state = CacheMutationState::new();
         state.inner.dirty_generation.store(1, Ordering::Release);
         state.inner.dirty_since_ms.store(1, Ordering::Release);
-        assert!(state
-            .begin_dump_if_due(120_000, 1024, 120_000, 120_000)
-            .is_some());
+        assert!(state.begin_dump_if_due(120_000, 1024, 120_000, 120_000).is_some());
 
         let state = CacheMutationState::new();
         state.inner.dirty_generation.store(1, Ordering::Release);
         state.inner.dirty_since_ms.store(1, Ordering::Release);
-        assert!(state
-            .begin_dump_if_due(60_000, 1024, 120_000, 60_000)
-            .is_none());
-        assert!(state
-            .begin_dump_if_due(60_001, 1024, 120_000, 60_000)
-            .is_some());
+        assert!(state.begin_dump_if_due(60_000, 1024, 120_000, 60_000).is_none());
+        assert!(state.begin_dump_if_due(60_001, 1024, 120_000, 60_000).is_some());
     }
 
     #[test]
@@ -1105,12 +1026,9 @@ mod tests {
         let generation = state.inner.dirty_generation.load(Ordering::Acquire);
         let dirty_since = state.inner.dirty_since_ms.load(Ordering::Acquire);
 
-        assert!(state
-            .begin_dump_if_due(dirty_since, 1024, 120_000, 60_000)
-            .is_none());
+        assert!(state.begin_dump_if_due(dirty_since, 1024, 120_000, 60_000).is_none());
         assert_eq!(state.inner.updated_keys.load(Ordering::Acquire), 7);
         assert_eq!(state.inner.dirty_generation.load(Ordering::Acquire), generation);
         assert_eq!(state.inner.dirty_since_ms.load(Ordering::Acquire), dirty_since);
     }
-
 }

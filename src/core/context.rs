@@ -571,5 +571,4 @@ mod tests {
         assert!(ctx.runtime.has_miss_leader_ancestor(11));
         assert!(!ctx.runtime.has_miss_leader_ancestor(22));
     }
-
 }

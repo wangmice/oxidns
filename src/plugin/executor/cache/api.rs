@@ -15,20 +15,16 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::key::{
-    CacheKey, canonical_ecs_key_digest, normalize_cache_key_domain, normalize_domain_key,
-};
-#[cfg(test)]
-use super::key::EcsLookupIndex;
-#[cfg(test)]
-use super::persistence::dump_cache_to_bytes;
-use super::persistence::{
-    CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes,
-};
-use super::store::DnsCacheStore;
-use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer};
 #[cfg(test)]
 use super::CacheMetrics;
+#[cfg(test)]
+use super::key::EcsLookupIndex;
+use super::key::{CacheKey, canonical_ecs_key_digest, normalize_cache_key_domain, normalize_domain_key};
+#[cfg(test)]
+use super::persistence::dump_cache_to_bytes;
+use super::persistence::{CacheDumpOutcome, dump_cache_to_bytes_with_limit, stage_cache_from_bytes};
+use super::store::DnsCacheStore;
+use super::{Cache, CacheItem, CacheLoadPolicy, CacheMap, CacheReclaimer};
 use crate::api::query::{optional_text, parse_usize_param, visit_query_params};
 use crate::api::{ApiHandler, json_error, json_ok, simple_response};
 use crate::infra::cache::ttl::{TtlCacheHandle, TtlCachePruneMode};
@@ -122,20 +118,17 @@ impl ApiHandler for CacheFlushHandler {
         // Preparing a replacement DashMap can allocate. Keep that work off the
         // async worker just like dump parsing/pruning.
         let initial_capacity = Cache::initial_cache_capacity(self.store.cache_size());
-        let replacement =
-            match tokio::task::spawn_blocking(move || CacheMap::with_capacity(initial_capacity))
-                .await
-            {
-                Ok(replacement) => replacement,
-                Err(err) => {
-                    warn!("Cache flush preparation worker failed: {}", err);
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "cache_worker_failed",
-                        "cache flush preparation worker failed",
-                    );
-                }
-            };
+        let replacement = match tokio::task::spawn_blocking(move || CacheMap::with_capacity(initial_capacity)).await {
+            Ok(replacement) => replacement,
+            Err(err) => {
+                warn!("Cache flush preparation worker failed: {}", err);
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cache_worker_failed",
+                    "cache flush preparation worker failed",
+                );
+            }
+        };
 
         let mutation_guard = self.mutation_gate.lock().await;
         let retired = self.store.replace_generation(&replacement, 0);
@@ -168,10 +161,7 @@ impl ApiHandler for CacheDumpHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
         let store = self.store.clone();
         match tokio::task::spawn_blocking(move || {
-            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(
-                store.cache_map(),
-                MAX_CACHE_DUMP_BODY,
-            )
+            dump_cache_to_bytes_with_limit::<MAX_CACHE_DUMP_BODY>(store.cache_map(), MAX_CACHE_DUMP_BODY)
         })
         .await
         {
@@ -181,20 +171,12 @@ impl ApiHandler for CacheDumpHandler {
                     http::header::CONTENT_TYPE,
                     http::HeaderValue::from_static("application/octet-stream"),
                 );
-                if let Ok(value) = http::HeaderValue::from_str(&format!(
-                    "attachment; filename=\"{}.dump\"",
-                    self.tag
-                )) {
-                    response
-                        .headers_mut()
-                        .insert(http::header::CONTENT_DISPOSITION, value);
+                if let Ok(value) = http::HeaderValue::from_str(&format!("attachment; filename=\"{}.dump\"", self.tag)) {
+                    response.headers_mut().insert(http::header::CONTENT_DISPOSITION, value);
                 }
                 response
             }
-            Ok(Ok(CacheDumpOutcome::TooLarge {
-                limit,
-                minimum_size,
-            })) => {
+            Ok(Ok(CacheDumpOutcome::TooLarge { limit, minimum_size })) => {
                 warn!(
                     minimum_size,
                     limit, "Cache dump exceeds API size limit; stopped before full serialization"
@@ -207,10 +189,7 @@ impl ApiHandler for CacheDumpHandler {
             }
             Ok(Err(err)) => {
                 warn!("Failed to dump cache via API: {}", err);
-                simple_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Bytes::from("failed to dump cache"),
-                )
+                simple_response(StatusCode::INTERNAL_SERVER_ERROR, Bytes::from("failed to dump cache"))
             }
             Err(err) => {
                 warn!("Cache dump worker failed: {}", err);
@@ -300,9 +279,7 @@ impl ApiHandler for CacheLoadDumpHandler {
                 cache_size,
             )?;
             let (expired_removed, evicted, after_len) = staged_cache.prune(
-                TtlCachePruneMode::Exact {
-                    max_size: cache_size,
-                },
+                TtlCachePruneMode::Exact { max_size: cache_size },
                 AppClock::elapsed_millis(),
             );
 
@@ -320,11 +297,7 @@ impl ApiHandler for CacheLoadDumpHandler {
             // dedicated reclaimer after pre-swap readers are gone.
             cache_reclaimer.submit(retired, reclaim_permit);
 
-            Ok::<_, crate::infra::error::DnsError>((
-                expired_removed,
-                evicted,
-                after_len,
-            ))
+            Ok::<_, crate::infra::error::DnsError>((expired_removed, evicted, after_len))
         })
         .await;
 
@@ -526,11 +499,9 @@ impl ApiHandler for CacheEntriesListHandler {
                 }
 
                 let should_keep = candidates.len() < candidate_limit
-                    || candidates
-                        .peek()
-                        .is_some_and(|largest: &CacheEntryPageCandidate| {
-                            cmp_cache_keys(key, &largest.key) == Ordering::Less
-                        });
+                    || candidates.peek().is_some_and(|largest: &CacheEntryPageCandidate| {
+                        cmp_cache_keys(key, &largest.key) == Ordering::Less
+                    });
 
                 if should_keep {
                     if candidates.len() == candidate_limit {
@@ -556,10 +527,7 @@ impl ApiHandler for CacheEntriesListHandler {
             // Cursor identifies the last key in this page rather than an
             // offset into a mutable collection.
             let next_cursor = if has_more {
-                match entries
-                    .last()
-                    .map(|candidate| encode_cache_entry_id(&candidate.key))
-                {
+                match entries.last().map(|candidate| encode_cache_entry_id(&candidate.key)) {
                     Some(Ok(cursor)) => Some(cursor),
                     Some(Err(err)) => {
                         warn!("Failed to encode cache entries cursor: {}", err);
@@ -578,9 +546,7 @@ impl ApiHandler for CacheEntriesListHandler {
 
             let rows = entries
                 .iter()
-                .filter_map(|candidate| {
-                    cache_entry_row(&candidate.key, &candidate.entry, now, now_unix_ms).ok()
-                })
+                .filter_map(|candidate| cache_entry_row(&candidate.key, &candidate.entry, now, now_unix_ms).ok())
                 .collect::<Vec<_>>();
 
             json_ok(
@@ -657,9 +623,7 @@ struct CacheEntriesQuery {
     qname: Option<String>,
 }
 
-fn parse_cache_entries_query(
-    query: Option<&str>,
-) -> std::result::Result<CacheEntriesQuery, String> {
+fn parse_cache_entries_query(query: Option<&str>) -> std::result::Result<CacheEntriesQuery, String> {
     let mut limit = 100usize;
     let mut cursor = None;
     let mut qname = None;
@@ -667,17 +631,12 @@ fn parse_cache_entries_query(
     visit_query_params(query, |key, value| {
         match key {
             "limit" => {
-                limit =
-                    parse_usize_param(value, |_| "limit must be a positive integer".to_string())?
-                        .clamp(1, 500);
+                limit = parse_usize_param(value, |_| "limit must be a positive integer".to_string())?.clamp(1, 500);
             }
 
             "cursor" => {
                 cursor = optional_text(value)
-                    .map(|raw| {
-                        decode_cache_entry_id(raw.as_str())
-                            .map_err(|err| format!("invalid cursor: {err}"))
-                    })
+                    .map(|raw| decode_cache_entry_id(raw.as_str()).map_err(|err| format!("invalid cursor: {err}")))
                     .transpose()?;
             }
 
@@ -691,11 +650,7 @@ fn parse_cache_entries_query(
         Ok(())
     })?;
 
-    Ok(CacheEntriesQuery {
-        limit,
-        cursor,
-        qname,
-    })
+    Ok(CacheEntriesQuery { limit, cursor, qname })
 }
 
 #[inline]
@@ -807,24 +762,9 @@ fn cache_entry_row(
         do_bit: key.do_bit,
         cd_bit: key.cd_bit,
         answers_json: item.resp.answers().iter().map(cache_record_json).collect(),
-        authorities_json: item
-            .resp
-            .authorities()
-            .iter()
-            .map(cache_record_json)
-            .collect(),
-        additionals_json: item
-            .resp
-            .additionals()
-            .iter()
-            .map(cache_record_json)
-            .collect(),
-        signature_json: item
-            .resp
-            .signature()
-            .iter()
-            .map(cache_record_json)
-            .collect(),
+        authorities_json: item.resp.authorities().iter().map(cache_record_json).collect(),
+        additionals_json: item.resp.additionals().iter().map(cache_record_json).collect(),
+        signature_json: item.resp.signature().iter().map(cache_record_json).collect(),
         ecs_scope,
     })
 }
@@ -838,8 +778,7 @@ fn elapsed_to_unix_ms(elapsed_ms: u64, now_ms: u64, now_unix_ms: u64) -> u64 {
 }
 
 fn cache_record_json(record: &Record) -> CacheRecordJson {
-    let (payload_kind, payload_text, payload) =
-        rdata_payload(record.data(), RDataPayloadMode::Cache);
+    let (payload_kind, payload_text, payload) = rdata_payload(record.data(), RDataPayloadMode::Cache);
     CacheRecordJson {
         name: record.name().to_fqdn(),
         class: dns_class_name(record.class()),
@@ -890,8 +829,8 @@ fn decode_cache_entry_id(raw: &str) -> std::result::Result<CacheKey, String> {
     let bytes = URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| "cache entry id is not valid base64url".to_string())?;
-    let id: CacheEntryId = serde_json::from_slice(&bytes)
-        .map_err(|_| "cache entry id is not valid json".to_string())?;
+    let id: CacheEntryId =
+        serde_json::from_slice(&bytes).map_err(|_| "cache entry id is not valid json".to_string())?;
 
     let domain = normalize_cache_key_domain(&id.domain)
         .ok_or_else(|| "cache entry id domain is invalid DNS text".to_string())?;
@@ -986,26 +925,14 @@ mod tests {
             qname: Some("example.com".to_string()),
         };
 
-        assert!(cache_entry_matches_query(
-            &test_cache_key("www.Example.COM"),
-            &query
-        ));
-        assert!(!cache_entry_matches_query(
-            &test_cache_key("www.example.net"),
-            &query
-        ));
+        assert!(cache_entry_matches_query(&test_cache_key("www.Example.COM"), &query));
+        assert!(!cache_entry_matches_query(&test_cache_key("www.example.net"), &query));
     }
 
     #[test]
     fn contains_ascii_case_insensitive_avoids_case_sensitive_qname_regression() {
-        assert!(contains_ascii_case_insensitive(
-            "WWW.Example.COM",
-            "example.com"
-        ));
-        assert!(!contains_ascii_case_insensitive(
-            "www.example.net",
-            "example.com"
-        ));
+        assert!(contains_ascii_case_insensitive("WWW.Example.COM", "example.com"));
+        assert!(!contains_ascii_case_insensitive("www.example.net", "example.com"));
     }
 
     #[test]
@@ -1182,8 +1109,7 @@ mod tests {
             .expect("load should run after the mutation gate is released");
 
         let gate_guard = mutation_gate.lock().await;
-        let flush_task =
-            tokio::spawn(async move { flush.handle(Request::new(Bytes::new())).await });
+        let flush_task = tokio::spawn(async move { flush.handle(Request::new(Bytes::new())).await });
         tokio::task::yield_now().await;
         assert!(!flush_task.is_finished());
         drop(gate_guard);

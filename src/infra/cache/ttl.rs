@@ -170,7 +170,8 @@ pub(crate) enum TtlCacheConditionalMoveResult {
     /// contained a retained entry. The existing target entry was preserved.
     Consolidated,
     /// The source still matched and the target existed but was already expired.
-    /// Both old entries were removed and the refreshed value replaced the target.
+    /// Both old entries were removed and the refreshed value replaced the
+    /// target.
     ReplacedExpiredTarget,
     /// The source entry was missing or no longer matched the supplied identity.
     SourceChanged,
@@ -419,7 +420,8 @@ where
                 impl Drop for RollbackGuard<'_> {
                     fn drop(&mut self) {
                         if !self.success {
-                            // Roll back the reserved slot if insertion cannot complete.
+                            // Roll back the reserved slot if insertion cannot
+                            // complete.
                             self.entry_count.fetch_sub(1, Ordering::Release);
                         }
                     }
@@ -569,7 +571,6 @@ where
     /// Moving an existing entry preserves cache cardinality, so capacity
     /// accounting does not need a release/reacquire cycle and concurrent
     /// bounded insertions cannot steal the source entry's slot mid-move.
-    ///
     pub(crate) fn conditional_move_handle(
         &self,
         source_key: &K,
@@ -618,8 +619,7 @@ where
 
                     // SAFETY: `source_bucket` came from this write-locked
                     // RawTable and no mutation has happened since `find`.
-                    let ((_removed_key, removed_value), _) =
-                        unsafe { shard.remove(source_bucket) };
+                    let ((_removed_key, removed_value), _) = unsafe { shard.remove(source_bucket) };
                     drop(removed_value);
 
                     match target_expired {
@@ -1130,10 +1130,7 @@ where
     ///
     /// The callback runs while the corresponding DashMap read guard is held, so
     /// it must stay lightweight and must not call back into this cache.
-    pub(crate) fn visit_handles(
-        &self,
-        mut visitor: impl FnMut(&K, TtlCacheHandle<V>) -> bool,
-    ) {
+    pub(crate) fn visit_handles(&self, mut visitor: impl FnMut(&K, TtlCacheHandle<V>) -> bool) {
         let state = self.state.load();
         for item in state.map.iter() {
             let handle = TtlCacheHandle {
@@ -1224,10 +1221,8 @@ where
                     .load(Ordering::Acquire)
                     .saturating_sub(max_size);
                 if remaining_excess > 0 {
-                    evicted = evicted.saturating_add(Self::evict_lru_exact_fallback(
-                        &state,
-                        remaining_excess,
-                    ));
+                    evicted = evicted
+                        .saturating_add(Self::evict_lru_exact_fallback(&state, remaining_excess));
                 }
 
                 // Prepared/imported generations can temporarily grow far
@@ -1287,8 +1282,8 @@ where
             return (0, 0, state.entry_count.load(Ordering::Acquire));
         }
 
-        let sampled_all_entries = current_size <= PERIODIC_MAINTENANCE_SAMPLE_SIZE
-            && sample.len() == current_size;
+        let sampled_all_entries =
+            current_size <= PERIODIC_MAINTENANCE_SAMPLE_SIZE && sample.len() == current_size;
         let mut live_candidates = Vec::with_capacity(sample.len());
         let mut expired_removed = 0usize;
 
@@ -1670,7 +1665,10 @@ mod tests {
             TtlCacheConditionalMoveResult::Moved
         );
         assert!(cache.get_retained_handle(&source, 20, 0).is_none());
-        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 20);
+        assert_eq!(
+            *cache.get_retained_handle(&target, 20, 0).unwrap().value(),
+            20
+        );
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -1698,7 +1696,10 @@ mod tests {
             TtlCacheConditionalMoveResult::Consolidated
         );
         assert!(cache.get_retained_handle(&source, 20, 0).is_none());
-        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
+        assert_eq!(
+            *cache.get_retained_handle(&target, 20, 0).unwrap().value(),
+            99
+        );
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -1726,7 +1727,10 @@ mod tests {
             TtlCacheConditionalMoveResult::Consolidated
         );
         assert!(cache.get_retained_handle(&source, 20, 0).is_none());
-        assert_eq!(*cache.get_retained_handle(&target, 20, 0).unwrap().value(), 99);
+        assert_eq!(
+            *cache.get_retained_handle(&target, 20, 0).unwrap().value(),
+            99
+        );
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -1818,8 +1822,14 @@ mod tests {
             ),
             TtlCacheConditionalMoveResult::SourceChanged
         );
-        assert_eq!(*cache.get_retained_handle(&source, 40, 0).unwrap().value(), 11);
-        assert_eq!(*cache.get_retained_handle(&target, 40, 0).unwrap().value(), 99);
+        assert_eq!(
+            *cache.get_retained_handle(&source, 40, 0).unwrap().value(),
+            11
+        );
+        assert_eq!(
+            *cache.get_retained_handle(&target, 40, 0).unwrap().value(),
+            99
+        );
         assert_eq!(cache.entry_count(), 2);
     }
 
@@ -2153,7 +2163,10 @@ mod tests {
         );
 
         assert_eq!(expired_removed, 0);
-        assert!(evicted > 0, "periodic prune made no progress after compaction");
+        assert!(
+            evicted > 0,
+            "periodic prune made no progress after compaction"
+        );
         assert_eq!(after_len, before_len - evicted);
     }
 
