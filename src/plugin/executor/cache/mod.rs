@@ -1292,19 +1292,36 @@ impl Cache {
             } => {
                 let value = entry.value();
                 let cache_age_ms = value.total_cache_age_ms(entry.cache_time_ms(), now);
-                let mut resp = Self::restore_fresh_cached_message(
+                debug_assert!(
+                    self.ecs_in_key
+                        || value
+                            .resp
+                            .edns()
+                            .as_ref()
+                            .and_then(|edns| edns.option(EdnsCode::Subnet))
+                            .is_none(),
+                    "ordinary cache entries must not retain ECS",
+                );
+                let resp = Self::restore_fresh_cached_message(
                     value,
                     &context.request,
                     cache_age_ms,
                     *remaining_ttl,
                 );
-                if !self.ecs_in_key {
-                    strip_ecs_from_message(&mut resp);
-                }
                 context.set_response(resp);
             }
             DnsCacheLookup::Stale { entry, .. } => {
                 let value = entry.value();
+                debug_assert!(
+                    self.ecs_in_key
+                        || value
+                            .resp
+                            .edns()
+                            .as_ref()
+                            .and_then(|edns| edns.option(EdnsCode::Subnet))
+                            .is_none(),
+                    "ordinary cache entries must not retain ECS",
+                );
                 let mut resp = Self::restore_stale_cached_message(
                     value,
                     &context.request,
@@ -1315,9 +1332,6 @@ impl Cache {
                 // longer be safely preserved (for example, its RRSIG may have
                 // expired), so never serve stale data with AD set.
                 resp.set_authentic_data(false);
-                if !self.ecs_in_key {
-                    strip_ecs_from_message(&mut resp);
-                }
                 context.set_response(resp);
             }
             DnsCacheLookup::Miss { .. } => {}
@@ -2811,6 +2825,120 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ecs_disabled_for_keying_strips_ecs_after_coalesce_timeout() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(false);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            EcsSteeredResponseExecutor {
+                calls: calls.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut request, "203.0.113.199/24");
+        let mut context = make_context(request);
+        let key = Cache::build_cache_key(&mut context, false).expect("cache key should exist");
+        let miss_key = MissCoalesceKey::new(key, Some(next.coalesce_identity()));
+        let _leader = match cache.miss_coalescer.register(miss_key, &context) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("pre-registered miss should become leader")
+            }
+        };
+
+        let step = cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("timed-out follower should execute downstream");
+
+        assert_eq!(step, ExecStep::Next);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesce_timeout_total
+                .load(AtomicOrdering::Relaxed),
+            1,
+        );
+        assert_eq!(cache.store.cache_map().len(), 0);
+        let response = context.response().expect("timeout bypass should return response");
+        assert!(response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))));
+        assert!(
+            response
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "coalescing timeout bypass must strip upstream ECS",
+        );
+    }
+
+    #[tokio::test]
+    async fn ecs_disabled_for_keying_strips_ecs_on_reentrant_miss_bypass() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(false);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            EcsSteeredResponseExecutor {
+                calls: calls.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut request, "198.51.100.45/24");
+        let mut context = make_context(request);
+        let key = Cache::build_cache_key(&mut context, false).expect("cache key should exist");
+        let miss_key = MissCoalesceKey::new(key, Some(next.coalesce_identity()));
+        let leader = match cache.miss_coalescer.register(miss_key, &context) {
+            MissRole::Leader(leader) => leader,
+            MissRole::Follower(_) | MissRole::Reentrant => {
+                panic!("pre-registered miss should become leader")
+            }
+        };
+        let previous_ancestry = context.runtime.push_miss_leader_ancestor(leader.token());
+
+        let result = cache.execute_with_next(&mut context, Some(next)).await;
+        context
+            .runtime
+            .restore_miss_leader_ancestry(previous_ancestry);
+        let step = result.expect("reentrant miss should execute downstream directly");
+
+        assert_eq!(step, ExecStep::Next);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .miss_coalesce_reentrant_total
+                .load(AtomicOrdering::Relaxed),
+            1,
+        );
+        assert_eq!(cache.store.cache_map().len(), 0);
+        let response = context.response().expect("reentrant bypass should return response");
+        assert!(response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 2))));
+        assert!(
+            response
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "reentrant miss bypass must strip upstream ECS",
+        );
+    }
+
     #[tokio::test]
     async fn miss_coalescer_does_not_share_transient_results_across_programs() {
         AppClock::start();
@@ -3421,6 +3549,80 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct EcsSteeredResponseExecutor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for EcsSteeredResponseExecutor {
+        fn tag(&self) -> &str {
+            "ecs_steered_response_executor"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for EcsSteeredResponseExecutor {
+        fn with_next(&self) -> bool {
+            true
+        }
+
+        async fn execute(&self, _context: &mut DnsContext) -> Result<ExecStep> {
+            Ok(ExecStep::Next)
+        }
+
+        async fn execute_with_next(
+            &self,
+            context: &mut DnsContext,
+            next: Option<ExecutorNext>,
+        ) -> Result<ExecStep> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            let question = context
+                .request
+                .first_question()
+                .cloned()
+                .expect("ECS-steered request should contain a question");
+            let request_subnet = context
+                .request
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .and_then(|option| match option {
+                    EdnsOption::Subnet(subnet) => Some(subnet),
+                    _ => None,
+                });
+            let answer = match request_subnet.map(|subnet| subnet.addr()) {
+                Some(IpAddr::V4(addr)) if addr.octets()[0] == 203 => {
+                    Ipv4Addr::new(9, 9, 9, 1)
+                }
+                Some(IpAddr::V4(_)) => Ipv4Addr::new(9, 9, 9, 2),
+                Some(IpAddr::V6(_)) => Ipv4Addr::new(9, 9, 9, 3),
+                None => Ipv4Addr::new(9, 9, 9, 4),
+            };
+
+            let mut response = Message::new();
+            response.set_id(context.request.id());
+            response.set_rcode(Rcode::NoError);
+            response.add_question(question.clone());
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                55,
+                RData::A(crate::proto::rdata::A(answer)),
+            ));
+            if let Some(request_subnet) = request_subnet {
+                let mut edns = Edns::new();
+                edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+                    request_subnet.addr(),
+                    request_subnet.source_prefix(),
+                    16,
+                )));
+                response.set_edns(edns);
+            }
+            context.set_response(response);
+            continue_next!(next, context)
+        }
+    }
+
+    #[derive(Debug)]
     struct RecursiveCacheExecutor {
         cache: Arc<Cache>,
         inner_next: ExecutorNext,
@@ -3772,10 +3974,11 @@ mod tests {
         let _ = cache.init_for_test().await;
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let program =
-            ChainProgram::single_with_next_executor_for_test(Arc::new(StubRefreshExecutor {
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            EcsSteeredResponseExecutor {
                 calls: calls.clone(),
-            }));
+            },
+        ));
         let next = ExecutorNext::from_program_for_test(program, 0);
 
         let mut first_request = make_request_with_query("example.com.", false, false);
@@ -3789,6 +3992,14 @@ mod tests {
         assert_eq!(first_step, ExecStep::Next);
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(cache.store.cache_map().len(), 1);
+        assert!(
+            first_context
+                .response()
+                .is_some_and(|response| response.has_answer_ip(|ip| {
+                    ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))
+                })),
+            "the first ECS request should determine the shared cached answer",
+        );
         assert!(
             first_context
                 .response()
@@ -3808,6 +4019,17 @@ mod tests {
             .expect("second ECS request should succeed from shared cache");
         assert_eq!(second_step, ExecStep::Stop);
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        let second_response = second_context
+            .response()
+            .expect("shared cache hit should set a response");
+        assert!(
+            second_response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))),
+            "the second ECS client must reuse the first client's cached answer",
+        );
+        assert!(
+            !second_response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 2))),
+            "the second ECS client must not run upstream and replace the first-writer answer",
+        );
         assert!(
             second_context
                 .response()
@@ -3866,6 +4088,125 @@ mod tests {
                 .and_then(|edns| edns.option(EdnsCode::Subnet))
                 .is_none(),
             "ordinary cache entries must not retain upstream ECS"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecs_disabled_for_keying_lazy_refresh_uses_triggering_ecs_for_shared_answer() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.ecs_in_key = Some(false);
+        config.lazy_cache_ttl = Some(3_600);
+        config.short_circuit = Some(true);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+
+        let mut stale_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut stale_request, "198.51.100.45/24");
+        let mut stale_context = make_context(stale_request);
+        let key = Cache::build_cache_key(&mut stale_context, false)
+            .expect("shared cache key should exist");
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key.clone(),
+            CacheItem::new_validated(
+                cacheable_response_for_domain("example.com.", 120),
+                120,
+                now.saturating_sub(1),
+            ),
+            now.saturating_sub(121_000),
+            now.saturating_add(3_000_000),
+            now,
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            EcsSteeredResponseExecutor {
+                calls: calls.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let step = cache
+            .execute_with_next(&mut stale_context, Some(next.clone()))
+            .await
+            .expect("stale shared hit should start lazy refresh");
+        assert_eq!(step, ExecStep::Stop);
+        assert!(
+            stale_context
+                .response()
+                .is_some_and(|response| response.has_answer_ip(|ip| {
+                    ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
+                })),
+            "the stale answer should be served before refresh completes",
+        );
+        assert!(
+            stale_context
+                .response()
+                .and_then(|response| response.edns().as_ref())
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "stale ordinary cache hits must not reconstruct ECS",
+        );
+
+        wait_until("shared ECS lazy refresh should complete", || {
+            cache
+                .store
+                .metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+
+        let refreshed = cache
+            .store
+            .cache_map()
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
+            .expect("refreshed shared entry should remain cached");
+        assert!(
+            refreshed
+                .value()
+                .resp
+                .has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 2))),
+            "the ECS that triggered refresh should determine the new shared answer",
+        );
+        assert!(
+            refreshed
+                .value()
+                .resp
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "lazy refresh must strip ECS before replacing the ordinary cache entry",
+        );
+        drop(refreshed);
+
+        let mut later_request = make_request_with_query("example.com.", false, false);
+        add_ecs(&mut later_request, "203.0.113.199/24");
+        let mut later_context = make_context(later_request);
+        let later_step = cache
+            .execute_with_next(&mut later_context, Some(next))
+            .await
+            .expect("later ECS client should use refreshed shared cache");
+        assert_eq!(later_step, ExecStep::Stop);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        let later_response = later_context
+            .response()
+            .expect("shared cache hit should return refreshed response");
+        assert!(
+            later_response.has_answer_ip(|ip| ip == IpAddr::V4(Ipv4Addr::new(9, 9, 9, 2))),
+            "later ECS clients must reuse the refresh winner's shared answer",
+        );
+        assert!(
+            later_response
+                .edns()
+                .as_ref()
+                .and_then(|edns| edns.option(EdnsCode::Subnet))
+                .is_none(),
+            "shared cache hits after refresh must not expose ECS",
         );
     }
 
