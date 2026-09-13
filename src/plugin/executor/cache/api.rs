@@ -292,6 +292,7 @@ impl ApiHandler for CacheLoadDumpHandler {
                 policy,
                 &ecs_prefix_hints,
                 Cache::initial_cache_capacity(cache_size),
+                cache_size,
             )?;
             let (expired_removed, evicted, after_len) = staged_cache.prune(
                 TtlCachePruneMode::Exact {

@@ -3,6 +3,8 @@
 
 //! Cache persistence helpers.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
@@ -90,6 +92,8 @@ struct PreparedCacheEntry {
     cache_time_ms: u64,
     expire_at_ms: u64,
     last_access_ms: u64,
+    restore_cache_age_ms: u64,
+    restore_last_access_age_ms: u64,
 }
 
 fn invalid_dump(message: impl Into<String>) -> DnsError {
@@ -451,10 +455,142 @@ fn to_cache_key(entry: &PersistedCacheEntry, ecs_in_key: bool) -> Result<Option<
     }))
 }
 
-fn prepare_persisted_entries(
+fn prepare_loaded_entry(
+    entry: PersistedCacheEntry,
+    ecs_in_key: bool,
+    policy: CacheLoadPolicy,
+    dump_version: u32,
+    now_elapsed_ms: u64,
+    downtime_ms: u64,
+) -> Result<Option<PreparedCacheEntry>> {
+    let remaining_before_clamp = entry.remaining_ttl_ms.saturating_sub(downtime_ms);
+    if remaining_before_clamp == 0 {
+        return Ok(None);
+    }
+
+    let effective_cache_age_ms = entry.cache_age_ms.saturating_add(downtime_ms);
+    let effective_last_access_age_ms = entry.last_access_age_ms.saturating_add(downtime_ms);
+
+    let Some(key) = to_cache_key(&entry, ecs_in_key)? else {
+        return Ok(None);
+    };
+
+    let resp = Message::from_bytes(&entry.resp_bytes).map_err(|err| {
+        invalid_dump(format!(
+            "failed to parse DNS message for {}: {}",
+            entry.domain, err
+        ))
+    })?;
+
+    let disposition = response_disposition_for_cache(&resp, &key);
+    if !is_cache_disposition_valid(disposition) {
+        // A structurally valid dump can contain entries that are no longer
+        // cacheable under current validation rules. Skip those entries.
+        return Ok(None);
+    }
+
+    if !persisted_ecs_key_matches_response(&key, &resp) {
+        return Err(invalid_dump(format!(
+            "entry for {} contains ECS metadata inconsistent with its response",
+            entry.domain
+        )));
+    }
+
+    // Version 1 derived cache_age_ms from the freshness deadline. For an
+    // entry that was already stale when dumped, that value is pinned at
+    // ttl_ms and its real age is unrecoverable. Keep compatible v1 fresh
+    // entries, whose age is exact, but conservatively drop ambiguous stale
+    // entries instead of potentially reviving them under a new lazy TTL.
+    if dump_version == LEGACY_CACHE_DUMP_VERSION
+        && entry.cache_age_ms >= u64::from(entry.ttl).saturating_mul(1000)
+    {
+        return Ok(None);
+    }
+
+    let (ttl, fresh_remaining_ms, retention_remaining_ms) = clamp_persisted_cache_ttl(
+        &resp,
+        &key,
+        disposition,
+        entry.ttl,
+        remaining_before_clamp,
+        effective_cache_age_ms,
+        policy,
+    );
+    if ttl == 0 || retention_remaining_ms == 0 {
+        return Ok(None);
+    }
+
+    let expire_at_ms = now_elapsed_ms.saturating_add(retention_remaining_ms);
+    let represented_cache_age_ms = effective_cache_age_ms.min(now_elapsed_ms);
+    let cache_time_ms = now_elapsed_ms.saturating_sub(represented_cache_age_ms);
+    let cache_age_offset_ms = effective_cache_age_ms.saturating_sub(represented_cache_age_ms);
+    let last_access_ms = now_elapsed_ms.saturating_sub(effective_last_access_age_ms);
+
+    // Freshness and stale retention are both calculated from the true
+    // persisted age above. Preserve the part that the current process's
+    // monotonic epoch cannot encode so later dumps continue that same age.
+    let fresh_until_ms = now_elapsed_ms.saturating_add(fresh_remaining_ms);
+
+    Ok(Some(PreparedCacheEntry {
+        key,
+        value: CacheItem::new_validated_with_age_offset(
+            resp,
+            ttl,
+            fresh_until_ms,
+            cache_age_offset_ms,
+        ),
+        cache_time_ms,
+        expire_at_ms,
+        last_access_ms,
+        restore_cache_age_ms: effective_cache_age_ms,
+        restore_last_access_age_ms: effective_last_access_age_ms,
+    }))
+}
+
+struct RankedPreparedEntry {
+    entry: PreparedCacheEntry,
+    sequence: usize,
+}
+
+impl RankedPreparedEntry {
+    #[inline]
+    fn rank(&self) -> (u64, u64, usize) {
+        (
+            u64::MAX.saturating_sub(self.entry.restore_last_access_age_ms),
+            u64::MAX.saturating_sub(self.entry.restore_cache_age_ms),
+            self.sequence,
+        )
+    }
+}
+
+impl PartialEq for RankedPreparedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+
+impl Eq for RankedPreparedEntry {}
+
+impl PartialOrd for RankedPreparedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedPreparedEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse the natural rank ordering so BinaryHeap::peek() is the
+        // oldest retained candidate. A more-recent candidate can then replace
+        // it in O(log cache_size) without materializing the whole dump twice.
+        other.rank().cmp(&self.rank())
+    }
+}
+
+fn prepare_persisted_entries_bounded(
     dump: PersistedCacheDump,
     ecs_in_key: bool,
     policy: CacheLoadPolicy,
+    max_entries: usize,
 ) -> Result<Vec<PreparedCacheEntry>> {
     let now_elapsed_ms = AppClock::elapsed_millis();
     let now_unix_ms = AppClock::now_timestamp();
@@ -463,93 +599,52 @@ fn prepare_persisted_entries(
     // expiry still uses AppClock's monotonic elapsed time.
     let downtime_ms = now_unix_ms.saturating_sub(dump.dumped_at_unix_ms);
     let dump_version = dump.version;
-    let mut prepared = Vec::with_capacity(dump.entries.len());
+    let mut retained = BinaryHeap::with_capacity(max_entries.min(dump.entries.len()));
 
-    for entry in dump.entries {
-        let remaining_before_clamp = entry.remaining_ttl_ms.saturating_sub(downtime_ms);
-        if remaining_before_clamp == 0 {
-            continue;
-        }
-
-        let effective_cache_age_ms = entry.cache_age_ms.saturating_add(downtime_ms);
-        let effective_last_access_age_ms = entry.last_access_age_ms.saturating_add(downtime_ms);
-
-        let Some(key) = to_cache_key(&entry, ecs_in_key)? else {
+    for (sequence, persisted) in dump.entries.into_iter().enumerate() {
+        let Some(entry) = prepare_loaded_entry(
+            persisted,
+            ecs_in_key,
+            policy,
+            dump_version,
+            now_elapsed_ms,
+            downtime_ms,
+        )?
+        else {
             continue;
         };
 
-        let resp = Message::from_bytes(&entry.resp_bytes).map_err(|err| {
-            invalid_dump(format!(
-                "failed to parse DNS message for {}: {}",
-                entry.domain, err
-            ))
-        })?;
-
-        let disposition = response_disposition_for_cache(&resp, &key);
-        if !is_cache_disposition_valid(disposition) {
-            // A structurally valid dump can contain entries that are no longer
-            // cacheable under current validation rules. Skip those entries,
-            // but do not partially mutate the live cache while deciding.
+        if max_entries == 0 {
+            // Keep validating the full dump transactionally, but retain no
+            // expensive decoded cache objects when the configured cache size
+            // is zero.
             continue;
         }
 
-        if !persisted_ecs_key_matches_response(&key, &resp) {
-            return Err(invalid_dump(format!(
-                "entry for {} contains ECS metadata inconsistent with its response",
-                entry.domain
-            )));
-        }
-
-        // Version 1 derived cache_age_ms from the freshness deadline. For an
-        // entry that was already stale when dumped, that value is pinned at
-        // ttl_ms and its real age is unrecoverable. Keep compatible v1 fresh
-        // entries, whose age is exact, but conservatively drop ambiguous stale
-        // entries instead of potentially reviving them under a new lazy TTL.
-        if dump_version == LEGACY_CACHE_DUMP_VERSION
-            && entry.cache_age_ms >= u64::from(entry.ttl).saturating_mul(1000)
-        {
+        let candidate = RankedPreparedEntry { entry, sequence };
+        if retained.len() < max_entries {
+            retained.push(candidate);
             continue;
         }
 
-        let (ttl, fresh_remaining_ms, retention_remaining_ms) = clamp_persisted_cache_ttl(
-            &resp,
-            &key,
-            disposition,
-            entry.ttl,
-            remaining_before_clamp,
-            effective_cache_age_ms,
-            policy,
-        );
-        if ttl == 0 || retention_remaining_ms == 0 {
-            continue;
+        let should_replace_oldest = retained
+            .peek()
+            .is_some_and(|oldest| candidate.rank() > oldest.rank());
+        if should_replace_oldest {
+            retained.pop();
+            retained.push(candidate);
         }
-
-        let expire_at_ms = now_elapsed_ms.saturating_add(retention_remaining_ms);
-        let represented_cache_age_ms = effective_cache_age_ms.min(now_elapsed_ms);
-        let cache_time_ms = now_elapsed_ms.saturating_sub(represented_cache_age_ms);
-        let cache_age_offset_ms = effective_cache_age_ms.saturating_sub(represented_cache_age_ms);
-        let last_access_ms = now_elapsed_ms.saturating_sub(effective_last_access_age_ms);
-
-        // Freshness and stale retention are both calculated from the true
-        // persisted age above. Preserve the part that the current process's
-        // monotonic epoch cannot encode so later dumps continue that same age.
-        let fresh_until_ms = now_elapsed_ms.saturating_add(fresh_remaining_ms);
-
-        prepared.push(PreparedCacheEntry {
-            key,
-            value: CacheItem::new_validated_with_age_offset(
-                resp,
-                ttl,
-                fresh_until_ms,
-                cache_age_offset_ms,
-            ),
-            cache_time_ms,
-            expire_at_ms,
-            last_access_ms,
-        });
     }
 
-    Ok(prepared)
+    // Insertion order is irrelevant for capacity, but restoring chronological
+    // order makes equal-key replacement deterministic and preserves the newer
+    // cache_time_ms value through insert_if_not_newer().
+    let mut prepared: Vec<_> = retained.into_iter().collect();
+    prepared.sort_unstable_by_key(|candidate| candidate.sequence);
+    Ok(prepared
+        .into_iter()
+        .map(|candidate| candidate.entry)
+        .collect())
 }
 
 async fn read_cache_dump_file_bounded(
@@ -600,6 +695,7 @@ pub(super) async fn load_cache_from_file(
     ecs_in_key: bool,
     ecs_prefix_hints: Arc<EcsPrefixHints>,
     policy: CacheLoadPolicy,
+    max_entries: usize,
 ) -> Result<()> {
     let Some(file_len) = file_len_if_exists(dump_path).await? else {
         return Ok(());
@@ -619,13 +715,14 @@ pub(super) async fn load_cache_from_file(
     let cache_map = cache_map.clone();
 
     let loaded = match tokio::task::spawn_blocking(move || {
-        load_cache_from_bytes_with_hints::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+        load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
             ecs_in_key,
             policy,
             false,
             &ecs_prefix_hints,
+            max_entries,
         )
     })
     .await
@@ -682,11 +779,32 @@ fn load_cache_from_bytes_with_hints<const PREALLOCATION_LIMIT: usize>(
     replace: bool,
     ecs_prefix_hints: &EcsPrefixHints,
 ) -> Result<usize> {
-    // Transaction boundary: deserialize, validate, age and build every entry
-    // before touching the live cache. If any structural validation fails, the
-    // caller gets Err and the existing cache remains unchanged.
+    load_cache_from_bytes_with_hints_bounded::<PREALLOCATION_LIMIT>(
+        cache_map,
+        data,
+        ecs_in_key,
+        policy,
+        replace,
+        ecs_prefix_hints,
+        usize::MAX,
+    )
+}
+
+fn load_cache_from_bytes_with_hints_bounded<const PREALLOCATION_LIMIT: usize>(
+    cache_map: &CacheMap,
+    data: &[u8],
+    ecs_in_key: bool,
+    policy: CacheLoadPolicy,
+    replace: bool,
+    ecs_prefix_hints: &EcsPrefixHints,
+    max_entries: usize,
+) -> Result<usize> {
+    // Transaction boundary: deserialize and validate the entire dump before
+    // touching the destination cache. Expensive decoded cache objects are kept
+    // only for the most-recent `max_entries` candidates, so staging memory is
+    // bounded by the configured cache size rather than dump entry count.
     let dump = parse_persisted_dump_with_limit::<PREALLOCATION_LIMIT>(data)?;
-    let prepared = prepare_persisted_entries(dump, ecs_in_key, policy)?;
+    let prepared = prepare_persisted_entries_bounded(dump, ecs_in_key, policy, max_entries)?;
 
     if replace {
         cache_map.clear();
@@ -724,15 +842,17 @@ pub(super) fn stage_cache_from_bytes<const PREALLOCATION_LIMIT: usize>(
     policy: CacheLoadPolicy,
     ecs_prefix_hints: &EcsPrefixHints,
     capacity: usize,
+    max_entries: usize,
 ) -> Result<(CacheMap, usize)> {
     let staged = CacheMap::with_capacity(capacity);
-    let loaded = load_cache_from_bytes_with_hints::<PREALLOCATION_LIMIT>(
+    let loaded = load_cache_from_bytes_with_hints_bounded::<PREALLOCATION_LIMIT>(
         &staged,
         data,
         ecs_in_key,
         policy,
         false,
         ecs_prefix_hints,
+        max_entries,
     )?;
     Ok((staged, loaded))
 }
@@ -878,11 +998,7 @@ mod tests {
                     cd_bit: false,
                     ecs_scope: None,
                 },
-                CacheItem::new_validated(
-                    response,
-                    120,
-                    now.saturating_add(120_000),
-                ),
+                CacheItem::new_validated(response, 120, now.saturating_add(120_000)),
                 now,
                 now.saturating_add(120_000),
                 now,
@@ -1000,6 +1116,30 @@ mod tests {
         entry
     }
 
+    fn positive_entry_for_domain(domain: &str, last_access_age_ms: u64) -> PersistedCacheEntry {
+        let name = Name::from_ascii(domain).expect("test domain should parse");
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NoError);
+        response.add_question(Question::new(name.clone(), RecordType::A, DNSClass::IN));
+        response.add_answer(Record::from_rdata(
+            name,
+            120,
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
+        ));
+
+        let mut entry = valid_address_entry();
+        entry.domain = domain.to_string();
+        entry.do_bit = false;
+        entry.resp_bytes = response.to_bytes().expect("response should encode");
+        entry.cache_age_ms = 10;
+        entry.last_access_age_ms = last_access_age_ms;
+        entry.ttl = 120;
+        entry.remaining_ttl_ms = 120_000;
+        entry
+    }
+
     #[test]
     fn test_parse_persisted_dump_returns_error_for_invalid_bytes() {
         let parsed = parse_persisted_dump(b"not a valid cache dump");
@@ -1012,6 +1152,74 @@ mod tests {
         let mut data = serialize_current_dump(Vec::new());
         data.extend_from_slice(b"garbage");
         assert!(parse_persisted_dump(&data).is_err());
+    }
+
+    #[test]
+    fn test_bounded_load_retains_only_most_recent_entries() {
+        AppClock::start();
+        let entries = vec![
+            positive_entry_for_domain("n0.example.com.", 500),
+            positive_entry_for_domain("n1.example.com.", 400),
+            positive_entry_for_domain("n2.example.com.", 300),
+            positive_entry_for_domain("n3.example.com.", 200),
+            positive_entry_for_domain("n4.example.com.", 100),
+        ];
+        let data = serialize_current_dump(entries);
+        let cache_map = CacheMap::with_capacity(2);
+        let hints = EcsPrefixHints::new();
+
+        let loaded = load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            &data,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+            &hints,
+            2,
+        )
+        .expect("bounded dump should load");
+
+        assert_eq!(loaded, 2);
+        assert_eq!(cache_map.len(), 2);
+        let mut domains = Vec::new();
+        cache_map.visit_handles(|key, _| {
+            domains.push(key.domain.to_string());
+            true
+        });
+        domains.sort();
+        assert_eq!(
+            domains,
+            vec!["n3.example.com".to_string(), "n4.example.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_bounded_load_still_validates_entries_after_capacity_is_full() {
+        AppClock::start();
+        let mut corrupt = positive_entry_for_domain("bad.example.com.", 0);
+        corrupt.ecs_family = Some(1);
+        // Partial ECS metadata is structurally invalid and must reject the
+        // entire transaction even though the retained candidate set is full.
+        let data = serialize_current_dump(vec![
+            positive_entry_for_domain("good.example.com.", 100),
+            corrupt,
+        ]);
+        let cache_map = CacheMap::with_capacity(1);
+        let hints = EcsPrefixHints::new();
+
+        let err = load_cache_from_bytes_with_hints_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
+            &cache_map,
+            &data,
+            false,
+            CacheLoadPolicy::default(),
+            false,
+            &hints,
+            1,
+        )
+        .expect_err("trailing invalid entry must reject the bounded load");
+
+        assert!(err.to_string().contains("partial ECS metadata"));
+        assert!(cache_map.is_empty());
     }
 
     #[test]
@@ -1618,14 +1826,9 @@ mod tests {
         let data = serialize_current_dump(vec![entry]);
         let cache_map = CacheMap::with_capacity(1);
 
-        let err = load_cache_from_bytes(
-            &cache_map,
-            &data,
-            false,
-            CacheLoadPolicy::default(),
-            false,
-        )
-        .expect_err("empty domain dump entry must be rejected");
+        let err =
+            load_cache_from_bytes(&cache_map, &data, false, CacheLoadPolicy::default(), false)
+                .expect_err("empty domain dump entry must be rejected");
 
         assert!(err.to_string().contains("invalid empty domain"));
         assert!(cache_map.is_empty());
@@ -1651,7 +1854,9 @@ mod tests {
         response.add_answer(Record::from_rdata(
             Name::root(),
             60,
-            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::new(
+                192, 0, 2, 1,
+            ))),
         ));
 
         let now = AppClock::elapsed_millis();
@@ -1671,14 +1876,8 @@ mod tests {
 
         let restored = CacheMap::with_capacity(1);
         assert_eq!(
-            load_cache_from_bytes(
-                &restored,
-                &dump,
-                false,
-                CacheLoadPolicy::default(),
-                false,
-            )
-            .expect("root dump should restore"),
+            load_cache_from_bytes(&restored, &dump, false, CacheLoadPolicy::default(), false,)
+                .expect("root dump should restore"),
             1
         );
         let (restored_key, restored_entry) = first_cache_entry(&restored);
@@ -1738,11 +1937,7 @@ mod tests {
 
         cache_map.insert_if_not_newer(
             stored_key,
-            CacheItem::new_validated(
-                response,
-                120,
-                now.saturating_add(120_000),
-            ),
+            CacheItem::new_validated(response, 120, now.saturating_add(120_000)),
             now,
             now.saturating_add(120_000),
             now,

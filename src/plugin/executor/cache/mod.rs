@@ -300,10 +300,22 @@ struct MissCoalescer {
     inflight: DashMap<CacheKey, Arc<MissFlight>>,
 }
 
+#[derive(Debug, Clone)]
+enum MissFlightOutcome {
+    Pending,
+    Cached,
+    SharedResponse {
+        request: Arc<Message>,
+        response: Arc<Message>,
+        step: ExecStep,
+    },
+    Retry,
+}
+
 #[derive(Debug)]
 struct MissFlight {
     id: u64,
-    sender: watch::Sender<bool>,
+    sender: watch::Sender<MissFlightOutcome>,
 }
 
 impl MissCoalescer {
@@ -324,7 +336,7 @@ impl MissCoalescer {
                 }
             }
             Entry::Vacant(entry) => {
-                let (sender, _receiver) = watch::channel(false);
+                let (sender, _receiver) = watch::channel(MissFlightOutcome::Pending);
                 let flight = Arc::new(MissFlight {
                     id: NEXT_MISS_FLIGHT_ID.fetch_add(1, Ordering::Relaxed),
                     sender,
@@ -340,18 +352,23 @@ impl MissCoalescer {
         }
     }
 
-    fn complete(&self, key: &CacheKey, flight: &Arc<MissFlight>, cached: bool) {
+    fn complete(
+        &self,
+        key: &CacheKey,
+        flight: &Arc<MissFlight>,
+        outcome: MissFlightOutcome,
+    ) {
         let _ = self
             .inflight
             .remove_if(key, |_, current| Arc::ptr_eq(current, flight));
-        let _ = flight.sender.send(cached);
+        let _ = flight.sender.send(outcome);
     }
 }
 
 #[derive(Debug)]
 enum MissRole<'a> {
     Leader(MissLeader<'a>),
-    Follower(watch::Receiver<bool>),
+    Follower(watch::Receiver<MissFlightOutcome>),
     Reentrant,
 }
 
@@ -369,16 +386,16 @@ impl MissLeader<'_> {
         self.flight.id
     }
 
-    fn complete(mut self, cached: bool) {
+    fn complete(mut self, outcome: MissFlightOutcome) {
         self.completed = true;
-        self.coalescer.complete(&self.key, &self.flight, cached);
+        self.coalescer.complete(&self.key, &self.flight, outcome);
     }
 }
 
 impl Drop for MissLeader<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.coalescer.complete(&self.key, &self.flight, false);
+            self.coalescer.complete(&self.key, &self.flight, MissFlightOutcome::Retry);
         }
     }
 }
@@ -1593,6 +1610,7 @@ impl Plugin for Cache {
                 self.ecs_in_key,
                 self.store.ecs_prefix_hints().clone(),
                 self.cache_load_policy(),
+                self.store.cache_size(),
             )
             .await
             {
@@ -1762,19 +1780,42 @@ impl Executor for Cache {
                         .fetch_add(1, Ordering::Relaxed);
                 }
 
-                if ready.borrow().to_owned()
-                    && self
-                        .try_cache_hit(context, store)
-                        .is_some_and(|lookup| lookup.is_hit())
-                {
-                    if self.should_short_circuit(true) {
-                        return Ok(ExecStep::Stop);
+                let outcome = ready.borrow().clone();
+                match outcome {
+                    MissFlightOutcome::Cached => {
+                        if self
+                            .try_cache_hit(context, store)
+                            .is_some_and(|lookup| lookup.is_hit())
+                        {
+                            if self.should_short_circuit(true) {
+                                return Ok(ExecStep::Stop);
+                            }
+                            return continue_next!(next, context);
+                        }
                     }
-                    return continue_next!(next, context);
+                    MissFlightOutcome::SharedResponse {
+                        request,
+                        response,
+                        step,
+                    } => {
+                        // CacheKey intentionally ignores some request fields.
+                        // A transient, uncacheable response is safe to reuse
+                        // only when the original DNS request is otherwise
+                        // identical (transaction ID may differ).
+                        if dns_requests_equal_except_id(&request, &context.request) {
+                            let mut response = (*response).clone();
+                            response.set_id(context.request.id());
+                            context.set_response(response);
+                            return Ok(step);
+                        }
+                    }
+                    MissFlightOutcome::Pending | MissFlightOutcome::Retry => {}
                 }
 
-                // The leader did not produce a cacheable response. Resolve
-                // this request directly instead of registering it again.
+                // The leader failed before producing a safely shareable DNS
+                // response, or a cached result disappeared before this follower
+                // could consume it. Resolve this request directly without
+                // registering it again.
                 return continue_next!(next, context);
             }
             MissRole::Reentrant => {
@@ -1796,6 +1837,17 @@ impl Executor for Cache {
                     .runtime
                     .restore_miss_leader_ancestry(previous_ancestry);
                 let next_step = next_result?;
+                let shareable_response = if self.short_circuit {
+                    context.response().and_then(|response| {
+                        (!response.truncated()
+                            && response.signature().is_empty()
+                            && response_question_matches_cache_key(response, &key))
+                        .then(|| Arc::new(response.clone()))
+                    })
+                } else {
+                    None
+                };
+
                 let cached = if let Some(response) = context.response() {
                     if response.truncated() {
                         self.metrics()
@@ -1821,7 +1873,19 @@ impl Executor for Cache {
                 } else {
                     false
                 };
-                leader.complete(cached);
+
+                let outcome = if cached {
+                    MissFlightOutcome::Cached
+                } else if let Some(response) = shareable_response {
+                    MissFlightOutcome::SharedResponse {
+                        request: Arc::new(context.request.clone()),
+                        response,
+                        step: next_step,
+                    }
+                } else {
+                    MissFlightOutcome::Retry
+                };
+                leader.complete(outcome);
                 return Ok(next_step);
             }
         }
@@ -1903,6 +1967,27 @@ fn compute_cache_ttl_with_policy(
         ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
     };
     (decision, disposition)
+}
+
+#[inline]
+fn dns_requests_equal_except_id(left: &Message, right: &Message) -> bool {
+    if left.id() == right.id() {
+        return left == right;
+    }
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.set_id(0);
+    right.set_id(0);
+    left == right
+}
+
+#[inline]
+fn response_question_matches_cache_key(response: &Message, key: &CacheKey) -> bool {
+    response.first_question().is_some_and(|question| {
+        cache_domain_matches_name(key.domain.as_ref(), question.name())
+            && question.qtype() == key.record_type
+            && question.qclass() == key.dns_class
+    })
 }
 
 #[inline]
@@ -2339,12 +2424,12 @@ mod tests {
             }
         };
 
-        leader.complete(true);
+        leader.complete(MissFlightOutcome::Cached);
         follower
             .changed()
             .await
             .expect("leader completion should notify follower");
-        assert!(*follower.borrow());
+        assert!(matches!(&*follower.borrow(), MissFlightOutcome::Cached));
 
         assert!(matches!(
             coalescer.register(key, &context),
@@ -2463,6 +2548,80 @@ mod tests {
                 .load(AtomicOrdering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn miss_coalescer_shares_uncacheable_response_without_upstream_fanout() {
+        AppClock::start();
+        let mut config = default_test_config();
+        config.short_circuit = Some(true);
+        config.min_positive_ttl = Some(10);
+        let mut cache = test_cache(config);
+        let _ = cache.init_for_test().await;
+        let cache = Arc::new(cache);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let program = ChainProgram::single_with_next_executor_for_test(Arc::new(
+            BlockingUncacheableMissExecutor {
+                calls: calls.clone(),
+                release: release.clone(),
+            },
+        ));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut request_a = make_request_with_query("example.com.", false, false);
+        request_a.set_id(101);
+        let mut request_b = make_request_with_query("example.com.", false, false);
+        request_b.set_id(202);
+        let mut context_a = make_context(request_a);
+        let mut context_b = make_context(request_b);
+
+        let cache_a = cache.clone();
+        let next_a = next.clone();
+        let first = async move {
+            cache_a
+                .execute_with_next(&mut context_a, Some(next_a))
+                .await
+                .map(|step| (step, context_a))
+        };
+        let cache_b = cache.clone();
+        let next_b = next.clone();
+        let second = async move {
+            cache_b
+                .execute_with_next(&mut context_b, Some(next_b))
+                .await
+                .map(|step| (step, context_b))
+        };
+        let release_when_coalesced = async {
+            wait_until("one miss should reach downstream", || {
+                calls.load(AtomicOrdering::Relaxed) == 1
+            })
+            .await;
+            wait_until("second miss should become follower", || {
+                cache
+                    .store
+                    .metrics()
+                    .miss_coalesced_total
+                    .load(AtomicOrdering::Relaxed)
+                    == 1
+            })
+            .await;
+            release.notify_waiters();
+        };
+
+        let (first, second, ()) = tokio::join!(first, second, release_when_coalesced);
+        let (first_step, first_context) = first.expect("first miss should succeed");
+        let (second_step, second_context) = second.expect("second miss should succeed");
+
+        assert_eq!(first_step, ExecStep::Next);
+        assert_eq!(second_step, ExecStep::Next);
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.store.cache_map().len(), 0, "low TTL response must remain uncached");
+        assert_eq!(first_context.response().expect("first response").id(), 101);
+        assert_eq!(second_context.response().expect("second response").id(), 202);
+        assert_eq!(first_context.response().unwrap().answers()[0].ttl(), 3);
+        assert_eq!(second_context.response().unwrap().answers()[0].ttl(), 3);
     }
 
     #[test]
@@ -3003,6 +3162,56 @@ mod tests {
         async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
             context.set_response(cname_only_response_for_domain("example.com.", 60));
             Ok(ExecStep::Next)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingUncacheableMissExecutor {
+        calls: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Plugin for BlockingUncacheableMissExecutor {
+        fn tag(&self) -> &str {
+            "blocking_uncacheable_miss_executor"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for BlockingUncacheableMissExecutor {
+        fn with_next(&self) -> bool {
+            true
+        }
+
+        async fn execute(&self, _context: &mut DnsContext) -> Result<ExecStep> {
+            Ok(ExecStep::Next)
+        }
+
+        async fn execute_with_next(
+            &self,
+            context: &mut DnsContext,
+            next: Option<ExecutorNext>,
+        ) -> Result<ExecStep> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.release.notified().await;
+
+            let question = context
+                .request
+                .first_question()
+                .cloned()
+                .expect("miss request should contain a question");
+            let mut response = Message::new();
+            response.set_id(context.request.id());
+            response.set_rcode(Rcode::NoError);
+            response.add_question(question.clone());
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                3,
+                RData::A(crate::proto::rdata::A(Ipv4Addr::new(9, 9, 9, 9))),
+            ));
+            context.set_response(response);
+            continue_next!(next, context)
         }
     }
 
