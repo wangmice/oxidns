@@ -472,7 +472,7 @@ mod tests {
             }
         });
 
-        let (mut sender, connection) = h2::client::handshake::<_, Bytes>(client_io)
+        let (mut sender, connection) = h2::client::handshake(client_io)
             .await
             .expect("client handshake should succeed");
         let client_task = tokio::spawn(async move {

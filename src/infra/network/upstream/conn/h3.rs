@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use futures::future::poll_fn;
 use h3::client::{RequestStream, SendRequest};
-use h3::error::StreamError;
 use h3_quinn::{BidiStream, OpenStreams};
 use http::{Request, Version};
 use tokio::select;
@@ -35,23 +34,17 @@ use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
 enum H3RecvError {
-    Connection(DnsError),
     Stream(DnsError),
     HttpStatus(DnsError),
     InvalidResponse(DnsError),
 }
 
-fn classify_h3_stream_error(context: &str, error: StreamError) -> H3RecvError {
-    let connection_scoped = matches!(
-        error,
-        StreamError::ConnectionError(_) | StreamError::RemoteClosing
-    );
-    let error = DnsError::protocol(format!("{context}: {error}"));
-    if connection_scoped {
-        H3RecvError::Connection(error)
-    } else {
-        H3RecvError::Stream(error)
-    }
+fn classify_h3_stream_error(context: &str, error: h3::error::StreamError) -> H3RecvError {
+    // h3 0.0.8 keeps StreamError's concrete variants private to the crate.
+    // Request-path failures therefore stay stream-local here; the connection
+    // driver is responsible for observing connection-level closure and making
+    // this H3Connection unavailable to the pool.
+    H3RecvError::Stream(DnsError::protocol(format!("{context}: {error}")))
 }
 
 pub struct H3Connection {
@@ -128,10 +121,6 @@ impl H3Connection {
         let mut request_stream = match self.sender.clone().send_request(http_request).await {
             Ok(stream) => stream,
             Err(error) => match classify_h3_stream_error("H3 send_request error", error) {
-                H3RecvError::Connection(error) => {
-                    self.close();
-                    return Err(error);
-                }
                 H3RecvError::Stream(error) => return Err(error),
                 H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
             },
@@ -139,10 +128,6 @@ impl H3Connection {
 
         if let Err(error) = request_stream.finish().await {
             match classify_h3_stream_error("H3 finish stream error", error) {
-                H3RecvError::Connection(error) => {
-                    self.close();
-                    return Err(error);
-                }
                 H3RecvError::Stream(error) => return Err(error),
                 H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
             }
@@ -157,12 +142,6 @@ impl H3Connection {
                 trace!(conn_id = self.id,
             upstream = %self.upstream, raw_id, "Received H3 response");
                 Ok(resp)
-            }
-            Err(H3RecvError::Connection(e)) => {
-                self.close();
-                warn!(conn_id = self.id,
-            upstream = %self.upstream, raw_id, ?e, "H3 connection request error");
-                Err(e)
             }
             Err(H3RecvError::Stream(e) | H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
         }

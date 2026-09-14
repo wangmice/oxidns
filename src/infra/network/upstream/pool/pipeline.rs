@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
-use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
     QueryDeadline, QueryTimeoutPolicy, start_maintenance,

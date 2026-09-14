@@ -69,7 +69,7 @@ impl QueryDeadline {
     }
 
     /// Record and construct a timeout error for the stage that exhausted this query deadline.
-    pub fn timeout_error_for(&self, stage: UpstreamTimeoutStage) -> DnsError {
+    pub(crate) fn timeout_error_for(&self, stage: UpstreamTimeoutStage) -> DnsError {
         metrics::upstream_timeout(stage);
         self.timeout_error()
     }
