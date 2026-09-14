@@ -391,6 +391,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         advanced: true,
       },
       {
+        key: "lazy_refresh_timeout",
+        description: "限制单次 Lazy Cache 后台刷新的最长执行时间。",
+        label: "Lazy 刷新超时(秒)",
+        type: "number",
+        default: 10,
+        advanced: true,
+      },
+      {
         key: "lazy_refresh_failure_cooldown",
         description: "定义 Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。",
         label: "Lazy 刷新失败冷却(秒)",

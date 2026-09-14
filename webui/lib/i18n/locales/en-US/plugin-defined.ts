@@ -512,6 +512,11 @@ export const enUSPluginDefined = {
           description:
             "Limits the number of Lazy Cache background refresh tasks that may run concurrently.",
         },
+        lazy_refresh_timeout: {
+          label: "Lazy refresh timeout (seconds)",
+          description:
+            "Limits the wall-clock time for one background lazy refresh; the default is 10 seconds so the upstream 5-second query timeout can complete first.",
+        },
         lazy_refresh_failure_cooldown: {
           label: "Lazy refresh failure cooldown (seconds)",
           description:

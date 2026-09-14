@@ -302,6 +302,8 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
     lazy_cache_ttl: 120
     # Bound concurrent background lazy refreshes across distinct cache keys
     lazy_refresh_concurrency: 64
+    # Maximum wall-clock time for one background lazy refresh, in seconds
+    lazy_refresh_timeout: 10
     # Minimum retry delay after a failed lazy refresh, in seconds
     lazy_refresh_failure_cooldown: 30
     # Cache NXDOMAIN / NODATA responses too
@@ -348,6 +350,13 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
   - When all refresh slots are busy, stale responses are still served, but no task is queued or spawned.
   - Refreshes skipped by the concurrency limit increment `cache_lazy_refresh_total{result="skipped_busy"}`.
   - A later stale request can retry once a refresh slot becomes available.
+
+#### `lazy_refresh_timeout`
+
+- Type: `integer`; Required: no; Default: `10`
+- Unit: seconds
+- Purpose: Limit the wall-clock time for one background lazy refresh.
+- Design note: the default is intentionally longer than the upstream default `5s` query timeout so upstream/forward can report its own timeout or error before the cache wrapper cancels the refresh.
 
 #### `lazy_refresh_failure_cooldown`
 

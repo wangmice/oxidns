@@ -30,6 +30,7 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   ],
   "executor/cache": [
     "lazy_refresh_concurrency",
+    "lazy_refresh_timeout",
     "lazy_refresh_failure_cooldown",
     "dump_file",
     "dump_interval",

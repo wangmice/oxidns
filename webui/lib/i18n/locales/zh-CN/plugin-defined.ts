@@ -456,6 +456,11 @@ export const zhCNPluginDefined = {
           label: "Lazy 刷新并发数",
           description: "限制同时运行的 Lazy Cache 后台刷新任务数量。",
         },
+        lazy_refresh_timeout: {
+          label: "Lazy 刷新超时(秒)",
+          description:
+            "限制单次 Lazy Cache 后台刷新的最长执行时间；默认 10 秒，避免与上游默认 5 秒查询超时抢跑。",
+        },
         lazy_refresh_failure_cooldown: {
           label: "Lazy 刷新失败冷却(秒)",
           description:

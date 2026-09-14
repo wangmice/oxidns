@@ -350,6 +350,8 @@ import Admonition from "@theme/Admonition";
     lazy_cache_ttl: 120
     # 限制不同缓存键同时执行的后台 lazy refresh 数量
     lazy_refresh_concurrency: 64
+    # 单次后台 lazy refresh 的最长 wall-clock 时间（秒）
+    lazy_refresh_timeout: 10
     # lazy refresh 失败后，同一缓存键再次尝试刷新的最小间隔（秒）
     lazy_refresh_failure_cooldown: 30
     # 开启 NXDOMAIN / NODATA 负缓存
@@ -397,6 +399,13 @@ import Admonition from "@theme/Admonition";
   - 达到并发上限时继续返回 stale 响应，但不会排队或启动新的后台 refresh task。
   - 被并发上限跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_busy"}`。
   - 后续 stale 请求可在有空闲槽位时再次尝试刷新。
+
+#### `lazy_refresh_timeout`
+
+- 类型：`integer`；必填：否；默认值：`10`
+- 单位：秒
+- 作用：限制单次后台 lazy refresh 的最长 wall-clock 时间。
+- 设计说明：默认值刻意长于上游默认 `5s` 查询超时，使 upstream/forward 能先返回自身超时或错误，而不是被 cache 外层 timer 抢先取消。
 
 #### `lazy_refresh_failure_cooldown`
 

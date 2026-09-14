@@ -96,6 +96,8 @@ export const zhCNDocs = {
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：为正向成功响应启用 lazy cache。\n- 运行影响：\n  - 原始 TTL 决定 fresh 命中窗口。\n  - `lazy_cache_ttl` 决定 stale 回包 TTL，并允许在原始 TTL 过期后短时间返回 stale 响应。\n  - stale 命中会在后台异步刷新缓存。\n  - 该配置不会缩短原始 fresh TTL。",
     lazy_refresh_concurrency:
       "- 类型：`integer`；必填：否；默认值：`64`\n- 配置要求：必须大于 0。\n- 作用：限制同时运行的 Lazy Cache 后台刷新任务数量。\n- 运行影响：过低会增加 `skipped_busy`，过高会增加并发上游查询和资源占用。",
+    lazy_refresh_timeout:
+      "- 类型：`integer`；必填：否；默认值：`10`\n- 单位：秒\n- 配置要求：必须大于 0。\n- 作用：限制单次 Lazy Cache 后台刷新的最长 wall-clock 时间。\n- 设计说明：默认值刻意长于上游默认 `5s` 查询超时，使 upstream/forward 能先返回自己的超时或错误，而不是被 cache 外层 timer 抢先取消。",
     lazy_refresh_failure_cooldown:
       "- 类型：`integer`；必填：否；默认值：`30`\n- 单位：秒\n- 配置要求：必须大于 0。\n- 作用：Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。\n- 运行影响：冷却期间的 stale 命中会记录为 `skipped_cooldown`，避免持续失败时反复打上游。",
     dump_file:

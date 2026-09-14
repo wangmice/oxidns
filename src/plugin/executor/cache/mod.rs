@@ -85,7 +85,7 @@ const MEDIUM_CACHE_TOUCH_SIZE: usize = 32_768;
 const MAX_INITIAL_CACHE_CAPACITY: usize = 16_384;
 const EVICT_HIGH_WATERMARK_PERCENT: usize = 95;
 const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
-const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_LAZY_REFRESH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS: u64 = 30;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -113,6 +113,15 @@ pub struct CacheConfig {
     ///
     /// Default: 64.
     lazy_refresh_concurrency: Option<usize>,
+
+    /// Maximum wall-clock time (seconds) allowed for one lazy refresh.
+    ///
+    /// This outer deadline is intentionally longer than the default upstream
+    /// query timeout so the upstream can report its own timeout instead of
+    /// being cancelled by the cache refresh wrapper first.
+    ///
+    /// Default: 10.
+    lazy_refresh_timeout: Option<u64>,
 
     /// Minimum retry delay (seconds) after a lazy refresh failure.
     ///
@@ -1543,6 +1552,11 @@ impl Cache {
             .lazy_refresh_failure_cooldown
             .unwrap_or(DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS)
             .saturating_mul(1000);
+        let refresh_timeout = Duration::from_secs(
+            self.config
+                .lazy_refresh_timeout
+                .unwrap_or(DEFAULT_LAZY_REFRESH_TIMEOUT_SECS),
+        );
 
         let refresh_task = async move {
             let _refresh_guard = refresh_guard;
@@ -1550,7 +1564,7 @@ impl Cache {
             let refresh = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
+                refresh = tokio::time::timeout(refresh_timeout, async {
                     let _ = next.next(&mut sub_ctx).await?;
                     Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
                 }) => refresh,
@@ -2242,6 +2256,7 @@ fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
         size: None,
         lazy_cache_ttl: None,
         lazy_refresh_concurrency: None,
+        lazy_refresh_timeout: None,
         lazy_refresh_failure_cooldown: None,
         dump_file: None,
         dump_interval: None,
@@ -2284,6 +2299,14 @@ fn validate_cache_config(config: &CacheConfig) -> Result<()> {
     {
         return Err(DnsError::plugin(
             "cache lazy_refresh_concurrency must be greater than 0",
+        ));
+    }
+
+    if let Some(timeout) = config.lazy_refresh_timeout
+        && timeout == 0
+    {
+        return Err(DnsError::plugin(
+            "cache lazy_refresh_timeout must be greater than 0",
         ));
     }
 
@@ -2393,6 +2416,7 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
         size: None,
         lazy_cache_ttl: None,
         lazy_refresh_concurrency: None,
+        lazy_refresh_timeout: None,
         lazy_refresh_failure_cooldown: None,
         dump_file: None,
         dump_interval: None,
@@ -2503,6 +2527,7 @@ mod tests {
             size: Some(128),
             lazy_cache_ttl: None,
             lazy_refresh_concurrency: None,
+            lazy_refresh_timeout: None,
             lazy_refresh_failure_cooldown: None,
             dump_file: None,
             dump_interval: None,
@@ -5701,6 +5726,73 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn default_lazy_refresh_timeout_does_not_preempt_five_second_upstream_deadline() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(BlockingRefreshExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            }));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context = make_context(make_request_with_query("timeout.example.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let now = AppClock::elapsed_millis();
+        cache.store.cache_map().insert_or_update_with_meta(
+            key,
+            CacheItem::new(
+                cacheable_response_for_domain("timeout.example.", 120),
+                120,
+                now.saturating_sub(1_000),
+            ),
+            now.saturating_sub(121_000),
+            now.saturating_add(30_000),
+            now.saturating_sub(100),
+        );
+
+        cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .expect("stale hit should start refresh");
+        wait_until("lazy refresh should start", || {
+            started.load(AtomicOrdering::Relaxed) == 1
+        })
+        .await;
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            cache
+                .store
+                .metrics()
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed),
+            0,
+            "the default cache refresh timeout must not preempt a 5s upstream deadline",
+        );
+
+        release.notify_one();
+        wait_until("lazy refresh should complete after release", || {
+            cache
+                .store
+                .metrics()
+                .lazy_refresh_success_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn lazy_refresh_concurrency_limit_skips_busy_keys_without_queueing() {
         AppClock::start();
@@ -6465,6 +6557,7 @@ mod tests {
             size: Some(128),
             lazy_cache_ttl: None,
             lazy_refresh_concurrency: None,
+            lazy_refresh_timeout: None,
             lazy_refresh_failure_cooldown: None,
             dump_file: Some("cache.dump".to_string()),
             dump_interval: Some(0),
@@ -6484,6 +6577,14 @@ mod tests {
     fn validate_config_rejects_zero_lazy_refresh_concurrency() {
         let mut cfg = default_test_config();
         cfg.lazy_refresh_concurrency = Some(0);
+
+        assert!(validate_cache_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_lazy_refresh_timeout() {
+        let mut cfg = default_test_config();
+        cfg.lazy_refresh_timeout = Some(0);
 
         assert!(validate_cache_config(&cfg).is_err());
     }
