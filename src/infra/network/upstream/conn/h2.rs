@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
@@ -51,7 +51,6 @@ pub struct H2Connection {
     id: u16,
     upstream: String,
     sender: SendRequest<Bytes>,
-    peer_max_concurrent_streams: AtomicU16,
     using_count: AtomicU32,
     closed: AtomicBool,
     transport_error_reported: AtomicBool,
@@ -96,10 +95,6 @@ impl Connection for H2Connection {
         !self.closed.load(Ordering::Acquire)
     }
 
-    fn max_concurrent_queries(&self) -> u16 {
-        self.peer_max_concurrent_streams.load(Ordering::Acquire)
-    }
-
     fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
     }
@@ -138,6 +133,10 @@ impl H2Connection {
         )?;
         drop(body_bytes);
 
+        // `ready()` is the authoritative protocol-level backpressure point.
+        // The h2 state machine updates it when peer SETTINGS change during the
+        // connection lifetime, while the pool separately enforces OxiDNS's
+        // local per-connection load cap.
         let mut sender = match self.sender.clone().ready().await {
             Ok(sender) => sender,
             Err(error) => match classify_h2_error("H2 sender readiness error", error) {
@@ -266,15 +265,10 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             }
         };
 
-        let peer_max_concurrent_streams = connection
-            .max_concurrent_send_streams()
-            .min(u16::MAX as usize) as u16;
-
         let h2_conn = Arc::new(H2Connection {
             id: conn_id,
             upstream: self.upstream.clone(),
             sender,
-            peer_max_concurrent_streams: AtomicU16::new(peer_max_concurrent_streams),
             closed: AtomicBool::new(false),
             transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
@@ -282,13 +276,6 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });
-
-        debug!(
-            conn_id,
-            upstream = %h2_conn.upstream,
-            peer_max_concurrent_streams,
-            "H2 connection established"
-        );
 
         let _conn = h2_conn.clone();
         tokio::spawn(async move {
