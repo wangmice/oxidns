@@ -16,6 +16,7 @@ use crate::infra::network::dial::{
     DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
     connect_quic_abstract, connect_udp,
 };
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::quic::{
     QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
@@ -324,7 +325,7 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
             self.insecure_skip_verify,
             deadline
                 .remaining()
-                .ok_or_else(|| deadline.timeout_error())?,
+                .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
             quic_idle_timeout(self.timeout),
             vec![b"doq".to_vec()],
         );

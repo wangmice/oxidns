@@ -73,13 +73,13 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 result
             }
             DeadlineOutcome::Expired => {
-                metrics::upstream_timeout(UpstreamTimeoutStage::QueryIo);
+                let timeout_error = deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo);
                 match self.timeout_policy {
                     QueryTimeoutPolicy::Reuse => {}
                     QueryTimeoutPolicy::Retire => lease.retire(),
                     QueryTimeoutPolicy::Close => lease.close(),
                 }
-                Err(deadline.timeout_error())
+                Err(timeout_error)
             }
         }
     }
@@ -266,8 +266,7 @@ impl<C: Connection> PipelinePool<C> {
                 match deadline.run(notified.as_mut()).await {
                     DeadlineOutcome::Completed(()) => {}
                     DeadlineOutcome::Expired => {
-                        metrics::upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
-                        return Err(deadline.timeout_error());
+                        return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
                     },
                 }
             }
@@ -344,8 +343,7 @@ impl<C: Connection> PipelinePool<C> {
             }
             DeadlineOutcome::Completed(Err(e)) => Err(e),
             DeadlineOutcome::Expired => {
-                metrics::upstream_timeout(UpstreamTimeoutStage::ConnectionCreate);
-                Err(deadline.timeout_error())
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
             }
         }
     }
@@ -436,8 +434,7 @@ impl<C: Connection> PipelinePool<C> {
         match deadline.run(tokio::time::sleep(delay)).await {
             DeadlineOutcome::Completed(()) => Ok(()),
             DeadlineOutcome::Expired => {
-                metrics::upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
-                Err(deadline.timeout_error())
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire))
             }
         }
     }

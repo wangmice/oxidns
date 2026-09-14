@@ -15,7 +15,7 @@ use tracing::{debug, trace, warn};
 use super::UsingCountGuard;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
@@ -230,7 +230,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             .await
         {
             DeadlineOutcome::Completed(result) => result?,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+            },
         };
 
         let tls_stream = connect_tls(
@@ -240,7 +242,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                 self.insecure_skip_verify,
                 deadline
                     .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
+                    .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
                 vec![b"h2".to_vec()],
             ),
         )
@@ -255,8 +257,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                 return Err(DnsError::protocol(format!("H2 handshake error: {}", e)));
             }
             DeadlineOutcome::Expired => {
-                metrics::upstream_timeout(UpstreamTimeoutStage::ProtocolHandshake);
-                return Err(deadline.timeout_error());
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ProtocolHandshake));
             }
         };
 

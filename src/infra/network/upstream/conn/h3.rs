@@ -18,7 +18,7 @@ use tracing::{debug, trace, warn};
 use super::{UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
     DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
@@ -214,7 +214,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             self.insecure_skip_verify,
             deadline
                 .remaining()
-                .ok_or_else(|| deadline.timeout_error())?,
+                .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
             quic_idle_timeout(self.timeout),
             vec![b"h3".to_vec()],
         );
@@ -240,8 +240,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
                 return Err(DnsError::protocol(format!("h3 connection failed: {e}")));
             }
             DeadlineOutcome::Expired => {
-                metrics::upstream_timeout(UpstreamTimeoutStage::ProtocolHandshake);
-                return Err(deadline.timeout_error());
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ProtocolHandshake));
             }
         };
 

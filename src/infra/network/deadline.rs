@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::DnsError;
+use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
 
 /// Outcome of running a future under a query deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,12 @@ impl QueryDeadline {
             "DNS query timeout after {:?}",
             Duration::from_millis(self.expires_at_ms.saturating_sub(self.started_at_ms))
         ))
+    }
+
+    /// Record and construct a timeout error for the stage that exhausted this query deadline.
+    pub fn timeout_error_for(&self, stage: UpstreamTimeoutStage) -> DnsError {
+        metrics::upstream_timeout(stage);
+        self.timeout_error()
     }
 }
 

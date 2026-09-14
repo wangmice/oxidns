@@ -19,6 +19,7 @@ use crate::infra::network::dial::TlsDialOptions;
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::dial::connect_tls;
 use crate::infra::network::dial::{DialTarget, SocketOptions};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::transport::tcp::TcpTransport;
@@ -487,7 +488,9 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
             .await
         {
             DeadlineOutcome::Completed(result) => result?,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+            },
         };
 
         debug!(
@@ -518,7 +521,7 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
                         self.insecure_skip_verify,
                         deadline
                             .remaining()
-                            .ok_or_else(|| deadline.timeout_error())?,
+                            .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
                         vec![b"dot".to_vec()],
                     ),
                 )
