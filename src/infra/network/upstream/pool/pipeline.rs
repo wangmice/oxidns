@@ -473,9 +473,14 @@ impl<C: Connection> PipelineSlot<C> {
             return false;
         }
 
+        let effective_max_load = max_load.min(self.conn.max_concurrent_queries());
+        if effective_max_load == 0 {
+            return false;
+        }
+
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
-            if current >= max_load {
+            if current >= effective_max_load {
                 return false;
             }
             match self.inflight.compare_exchange_weak(
@@ -660,6 +665,7 @@ mod tests {
         using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
+        max_concurrent_queries: u16,
         query_delay: Duration,
     }
 
@@ -670,12 +676,18 @@ mod tests {
                 using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
+                max_concurrent_queries: u16::MAX,
                 query_delay: Duration::ZERO,
             }
         }
 
         fn with_query_delay(mut self, query_delay: Duration) -> Self {
             self.query_delay = query_delay;
+            self
+        }
+
+        fn with_max_concurrent_queries(mut self, max_concurrent_queries: u16) -> Self {
+            self.max_concurrent_queries = max_concurrent_queries;
             self
         }
 
@@ -706,6 +718,10 @@ mod tests {
 
         fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed)
+        }
+
+        fn max_concurrent_queries(&self) -> u16 {
+            self.max_concurrent_queries
         }
 
         fn last_used(&self) -> u64 {
@@ -1125,5 +1141,17 @@ mod tests {
         assert_eq!(conn.close_calls(), 0);
         assert_eq!(pool.slots.load().len(), 1);
         drop(lease);
+    }
+    #[test]
+    fn pipeline_slot_honors_connection_concurrency_limit() {
+        let conn = Arc::new(MockConnection::new(true, 0, 0).with_max_concurrent_queries(2));
+        let slot = PipelineSlot::new(conn);
+
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        slot.release_without_notify();
+        assert!(slot.try_acquire(32));
     }
 }
