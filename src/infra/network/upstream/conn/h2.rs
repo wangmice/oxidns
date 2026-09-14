@@ -15,6 +15,7 @@ use tracing::{debug, trace, warn};
 use super::UsingCountGuard;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
+use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
@@ -223,7 +224,10 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("H2 handshake error: {}", e)));
             }
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                metrics::upstream_timeout(UpstreamTimeoutStage::ProtocolHandshake);
+                return Err(deadline.timeout_error());
+            }
         };
 
         let h2_conn = Arc::new(H2Connection {

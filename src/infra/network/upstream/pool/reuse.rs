@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
+use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
     QueryDeadline, QueryTimeoutPolicy, start_maintenance,
@@ -83,6 +84,7 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
                 result
             }
             DeadlineOutcome::Expired => {
+                metrics::upstream_timeout(UpstreamTimeoutStage::QueryIo);
                 match self.timeout_policy {
                     QueryTimeoutPolicy::Reuse if borrowed.connection().available() => {
                         borrowed.release();
@@ -290,7 +292,10 @@ impl<C: Connection> ReusePool<C> {
                 }
                 match deadline.run(notified.as_mut()).await {
                     DeadlineOutcome::Completed(()) => {}
-                    DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+                    DeadlineOutcome::Expired => {
+                        metrics::upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
+                        return Err(deadline.timeout_error());
+                    },
                 }
             }
         }
@@ -404,7 +409,10 @@ impl<C: Connection> ReusePool<C> {
                 Ok(conn)
             }
             DeadlineOutcome::Completed(Err(e)) => Err(e),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                metrics::upstream_timeout(UpstreamTimeoutStage::ConnectionCreate);
+                Err(deadline.timeout_error())
+            }
         }
     }
 
@@ -415,7 +423,10 @@ impl<C: Connection> ReusePool<C> {
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {
             DeadlineOutcome::Completed(()) => Ok(()),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                metrics::upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
+                Err(deadline.timeout_error())
+            }
         }
     }
 }

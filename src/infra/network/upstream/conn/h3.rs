@@ -17,6 +17,7 @@ use tracing::{debug, trace, warn};
 use super::{UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
+use crate::infra::network::metrics::{self, UpstreamTimeoutStage};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
     DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
@@ -209,7 +210,10 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("h3 connection failed: {e}")));
             }
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                metrics::upstream_timeout(UpstreamTimeoutStage::ProtocolHandshake);
+                return Err(deadline.timeout_error());
+            }
         };
 
         let h3_conn = Arc::new(H3Connection {
