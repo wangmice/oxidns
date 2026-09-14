@@ -478,6 +478,8 @@ function labelValueLabel(key: string, value: string, locale: Locale): string {
     return translate(locale, WEBUI.metrics.noTtl);
   if (key === "reason" && value === "low_positive_ttl")
     return translate(locale, WEBUI.metrics.lowPositiveTtl);
+  if (key === "reason" && value === "incomplete_answer")
+    return translate(locale, WEBUI.metrics.incompleteAnswer);
   if (key === "result" && value === "started") {
     return translate(locale, WEBUI.metrics.started);
   }
@@ -486,6 +488,12 @@ function labelValueLabel(key: string, value: string, locale: Locale): string {
   }
   if (key === "result" && value === "failed") {
     return translate(locale, WEBUI.metrics.failed);
+  }
+  if (key === "result" && value === "skipped_busy") {
+    return translate(locale, WEBUI.metrics.skippedBusy);
+  }
+  if (key === "result" && value === "skipped_cooldown") {
+    return translate(locale, WEBUI.metrics.skippedCooldown);
   }
   return value;
 }

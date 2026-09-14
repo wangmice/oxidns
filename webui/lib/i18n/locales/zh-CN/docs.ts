@@ -94,6 +94,10 @@ export const zhCNDocs = {
     size: "- 类型：`integer`；必填：否；默认值：`1024`\n- 作用：定义缓存最大条目数。",
     lazy_cache_ttl:
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：为正向成功响应启用 lazy cache。\n- 运行影响：\n  - 原始 TTL 决定 fresh 命中窗口。\n  - `lazy_cache_ttl` 决定 stale 回包 TTL，并允许在原始 TTL 过期后短时间返回 stale 响应。\n  - stale 命中会在后台异步刷新缓存。\n  - 该配置不会缩短原始 fresh TTL。",
+    lazy_refresh_concurrency:
+      "- 类型：`integer`；必填：否；默认值：`64`\n- 配置要求：必须大于 0。\n- 作用：限制同时运行的 Lazy Cache 后台刷新任务数量。\n- 运行影响：过低会增加 `skipped_busy`，过高会增加并发上游查询和资源占用。",
+    lazy_refresh_failure_cooldown:
+      "- 类型：`integer`；必填：否；默认值：`30`\n- 单位：秒\n- 配置要求：必须大于 0。\n- 作用：Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。\n- 运行影响：冷却期间的 stale 命中会记录为 `skipped_cooldown`，避免持续失败时反复打上游。",
     dump_file:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定缓存持久化文件路径。",
     dump_interval:
@@ -111,7 +115,7 @@ export const zhCNDocs = {
     min_positive_ttl:
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：定义正响应进入缓存所需的最小 TTL。\n- 说明：正响应的有效缓存 TTL 低于该值时不会写入缓存。该判断在 `max_positive_ttl` 裁剪之后执行。",
     ecs_in_key:
-      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 ECS scope 是否参与缓存键计算。",
+      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 ECS 是否参与缓存键与 RFC 7871 scope 复用。\n- 关闭时：客户端 ECS 仍可原样向上游转发，但不参与 CacheKey；上游响应中的 ECS 会在进入共享普通缓存前移除，因此 ECS 与非 ECS 客户端共享普通缓存条目。\n- 开启时：按 RFC 7871 的 FAMILY、SOURCE、SCOPE 与地址前缀构造和复用 ECS 缓存键。\n- 持久化：共享模式生成的 V4 dump 不能加载到开启 ECS 键的实例；旧版未记录模式的 dump 在开启 ECS 键时也会被拒绝。",
   },
   fallback: {
     primary: "- 类型：`string`；必填：是；默认值：无\n- 作用：指定主执行器。",

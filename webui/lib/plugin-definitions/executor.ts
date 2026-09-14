@@ -315,8 +315,16 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     metrics: {
       metricLabels: {
         cache_lookup_total: "缓存查询",
+        cache_ecs_lookup_requests_total: "ECS 缓存查询",
+        cache_ecs_lookup_candidates_total: "ECS 候选探测",
+        cache_ecs_lookup_exact_fallback_total: "ECS 精确回退",
+        cache_ecs_prefix_hint_count: "ECS 前缀提示",
+        cache_ecs_lookup_index_base_keys: "ECS 索引键",
         cache_hit_total: "命中",
         cache_miss_total: "未命中",
+        cache_miss_coalesced_total: "合并未命中",
+        cache_miss_coalesce_timeout_total: "合并等待超时",
+        cache_miss_coalesce_reentrant_total: "重入旁路",
         cache_expired_total: "过期",
         cache_insert_total: "写入",
         cache_skip_total: "跳过",
@@ -325,15 +333,23 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       metricHelp: {
         cache_lookup_total: "带有可缓存请求键的缓存查询总数。",
+        cache_ecs_lookup_requests_total: "启用 ECS 参与缓存键时执行的 ECS 缓存查询总数。",
+        cache_ecs_lookup_candidates_total: "ECS 查询根据前缀索引实际探测的候选缓存键总数。",
+        cache_ecs_lookup_exact_fallback_total: "ECS 查询未命中可复用 scope 后回退精确 SOURCE 键的次数。",
+        cache_ecs_prefix_hint_count: "当前 ECS 前缀提示索引中的前缀成员数量，按地址族分类。",
+        cache_ecs_lookup_index_base_keys: "当前 ECS 前缀提示索引包含的基础 DNS 缓存键数量。",
         cache_hit_total:
           "按新鲜度分类的缓存命中总数（fresh = 直接命中，stale = 过期可用）。",
         cache_miss_total: "缓存未命中的查询总数。",
+        cache_miss_coalesced_total: "同一缓存键的并发 miss 被合并并等待 leader 结果的次数。",
+        cache_miss_coalesce_timeout_total: "等待合并 miss leader 超时后绕过等待继续下游执行的次数。",
+        cache_miss_coalesce_reentrant_total: "检测到递归/重入 miss 后绕过合并等待的次数。",
         cache_expired_total: "查找时发现并移除过期条目的次数。",
         cache_insert_total: "缓存条目插入或更新的总次数。",
         cache_skip_total:
-          "因写入策略（截断响应、无 TTL、正响应 TTL 过低）而跳过缓存的响应总数。",
+          "因写入策略（截断响应、无 TTL、不完整答案、正响应 TTL 过低）而跳过缓存的响应总数。",
         cache_lazy_refresh_total:
-          "Lazy Cache 后台刷新尝试总数（按结果：started / success / failed）。",
+          "Lazy Cache 后台刷新状态总数（started / success / failed / skipped_busy / skipped_cooldown）。",
         cache_entry_count: "当前缓存中的条目数量。",
       },
       cardPriority: [
@@ -365,6 +381,22 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         description: "为正向成功响应启用 lazy cache。",
         label: "Lazy Cache TTL(秒)",
         type: "number",
+      },
+      {
+        key: "lazy_refresh_concurrency",
+        description: "限制同时运行的 Lazy Cache 后台刷新任务数量。",
+        label: "Lazy 刷新并发数",
+        type: "number",
+        default: 64,
+        advanced: true,
+      },
+      {
+        key: "lazy_refresh_failure_cooldown",
+        description: "定义 Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。",
+        label: "Lazy 刷新失败冷却(秒)",
+        type: "number",
+        default: 30,
+        advanced: true,
       },
       {
         key: "dump_file",
@@ -426,7 +458,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       {
         key: "ecs_in_key",
-        description: "控制 ECS scope 是否参与缓存键计算。",
+        description:
+          "开启时按 RFC 7871 scope 建立和复用 ECS 缓存键；关闭时请求 ECS 仍可向上游转发，但不参与缓存键，响应 ECS 会在共享普通缓存前移除。",
         label: "ECS 参与缓存键",
         type: "switch",
         default: false,

@@ -244,9 +244,12 @@ export const zhCNWebui = {
     truncated: "截断响应",
     noTtl: "无 TTL",
     lowPositiveTtl: "正响应 TTL 过低",
+    incompleteAnswer: "不完整答案",
     started: "已启动",
     success: "成功",
     failed: "失败",
+    skippedBusy: "并发已满",
+    skippedCooldown: "失败冷却中",
   },
   pluginDetail: {
     expand: "放大详情",
@@ -466,6 +469,11 @@ export const zhCNWebui = {
     readEntriesFailed: "读取缓存项失败",
     deleteEntryFailed: "删除缓存项失败",
     flushFailed: "清空缓存失败",
+    flushedResult: "已清除 {count} 项缓存",
+    dumpEcsModeMismatch:
+      "该缓存文件由共享 ECS 模式（ecs_in_key=false）生成，不能加载到当前启用 ECS 缓存键的实例。",
+    dumpEcsModeUnknown:
+      "该旧版缓存文件未记录 ecs_in_key 模式，无法安全加载到当前启用 ECS 缓存键的实例。",
     entriesTitle: "缓存项",
     matchCount: "匹配 {total} 项",
     totalCount: "共 {total} 项",

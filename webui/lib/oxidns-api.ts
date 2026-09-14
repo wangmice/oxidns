@@ -108,6 +108,18 @@ export interface ProviderReloadResponse {
 
 export class ProviderReloadBusyError extends Error {}
 
+export class ApiResponseError extends Error {
+  readonly code?: string;
+  readonly status: number;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = "ApiResponseError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
 export type ProcessMemoryKind =
   | "rss"
   | "private_working_set"
@@ -594,7 +606,12 @@ export async function deleteCacheEntry(tag: string, id: string): Promise<void> {
   await readJsonResponse<unknown>(response);
 }
 
-export async function flushCache(tag: string): Promise<void> {
+export interface CacheFlushResponse {
+  ok: boolean;
+  cleared_entries: number;
+}
+
+export async function flushCache(tag: string): Promise<CacheFlushResponse> {
   const response = await fetch(
     apiUrl(`/plugins/${encodeURIComponent(tag)}/flush`),
     {
@@ -602,7 +619,7 @@ export async function flushCache(tag: string): Promise<void> {
       headers: apiHeaders(),
     },
   );
-  await readJsonResponse<unknown>(response);
+  return readJsonResponse<CacheFlushResponse>(response);
 }
 
 export async function fetchCacheDump(tag: string): Promise<Blob> {
@@ -1116,7 +1133,11 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
           : [],
       );
     }
-    throw new Error(message);
+    throw new ApiResponseError(
+      message,
+      response.status,
+      typeof bodyRecord?.code === "string" ? bodyRecord.code : undefined,
+    );
   }
 
   if (!parsed.ok) {

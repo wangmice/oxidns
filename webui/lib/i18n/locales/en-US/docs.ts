@@ -97,6 +97,10 @@ export const enUSDocs = {
     size: "- Type: `integer`; required: no; default value: `1024`\n- Function: Define the maximum number of entries in the cache.",
     lazy_cache_ttl:
       "- Type: `integer`; required: no; default value: none\n- Unit: seconds\n- Function: Enable lazy cache for positive successful responses.\n- Operational impact:\n  - The original TTL determines the fresh-hit window.\n  - `lazy_cache_ttl` determines the TTL returned for stale responses and allows stale data to be returned briefly after the original TTL expires.\n  - Stale hits refresh the cache asynchronously in the background.\n  - This setting does not shorten the original fresh TTL.",
+    lazy_refresh_concurrency:
+      "- Type: `integer`; required: no; default value: `64`\n- Requirement: must be greater than 0.\n- Function: Limit the number of Lazy Cache background refresh tasks that may run concurrently.\n- Operational impact: values that are too low increase `skipped_busy`; values that are too high increase concurrent upstream traffic and resource use.",
+    lazy_refresh_failure_cooldown:
+      "- Type: `integer`; required: no; default value: `30`\n- Unit: seconds\n- Requirement: must be greater than 0.\n- Function: Define the minimum wait before retrying the same cache entry after a Lazy refresh failure.\n- Operational impact: stale hits during the cooldown are recorded as `skipped_cooldown`, preventing repeated upstream pressure while refreshes keep failing.",
     dump_file:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the cache persistence file path.",
     dump_interval:
@@ -114,7 +118,7 @@ export const enUSDocs = {
     min_positive_ttl:
       "- Type: `integer`; Required: No; Default: None\n- Unit: seconds\n- Function: Define the minimum TTL required before writing a positive response to cache.\n- Notes: Positive responses whose effective cache TTL is lower than this value are not cached. The check runs after `max_positive_ttl` capping.",
     ecs_in_key:
-      "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether the ECS scope is included in cache key calculation.",
+      "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether ECS participates in cache keys and RFC 7871 scope reuse.\n- Disabled: client ECS may still be forwarded upstream unchanged, but is excluded from the CacheKey; response ECS is removed before the shared ordinary cache entry is stored, so ECS and non-ECS clients share that entry.\n- Enabled: ECS cache keys and reuse follow RFC 7871 FAMILY, SOURCE, SCOPE, and address-prefix semantics.\n- Persistence: a V4 dump created in shared mode cannot be loaded into an ECS-keyed instance; legacy dumps that do not record the mode are also rejected when ECS keying is enabled.",
   },
   fallback: {
     primary:

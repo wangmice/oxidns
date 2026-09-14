@@ -507,6 +507,16 @@ export const enUSPluginDefined = {
           label: "Lazy Cache TTL (seconds)",
           description: "Enable lazy cache for positive success responses.",
         },
+        lazy_refresh_concurrency: {
+          label: "Lazy refresh concurrency",
+          description:
+            "Limits the number of Lazy Cache background refresh tasks that may run concurrently.",
+        },
+        lazy_refresh_failure_cooldown: {
+          label: "Lazy refresh failure cooldown (seconds)",
+          description:
+            "Defines the minimum wait before retrying the same cache entry after a Lazy refresh failure.",
+        },
         dump_file: {
           label: "Persistence file",
           description: "Specify the cache persistence file path.",
@@ -546,7 +556,7 @@ export const enUSPluginDefined = {
         ecs_in_key: {
           label: "Include ECS in cache key",
           description:
-            "Controls whether the ECS scope is included in cache key calculation.",
+            "When enabled, cache keys and reuse follow RFC 7871 scope semantics. When disabled, request ECS may still be forwarded upstream but is excluded from the key, and response ECS is removed before storing the shared ordinary cache entry.",
         },
       },
       quickSetup: {
@@ -555,8 +565,16 @@ export const enUSPluginDefined = {
       metrics: {
         labels: {
           cache_lookup_total: "Cache lookups",
+          cache_ecs_lookup_requests_total: "ECS cache lookups",
+          cache_ecs_lookup_candidates_total: "ECS candidates probed",
+          cache_ecs_lookup_exact_fallback_total: "ECS exact fallbacks",
+          cache_ecs_prefix_hint_count: "ECS prefix hints",
+          cache_ecs_lookup_index_base_keys: "ECS index base keys",
           cache_hit_total: "Hits",
           cache_miss_total: "Misses",
+          cache_miss_coalesced_total: "Coalesced misses",
+          cache_miss_coalesce_timeout_total: "Coalesce timeouts",
+          cache_miss_coalesce_reentrant_total: "Reentrant bypasses",
           cache_expired_total: "Expired",
           cache_insert_total: "Writes",
           cache_skip_total: "Skipped",
@@ -566,17 +584,33 @@ export const enUSPluginDefined = {
         help: {
           cache_lookup_total:
             "The total number of cached queries with cacheable request keys.",
+          cache_ecs_lookup_requests_total:
+            "The total number of ECS cache lookups performed while ECS participates in cache keys.",
+          cache_ecs_lookup_candidates_total:
+            "The total number of candidate cache keys actually probed from ECS prefix hints.",
+          cache_ecs_lookup_exact_fallback_total:
+            "The number of ECS lookups that fell back to the exact SOURCE key after reusable scopes missed.",
+          cache_ecs_prefix_hint_count:
+            "The current number of ECS prefix memberships in the advisory index, classified by address family.",
+          cache_ecs_lookup_index_base_keys:
+            "The current number of base DNS cache keys represented in the ECS prefix index.",
           cache_hit_total:
             "Total cache hits classified by freshness (fresh = direct hits, stale = stale available).",
           cache_miss_total: "The total number of cache misses for queries.",
+          cache_miss_coalesced_total:
+            "The number of concurrent misses coalesced behind the leader for the same cache key.",
+          cache_miss_coalesce_timeout_total:
+            "The number of coalesced miss waiters that timed out and continued downstream.",
+          cache_miss_coalesce_reentrant_total:
+            "The number of recursive or reentrant misses that bypassed coalescing.",
           cache_expired_total:
             "The number of times expired entries were found and removed during a lookup.",
           cache_insert_total:
             "The total number of times cache entries have been inserted or updated.",
           cache_skip_total:
-            "The total number of responses that were skipped from cache due to write policy (truncated responses, no TTL, low positive TTL).",
+            "The total number of responses skipped by cache admission policy (truncated responses, no TTL, incomplete answers, or low positive TTL).",
           cache_lazy_refresh_total:
-            "Total number of Lazy Cache background refresh attempts (by result: started / success / failed).",
+            "Lazy Cache background refresh states by result (started / success / failed / skipped_busy / skipped_cooldown).",
           cache_entry_count: "The number of entries currently in the cache.",
         },
         derived: {

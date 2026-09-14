@@ -41,6 +41,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  ApiResponseError,
   deleteCacheEntry,
   fetchCacheDump,
   fetchCacheEntries,
@@ -135,6 +136,8 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
   const [qnameInput, setQnameInput] = useState("");
   const [appliedQname, setAppliedQname] = useState("");
   const [loading, setLoading] = useState(false);
+  const [flushLoading, setFlushLoading] = useState(false);
+  const [flushResult, setFlushResult] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(
@@ -185,15 +188,20 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
   };
 
   const handleFlush = async () => {
+    setFlushLoading(true);
+    setFlushResult(null);
     setError(null);
     try {
-      await flushCache(tag);
+      const result = await flushCache(tag);
       setEntries([]);
       setTotal(0);
       setNextCursor(undefined);
       setSelected(null);
+      setFlushResult(result.cleared_entries);
     } catch (err) {
       setError(err instanceof Error ? err.message : t(WEBUI.cache.flushFailed));
+    } finally {
+      setFlushLoading(false);
     }
   };
 
@@ -240,7 +248,7 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
             <Button
               variant="outline"
               size="sm"
-              disabled={loading}
+              disabled={loading || flushLoading}
               onClick={() => load(undefined, appliedQname)}
             >
               <RefreshCw className="h-4 w-4" />
@@ -248,7 +256,11 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
             </Button>
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <Button variant="outline" size="sm" disabled={loading}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={loading || flushLoading}
+                >
                   <Trash2 className="h-4 w-4" />
                   {t(WEBUI.common.clear)}
                 </Button>
@@ -271,6 +283,7 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
                   </AlertDialogCancel>
                   <AlertDialogAction
                     variant="destructive"
+                    disabled={flushLoading}
                     onClick={() => void handleFlush()}
                   >
                     {t(WEBUI.common.clear)}
@@ -284,6 +297,11 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
           {error && (
             <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {error}
+            </div>
+          )}
+          {flushResult !== null && (
+            <div className="mb-3 rounded-md border border-green-500/30 bg-green-500/10 px-3 py-2 text-sm text-green-600 dark:text-green-400">
+              {t(WEBUI.cache.flushedResult, { count: flushResult })}
             </div>
           )}
           <form
@@ -575,9 +593,19 @@ function CacheMaintenancePanel({ tag }: { tag: string }) {
       const result = await loadCacheDump(tag, buffer);
       setLoadResult(result.loaded_entries);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t(WEBUI.cache.importFailed),
-      );
+      if (err instanceof ApiResponseError) {
+        if (err.code === "cache_dump_ecs_mode_mismatch") {
+          setError(t(WEBUI.cache.dumpEcsModeMismatch));
+        } else if (err.code === "cache_dump_ecs_mode_unknown") {
+          setError(t(WEBUI.cache.dumpEcsModeUnknown));
+        } else {
+          setError(err.message);
+        }
+      } else {
+        setError(
+          err instanceof Error ? err.message : t(WEBUI.cache.importFailed),
+        );
+      }
     } finally {
       setLoadLoading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";

@@ -255,9 +255,12 @@ export const enUSWebui = {
     truncated: "Truncated response",
     noTtl: "No TTL",
     lowPositiveTtl: "Low positive TTL",
+    incompleteAnswer: "Incomplete answer",
     started: "Started",
     success: "Success",
     failed: "Failed",
+    skippedBusy: "Concurrency busy",
+    skippedCooldown: "Failure cooldown",
   },
   pluginDetail: {
     expand: "Expand detail",
@@ -485,6 +488,11 @@ export const enUSWebui = {
     readEntriesFailed: "Failed to read cache entries",
     deleteEntryFailed: "Failed to delete cache entry",
     flushFailed: "Failed to flush cache",
+    flushedResult: "Cleared {count} cache entries",
+    dumpEcsModeMismatch:
+      "This cache dump was created in shared ECS mode (ecs_in_key=false) and cannot be loaded into the current ECS-keyed cache instance.",
+    dumpEcsModeUnknown:
+      "This legacy cache dump does not record its ecs_in_key mode and cannot be safely loaded into the current ECS-keyed cache instance.",
     entriesTitle: "Cache entries",
     matchCount: "Matched {total} entries",
     totalCount: "{total} entries total",
