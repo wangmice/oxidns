@@ -300,6 +300,10 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
     short_circuit: true
     # Serve stale responses briefly after original TTL expiry and refresh lazily
     lazy_cache_ttl: 120
+    # Bound concurrent background lazy refreshes across distinct cache keys
+    lazy_refresh_concurrency: 64
+    # Minimum retry delay after a failed lazy refresh, in seconds
+    lazy_refresh_failure_cooldown: 30
     # Cache NXDOMAIN / NODATA responses too
     cache_negative: true
     # Upper bound for negative-cache TTL
@@ -335,6 +339,28 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
   - Stale hits trigger an asynchronous background refresh.
   - This setting does not shorten the original fresh TTL.
 
+#### `lazy_refresh_concurrency`
+
+- Type: `integer`; Required: no; Default: `64`
+- Purpose: Bound concurrent lazy refreshes across distinct cache keys.
+- Behavior:
+  - The existing per-key deduplication still prevents duplicate refreshes for the same key.
+  - When all refresh slots are busy, stale responses are still served, but no task is queued or spawned.
+  - Refreshes skipped by the concurrency limit increment `cache_lazy_refresh_total{result="skipped_busy"}`.
+  - A later stale request can retry once a refresh slot becomes available.
+
+#### `lazy_refresh_failure_cooldown`
+
+- Type: `integer`; Required: no; Default: `30`
+- Unit: seconds
+- Purpose: Bound retry frequency for the same stale cache key after a lazy refresh failure.
+- Behavior:
+  - Upstream errors, timeouts, SERVFAIL/unusable responses, and similar refresh failures arm a cooldown on the current stale entry.
+  - During the cooldown, stale responses are still served but no new background refresh is started for that entry.
+  - Refreshes skipped by the failure cooldown increment `cache_lazy_refresh_total{result="skipped_cooldown"}`.
+  - A successful refresh publishes a new cache entry, so the previous entry's failure cooldown is not inherited.
+  - The 30-second default follows the RFC 8767 failure-recheck recommendation.
+
 #### `dump_file`
 
 - Type: `string`; Required: no
@@ -343,7 +369,11 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `dump_interval`
 
 - Type: `duration`; Required: no; Default: `600s`
-- Purpose: Periodic dump interval.
+- Purpose: Minimum interval between automatic periodic dump checks.
+- Behavior:
+  - Automatic periodic dumps never run more frequently than this configured interval.
+  - The internal dirty-age policy may defer a low-churn dump, but never shortens `dump_interval`.
+  - The final dump during shutdown and explicit API-triggered dumps are not delayed by this interval.
 
 #### `short_circuit`
 
@@ -382,7 +412,10 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `ecs_in_key`
 
 - Type: `boolean`; Required: no; Default: `false`
-- Purpose: Include ECS information in the cache key.
+- Purpose: Control whether ECS participates in cache keying.
+- `false`: ECS from the client request is still forwarded unchanged to downstream/upstream plugins, but the cache key ignores ECS. ECS is stripped from the upstream response before the cache stage returns or stores it, so clients with different ECS values (or no ECS) share the same ordinary cache entry. This is a first-writer-wins policy: the first successfully cached ECS-steered answer may be reused by other ECS clients.
+- `true`: ECS participates in scope-aware cache keying and lookup. Cache isolation and reuse follow RFC 7871 FAMILY, SOURCE PREFIX-LENGTH, ADDRESS, and response SCOPE PREFIX-LENGTH semantics.
+- Regardless of this setting, invalid request ECS (for example, a non-zero SCOPE PREFIX-LENGTH or an out-of-range prefix) bypasses caching and continues through the downstream chain.
 
 ### quick setup
 

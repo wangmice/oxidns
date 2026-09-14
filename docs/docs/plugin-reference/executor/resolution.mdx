@@ -348,6 +348,10 @@ import Admonition from "@theme/Admonition";
     short_circuit: true
     # 允许在原始 TTL 过期后短时间返回 stale 响应，并异步刷新缓存
     lazy_cache_ttl: 120
+    # 限制不同缓存键同时执行的后台 lazy refresh 数量
+    lazy_refresh_concurrency: 64
+    # lazy refresh 失败后，同一缓存键再次尝试刷新的最小间隔（秒）
+    lazy_refresh_failure_cooldown: 30
     # 开启 NXDOMAIN / NODATA 负缓存
     cache_negative: true
     # 负缓存 TTL 上限
@@ -384,6 +388,28 @@ import Admonition from "@theme/Admonition";
   - stale 命中会在后台异步刷新缓存。
   - 该配置不会缩短原始 fresh TTL。
 
+#### `lazy_refresh_concurrency`
+
+- 类型：`integer`；必填：否；默认值：`64`
+- 作用：限制不同缓存键同时运行的 lazy refresh 数量。
+- 运行影响：
+  - 同一个缓存键仍通过 per-key 去重避免重复刷新。
+  - 达到并发上限时继续返回 stale 响应，但不会排队或启动新的后台 refresh task。
+  - 被并发上限跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_busy"}`。
+  - 后续 stale 请求可在有空闲槽位时再次尝试刷新。
+
+#### `lazy_refresh_failure_cooldown`
+
+- 类型：`integer`；必填：否；默认值：`30`
+- 单位：秒
+- 作用：限制同一个 stale 缓存键在刷新失败后的重试频率。
+- 运行影响：
+  - 上游错误、超时、SERVFAIL/不可缓存响应等刷新失败后，为当前 stale entry 设置失败冷却。
+  - 冷却期间继续返回 stale 响应，但不启动新的后台 refresh。
+  - 被失败冷却跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_cooldown"}`。
+  - 成功刷新会发布新的 cache entry，新 entry 不继承旧 entry 的失败冷却。
+  - 默认 30 秒与 RFC 8767 的 failure recheck 建议一致。
+
 #### `dump_file`
 
 - 类型：`string`；必填：否；默认值：无
@@ -393,7 +419,11 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`integer`；必填：否；默认值：`600`
 - 单位：秒
-- 作用：定义缓存定期落盘周期。
+- 作用：定义自动周期 dump 的最小检查间隔。
+- 行为：
+  - 自动周期 dump 不会以短于该配置值的间隔执行。
+  - 内部 dirty-age 策略可以延后低变更量缓存的 dump，但不会缩短 `dump_interval`。
+  - shutdown 时的最终 dump 和显式 API 手动 dump 不受该间隔限制。
 
 #### `short_circuit`
 
@@ -437,6 +467,9 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`boolean`；必填：否；默认值：`false`
 - 作用：控制 ECS scope 是否参与缓存键计算。
+- `false`：客户端请求中的 ECS 仍会原样传递给后续上游插件，但缓存键忽略 ECS。上游响应中的 ECS 会在 cache 返回响应和写入缓存前剥离，因此带不同 ECS 或不带 ECS 的客户端共享同一个普通缓存项。该模式属于 first-writer-wins：首次成功写入的 ECS 调度结果可能被其它 ECS 客户端复用。
+- `true`：ECS 参与 scope-aware 缓存键与查找，按 RFC 7871 的 FAMILY、SOURCE PREFIX-LENGTH、ADDRESS 与响应 SCOPE PREFIX-LENGTH 隔离和复用缓存结果。
+- 无论取值为何，非法请求 ECS（例如非零 SCOPE PREFIX-LENGTH 或超出地址族范围的前缀）不会进入缓存，而是旁路 cache 继续执行后续链路。
 
 ### quick setup
 
