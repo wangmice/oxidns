@@ -14,7 +14,7 @@ use crate::infra::network::upstream::pool::{DeadlineOutcome, QueryDeadline};
 use crate::proto::Message;
 
 #[async_trait]
-#[allow(unused)]
+// #[allow(unused)]
 pub trait Upstream: Send + Sync + Debug {
     /// **Internal API - Do not call directly!**
     ///
@@ -67,7 +67,11 @@ pub trait Upstream: Send + Sync + Debug {
         deadline: QueryDeadline,
     ) -> Result<Message> {
         if deadline.remaining().is_none() {
+            let info = self.connection_info();
             warn!(
+                upstream = %info.raw_addr,
+                upstream_tag = info.tag.as_deref().unwrap_or(""),
+                protocol = ?info.connection_type,
                 timeout_secs = self.timeout().as_secs_f64(),
                 "Upstream DNS query timeout"
             );
@@ -84,7 +88,11 @@ pub trait Upstream: Send + Sync + Debug {
         match deadline.run(self.inner_query(message, deadline)).await {
             DeadlineOutcome::Completed(result) => result,
             DeadlineOutcome::Expired => {
+                let info = self.connection_info();
                 warn!(
+                    upstream = %info.raw_addr,
+                    upstream_tag = info.tag.as_deref().unwrap_or(""),
+                    protocol = ?info.connection_type,
                     timeout_secs = self.timeout().as_secs_f64(),
                     "Upstream DNS query timeout"
                 );

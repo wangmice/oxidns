@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use super::is_timeout_error;
+use super::{contextualize_upstream_error, is_timeout_error};
 use super::metrics::ForwardMetrics;
 use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result};
@@ -67,16 +67,20 @@ impl Executor for SingleDnsForwarder {
                 let timeout = is_timeout_error(&e);
                 self.metrics.record_error(start_ms, timeout);
                 self.metrics.record_upstream_error(0, start_ms, timeout);
+                let upstream_error =
+                    contextualize_upstream_error(self.upstream.connection_info(), e);
                 warn!(
-                    "DNS query failed - source: {}, queries: {:?}, id: {}, reason: {}",
-                    context.peer_addr(),
-                    context.request.questions(),
-                    context.request.id(),
-                    e
+                    upstream = %self.upstream.connection_info().raw_addr,
+                    upstream_tag = self.upstream.connection_info().tag.as_deref().unwrap_or(""),
+                    source = %context.peer_addr(),
+                    query_id = context.request.id(),
+                    queries = ?context.request.questions(),
+                    error = %upstream_error,
+                    "DNS query failed"
                 );
                 return Err(DnsError::plugin(format!(
                     "forward plugin '{}' query failed: {}",
-                    self.tag, e
+                    self.tag, upstream_error
                 )));
             }
         }

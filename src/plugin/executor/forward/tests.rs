@@ -197,6 +197,7 @@ async fn concurrent_returns_error_when_all_upstreams_fail() {
         err.to_string()
             .contains("failed across all concurrent upstreams")
     );
+    assert!(err.to_string().contains("upstream '1.1.1.1' query failed"));
     assert!(context.response().is_none());
     assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
@@ -386,6 +387,7 @@ async fn single_metrics_record_error_and_timeout() {
     let err = forwarder.execute(&mut context).await.unwrap_err();
 
     assert!(err.to_string().contains("query failed"));
+    assert!(err.to_string().contains("upstream '1.1.1.1' query failed"));
     assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.timeout_total.load(Ordering::Relaxed), 1);
