@@ -29,6 +29,11 @@ use crate::proto::Message;
 
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
 
+#[inline]
+fn h2_pool_stream_limit(peer_limit: usize) -> u16 {
+    peer_limit.clamp(1, u16::MAX as usize) as u16
+}
+
 enum H2RecvError {
     Connection(DnsError),
     Stream(DnsError),
@@ -93,6 +98,14 @@ impl Connection for H2Connection {
 
     fn available(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+    }
+
+    fn max_concurrent_queries(&self) -> u16 {
+        // Read h2's live peer SETTINGS value rather than caching a handshake
+        // snapshot. A floor of one keeps a query parked in `ready()` when the
+        // peer temporarily advertises zero streams so a later SETTINGS update
+        // can wake it without requiring a separate pool notification channel.
+        h2_pool_stream_limit(self.sender.current_max_send_streams())
     }
 
     fn last_used(&self) -> u64 {
@@ -488,6 +501,15 @@ mod tests {
         drop(sender);
         client_task.abort();
         server_task.abort();
+    }
+
+    #[test]
+    fn test_h2_pool_stream_limit_keeps_liveness_floor_and_clamps_large_values() {
+        assert_eq!(h2_pool_stream_limit(0), 1);
+        assert_eq!(h2_pool_stream_limit(1), 1);
+        assert_eq!(h2_pool_stream_limit(8), 8);
+        assert_eq!(h2_pool_stream_limit(u16::MAX as usize), u16::MAX);
+        assert_eq!(h2_pool_stream_limit(usize::MAX), u16::MAX);
     }
 
     #[test]

@@ -480,9 +480,10 @@ impl<C: Connection> PipelineSlot<C> {
             return false;
         }
 
+        let effective_max_load = max_load.min(self.conn.max_concurrent_queries());
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
-            if current >= max_load {
+            if current >= effective_max_load {
                 return false;
             }
             match self.inflight.compare_exchange_weak(
@@ -659,7 +660,7 @@ impl<C: Connection> Drop for PipelinePool<C> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
 
     use async_trait::async_trait;
 
@@ -672,6 +673,7 @@ mod tests {
         using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
+        max_concurrent_queries: AtomicU16,
         query_delay: Duration,
     }
 
@@ -682,6 +684,7 @@ mod tests {
                 using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
+                max_concurrent_queries: AtomicU16::new(u16::MAX),
                 query_delay: Duration::ZERO,
             }
         }
@@ -693,6 +696,10 @@ mod tests {
 
         fn close_calls(&self) -> usize {
             self.close_calls.load(Ordering::Relaxed)
+        }
+
+        fn set_max_concurrent_queries(&self, max: u16) {
+            self.max_concurrent_queries.store(max, Ordering::Release);
         }
     }
 
@@ -718,6 +725,10 @@ mod tests {
 
         fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed)
+        }
+
+        fn max_concurrent_queries(&self) -> u16 {
+            self.max_concurrent_queries.load(Ordering::Acquire)
         }
 
         fn last_used(&self) -> u64 {
@@ -1180,5 +1191,25 @@ mod tests {
 
         assert_eq!(first.close_calls(), 1);
         assert_eq!(second.close_calls(), 1);
+    }
+    #[test]
+    fn test_pipeline_slot_tracks_dynamic_connection_load_limit() {
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        conn.set_max_concurrent_queries(2);
+        let slot = PipelineSlot::new(conn.clone());
+
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        conn.set_max_concurrent_queries(4);
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
     }
 }
