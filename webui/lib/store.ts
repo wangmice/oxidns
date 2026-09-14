@@ -37,6 +37,7 @@ import {
 } from "./oxidns-api";
 import {
   parsePrometheusMetrics,
+  type GlobalNetworkMetrics,
   type OutboundMetricsMap,
   type PluginMetricsMap,
 } from "./metrics";
@@ -123,6 +124,7 @@ interface AppState {
   reloadStatus: ReloadSnapshot | null;
   pluginMetrics: PluginMetricsMap;
   outboundMetrics: OutboundMetricsMap;
+  networkMetrics: GlobalNetworkMetrics;
   trafficMetrics: DnsTrafficMetrics;
   dependencyGraph: DependencyGraphReport | null;
   runningDependencyGraph: DependencyGraphReport | null;
@@ -256,6 +258,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadStatus: null,
   pluginMetrics: {},
   outboundMetrics: {},
+  networkMetrics: [],
   trafficMetrics: {
     status: "pending",
     qps: null,
@@ -364,6 +367,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         reloadStatus: null,
         pluginMetrics: {},
         outboundMetrics: {},
+        networkMetrics: [],
         trafficMetrics: {
           status: "pending",
           qps: null,
@@ -632,6 +636,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({
           pluginMetrics: metrics.byTag,
           outboundMetrics: metrics.outbound,
+          networkMetrics: metrics.network,
           trafficMetrics,
         });
       } catch {

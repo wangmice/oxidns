@@ -211,6 +211,63 @@ function OutboundMetricTile({
   );
 }
 
+const NETWORK_TIMEOUT_STAGES = [
+  {
+    stage: "pool_acquire",
+    labelKey: WEBUI.settings.networkTimeoutPoolAcquire,
+  },
+  {
+    stage: "connection_create",
+    labelKey: WEBUI.settings.networkTimeoutConnectionCreate,
+  },
+  {
+    stage: "protocol_handshake",
+    labelKey: WEBUI.settings.networkTimeoutProtocolHandshake,
+  },
+  {
+    stage: "query_io",
+    labelKey: WEBUI.settings.networkTimeoutQueryIo,
+  },
+] as const;
+
+function NetworkTimeoutMetricsPanel({ metrics }: { metrics: MetricSeries[] }) {
+  const { t, formatNumber } = useI18n();
+  const timeoutSeries = metrics.filter(
+    (item) => item.name === "network_upstream_timeout_total",
+  );
+
+  if (timeoutSeries.length === 0) return null;
+
+  return (
+    <div className="space-y-3 border-t pt-4">
+      <div>
+        <p className="text-sm font-medium">
+          {t(WEBUI.settings.networkTimeoutMetricsTitle)}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {t(WEBUI.settings.networkTimeoutMetricsDesc)}
+        </p>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {NETWORK_TIMEOUT_STAGES.map(({ stage, labelKey }) => (
+          <OutboundMetricTile
+            key={stage}
+            label={t(labelKey)}
+            value={formatMetricCount(
+              sumMetric(
+                timeoutSeries,
+                "network_upstream_timeout_total",
+                (item) => item.labels.stage === stage,
+              ),
+              formatNumber,
+            )}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function OutboundRuntimeMetricsPanel({
   metrics,
   configuredProfileNames,
@@ -368,6 +425,7 @@ export default function SettingsPage() {
   const saveConfig = useAppStore((s) => s.saveConfig);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const outboundMetrics = useAppStore((s) => s.outboundMetrics);
+  const networkMetrics = useAppStore((s) => s.networkMetrics);
   const isConfigSaving = useAppStore((s) => s.isConfigSaving);
   const isRestarting = useAppStore((s) => s.isRestarting);
   const restartApp = useAppStore((s) => s.restartApp);
@@ -1481,6 +1539,8 @@ export default function SettingsPage() {
                       ))}
                     </div>
                   )}
+
+                  <NetworkTimeoutMetricsPanel metrics={networkMetrics} />
 
                   <OutboundRuntimeMetricsPanel
                     metrics={outboundMetrics}
