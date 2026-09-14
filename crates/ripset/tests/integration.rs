@@ -22,7 +22,7 @@ use std::net::IpAddr;
 
 use harness::{NftCleanup, ensure_nft_available, run_nft, unique_name};
 use ripset::{
-    IpCidr, IpEntry, IpSetError, NftSetCreateOptions, NftSetType, nftset_add, nftset_create_set,
+    IpCidr, IpEntry, IpSetError, NftSetCreateOptions, NftSetType, nftset_add, nftset_add_many, nftset_create_set,
     nftset_create_table, nftset_del, nftset_delete_set, nftset_delete_table, nftset_list,
     nftset_list_tables, nftset_test,
 };
@@ -759,4 +759,42 @@ fn ipset_add_to_missing_set_returns_set_not_found() {
         Err(IpSetError::SetNotFound(_)) => {}
         other => panic!("expected SetNotFound, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore]
+fn nftset_bulk_add_reports_existing_elements_without_losing_new_entries() {
+    ensure_nft_available();
+    let table = unique_name("oxi_nft_bulk");
+    let set = "v4_set";
+    let _g = NftCleanup::new("ip", &table);
+
+    run_nft(&["add", "table", "ip", &table]);
+    run_nft(&[
+        "add",
+        "set",
+        "ip",
+        &table,
+        set,
+        "{ type ipv4_addr; flags interval; }",
+    ]);
+
+    let existing = IpCidr::new("192.0.2.1".parse().unwrap(), 32).unwrap();
+    nftset_add("ip", &table, set, existing).unwrap();
+
+    let entries = [
+        existing,
+        IpCidr::new("198.51.100.1".parse().unwrap(), 32).unwrap(),
+        IpCidr::new("203.0.113.1".parse().unwrap(), 32).unwrap(),
+    ];
+    let outcome = nftset_add_many("ip", &table, set, entries).unwrap();
+
+    assert_eq!(outcome.added, 2);
+    assert_eq!(outcome.exists, 1);
+    assert!(outcome.failed.is_empty());
+
+    let listing = run_nft(&["list", "set", "ip", &table, set]);
+    assert!(listing.contains("192.0.2.1"));
+    assert!(listing.contains("198.51.100.1"));
+    assert!(listing.contains("203.0.113.1"));
 }

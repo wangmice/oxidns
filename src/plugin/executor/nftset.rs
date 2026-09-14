@@ -22,14 +22,14 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 #[cfg(target_os = "linux")]
 use std::thread;
 
 use ahash::AHashSet;
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
-use ripset::{IpCidr, IpSetError, nftset_add};
+use ripset::{IpCidr, IpSetError, nftset_add_many};
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 #[cfg(target_os = "linux")]
@@ -48,6 +48,8 @@ use crate::plugin_factory;
 
 #[cfg(target_os = "linux")]
 const NFTSET_WRITER_QUEUE_SIZE: usize = 256;
+#[cfg(target_os = "linux")]
+const NFTSET_WRITER_DRAIN_MAX_BATCHES: usize = 64;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct NftSetConfig {
@@ -471,6 +473,18 @@ fn validate_set(set: &ResolvedSet, ip_type: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn drain_ready_batches(rx: &Receiver<NftSetBatch>, mut batch: NftSetBatch) -> NftSetBatch {
+    for _ in 1..NFTSET_WRITER_DRAIN_MAX_BATCHES {
+        let Ok(mut queued) = rx.try_recv() else {
+            break;
+        };
+        batch.ipv4_prefixes.append(&mut queued.ipv4_prefixes);
+        batch.ipv6_prefixes.append(&mut queued.ipv6_prefixes);
+    }
+    batch
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_nftset_writer(
     tag: &str,
     enabled: Arc<AtomicBool>,
@@ -485,9 +499,15 @@ fn spawn_nftset_writer(
         .name(format!("nftset-{}", thread_tag))
         .spawn(move || {
             while enabled.load(Ordering::Relaxed) {
-                let Ok(batch) = rx.recv() else {
+                let Ok(mut batch) = rx.recv() else {
                     break;
                 };
+
+                // Coalesce work that is already queued without sleeping or
+                // delaying the first batch. This amortizes wakeups/netlink
+                // setup and lets canonical CIDR dedup remove duplicates across
+                // adjacent DNS responses as well as inside one response.
+                batch = drain_ready_batches(&rx, batch);
 
                 if let Some(set) = ipv4.as_ref()
                     && !batch.ipv4_prefixes.is_empty()
@@ -513,6 +533,7 @@ fn spawn_nftset_writer(
 struct WriteOutcome {
     ok: u64,
     skipped_exists: u64,
+    skipped_duplicate: u64,
     /// Failed (prefix-as-string, rendered error). Bounded to avoid unbounded
     /// memory growth on persistent backend failures.
     failed: Vec<(String, String)>,
@@ -523,11 +544,28 @@ struct WriteOutcome {
 const NFTSET_FAILURE_SAMPLE_CAP: usize = 4;
 
 #[cfg(target_os = "linux")]
+#[inline]
+fn canonical_cidr_once(
+    seen: &mut AHashSet<IpCidr>,
+    prefix: &IpPrefix,
+) -> std::result::Result<Option<IpCidr>, IpSetError> {
+    let cidr = IpCidr::new(prefix.addr, prefix.mask)?;
+    Ok(seen.insert(cidr).then_some(cidr))
+}
+
+#[cfg(target_os = "linux")]
 fn write_nftset_prefixes(set: &ResolvedSet, prefixes: &[IpPrefix]) -> WriteOutcome {
     let mut outcome = WriteOutcome::default();
+    let mut seen = AHashSet::with_capacity(prefixes.len());
+    let mut canonical = Vec::with_capacity(prefixes.len());
+
     for prefix in prefixes {
-        let cidr = match IpCidr::new(prefix.addr, prefix.mask) {
-            Ok(c) => c,
+        // Multiple DNS answers/batches can collapse to the same nftables
+        // element after applying the configured mask. Canonicalize first and
+        // submit each CIDR only once per drained writer group.
+        match canonical_cidr_once(&mut seen, prefix) {
+            Ok(Some(cidr)) => canonical.push(cidr),
+            Ok(None) => outcome.skipped_duplicate += 1,
             Err(e) => {
                 outcome.failed_total += 1;
                 if outcome.failed.len() < NFTSET_FAILURE_SAMPLE_CAP {
@@ -535,30 +573,47 @@ fn write_nftset_prefixes(set: &ResolvedSet, prefixes: &[IpPrefix]) -> WriteOutco
                         .failed
                         .push((prefix.addr.to_string(), format!("invalid prefix: {e}")));
                 }
-                continue;
-            }
-        };
-
-        match nftset_add(
-            set.table_family.as_str(),
-            set.table_name.as_str(),
-            set.set_name.as_str(),
-            cidr,
-        ) {
-            Ok(()) => outcome.ok += 1,
-            // EEXIST / range overlap is expected when the DNS path re-resolves
-            // the same answer (or when a /32 is already covered by an existing
-            // CIDR). Treat it as a non-error skip so we don't tear the plugin
-            // down on entirely normal traffic.
-            Err(IpSetError::ElementExists) => outcome.skipped_exists += 1,
-            Err(e) => {
-                outcome.failed_total += 1;
-                if outcome.failed.len() < NFTSET_FAILURE_SAMPLE_CAP {
-                    outcome.failed.push((cidr.to_string(), e.to_string()));
-                }
             }
         }
     }
+
+    if canonical.is_empty() {
+        return outcome;
+    }
+
+    match nftset_add_many(
+        set.table_family.as_str(),
+        set.table_name.as_str(),
+        set.set_name.as_str(),
+        canonical.iter().copied(),
+    ) {
+        Ok(batch) => {
+            outcome.ok += batch.added as u64;
+            outcome.skipped_exists += batch.exists as u64;
+            outcome.failed_total += batch.failed.len() as u64;
+            for (index, error) in batch.failed {
+                if outcome.failed.len() >= NFTSET_FAILURE_SAMPLE_CAP {
+                    break;
+                }
+                let prefix = canonical
+                    .get(index)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("entry#{index}"));
+                outcome.failed.push((prefix, error.to_string()));
+            }
+        }
+        Err(error) => {
+            // A setup/protocol failure applies to the whole bulk operation.
+            outcome.failed_total += canonical.len() as u64;
+            if outcome.failed.len() < NFTSET_FAILURE_SAMPLE_CAP {
+                outcome.failed.push((
+                    format!("{} entries", canonical.len()),
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+
     outcome
 }
 
@@ -589,6 +644,7 @@ fn record_outcome(
             set = %set.set_name,
             ok = outcome.ok,
             skipped_exists = outcome.skipped_exists,
+            skipped_duplicate = outcome.skipped_duplicate,
             failed = outcome.failed_total,
             sample = %sample,
             "nftset batch had write failures"
@@ -606,6 +662,66 @@ mod tests {
     #[test]
     fn test_parse_config_rejects_empty_table_or_set_name() {
         assert!(parse_config(Some(Value::String("bad".into()))).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_writer_batch_deduplicates_canonical_cidrs() {
+        let mut seen = AHashSet::new();
+        let first = IpPrefix {
+            addr: IpAddr::V4("192.0.2.10".parse().unwrap()),
+            mask: 24,
+        };
+        let same_network = IpPrefix {
+            addr: IpAddr::V4("192.0.2.20".parse().unwrap()),
+            mask: 24,
+        };
+        let other_network = IpPrefix {
+            addr: IpAddr::V4("198.51.100.7".parse().unwrap()),
+            mask: 24,
+        };
+
+        assert_eq!(
+            canonical_cidr_once(&mut seen, &first).unwrap(),
+            Some(IpCidr::new("192.0.2.0".parse().unwrap(), 24).unwrap())
+        );
+        assert_eq!(canonical_cidr_once(&mut seen, &same_network).unwrap(), None);
+        assert_eq!(
+            canonical_cidr_once(&mut seen, &other_network).unwrap(),
+            Some(IpCidr::new("198.51.100.0".parse().unwrap(), 24).unwrap())
+        );
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_writer_drains_ready_batches_without_waiting() {
+        let (tx, rx) = sync_channel(8);
+        let prefix = |addr: &str| IpPrefix {
+            addr: IpAddr::V4(addr.parse().unwrap()),
+            mask: 24,
+        };
+
+        tx.send(NftSetBatch {
+            ipv4_prefixes: vec![prefix("192.0.2.1")],
+            ipv6_prefixes: Vec::new(),
+        })
+        .unwrap();
+        tx.send(NftSetBatch {
+            ipv4_prefixes: vec![prefix("192.0.2.2")],
+            ipv6_prefixes: Vec::new(),
+        })
+        .unwrap();
+        tx.send(NftSetBatch {
+            ipv4_prefixes: vec![prefix("198.51.100.1")],
+            ipv6_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+        let first = rx.recv().unwrap();
+        let merged = drain_ready_batches(&rx, first);
+        assert_eq!(merged.ipv4_prefixes.len(), 3);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

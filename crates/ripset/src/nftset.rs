@@ -676,46 +676,30 @@ fn put_set_elem(buf: &mut MsgBuffer, key_bytes: &[u8], flags: u32, timeout_ms: O
     buf.end_nested(elem_offset);
 }
 
-/// Internal function to perform nftset element operations.
-fn nftset_operate(
-    family: &str,
+/// Perform one prepared nftset element operation using already-resolved set
+/// metadata and an existing netlink socket.
+fn nftset_operate_prepared(
+    nf_family: u8,
     table: &str,
     setname: &str,
     entry: &IpEntry,
     cmd: u16,
+    is_interval: bool,
+    socket: &NetlinkSocket,
 ) -> Result<()> {
-    // Validate names
-    if table.is_empty() || table.len() >= NFT_SET_MAXNAMELEN {
-        return Err(IpSetError::InvalidTableName(table.to_string()));
-    }
-    if setname.is_empty() || setname.len() >= NFT_SET_MAXNAMELEN {
-        return Err(IpSetError::InvalidSetName(setname.to_string()));
-    }
-
-    let nf_family = parse_nf_family(family)?;
-
-    // Get set flags to determine if it's an interval set
-    let set_flags = nftset_get_flags(family, table, setname).unwrap_or(0);
-    let is_interval = (set_flags & NFT_SET_INTERVAL) != 0;
     let is_cidr = matches!(entry.target, IpTarget::Cidr(_));
-
     if is_cidr && !is_interval {
         return Err(IpSetError::UnsupportedEntry(entry.target.to_string()));
     }
 
     let addr_bytes = target_start_bytes(entry.target);
-
-    // Build the batched netlink message
     let mut buf = MsgBuffer::new(BUFF_SZ);
 
-    // Batch begin message
     buf.put_nlmsghdr(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0);
     buf.put_nfgenmsg(libc::AF_UNSPEC as u8, 0, NFNL_SUBSYS_NFTABLES as u16);
     buf.finalize_nlmsg();
 
     let msg_start = buf.len();
-
-    // Main message
     let flags = if cmd == NFT_MSG_NEWSETELEM {
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE
     } else {
@@ -724,20 +708,10 @@ fn nftset_operate(
 
     buf.put_nlmsghdr(nft_msg_type(cmd), flags, 1);
     buf.put_nfgenmsg(nf_family, 0, 0);
-
     buf.put_attr_str(NFTA_SET_ELEM_LIST_TABLE, table);
     buf.put_attr_str(NFTA_SET_ELEM_LIST_SET, setname);
 
-    // Elements list (nested). For interval sets, encode the range as two
-    // list items the way the userspace `nft` client does:
-    //   1. start key, flags=0
-    //   2. end key (exclusive), flags=NFT_SET_ELEM_INTERVAL_END
-    // The single-element NFTA_SET_ELEM_KEY_END form is technically supported
-    // by newer kernels but is rejected with EINVAL in several real-world
-    // configurations (issue #127). Mirroring `nft` keeps us compatible with
-    // the broadest range of kernel versions and existing sets.
     let elems_offset = buf.start_nested(NFTA_SET_ELEM_LIST_ELEMENTS);
-
     let timeout_ms = entry.timeout.map(|t| (t as u64) * 1000);
     put_set_elem(&mut buf, addr_bytes.as_slice(), 0, timeout_ms);
 
@@ -758,39 +732,33 @@ fn nftset_operate(
     }
 
     buf.end_nested(elems_offset);
-
     buf.finalize_nlmsg_at(msg_start);
 
-    // Batch end message
     let end_start = buf.len();
     buf.put_nlmsghdr(NFNL_MSG_BATCH_END, NLM_F_REQUEST, 2);
     buf.put_nfgenmsg(libc::AF_UNSPEC as u8, 0, NFNL_SUBSYS_NFTABLES as u16);
     buf.finalize_nlmsg_at(end_start);
 
-    // Send and receive
-    let socket = NetlinkSocket::new()?;
     socket.send(buf.as_slice())?;
 
-    // Receive all responses
     let mut recv_buf = [0u8; BUFF_SZ];
     loop {
         let recv_len = socket.recv(&mut recv_buf)?;
-
         if recv_len < NlMsgHdr::SIZE {
             return Err(IpSetError::ProtocolError);
         }
 
-        // Check for error
         if let Some(error) = parse_nlmsg_error(&recv_buf[..recv_len]) {
             if error == 0 {
-                // Continue reading
+                // Continue to the normal termination handling below.
             } else {
                 return match -error {
                     libc::ENOENT => {
                         if cmd == NFT_MSG_DELSETELEM {
-                            return Err(IpSetError::ElementNotFound);
+                            Err(IpSetError::ElementNotFound)
+                        } else {
+                            Err(IpSetError::SetNotFound(setname.to_string()))
                         }
-                        Err(IpSetError::SetNotFound(setname.to_string()))
                     }
                     libc::EEXIST => Err(IpSetError::ElementExists),
                     _ => Err(IpSetError::NetlinkError(-error)),
@@ -798,20 +766,46 @@ fn nftset_operate(
             }
         }
 
-        // Check for NLMSG_DONE
         if is_nlmsg_done(&recv_buf[..recv_len]) {
             break;
         }
 
-        // Check message type to determine if we should continue
-        let msg_type = get_nlmsg_type(&recv_buf[..recv_len]);
-        if msg_type == Some(crate::netlink::NLMSG_ERROR) {
-            // Already handled above
+        if get_nlmsg_type(&recv_buf[..recv_len]) == Some(crate::netlink::NLMSG_ERROR) {
             break;
         }
     }
 
     Ok(())
+}
+
+/// Internal function to perform nftset element operations.
+fn nftset_operate(
+    family: &str,
+    table: &str,
+    setname: &str,
+    entry: &IpEntry,
+    cmd: u16,
+) -> Result<()> {
+    if table.is_empty() || table.len() >= NFT_SET_MAXNAMELEN {
+        return Err(IpSetError::InvalidTableName(table.to_string()));
+    }
+    if setname.is_empty() || setname.len() >= NFT_SET_MAXNAMELEN {
+        return Err(IpSetError::InvalidSetName(setname.to_string()));
+    }
+
+    let nf_family = parse_nf_family(family)?;
+    let set_flags = nftset_get_flags(family, table, setname).unwrap_or(0);
+    let is_interval = (set_flags & NFT_SET_INTERVAL) != 0;
+    let socket = NetlinkSocket::new()?;
+    nftset_operate_prepared(
+        nf_family,
+        table,
+        setname,
+        entry,
+        cmd,
+        is_interval,
+        &socket,
+    )
 }
 
 /// Add an IP address to an nftables set.
@@ -839,6 +833,162 @@ pub fn nftset_add<E: Into<IpEntry>>(
     entry: E,
 ) -> Result<()> {
     nftset_operate(family, table, setname, &entry.into(), NFT_MSG_NEWSETELEM)
+}
+
+
+/// Outcome of a bulk nftables set insertion.
+///
+/// The common path submits every element in one netlink batch. If the kernel
+/// reports `EEXIST` for the batch, the implementation falls back to the
+/// single-element path so callers retain per-element "added vs already
+/// exists" accounting without changing existing semantics.
+#[derive(Debug, Default)]
+pub struct NftSetAddManyOutcome {
+    pub added: usize,
+    pub exists: usize,
+    pub failed: Vec<(usize, IpSetError)>,
+}
+
+/// Add multiple IP entries to the same nftables set.
+///
+/// On the fast path this performs one set-flags lookup, opens one netlink
+/// socket, and submits all entries in a single `NFT_MSG_NEWSETELEM` batch.
+/// A batch-level `EEXIST` is retried element-by-element to preserve the public
+/// single-add behavior for pre-existing/overlapping entries.
+pub fn nftset_add_many<I, E>(
+    family: &str,
+    table: &str,
+    setname: &str,
+    entries: I,
+) -> Result<NftSetAddManyOutcome>
+where
+    I: IntoIterator<Item = E>,
+    E: Into<IpEntry>,
+{
+    let entries = entries.into_iter().map(Into::into).collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(NftSetAddManyOutcome::default());
+    }
+
+    if table.is_empty() || table.len() >= NFT_SET_MAXNAMELEN {
+        return Err(IpSetError::InvalidTableName(table.to_string()));
+    }
+    if setname.is_empty() || setname.len() >= NFT_SET_MAXNAMELEN {
+        return Err(IpSetError::InvalidSetName(setname.to_string()));
+    }
+
+    let nf_family = parse_nf_family(family)?;
+    let set_flags = nftset_get_flags(family, table, setname).unwrap_or(0);
+    let is_interval = (set_flags & NFT_SET_INTERVAL) != 0;
+
+    for entry in &entries {
+        if matches!(entry.target, IpTarget::Cidr(_)) && !is_interval {
+            return Err(IpSetError::UnsupportedEntry(entry.target.to_string()));
+        }
+    }
+
+    let mut buf = MsgBuffer::new(BUFF_SZ.max(entries.len().saturating_mul(96)));
+
+    buf.put_nlmsghdr(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0);
+    buf.put_nfgenmsg(libc::AF_UNSPEC as u8, 0, NFNL_SUBSYS_NFTABLES as u16);
+    buf.finalize_nlmsg();
+
+    let msg_start = buf.len();
+    buf.put_nlmsghdr(
+        nft_msg_type(NFT_MSG_NEWSETELEM),
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        1,
+    );
+    buf.put_nfgenmsg(nf_family, 0, 0);
+    buf.put_attr_str(NFTA_SET_ELEM_LIST_TABLE, table);
+    buf.put_attr_str(NFTA_SET_ELEM_LIST_SET, setname);
+
+    let elems_offset = buf.start_nested(NFTA_SET_ELEM_LIST_ELEMENTS);
+    for entry in &entries {
+        let addr_bytes = target_start_bytes(entry.target);
+        let timeout_ms = entry.timeout.map(|t| (t as u64) * 1000);
+        put_set_elem(&mut buf, addr_bytes.as_slice(), 0, timeout_ms);
+
+        if is_interval {
+            let is_cidr = matches!(entry.target, IpTarget::Cidr(_));
+            let end_bytes = if is_cidr {
+                target_end_bytes(entry.target)?.expect("interval end must exist")
+            } else {
+                let end_addr = calculate_interval_end(&entry.target.range_start())
+                    .ok_or_else(|| IpSetError::UnsupportedEntry(entry.target.to_string()))?;
+                IpAddrBytes::from_ip(end_addr)
+            };
+            put_set_elem(
+                &mut buf,
+                end_bytes.as_slice(),
+                NFT_SET_ELEM_INTERVAL_END,
+                None,
+            );
+        }
+    }
+    buf.end_nested(elems_offset);
+    buf.finalize_nlmsg_at(msg_start);
+
+    let end_start = buf.len();
+    buf.put_nlmsghdr(NFNL_MSG_BATCH_END, NLM_F_REQUEST, 2);
+    buf.put_nfgenmsg(libc::AF_UNSPEC as u8, 0, NFNL_SUBSYS_NFTABLES as u16);
+    buf.finalize_nlmsg_at(end_start);
+
+    let socket = NetlinkSocket::new()?;
+    socket.send(buf.as_slice())?;
+
+    let mut recv_buf = [0u8; BUFF_SZ];
+    let batch_result = loop {
+        let recv_len = socket.recv(&mut recv_buf)?;
+        if recv_len < NlMsgHdr::SIZE {
+            break Err(IpSetError::ProtocolError);
+        }
+
+        if let Some(error) = parse_nlmsg_error(&recv_buf[..recv_len]) {
+            if error == 0 {
+                break Ok(());
+            }
+            break match -error {
+                libc::ENOENT => Err(IpSetError::SetNotFound(setname.to_string())),
+                libc::EEXIST => Err(IpSetError::ElementExists),
+                _ => Err(IpSetError::NetlinkError(-error)),
+            };
+        }
+
+        if is_nlmsg_done(&recv_buf[..recv_len]) {
+            break Ok(());
+        }
+    };
+
+    match batch_result {
+        Ok(()) => Ok(NftSetAddManyOutcome {
+            added: entries.len(),
+            ..NftSetAddManyOutcome::default()
+        }),
+        Err(IpSetError::ElementExists) => {
+            // Preserve legacy semantics when any member of a bulk add collides
+            // with an existing/overlapping element. The common no-conflict
+            // path above still amortizes flags lookup, socket creation and ACK.
+            let mut outcome = NftSetAddManyOutcome::default();
+            for (index, entry) in entries.into_iter().enumerate() {
+                match nftset_operate_prepared(
+                    nf_family,
+                    table,
+                    setname,
+                    &entry,
+                    NFT_MSG_NEWSETELEM,
+                    is_interval,
+                    &socket,
+                ) {
+                    Ok(()) => outcome.added += 1,
+                    Err(IpSetError::ElementExists) => outcome.exists += 1,
+                    Err(error) => outcome.failed.push((index, error)),
+                }
+            }
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Delete an IP address from an nftables set.
