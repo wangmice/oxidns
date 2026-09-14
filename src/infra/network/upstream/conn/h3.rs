@@ -214,18 +214,36 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
                 .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
             quic_idle_timeout(self.timeout),
             vec![b"h3".to_vec()],
-        );
+        )
+        .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake);
         let quic_conn = if let Some(socks5) = self.socks5.clone() {
-            let (socket, peer_addr) =
-                Socks5QuicSocket::connect(self.target.clone(), self.socket_options.clone(), socks5)
-                    .await?;
+            let (socket, peer_addr) = match deadline
+                .run(Socks5QuicSocket::connect(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                    socks5,
+                ))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
             connect_quic_abstract(socket, peer_addr, dial_options).await?
         } else {
-            let socket = connect_udp(UdpDialOptions::new(
-                self.target.clone(),
-                self.socket_options.clone(),
-            ))
-            .await?;
+            let socket = match deadline
+                .run(connect_udp(UdpDialOptions::new(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                )))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
             connect_quic(socket, dial_options).await?
         };
 

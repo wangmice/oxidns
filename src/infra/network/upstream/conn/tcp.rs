@@ -523,7 +523,8 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
                             .remaining()
                             .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
                         vec![b"dot".to_vec()],
-                    ),
+                    )
+                    .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
                 )
                 .await?;
 

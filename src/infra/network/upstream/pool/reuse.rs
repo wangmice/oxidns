@@ -355,7 +355,7 @@ impl<C: Connection> ReusePool<C> {
                 Err(e) => {
                     debug!("Failed to create new connection: {:?}", e);
                     if deadline.remaining().is_none() {
-                        return Err(deadline.timeout_error());
+                        return Err(e);
                     }
                 }
             }

@@ -261,7 +261,8 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                     .remaining()
                     .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
                 vec![b"h2".to_vec()],
-            ),
+            )
+            .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
         )
         .await?;
 

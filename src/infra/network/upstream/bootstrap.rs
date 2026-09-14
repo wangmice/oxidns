@@ -12,7 +12,9 @@ use tracing::{debug, info};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::{self as network_metrics, NetworkProtocol, PoolRefreshReason};
+use crate::infra::network::metrics::{
+    self as network_metrics, NetworkProtocol, PoolRefreshReason, UpstreamTimeoutStage,
+};
 use crate::infra::network::resolver::{NameResolver, ResolvedIp};
 #[cfg(feature = "upstream-doh")]
 use crate::infra::network::upstream::bootstrap_factory::H2BootstrapPoolFactory;
@@ -189,7 +191,9 @@ impl<C: Connection> BootstrapUpstream<C> {
 
         let _update_guard = match deadline.run(self.pool_update_lock.lock()).await {
             DeadlineOutcome::Completed(guard) => guard,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+            }
         };
         let state = self.pool.load();
         if state.is_valid() {
@@ -205,7 +209,12 @@ impl<C: Connection> BootstrapUpstream<C> {
             .await
         {
             Ok(value) => value,
-            Err(value) => return Err(value),
+            Err(value) => {
+                if deadline.remaining().is_none() {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                }
+                return Err(value);
+            }
         };
         let protocol = NetworkProtocol::from_connection_info(&self.connection_info);
 

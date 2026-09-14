@@ -47,6 +47,18 @@ use tokio_rustls::client::TlsStream;
 use tracing::info;
 
 use crate::infra::error::{DnsError, Result};
+#[cfg(any(
+    feature = "_tls-client",
+    feature = "_dns-client-doq",
+    feature = "_dns-client-doh3"
+))]
+use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
+#[cfg(any(
+    feature = "_tls-client",
+    feature = "_dns-client-doq",
+    feature = "_dns-client-doh3"
+))]
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 #[cfg(feature = "_tls-client")]
 use crate::infra::network::tls_config::{insecure_client_config, secure_client_config};
 
@@ -192,6 +204,7 @@ pub(crate) struct TlsDialOptions {
     target: DialTarget,
     skip_cert: bool,
     handshake_timeout: Duration,
+    query_timeout: Option<(QueryDeadline, UpstreamTimeoutStage)>,
     alpn: Vec<Vec<u8>>,
 }
 
@@ -208,8 +221,18 @@ impl TlsDialOptions {
             target,
             skip_cert,
             handshake_timeout,
+            query_timeout: None,
             alpn,
         }
+    }
+
+    pub(crate) fn with_query_deadline(
+        mut self,
+        deadline: QueryDeadline,
+        stage: UpstreamTimeoutStage,
+    ) -> Self {
+        self.query_timeout = Some((deadline, stage));
+        self
     }
 }
 
@@ -219,6 +242,7 @@ pub(crate) struct QuicDialOptions {
     target: DialTarget,
     skip_cert: bool,
     handshake_timeout: Duration,
+    query_timeout: Option<(QueryDeadline, UpstreamTimeoutStage)>,
     idle_timeout: Duration,
     alpn: Vec<Vec<u8>>,
 }
@@ -236,9 +260,19 @@ impl QuicDialOptions {
             target,
             skip_cert,
             handshake_timeout,
+            query_timeout: None,
             idle_timeout,
             alpn,
         }
+    }
+
+    pub(crate) fn with_query_deadline(
+        mut self,
+        deadline: QueryDeadline,
+        stage: UpstreamTimeoutStage,
+    ) -> Self {
+        self.query_timeout = Some((deadline, stage));
+        self
     }
 }
 
@@ -276,14 +310,20 @@ pub(crate) async fn connect_tls(
     let dns_name = ServerName::try_from(options.target.server_name().to_string())
         .map_err(|_| DnsError::protocol("Invalid DNS server name"))?;
 
-    match timeout(
-        options.handshake_timeout,
-        connector.connect(dns_name, tcp_stream),
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(DnsError::protocol(format!("TLS connection error: {}", e))),
+    let connect = connector.connect(dns_name, tcp_stream);
+    if let Some((deadline, stage)) = options.query_timeout {
+        return match deadline.run(connect).await {
+            DeadlineOutcome::Completed(Ok(stream)) => Ok(stream),
+            DeadlineOutcome::Completed(Err(error)) => {
+                Err(DnsError::protocol(format!("TLS connection error: {error}")))
+            }
+            DeadlineOutcome::Expired => Err(deadline.timeout_error_for(stage)),
+        };
+    }
+
+    match timeout(options.handshake_timeout, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(DnsError::protocol(format!("TLS connection error: {error}"))),
         Err(_) => Err(DnsError::protocol("TLS handshake timeout")),
     }
 }
@@ -364,14 +404,20 @@ async fn connect_quic_endpoint(
 
     endpoint.set_default_client_config(client_config);
 
-    match timeout(
-        options.handshake_timeout,
-        endpoint.connect(remote_addr, options.target.server_name())?,
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(DnsError::protocol(format!("QUIC connection error: {}", e))),
+    let connecting = endpoint.connect(remote_addr, options.target.server_name())?;
+    if let Some((deadline, stage)) = options.query_timeout {
+        return match deadline.run(connecting).await {
+            DeadlineOutcome::Completed(Ok(connection)) => Ok(connection),
+            DeadlineOutcome::Completed(Err(error)) => {
+                Err(DnsError::protocol(format!("QUIC connection error: {error}")))
+            }
+            DeadlineOutcome::Expired => Err(deadline.timeout_error_for(stage)),
+        };
+    }
+
+    match timeout(options.handshake_timeout, connecting).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(DnsError::protocol(format!("QUIC connection error: {error}"))),
         Err(_) => Err(DnsError::protocol("QUIC handshake timeout")),
     }
 }
