@@ -237,8 +237,14 @@ impl TcpConnection {
     ///
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging and debugging
+    /// * `upstream` - Stable upstream identity for connection diagnostics
     /// * `sender` - Bounded channel for queuing outbound DNS messages
-    fn new(conn_id: u16, sender: Sender<QueuedQuery>, request_map_capacity: u16) -> Self {
+    fn new(
+        conn_id: u16,
+        upstream: String,
+        sender: Sender<QueuedQuery>,
+        request_map_capacity: u16,
+    ) -> Self {
         debug!(
             conn_id,
             "Initialized TCP connection wrapper with async I/O tasks"

@@ -381,7 +381,6 @@ pub(crate) fn resolver_error(profile: &NetworkProfileMetrics) {
 }
 
 #[inline]
-#[inline]
 pub(crate) fn upstream_timeout(stage: UpstreamTimeoutStage) {
     ensure_registered();
     network_metrics().upstream_timeout_total[stage.as_index()].fetch_add(1, Ordering::Relaxed);
