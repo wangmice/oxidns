@@ -61,6 +61,7 @@ impl Drop for DoqQueryStream {
 
 pub struct QuicConnection {
     id: u16,
+    upstream: String,
     transport: QuicTransport,
     using_count: AtomicU32,
     closed: AtomicBool,
@@ -95,6 +96,7 @@ impl Connection for QuicConnection {
         if self.close_with_code(DOQ_NO_ERROR, b"closing") {
             debug!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 "Closing QUIC connection, sending CONNECTION_CLOSE frame"
             );
         }
@@ -150,6 +152,7 @@ impl Connection for QuicConnection {
                     self.close_with_code(DOQ_PROTOCOL_ERROR, b"peer sent STOP_SENDING");
                     warn!(
                         conn_id = self.id,
+            upstream = %self.upstream,
                         query_id = raw_id,
                         %code,
                         "DoQ peer sent forbidden STOP_SENDING"
@@ -176,6 +179,7 @@ impl Connection for QuicConnection {
             self.close();
             warn!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 error = ?e,
                 "Failed to finish QUIC send stream (half-close)"
             );
@@ -194,6 +198,7 @@ impl Connection for QuicConnection {
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
                 trace!(
                     conn_id = self.id,
+            upstream = %self.upstream,
                     query_id = raw_id,
                     "Successfully received DNS response over QUIC"
                 );
@@ -202,6 +207,7 @@ impl Connection for QuicConnection {
             Err(QuicReadError::StreamReset(code)) => {
                 warn!(
                     conn_id = self.id,
+            upstream = %self.upstream,
                     query_id = raw_id,
                     %code,
                     "DoQ transaction reset by server"
@@ -214,6 +220,7 @@ impl Connection for QuicConnection {
                 self.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
                 warn!(
                     conn_id = self.id,
+            upstream = %self.upstream,
                     query_id = raw_id,
                     error = %message,
                     "Fatal DoQ protocol error"
@@ -224,6 +231,7 @@ impl Connection for QuicConnection {
                 self.close();
                 warn!(
                     conn_id = self.id,
+            upstream = %self.upstream,
                     query_id = raw_id,
                     error = ?e,
                     "QUIC connection lost while reading DoQ response"
@@ -234,6 +242,7 @@ impl Connection for QuicConnection {
                 self.close();
                 warn!(
                     conn_id = self.id,
+            upstream = %self.upstream,
                     query_id = raw_id,
                     error = %message,
                     "Unexpected DoQ stream read error"
@@ -260,6 +269,7 @@ impl Connection for QuicConnection {
 #[derive(Debug)]
 pub struct QuicConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     socks5: Option<Socks5Opt>,
     insecure_skip_verify: bool,
@@ -269,6 +279,7 @@ pub struct QuicConnectionBuilder {
 impl QuicConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -331,6 +342,7 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
 
         debug!(
             conn_id,
+            upstream = %self.upstream,
             server_name = %self.target.host(),
             remote_addr = ?quic_conn.remote_address(),
             "Established QUIC connection for DoQ (DNS over QUIC)"
@@ -338,6 +350,7 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
 
         let quic_conn = Arc::new(QuicConnection {
             id: conn_id,
+            upstream: self.upstream.clone(),
             transport: QuicTransport::new(quic_conn),
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
@@ -356,12 +369,14 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
                     _conn.close();
                     debug!(
                         conn_id,
+                        upstream = %_conn.upstream,
                         "QUIC connection closed by remote peer or network error"
                     );
                 }
                 _ = _conn.close_notify.notified() => {
                     debug!(
                         conn_id,
+                        upstream = %_conn.upstream,
                         "QUIC connection closed by local request"
                     );
                 }

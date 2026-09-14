@@ -38,6 +38,7 @@ enum H2RecvError {
 #[derive(Debug)]
 pub struct H2Connection {
     id: u16,
+    upstream: String,
     sender: SendRequest<Bytes>,
     using_count: AtomicU32,
     closed: AtomicBool,
@@ -53,7 +54,8 @@ impl Connection for H2Connection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        debug!(conn_id = self.id, "Closing DoH connection");
+        debug!(conn_id = self.id,
+            upstream = %self.upstream, "Closing DoH connection");
         // A single background driver waits for this signal. `notify_one()`
         // stores a permit when the waiter has not registered yet,
         // avoiding a lost close wakeup.
@@ -92,6 +94,7 @@ impl H2Connection {
         if !self.transport_error_reported.swap(true, Ordering::AcqRel) {
             warn!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 raw_id,
                 ?error,
                 "H2 connection transport error"
@@ -99,6 +102,7 @@ impl H2Connection {
         } else {
             debug!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 raw_id,
                 ?error,
                 "H2 stream failed after connection transport error"
@@ -142,7 +146,8 @@ impl H2Connection {
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                trace!(conn_id = self.id, raw_id, "Received H2 response");
+                trace!(conn_id = self.id,
+            upstream = %self.upstream, raw_id, "Received H2 response");
                 Ok(resp)
             }
             Err(H2RecvError::Transport(e)) => {
@@ -159,6 +164,7 @@ impl H2Connection {
 #[derive(Debug)]
 pub struct H2ConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     request_uri: String,
     insecure_skip_verify: bool,
@@ -168,6 +174,7 @@ pub struct H2ConnectionBuilder {
 impl H2ConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -232,6 +239,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 
         let h2_conn = Arc::new(H2Connection {
             id: conn_id,
+            upstream: self.upstream.clone(),
             sender,
             closed: AtomicBool::new(false),
             transport_error_reported: AtomicBool::new(false),
@@ -247,12 +255,12 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                 res = connection => {
                     _conn.close();
                     match res {
-                        Ok(()) => debug!(conn_id, "H2 connection closed"),
-                        Err(e) => debug!(conn_id, ?e, "H2 connection error"),
+                        Ok(()) => debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed"),
+                        Err(e) => debug!(conn_id, upstream = %_conn.upstream, ?e, "H2 connection error"),
                     }
                 }
                 _ = _conn.close_notify.notified() => {
-                    debug!(conn_id, "H2 connection closed by notify");
+                    debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed by notify");
                 }
             }
         });

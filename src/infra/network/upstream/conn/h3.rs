@@ -41,6 +41,7 @@ enum H3RecvError {
 
 pub struct H3Connection {
     id: u16,
+    upstream: String,
     sender: SendRequest<OpenStreams, Bytes>,
     using_count: AtomicU32,
     closed: AtomicBool,
@@ -60,7 +61,8 @@ impl Connection for H3Connection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        debug!(conn_id = self.id, "Closing H3 connection");
+        debug!(conn_id = self.id,
+            upstream = %self.upstream, "Closing H3 connection");
         self.close_notify.notify_one();
     }
 
@@ -129,12 +131,14 @@ impl H3Connection {
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                trace!(conn_id = self.id, raw_id, "Received H3 response");
+                trace!(conn_id = self.id,
+            upstream = %self.upstream, raw_id, "Received H3 response");
                 Ok(resp)
             }
             Err(H3RecvError::Transport(e)) => {
                 self.close();
-                warn!(conn_id = self.id, raw_id, ?e, "H3 request error");
+                warn!(conn_id = self.id,
+            upstream = %self.upstream, raw_id, ?e, "H3 request error");
                 Err(e)
             }
             Err(H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
@@ -146,6 +150,7 @@ impl H3Connection {
 #[derive(Debug)]
 pub struct H3ConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     socks5: Option<Socks5Opt>,
     request_uri: String,
@@ -156,6 +161,7 @@ pub struct H3ConnectionBuilder {
 impl H3ConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -218,6 +224,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
 
         let h3_conn = Arc::new(H3Connection {
             id: conn_id,
+            upstream: self.upstream.clone(),
             sender: send_request,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
@@ -232,12 +239,12 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             select! {
                 _ = poll_fn(|cx| driver.poll_close(cx)) => {
                     _conn.closed.store(true, Ordering::Release);
-                    debug!(conn_id, "H3 connection poll closed");
+                    debug!(conn_id, upstream = %_conn.upstream, "H3 connection poll closed");
                 }
                 _ = _conn.close_notify.notified() => {
-                    debug!(conn_id, "H3 connection shutdown requested");
+                    debug!(conn_id, upstream = %_conn.upstream, "H3 connection shutdown requested");
                     if let Err(e) = driver.shutdown(0).await {
-                        warn!(conn_id, error = ?e, "H3 graceful shutdown failed");
+                        warn!(conn_id, upstream = %_conn.upstream, error = ?e, "H3 graceful shutdown failed");
                     }
                     let _ = poll_fn(|cx| driver.poll_close(cx)).await;
                 }

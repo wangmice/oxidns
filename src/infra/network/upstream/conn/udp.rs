@@ -34,6 +34,8 @@ const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
 pub struct UdpConnection {
     /// Unique connection ID (for debugging/tracing)
     id: u16,
+    /// Stable upstream identity used to disambiguate per-pool connection IDs.
+    upstream: String,
     /// The underlying UDP transport bound to a local address
     transport: UdpTransport,
     /// Notifier used to signal connection closure
@@ -72,6 +74,7 @@ impl Connection for UdpConnection {
         let cleared = self.request_map.clear();
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             canceled_queries = cleared,
             "Closing UDP connection and signaling listener task"
         );
@@ -119,6 +122,7 @@ impl Connection for UdpConnection {
 
             trace!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 attempt,
                 query_id,
                 timeout_ms = current_timeout.as_millis(),
@@ -133,7 +137,8 @@ impl Connection for UdpConnection {
             {
                 Ok(()) => {}
                 Err(e) => {
-                    error!(conn_id = self.id, err = %e, "Failed to send UDP query");
+                    error!(conn_id = self.id,
+            upstream = %self.upstream, err = %e, "Failed to send UDP query");
                     self.close();
                     return Err(e);
                 }
@@ -145,12 +150,14 @@ impl Connection for UdpConnection {
                     Ok(mut response) => {
                         query_guard.disarm();
                         response.set_id(raw_id);
-                        trace!(conn_id = self.id, query_id, raw_id, "Received UDP response");
+                        trace!(conn_id = self.id,
+            upstream = %self.upstream, query_id, raw_id, "Received UDP response");
                         return Ok(response);
                     }
                     Err(_canceled) => {
                         trace!(
                             conn_id = self.id,
+            upstream = %self.upstream,
                             query_id, "Listener dropped channel, retrying"
                         );
                         continue;
@@ -159,6 +166,7 @@ impl Connection for UdpConnection {
                 Err(_elapsed) => {
                     trace!(
                         conn_id = self.id,
+            upstream = %self.upstream,
                         query_id,
                         timeout_ms = current_timeout.as_millis(),
                         "UDP response timeout"
@@ -197,9 +205,15 @@ impl UdpConnection {
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging
     /// * `transport` - Pre-configured direct or SOCKS5 UDP transport
-    fn new(conn_id: u16, transport: UdpTransport, request_map_capacity: u16) -> UdpConnection {
+    fn new(
+        conn_id: u16,
+        upstream: String,
+        transport: UdpTransport,
+        request_map_capacity: u16,
+    ) -> UdpConnection {
         Self {
             id: conn_id,
+            upstream,
             transport,
             close_notify: Notify::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
@@ -226,12 +240,14 @@ impl UdpConnection {
 
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             "UDP listener task started, waiting for DNS responses"
         );
 
         loop {
             if (closing || self.closed.load(Ordering::Acquire)) && self.request_map.is_empty() {
-                debug!(conn_id = self.id, "Listener exiting (connection dropped)");
+                debug!(conn_id = self.id,
+            upstream = %self.upstream, "Listener exiting (connection dropped)");
                 break;
             }
 
@@ -240,6 +256,7 @@ impl UdpConnection {
                 _ = self.transport.control_closed(), if !closing => {
                     warn!(
                         conn_id = self.id,
+            upstream = %self.upstream,
                         "SOCKS5 UDP control connection closed; retiring UDP connection"
                     );
                     self.close();
@@ -256,12 +273,14 @@ impl UdpConnection {
                                 self.last_used.store(AppClock::elapsed_millis(), Ordering::Relaxed);
                                 trace!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     id,
                                     "Delivered UDP response to waiting query"
                                 );
                             } else {
                                 trace!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     id,
                                     "No pending query or response fingerprint mismatch"
                                 );
@@ -277,6 +296,7 @@ impl UdpConnection {
                             if consecutive_recv_errors == 1 || consecutive_recv_errors.is_power_of_two() {
                                 warn!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     err = %e,
                                     consecutive_errors = consecutive_recv_errors,
                                     backoff_ms = backoff.as_millis(),
@@ -285,6 +305,7 @@ impl UdpConnection {
                             } else {
                                 debug!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     err = %e,
                                     consecutive_errors = consecutive_recv_errors,
                                     backoff_ms = backoff.as_millis(),
@@ -321,6 +342,7 @@ fn udp_recv_error_backoff(consecutive_errors: u32) -> Duration {
 #[derive(Debug)]
 pub struct UdpConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     socks5: Option<Socks5Opt>,
     request_map_capacity: u16,
@@ -330,6 +352,7 @@ impl UdpConnectionBuilder {
     /// Initialize a new builder using upstream connection info.
     pub fn new(connection_info: &ConnectionInfo, request_map_capacity: u16) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -373,6 +396,7 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
             .await?;
             debug!(
                 conn_id,
+                upstream = %self.upstream,
                 local_addr = ?socket.local_addr(),
                 remote_addr = ?socket.peer_addr(),
                 "Established UDP connection to DNS server"
@@ -380,7 +404,12 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
             UdpTransport::new(UdpSocket::from_std(socket)?)
         };
 
-        let connection = UdpConnection::new(conn_id, transport, self.request_map_capacity);
+        let connection = UdpConnection::new(
+            conn_id,
+            self.upstream.clone(),
+            transport,
+            self.request_map_capacity,
+        );
         let arc = Arc::new(connection);
 
         // Spawn background task for listening responses
