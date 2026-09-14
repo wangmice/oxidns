@@ -26,6 +26,8 @@ use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, 
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
+const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
+
 enum H2RecvError {
     Transport(DnsError),
     HttpStatus(DnsError),
@@ -190,10 +192,10 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
         )
         .await?;
 
-        let (sender, connection) = match deadline
-            .run(h2::client::Builder::new().handshake(tls_stream))
-            .await
-        {
+        let mut builder = h2::client::Builder::new();
+        builder.data_frame_budget(H2_DATA_FRAME_BUDGET);
+
+        let (sender, connection) = match deadline.run(builder.handshake(tls_stream)).await {
             DeadlineOutcome::Completed(Ok(value)) => value,
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("H2 handshake error: {}", e)));
