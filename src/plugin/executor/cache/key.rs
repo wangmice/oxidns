@@ -554,6 +554,41 @@ pub(super) struct EcsLookupIndex {
     observed_ipv6_prefixes: AtomicU64,
 }
 
+#[derive(Debug)]
+#[must_use = "an unresolved ECS index rebuild handoff aborts the active shadow when dropped"]
+pub(super) struct EcsRebuildHandoff<'a> {
+    index: &'a EcsLookupIndex,
+    rebuilt: Arc<EcsLookupIndex>,
+    stale_revision: u64,
+    resolved: bool,
+}
+
+impl EcsRebuildHandoff<'_> {
+    #[inline]
+    pub(super) fn rebuilt(&self) -> &EcsLookupIndex {
+        &self.rebuilt
+    }
+
+    pub(super) fn commit(mut self) -> bool {
+        let committed = self
+            .index
+            .commit_rebuild(&self.rebuilt, self.stale_revision);
+        self.resolved = committed;
+        committed
+    }
+}
+
+impl Drop for EcsRebuildHandoff<'_> {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+
+        self.index.abort_rebuild(&self.rebuilt);
+        self.resolved = true;
+    }
+}
+
 impl Default for EcsLookupIndex {
     fn default() -> Self {
         Self {
@@ -666,7 +701,7 @@ impl EcsLookupIndex {
     /// Subsequent successful ECS publications mirror their hints into both the
     /// live index and this shadow until commit detaches it. This means normal
     /// publications no longer invalidate an in-progress rebuild.
-    pub(super) fn begin_rebuild(&self) -> Option<(Arc<Self>, u64)> {
+    pub(super) fn begin_rebuild(&self) -> Option<EcsRebuildHandoff<'_>> {
         let _guard = self
             .rebuild_gate
             .write()
@@ -681,9 +716,14 @@ impl EcsLookupIndex {
             return None;
         }
 
-        let shadow = Arc::new(Self::new());
-        self.rebuild_shadow.store(Some(shadow.clone()));
-        Some((shadow, stale_revision))
+        let rebuilt = Arc::new(Self::new());
+        self.rebuild_shadow.store(Some(rebuilt.clone()));
+        Some(EcsRebuildHandoff {
+            index: self,
+            rebuilt,
+            stale_revision,
+            resolved: false,
+        })
     }
 
     /// Publish an active rebuild shadow.
@@ -693,7 +733,7 @@ impl EcsLookupIndex {
     /// newer than `rebuilt_revision`, which schedules another cleanup pass. A
     /// successful publication cannot be missed because it is mirrored into the
     /// active shadow while holding the shared publication gate.
-    pub(super) fn commit_rebuild(&self, rebuilt: &Arc<Self>, stale_revision: u64) -> bool {
+    fn commit_rebuild(&self, rebuilt: &Arc<Self>, stale_revision: u64) -> bool {
         let (retired_entries, retired_shadow) = {
             let _guard = self
                 .rebuild_gate
@@ -738,6 +778,33 @@ impl EcsLookupIndex {
         // Neither a potentially large old index nor the rebuild wrapper is
         // destroyed while ECS publications are waiting on rebuild_gate.
         drop(retired_entries);
+        drop(retired_shadow);
+        true
+    }
+
+    /// Abort exactly the active rebuild generation represented by `rebuilt`.
+    ///
+    /// The identity check prevents an old unwind/early-return path from
+    /// detaching a newer generation. The retired shadow is destroyed only
+    /// after releasing the publication write gate.
+    fn abort_rebuild(&self, rebuilt: &Arc<Self>) -> bool {
+        let retired_shadow = {
+            let _guard = self
+                .rebuild_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let active = self.rebuild_shadow.load_full();
+            if active
+                .as_ref()
+                .is_none_or(|active| !Arc::ptr_eq(active, rebuilt))
+            {
+                return false;
+            }
+
+            self.rebuild_shadow.swap(None)
+        };
+
         drop(retired_shadow);
         true
     }
@@ -1183,10 +1250,10 @@ mod tests {
         index.observe_cache_key(&prefix_24);
         index.mark_rebuild_needed();
 
-        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
+        let rebuild = index.begin_rebuild().expect("rebuild should start");
         // Model the authoritative scan observing the entry that existed when
         // the rebuild started.
-        rebuilt.observe_cache_key(&prefix_24);
+        rebuild.rebuilt().observe_cache_key(&prefix_24);
 
         // Model a successful reusable-ECS publication racing the scan. The
         // publication guard makes the live+shadow hint update atomic with
@@ -1196,7 +1263,7 @@ mod tests {
             index.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
         }
 
-        assert!(index.commit_rebuild(&rebuilt, stale_revision));
+        assert!(rebuild.commit());
         assert!(!index.needs_rebuild());
         assert_eq!(index.indexed_base_keys(), 1);
         assert_eq!(index.observed_ipv4_prefixes(), 2);
@@ -1232,14 +1299,16 @@ mod tests {
         index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
         index.mark_rebuild_needed();
 
-        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
-        rebuilt.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
+        let rebuild = index.begin_rebuild().expect("rebuild should start");
+        rebuild
+            .rebuilt()
+            .observe_cache_key(&request_key.with_ecs_scope_prefix(24));
 
         // A removal/eviction racing the scan may make this snapshot
         // conservatively stale, but must not prevent this pass from committing.
         index.mark_rebuild_needed();
 
-        assert!(index.commit_rebuild(&rebuilt, stale_revision));
+        assert!(rebuild.commit());
         assert!(index.needs_rebuild());
         assert_eq!(index.observed_ipv4_prefixes(), 1);
     }
@@ -1260,10 +1329,12 @@ mod tests {
         index.observe_cache_key(&request_key.with_ecs_scope_prefix(24));
         index.mark_rebuild_needed();
 
-        let (rebuilt, stale_revision) = index.begin_rebuild().expect("rebuild should start");
-        rebuilt.observe_cache_key(&request_key.with_ecs_scope_prefix(16));
+        let rebuild = index.begin_rebuild().expect("rebuild should start");
+        rebuild
+            .rebuilt()
+            .observe_cache_key(&request_key.with_ecs_scope_prefix(16));
 
-        assert!(index.commit_rebuild(&rebuilt, stale_revision));
+        assert!(rebuild.commit());
         assert!(!index.needs_rebuild());
         assert_eq!(index.indexed_base_keys(), 1);
         assert_eq!(index.observed_ipv4_prefixes(), 1);
@@ -1282,6 +1353,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(prefixes, vec![16]);
+    }
+
+    #[test]
+    fn test_ecs_rebuild_drop_aborts_active_shadow_after_panic() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let index = EcsLookupIndex::new();
+        index.mark_rebuild_needed();
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let rebuild = index.begin_rebuild().expect("rebuild should start");
+            assert!(index.begin_rebuild().is_none());
+            assert_eq!(rebuild.rebuilt().indexed_base_keys(), 0);
+            panic!("simulated rebuild worker panic");
+        }));
+
+        assert!(panic_result.is_err());
+        assert!(index.needs_rebuild());
+
+        // The unwound handoff must have detached its own shadow so maintenance
+        // can immediately start another generation.
+        let retry = index
+            .begin_rebuild()
+            .expect("panic rollback should release rebuild shadow");
+        assert!(retry.commit());
+        assert!(!index.needs_rebuild());
     }
 
     #[test]

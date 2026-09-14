@@ -646,18 +646,16 @@ impl DnsCacheStore {
         // into the shadow while the scan runs, so sustained write traffic cannot
         // starve rebuild progress. Concurrent removals may leave conservative
         // false positives; their newer stale revision schedules another pass.
-        let Some((rebuilt, stale_revision)) = self.ecs_lookup_index.begin_rebuild() else {
+        let Some(rebuild) = self.ecs_lookup_index.begin_rebuild() else {
             return;
         };
         self.cache_map.visit_keys_cloned_by_shard(|keys| {
             for key in keys {
-                rebuilt.observe_cache_key(&key);
+                rebuild.rebuilt().observe_cache_key(&key);
             }
             true
         });
-        let _ = self
-            .ecs_lookup_index
-            .commit_rebuild(&rebuilt, stale_revision);
+        let _ = rebuild.commit();
     }
 
     /// Prune the published cache and account for every removed entry exactly
