@@ -24,6 +24,8 @@ use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, Query
 use crate::proto::Message;
 
 const UDP_RECV_BUFFER_SIZE: usize = 8_196;
+const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
+const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
 
 /// Represents a single UDP connection used in DNS upstream queries.
 /// Each connection manages its own socket and maintains a mapping
@@ -220,6 +222,7 @@ impl UdpConnection {
     async fn listen_dns_response(self: Arc<Self>) {
         let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
         let mut closing = false;
+        let mut consecutive_recv_errors = 0u32;
 
         debug!(
             conn_id = self.id,
@@ -246,6 +249,7 @@ impl UdpConnection {
                 recv = self.transport.read_message(&mut buf) => {
                     match recv {
                         Ok(msg) => {
+                            consecutive_recv_errors = 0;
                             let id = msg.id();
                             if let Some(sender) = self.request_map.take_for_response(id, &msg) {
                                 let _ = sender.send(msg);
@@ -268,7 +272,33 @@ impl UdpConnection {
                                 closing = true; // graceful shutdown path
                                 continue;
                             }
-                            warn!(conn_id = self.id, err = %e, "UDP listener error");
+                            consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                            let backoff = udp_recv_error_backoff(consecutive_recv_errors);
+                            if consecutive_recv_errors == 1 || consecutive_recv_errors.is_power_of_two() {
+                                warn!(
+                                    conn_id = self.id,
+                                    err = %e,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    backoff_ms = backoff.as_millis(),
+                                    "UDP listener receive error; backing off"
+                                );
+                            } else {
+                                debug!(
+                                    conn_id = self.id,
+                                    err = %e,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    backoff_ms = backoff.as_millis(),
+                                    "UDP listener receive error; backing off"
+                                );
+                            }
+
+                            select! {
+                                biased;
+                                _ = self.close_notify.notified() => {
+                                    closing = true;
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
                             continue;
                         }
                     }
@@ -279,6 +309,12 @@ impl UdpConnection {
             }
         }
     }
+}
+
+fn udp_recv_error_backoff(consecutive_errors: u32) -> Duration {
+    let shift = consecutive_errors.saturating_sub(1).min(5);
+    let delay_ms = (UDP_RECV_ERROR_BACKOFF_BASE_MS << shift).min(UDP_RECV_ERROR_BACKOFF_MAX_MS);
+    Duration::from_millis(delay_ms)
 }
 
 /// Builder for creating new `UdpConnection` instances.
@@ -357,6 +393,15 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
+
+    #[test]
+    fn udp_receive_error_backoff_is_bounded_and_exponential() {
+        assert_eq!(udp_recv_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(udp_recv_error_backoff(2), Duration::from_millis(20));
+        assert_eq!(udp_recv_error_backoff(5), Duration::from_millis(160));
+        assert_eq!(udp_recv_error_backoff(6), Duration::from_millis(250));
+        assert_eq!(udp_recv_error_backoff(64), Duration::from_millis(250));
+    }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
