@@ -741,6 +741,26 @@ mod tests {
         builder: MockBuilder,
         initial_connections: Vec<Arc<MockConnection>>,
     ) -> PipelinePool<MockConnection> {
+        make_pool_with_timeout_policy(
+            min_size,
+            max_size,
+            max_load,
+            idle_secs,
+            builder,
+            initial_connections,
+            QueryTimeoutPolicy::Retire,
+        )
+    }
+
+    fn make_pool_with_timeout_policy(
+        min_size: usize,
+        max_size: usize,
+        max_load: u16,
+        idle_secs: u64,
+        builder: MockBuilder,
+        initial_connections: Vec<Arc<MockConnection>>,
+        timeout_policy: QueryTimeoutPolicy,
+    ) -> PipelinePool<MockConnection> {
         AppClock::start();
         let slots = initial_connections
             .into_iter()
@@ -755,7 +775,7 @@ mod tests {
             max_load: max_load.max(1),
             max_idle: Duration::from_secs(idle_secs),
             connection_builder: Box::new(builder),
-            timeout_policy: QueryTimeoutPolicy::Retire,
+            timeout_policy,
             connect_timeout: Duration::from_secs(5),
             next_id: AtomicU16::new(1),
             release_notified: Notify::new(),
@@ -937,6 +957,41 @@ mod tests {
         assert_eq!(pool.slots.load()[0].state(), SLOT_RETIRING);
         drop(fast_lease);
         assert_eq!(conn.close_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_timeout_reuse_keeps_available_slot_active() {
+        AppClock::start();
+        let conn = Arc::new(
+            MockConnection::new(true, 0, AppClock::elapsed_millis())
+                .with_query_delay(Duration::from_secs(60)),
+        );
+        let pool = make_pool_with_timeout_policy(
+            0,
+            1,
+            2,
+            10,
+            MockBuilder::new(vec![]),
+            vec![conn.clone()],
+            QueryTimeoutPolicy::Reuse,
+        );
+
+        let result = pool
+            .query(
+                Message::new(),
+                QueryDeadline::new(Duration::from_millis(10)),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(conn.close_calls(), 0);
+        assert_eq!(pool.slots.load()[0].state(), SLOT_ACTIVE);
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("available connection should remain reusable after a stream-local timeout");
+        assert!(Arc::ptr_eq(&lease.slot.conn, &conn));
     }
 
     #[tokio::test]

@@ -112,7 +112,7 @@ impl UpstreamBuilder {
                 ConnectionType::DoQ => {
                     debug!("Creating QUIC upstream for {}", connection_info.raw_addr);
                     let builder = QuicConnectionBuilder::new(&connection_info);
-                    Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                    Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                 }
                 #[cfg(not(feature = "upstream-doq"))]
                 ConnectionType::DoQ => {
@@ -136,7 +136,7 @@ impl UpstreamBuilder {
                         #[cfg(feature = "upstream-doh3")]
                         {
                             let builder = H3ConnectionBuilder::new(&connection_info);
-                            Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                            Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                         }
                         #[cfg(not(feature = "upstream-doh3"))]
                         {
@@ -147,7 +147,7 @@ impl UpstreamBuilder {
                         }
                     } else {
                         let builder = H2ConnectionBuilder::new(&connection_info);
-                        Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                        Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                     }
                 }
                 #[cfg(not(feature = "upstream-doh"))]
@@ -243,6 +243,12 @@ pub(crate) const fn pipeline_request_map_capacity() -> u16 {
     ConnectionInfo::DEFAULT_MAX_CONNS_LOAD
 }
 
+/// Maximum number of concurrent streams assigned to a single multiplexed
+/// transport connection (H2/H3/DoQ). Keep this below the generic DNS
+/// pipelining limit so one connection cannot become an oversized failure
+/// domain under bursty refresh traffic.
+pub(crate) const MULTIPLEXED_MAX_CONNS_LOAD: u16 = 32;
+
 #[inline]
 pub(crate) const fn reuse_request_map_capacity() -> u16 {
     1
@@ -278,6 +284,30 @@ pub(crate) fn create_pipeline_pool<C: Connection>(
     }
 }
 
+/// Build a pool for transports where each DNS query has its own protocol
+/// stream (H2/H3/DoQ). A timeout is stream-local, so the underlying
+/// connection remains reusable unless the connection implementation marks
+/// itself unavailable because of a connection-level failure.
+pub(crate) fn create_multiplexed_pool<C: Connection>(
+    connection_info: ConnectionInfo,
+    builder: Box<dyn ConnectionBuilder<C>>,
+) -> PooledUpstream<C> {
+    let timeout = connection_info.timeout;
+    let min_size = main_pool_min_conns(&connection_info);
+    PooledUpstream::<C> {
+        pool: PipelinePool::new(
+            min_size,
+            connection_info.max_conns_or_default(),
+            MULTIPLEXED_MAX_CONNS_LOAD,
+            connection_info.idle_timeout,
+            builder,
+            QueryTimeoutPolicy::Reuse,
+            timeout,
+        ),
+        connection_info,
+    }
+}
+
 pub(crate) fn create_reuse_pool<C: Connection>(
     connection_info: ConnectionInfo,
     builder: Box<dyn ConnectionBuilder<C>>,
@@ -294,5 +324,16 @@ pub(crate) fn create_reuse_pool<C: Connection>(
             timeout,
         ),
         connection_info,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiplexed_connection_load_is_lower_than_generic_pipeline_load() {
+        assert_eq!(MULTIPLEXED_MAX_CONNS_LOAD, 32);
+        assert!(MULTIPLEXED_MAX_CONNS_LOAD < ConnectionInfo::DEFAULT_MAX_CONNS_LOAD);
     }
 }
