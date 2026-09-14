@@ -513,6 +513,7 @@ fn spawn_nftset_writer(
 struct WriteOutcome {
     ok: u64,
     skipped_exists: u64,
+    skipped_duplicate: u64,
     /// Failed (prefix-as-string, rendered error). Bounded to avoid unbounded
     /// memory growth on persistent backend failures.
     failed: Vec<(String, String)>,
@@ -523,11 +524,31 @@ struct WriteOutcome {
 const NFTSET_FAILURE_SAMPLE_CAP: usize = 4;
 
 #[cfg(target_os = "linux")]
+#[inline]
+fn canonical_cidr_once(
+    seen: &mut AHashSet<IpCidr>,
+    prefix: &IpPrefix,
+) -> std::result::Result<Option<IpCidr>, IpSetError> {
+    let cidr = IpCidr::new(prefix.addr, prefix.mask)?;
+    Ok(seen.insert(cidr).then_some(cidr))
+}
+
+#[cfg(target_os = "linux")]
 fn write_nftset_prefixes(set: &ResolvedSet, prefixes: &[IpPrefix]) -> WriteOutcome {
     let mut outcome = WriteOutcome::default();
+    let mut seen = AHashSet::with_capacity(prefixes.len());
+
     for prefix in prefixes {
-        let cidr = match IpCidr::new(prefix.addr, prefix.mask) {
-            Ok(c) => c,
+        // Multiple DNS answers can collapse to the same nftables element after
+        // applying the configured mask (for example, 192.0.2.10/24 and
+        // 192.0.2.20/24 both become 192.0.2.0/24). Deduplicate the canonical
+        // CIDR inside this writer batch so only one netlink request is sent.
+        let cidr = match canonical_cidr_once(&mut seen, prefix) {
+            Ok(Some(cidr)) => cidr,
+            Ok(None) => {
+                outcome.skipped_duplicate += 1;
+                continue;
+            }
             Err(e) => {
                 outcome.failed_total += 1;
                 if outcome.failed.len() < NFTSET_FAILURE_SAMPLE_CAP {
@@ -589,6 +610,7 @@ fn record_outcome(
             set = %set.set_name,
             ok = outcome.ok,
             skipped_exists = outcome.skipped_exists,
+            skipped_duplicate = outcome.skipped_duplicate,
             failed = outcome.failed_total,
             sample = %sample,
             "nftset batch had write failures"
@@ -606,6 +628,35 @@ mod tests {
     #[test]
     fn test_parse_config_rejects_empty_table_or_set_name() {
         assert!(parse_config(Some(Value::String("bad".into()))).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_writer_batch_deduplicates_canonical_cidrs() {
+        let mut seen = AHashSet::new();
+        let first = IpPrefix {
+            addr: IpAddr::V4("192.0.2.10".parse().unwrap()),
+            mask: 24,
+        };
+        let same_network = IpPrefix {
+            addr: IpAddr::V4("192.0.2.20".parse().unwrap()),
+            mask: 24,
+        };
+        let other_network = IpPrefix {
+            addr: IpAddr::V4("198.51.100.7".parse().unwrap()),
+            mask: 24,
+        };
+
+        assert_eq!(
+            canonical_cidr_once(&mut seen, &first).unwrap(),
+            Some(IpCidr::new("192.0.2.0".parse().unwrap(), 24).unwrap())
+        );
+        assert_eq!(canonical_cidr_once(&mut seen, &same_network).unwrap(), None);
+        assert_eq!(
+            canonical_cidr_once(&mut seen, &other_network).unwrap(),
+            Some(IpCidr::new("198.51.100.0".parse().unwrap(), 24).unwrap())
+        );
+        assert_eq!(seen.len(), 2);
     }
 
     #[test]
