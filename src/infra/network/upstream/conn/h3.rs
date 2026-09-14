@@ -34,17 +34,23 @@ use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
 enum H3RecvError {
+    Connection(DnsError),
     Stream(DnsError),
     HttpStatus(DnsError),
     InvalidResponse(DnsError),
 }
 
 fn classify_h3_stream_error(context: &str, error: h3::error::StreamError) -> H3RecvError {
-    // h3 0.0.8 keeps StreamError's concrete variants private to the crate.
-    // Request-path failures therefore stay stream-local here; the connection
-    // driver is responsible for observing connection-level closure and making
-    // this H3Connection unavailable to the pool.
-    H3RecvError::Stream(DnsError::protocol(format!("{context}: {error}")))
+    let connection_scoped = matches!(
+        error,
+        h3::error::StreamError::ConnectionError(_) | h3::error::StreamError::RemoteClosing
+    );
+    let error = DnsError::protocol(format!("{context}: {error}"));
+    if connection_scoped {
+        H3RecvError::Connection(error)
+    } else {
+        H3RecvError::Stream(error)
+    }
 }
 
 pub struct H3Connection {
@@ -121,6 +127,10 @@ impl H3Connection {
         let mut request_stream = match self.sender.clone().send_request(http_request).await {
             Ok(stream) => stream,
             Err(error) => match classify_h3_stream_error("H3 send_request error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
                 H3RecvError::Stream(error) => return Err(error),
                 H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
             },
@@ -128,6 +138,10 @@ impl H3Connection {
 
         if let Err(error) = request_stream.finish().await {
             match classify_h3_stream_error("H3 finish stream error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
                 H3RecvError::Stream(error) => return Err(error),
                 H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
             }
@@ -142,6 +156,10 @@ impl H3Connection {
                 trace!(conn_id = self.id,
             upstream = %self.upstream, raw_id, "Received H3 response");
                 Ok(resp)
+            }
+            Err(H3RecvError::Connection(e)) => {
+                self.close();
+                Err(e)
             }
             Err(H3RecvError::Stream(e) | H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
         }
@@ -308,6 +326,15 @@ async fn recv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_remote_closing_as_connection_scoped() {
+        let error = classify_h3_stream_error(
+            "H3 send_request error",
+            h3::error::StreamError::RemoteClosing,
+        );
+        assert!(matches!(error, H3RecvError::Connection(_)));
+    }
 
     #[test]
     fn test_builder_new_uses_http3_request_uri_and_flags() {
