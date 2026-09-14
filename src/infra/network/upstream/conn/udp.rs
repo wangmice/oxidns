@@ -17,7 +17,7 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
 use crate::infra::network::proxy::Socks5Opt;
-use crate::infra::network::transport::udp::UdpTransport;
+use crate::infra::network::transport::udp::{UdpReadError, UdpTransport};
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
 use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, QueryDeadline};
@@ -263,7 +263,7 @@ impl UdpConnection {
                     closing = true;
                     continue;
                 }
-                recv = self.transport.read_message(&mut buf) => {
+                recv = self.transport.read_message_classified(&mut buf) => {
                     match recv {
                         Ok(msg) => {
                             consecutive_recv_errors = 0;
@@ -286,17 +286,28 @@ impl UdpConnection {
                                 );
                             }
                         }
-                        Err(e) => {
+                        Err(UdpReadError::InvalidDatagram(e)) => {
+                            consecutive_recv_errors = 0;
+                            debug!(
+                                conn_id = self.id,
+                                upstream = %self.upstream,
+                                err = %e,
+                                "Dropping invalid UDP response datagram"
+                            );
+                            continue;
+                        }
+                        Err(e @ UdpReadError::Receive(_)) => {
                             if self.closed.load(Ordering::Acquire) {
                                 closing = true; // graceful shutdown path
                                 continue;
                             }
+                            debug_assert!(e.should_backoff());
                             consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
                             let backoff = udp_recv_error_backoff(consecutive_recv_errors);
                             if consecutive_recv_errors == 1 || consecutive_recv_errors.is_power_of_two() {
                                 warn!(
                                     conn_id = self.id,
-            upstream = %self.upstream,
+                                    upstream = %self.upstream,
                                     err = %e,
                                     consecutive_errors = consecutive_recv_errors,
                                     backoff_ms = backoff.as_millis(),
@@ -305,7 +316,7 @@ impl UdpConnection {
                             } else {
                                 debug!(
                                     conn_id = self.id,
-            upstream = %self.upstream,
+                                    upstream = %self.upstream,
                                     err = %e,
                                     consecutive_errors = consecutive_recv_errors,
                                     backoff_ms = backoff.as_millis(),
