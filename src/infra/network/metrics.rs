@@ -497,6 +497,12 @@ mod tests {
         );
         upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
 
+        let snapshot = snapshot_for_profile_for_tests("remote");
+        assert_eq!(
+            snapshot.upstream_timeout_total(UpstreamTimeoutStage::PoolAcquire),
+            1
+        );
+
         let output = render_prometheus_metrics();
         assert!(output.contains("network_resolver_cache_hit_total"));
         assert!(output.contains("network_resolver_cache_miss_total"));
