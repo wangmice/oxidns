@@ -40,6 +40,17 @@ use crate::register_plugin_api;
 
 const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
 
+#[inline]
+fn cache_load_error_code(message: &str) -> &'static str {
+    if message.contains("cache dump was created with ecs_in_key=false") {
+        "cache_dump_ecs_mode_mismatch"
+    } else if message.contains("does not record ecs_in_key") {
+        "cache_dump_ecs_mode_unknown"
+    } else {
+        "invalid_cache_dump"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CacheApiConfig {
     pub(super) ecs_in_key: bool,
@@ -350,12 +361,15 @@ impl ApiHandler for CacheLoadDumpHandler {
                 )
             }
             Ok(Err(err)) => {
-                warn!("Failed to load cache dump via API: {}", err);
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_cache_dump",
-                    "failed to load cache dump",
-                )
+                let detail = err.to_string();
+                let code = cache_load_error_code(&detail);
+                warn!("Failed to load cache dump via API: {}", detail);
+                let message = if code == "invalid_cache_dump" {
+                    "failed to load cache dump".to_string()
+                } else {
+                    detail
+                };
+                json_error(StatusCode::BAD_REQUEST, code, message)
             }
             Err(err) => {
                 warn!("Cache load worker failed: {}", err);
@@ -1132,6 +1146,26 @@ mod tests {
             .expect("reservation task should not fail")
             .expect("cache reclaimer should remain available");
         drop(second);
+    }
+
+    #[test]
+    fn cache_load_error_code_distinguishes_ecs_mode_failures() {
+        assert_eq!(
+            cache_load_error_code(
+                "cache dump was created with ecs_in_key=false and cannot be loaded with ecs_in_key=true"
+            ),
+            "cache_dump_ecs_mode_mismatch"
+        );
+        assert_eq!(
+            cache_load_error_code(
+                "cache dump version 3 does not record ecs_in_key; refusing to load it with ecs_in_key=true"
+            ),
+            "cache_dump_ecs_mode_unknown"
+        );
+        assert_eq!(
+            cache_load_error_code("truncated header"),
+            "invalid_cache_dump"
+        );
     }
 
     #[tokio::test]
