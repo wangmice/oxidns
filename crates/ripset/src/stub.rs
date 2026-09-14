@@ -126,6 +126,28 @@ pub fn nftset_add<E: Into<IpEntry>>(
     Err(IpSetError::UnsupportedPlatform)
 }
 
+
+#[derive(Debug, Default)]
+pub struct NftSetAddManyOutcome {
+    pub added: usize,
+    pub exists: usize,
+    pub failed: Vec<(usize, IpSetError)>,
+}
+
+/// Add multiple IPs to a nftables set (stub - returns UnsupportedPlatform error)
+pub fn nftset_add_many<I, E>(
+    _family: &str,
+    _table: &str,
+    _setname: &str,
+    _entries: I,
+) -> Result<NftSetAddManyOutcome>
+where
+    I: IntoIterator<Item = E>,
+    E: Into<IpEntry>,
+{
+    Err(IpSetError::UnsupportedPlatform)
+}
+
 /// Delete an IP from a nftables set (stub - returns UnsupportedPlatform error)
 pub fn nftset_del<E: Into<IpEntry>>(
     _family: &str,
