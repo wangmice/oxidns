@@ -30,9 +30,20 @@ use crate::proto::Message;
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
 
 enum H2RecvError {
-    Transport(DnsError),
+    Connection(DnsError),
+    Stream(DnsError),
     HttpStatus(DnsError),
     InvalidResponse(DnsError),
+}
+
+fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
+    let connection_scoped = error.is_go_away() || error.is_io();
+    let error = DnsError::protocol(format!("{context}: {error}"));
+    if connection_scoped {
+        H2RecvError::Connection(error)
+    } else {
+        H2RecvError::Stream(error)
+    }
 }
 
 #[derive(Debug)]
@@ -122,23 +133,35 @@ impl H2Connection {
         )?;
         drop(body_bytes);
 
-        let mut sender = self.sender.clone().ready().await.map_err(|e| {
-            let error = DnsError::protocol(format!("H2 sender readiness error: {e}"));
-            self.close();
-            self.report_transport_error(raw_id, &error);
-            error
-        })?;
+        let mut sender = match self.sender.clone().ready().await {
+            Ok(sender) => sender,
+            Err(error) => match classify_h2_error("H2 sender readiness error", error) {
+                H2RecvError::Connection(error) => {
+                    self.close();
+                    self.report_transport_error(raw_id, &error);
+                    return Err(error);
+                }
+                H2RecvError::Stream(error) => return Err(error),
+                H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
         // DoH GET carries the DNS payload in the URI, so the request body is
         // empty. Mark the stream as finished when sending headers,
         // otherwise some servers will wait for an end-of-stream signal
         // and never produce a response.
-        let (response_future, _send_stream) = sender.send_request(request, true).map_err(|e| {
-            let error = DnsError::protocol(format!("H2 send_request error: {e}"));
-            self.close();
-            self.report_transport_error(raw_id, &error);
-            error
-        })?;
+        let (response_future, _send_stream) = match sender.send_request(request, true) {
+            Ok(value) => value,
+            Err(error) => match classify_h2_error("H2 send_request error", error) {
+                H2RecvError::Connection(error) => {
+                    self.close();
+                    self.report_transport_error(raw_id, &error);
+                    return Err(error);
+                }
+                H2RecvError::Stream(error) => return Err(error),
+                H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
         match recv(response_future).await {
             Ok(bytes) => {
@@ -150,12 +173,12 @@ impl H2Connection {
             upstream = %self.upstream, raw_id, "Received H2 response");
                 Ok(resp)
             }
-            Err(H2RecvError::Transport(e)) => {
+            Err(H2RecvError::Connection(e)) => {
                 self.close();
                 self.report_transport_error(raw_id, &e);
                 Err(e)
             }
-            Err(H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
+            Err(H2RecvError::Stream(e) | H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
         }
     }
 }
@@ -270,9 +293,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 }
 
 async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2RecvError> {
-    let response = response_future.await.map_err(|e| {
-        H2RecvError::Transport(DnsError::protocol(format!("H2 response error: {}", e)))
-    })?;
+    let response = response_future
+        .await
+        .map_err(|e| classify_h2_error("H2 response error", e))?;
 
     let status_code = response.status();
     let body_limit = if status_code.is_success() {
@@ -286,9 +309,8 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
     let mut truncated = false;
 
     while let Some(partial_bytes) = body.data().await {
-        let partial_bytes = partial_bytes.map_err(|e| {
-            H2RecvError::Transport(DnsError::protocol(format!("H2 body error: {}", e)))
-        })?;
+        let partial_bytes = partial_bytes
+            .map_err(|e| classify_h2_error("H2 body error", e))?;
         let chunk_len = partial_bytes.len();
         let remaining = body_limit.saturating_sub(response_bytes.len());
         let exceeds_limit = chunk_len > remaining;
@@ -309,11 +331,9 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
         // one. Otherwise a response larger than the current
         // stream window can stall indefinitely.
         if chunk_len != 0 {
-            flow_control.release_capacity(chunk_len).map_err(|e| {
-                H2RecvError::Transport(DnsError::protocol(format!(
-                    "H2 flow-control release error: {e}"
-                )))
-            })?;
+            flow_control
+                .release_capacity(chunk_len)
+                .map_err(|e| classify_h2_error("H2 flow-control release error", e))?;
         }
 
         if exceeds_limit {
@@ -408,6 +428,57 @@ mod tests {
 
         assert_eq!(response_bytes.len(), 128);
         assert!(response_bytes.iter().all(|byte| *byte == 0x5A));
+
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn recv_classifies_rst_stream_as_stream_local() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let Some(Ok((_request, mut respond))) = connection.accept().await else {
+                panic!("server should receive one request");
+            };
+            respond.send_reset(h2::Reason::CANCEL);
+
+            while let Some(result) = connection.accept().await {
+                if let Err(error) = result {
+                    panic!("server connection failed: {error}");
+                }
+            }
+        });
+
+        let (mut sender, connection) = h2::client::handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        sender = sender
+            .ready()
+            .await
+            .expect("client sender should become ready");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://dns.example.test/dns-query")
+            .body(())
+            .expect("request should build");
+        let (response_future, _send_stream) = sender
+            .send_request(request, true)
+            .expect("request should send");
+
+        match recv(response_future).await {
+            Err(H2RecvError::Stream(_)) => {}
+            Err(_) => panic!("RST_STREAM must remain stream-local"),
+            Ok(_) => panic!("RST_STREAM must fail the request"),
+        }
 
         drop(sender);
         client_task.abort();

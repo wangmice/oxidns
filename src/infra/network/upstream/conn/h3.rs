@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use futures::future::poll_fn;
 use h3::client::{RequestStream, SendRequest};
+use h3::error::StreamError;
 use h3_quinn::{BidiStream, OpenStreams};
 use http::{Request, Version};
 use tokio::select;
@@ -34,9 +35,23 @@ use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
 enum H3RecvError {
-    Transport(DnsError),
+    Connection(DnsError),
+    Stream(DnsError),
     HttpStatus(DnsError),
     InvalidResponse(DnsError),
+}
+
+fn classify_h3_stream_error(context: &str, error: StreamError) -> H3RecvError {
+    let connection_scoped = matches!(
+        error,
+        StreamError::ConnectionError(_) | StreamError::RemoteClosing
+    );
+    let error = DnsError::protocol(format!("{context}: {error}"));
+    if connection_scoped {
+        H3RecvError::Connection(error)
+    } else {
+        H3RecvError::Stream(error)
+    }
 }
 
 pub struct H3Connection {
@@ -110,20 +125,28 @@ impl H3Connection {
     }
 
     async fn do_request(&self, http_request: Request<()>, raw_id: u16) -> Result<Message> {
-        let mut request_stream = self
-            .sender
-            .clone()
-            .send_request(http_request)
-            .await
-            .map_err(|e| {
-                self.close();
-                DnsError::protocol(format!("H3 send_request error: {e}"))
-            })?;
+        let mut request_stream = match self.sender.clone().send_request(http_request).await {
+            Ok(stream) => stream,
+            Err(error) => match classify_h3_stream_error("H3 send_request error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
-        request_stream.finish().await.map_err(|err| {
-            self.close();
-            DnsError::protocol(format!("H3 received a stream error: {err}"))
-        })?;
+        if let Err(error) = request_stream.finish().await {
+            match classify_h3_stream_error("H3 finish stream error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            }
+        }
 
         match recv(request_stream).await {
             Ok(bytes) => {
@@ -135,13 +158,13 @@ impl H3Connection {
             upstream = %self.upstream, raw_id, "Received H3 response");
                 Ok(resp)
             }
-            Err(H3RecvError::Transport(e)) => {
+            Err(H3RecvError::Connection(e)) => {
                 self.close();
                 warn!(conn_id = self.id,
-            upstream = %self.upstream, raw_id, ?e, "H3 request error");
+            upstream = %self.upstream, raw_id, ?e, "H3 connection request error");
                 Err(e)
             }
-            Err(H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
+            Err(H3RecvError::Stream(e) | H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
         }
     }
 }
@@ -258,9 +281,10 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
 async fn recv(
     mut request_stream: RequestStream<BidiStream<Bytes>, Bytes>,
 ) -> std::result::Result<Bytes, H3RecvError> {
-    let response = request_stream.recv_response().await.map_err(|e| {
-        H3RecvError::Transport(DnsError::protocol(format!("H3 response error: {}", e)))
-    })?;
+    let response = request_stream
+        .recv_response()
+        .await
+        .map_err(|e| classify_h3_stream_error("H3 response error", e))?;
 
     let status_code = response.status();
     let body_limit = if status_code.is_success() {
@@ -271,9 +295,11 @@ async fn recv(
     let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
     let mut truncated = false;
 
-    while let Some(partial_bytes) = request_stream.recv_data().await.map_err(|e| {
-        H3RecvError::Transport(DnsError::protocol(format!("h3 recv_data error: {e}")))
-    })? {
+    while let Some(partial_bytes) = request_stream
+        .recv_data()
+        .await
+        .map_err(|e| classify_h3_stream_error("H3 recv_data error", e))?
+    {
         let remaining = body_limit.saturating_sub(response_bytes.len());
         if partial_bytes.remaining() > remaining {
             if status_code.is_success() {

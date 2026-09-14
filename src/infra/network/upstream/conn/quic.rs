@@ -167,21 +167,24 @@ impl Connection for QuicConnection {
                         "QUIC connection lost while writing DoQ query: {error}"
                     )));
                 }
-                other => {
-                    self.close();
+                QuicWriteError::Stream(message) => {
                     return Err(DnsError::protocol(format!(
-                        "Failed to write DNS query to QUIC stream: {other}"
+                        "Failed to write DNS query to QUIC stream: {message}"
+                    )));
+                }
+                QuicWriteError::Encode(message) => {
+                    return Err(DnsError::protocol(format!(
+                        "Failed to encode DNS query for QUIC stream: {message}"
                     )));
                 }
             }
         }
         if let Err(e) = stream.writer.finish() {
-            self.close();
-            warn!(
+            debug!(
                 conn_id = self.id,
             upstream = %self.upstream,
                 error = ?e,
-                "Failed to finish QUIC send stream (half-close)"
+                "Failed to finish DoQ send stream"
             );
             return Err(DnsError::protocol(format!(
                 "Failed to finish QUIC send stream: {}",
@@ -239,13 +242,12 @@ impl Connection for QuicConnection {
                 Err(DnsError::protocol(format!("QUIC connection lost: {e}")))
             }
             Err(QuicReadError::Stream(message)) => {
-                self.close();
-                warn!(
+                debug!(
                     conn_id = self.id,
             upstream = %self.upstream,
                     query_id = raw_id,
                     error = %message,
-                    "Unexpected DoQ stream read error"
+                    "DoQ stream read error"
                 );
                 Err(DnsError::protocol(message))
             }
