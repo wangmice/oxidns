@@ -532,20 +532,18 @@ impl DnsCacheStore {
         let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
         let _index_publication =
             tracks_ecs_prefix.then(|| self.ecs_lookup_index.publication_guard());
-        self.ecs_lookup_index.observe_cache_key(&key);
-        let replaced = self.cache_map.replace_handle(
+        let replaced = self.cache_map.replace_handle_before_publish(
             key,
             expected,
             item,
             cache_time_ms,
             expire_at_ms,
             last_access_ms,
+            |key| self.ecs_lookup_index.observe_cache_key(key),
         );
         if replaced {
             self.mutations.mark_dirty(1);
             self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
-        } else if tracks_ecs_prefix {
-            self.ecs_lookup_index.mark_rebuild_needed();
         }
         replaced
     }
@@ -562,15 +560,15 @@ impl DnsCacheStore {
         let tracks_target_prefix = EcsLookupIndex::tracks_cache_key(&target_key);
         let _index_publication =
             tracks_target_prefix.then(|| self.ecs_lookup_index.publication_guard());
-        self.ecs_lookup_index.observe_cache_key(&target_key);
         let refresh_time_ms = metadata.cache_time_ms;
-        let result = self.cache_map.conditional_move_handle_if(
+        let result = self.cache_map.conditional_move_handle_if_before_publish(
             source_key,
             target_key,
             expected,
             item,
             metadata,
             move |target, _expire_at_ms| target.fresh_until_ms <= refresh_time_ms,
+            |key| self.ecs_lookup_index.observe_cache_key(key),
         );
         match result {
             TtlCacheConditionalMoveResult::Moved => {
@@ -586,11 +584,7 @@ impl DnsCacheStore {
             }
             TtlCacheConditionalMoveResult::SourceChanged => {}
         }
-        if matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
-            if tracks_target_prefix {
-                self.ecs_lookup_index.mark_rebuild_needed();
-            }
-        } else {
+        if !matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
             self.ecs_lookup_index.mark_cache_key_maybe_stale(source_key);
         }
         result
@@ -649,12 +643,15 @@ impl DnsCacheStore {
         let Some(rebuild) = self.ecs_lookup_index.begin_rebuild() else {
             return;
         };
-        self.cache_map.visit_keys_cloned_by_shard(|keys| {
-            for key in keys {
-                rebuild.rebuilt().observe_cache_key(&key);
-            }
-            true
-        });
+        self.cache_map.visit_keys_cloned_by_shard_filtered(
+            EcsLookupIndex::tracks_cache_key,
+            |keys| {
+                for key in keys {
+                    rebuild.rebuilt().observe_cache_key(&key);
+                }
+                true
+            },
+        );
         let _ = rebuild.commit();
     }
 
@@ -945,6 +942,57 @@ mod tests {
         assert_eq!(target_entry.value().ttl, 240);
         assert_eq!(store.cache_map().entry_count(), 1);
         assert_eq!(metrics.insert_total.load(Ordering::Relaxed), before_inserts);
+    }
+
+    #[test]
+    fn failed_conditional_move_does_not_publish_target_ecs_hint() {
+        AppClock::start();
+        let (store, _mutations, _metrics) = test_store(4);
+        let now = AppClock::elapsed_millis();
+        let source = test_ecs_key("speculative.example", 24);
+        let target = test_ecs_key("speculative.example", 16);
+
+        assert!(store.insert_or_update(
+            source.clone(),
+            CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+            now,
+            now.saturating_add(60_000),
+            now,
+        ));
+        let stale = store
+            .cache_map()
+            .get_retained_handle(&source, now, 0)
+            .expect("source should exist");
+
+        // Publish a newer source generation so the lazy-refresh handle loses
+        // the race before it can commit the re-key.
+        assert!(store.insert_or_update(
+            source.clone(),
+            CacheItem::new_validated(Message::new(), 120, now.saturating_add(120_000)),
+            now.saturating_add(1),
+            now.saturating_add(120_000),
+            now.saturating_add(1),
+        ));
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
+        assert!(!store.ecs_lookup_index_needs_rebuild());
+
+        assert_eq!(
+            store.conditional_move_handle(
+                &source,
+                target,
+                &stale,
+                CacheItem::new_validated(Message::new(), 30, now.saturating_add(30_000)),
+                TtlCacheMoveMetadata {
+                    cache_time_ms: now.saturating_add(2),
+                    expire_at_ms: now.saturating_add(60_000),
+                    last_access_ms: now.saturating_add(2),
+                },
+            ),
+            TtlCacheConditionalMoveResult::SourceChanged
+        );
+
+        assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
+        assert!(!store.ecs_lookup_index_needs_rebuild());
     }
 
     #[test]

@@ -2729,7 +2729,7 @@ mod tests {
             now,
         );
 
-        let dump = dump_cache_to_bytes(&cache_map).expect("dump should succeed");
+        let dump = dump_cache_to_bytes_for_mode(&cache_map, true).expect("dump should succeed");
 
         let restored = CacheMap::with_capacity(4);
         let index = EcsLookupIndex::new();

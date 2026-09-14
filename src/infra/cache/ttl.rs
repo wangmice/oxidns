@@ -486,6 +486,33 @@ where
         expire_at_ms: u64,
         last_access_ms: u64,
     ) -> bool {
+        self.replace_handle_before_publish(
+            key,
+            expected,
+            value,
+            cache_time_ms,
+            expire_at_ms,
+            last_access_ms,
+            |_| {},
+        )
+    }
+
+    /// Replace an existing generation while publishing a conservative side
+    /// index only after the expected generation has been validated, but before
+    /// the replacement node becomes visible.
+    pub fn replace_handle_before_publish<F>(
+        &self,
+        key: K,
+        expected: &TtlCacheHandle<V>,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+        before_publish: F,
+    ) -> bool
+    where
+        F: FnOnce(&K),
+    {
         let state = self.state.load();
         let Entry::Occupied(mut entry) = state.map.entry(key) else {
             return false;
@@ -493,7 +520,10 @@ where
         if !expected.same_node(entry.get()) {
             return false;
         }
-        entry.insert(state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms));
+
+        let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
+        before_publish(entry.key());
+        entry.insert(node);
         true
     }
 
@@ -640,6 +670,7 @@ where
     /// Moving an existing entry preserves cache cardinality, so capacity
     /// accounting does not need a release/reacquire cycle and concurrent
     /// bounded insertions cannot steal the source entry's slot mid-move.
+    #[cfg(test)]
     pub(crate) fn conditional_move_handle_if<F>(
         &self,
         source_key: &K,
@@ -652,7 +683,38 @@ where
     where
         F: Fn(&V, u64) -> bool,
     {
+        self.conditional_move_handle_if_before_publish(
+            source_key,
+            target_key,
+            expected,
+            value,
+            metadata,
+            should_replace_target,
+            |_| {},
+        )
+    }
+
+    /// Conditional move variant that publishes a side-index hint only when a
+    /// vacant target is known to be committed. Existing targets already have
+    /// authoritative membership, so consolidation/replacement needs no new
+    /// hint. The callback runs while the source/target write lock(s) are held,
+    /// immediately before the new target node becomes visible.
+    pub(crate) fn conditional_move_handle_if_before_publish<F, P>(
+        &self,
+        source_key: &K,
+        target_key: K,
+        expected: &TtlCacheHandle<V>,
+        value: V,
+        metadata: TtlCacheMoveMetadata,
+        should_replace_target: F,
+        before_publish: P,
+    ) -> TtlCacheConditionalMoveResult
+    where
+        F: Fn(&V, u64) -> bool,
+        P: FnOnce(&K),
+    {
         let state = self.state.load();
+        let mut before_publish = Some(before_publish);
 
         if source_key == &target_key {
             return TtlCacheConditionalMoveResult::SourceChanged;
@@ -727,17 +789,18 @@ where
                             TtlCacheConditionalMoveResult::ReplacedTarget
                         }
                         None => {
+                            let node = state.new_node(
+                                value,
+                                metadata.cache_time_ms,
+                                metadata.expire_at_ms,
+                                metadata.last_access_ms,
+                            );
+                            if let Some(before_publish) = before_publish.take() {
+                                before_publish(&target_key);
+                            }
                             shard.insert(
                                 target_hash,
-                                (
-                                    target_key,
-                                    SharedValue::new(state.new_node(
-                                        value,
-                                        metadata.cache_time_ms,
-                                        metadata.expire_at_ms,
-                                        metadata.last_access_ms,
-                                    )),
-                                ),
+                                (target_key, SharedValue::new(node)),
                                 |(key, _)| hash_key(key),
                             );
                             TtlCacheConditionalMoveResult::Moved
@@ -810,17 +873,18 @@ where
                             TtlCacheConditionalMoveResult::ReplacedTarget
                         }
                         None => {
+                            let node = state.new_node(
+                                value,
+                                metadata.cache_time_ms,
+                                metadata.expire_at_ms,
+                                metadata.last_access_ms,
+                            );
+                            if let Some(before_publish) = before_publish.take() {
+                                before_publish(&target_key);
+                            }
                             target_shard.insert(
                                 target_hash,
-                                (
-                                    target_key,
-                                    SharedValue::new(state.new_node(
-                                        value,
-                                        metadata.cache_time_ms,
-                                        metadata.expire_at_ms,
-                                        metadata.last_access_ms,
-                                    )),
-                                ),
+                                (target_key, SharedValue::new(node)),
                                 |(key, _)| hash_key(key),
                             );
                             TtlCacheConditionalMoveResult::Moved
@@ -1217,15 +1281,20 @@ where
         }
     }
 
-    /// Visit cache keys one shard at a time without holding the shard lock while
-    /// the caller performs additional work.
+    /// Visit selected cache keys one shard at a time without holding the shard
+    /// read lock while the caller performs additional work.
     ///
-    /// Only keys are cloned while the shard read lock is held. This is intended
-    /// for maintenance paths such as secondary-index rebuilds that do not need
-    /// value handles and may allocate or acquire unrelated locks per key.
-    pub(crate) fn visit_keys_cloned_by_shard(&self, mut visitor: impl FnMut(Vec<K>) -> bool)
-    where
+    /// `predicate` is evaluated under the shard read lock and must stay cheap
+    /// and side-effect free. Only matching keys are cloned. This lets secondary
+    /// indexes avoid cloning unrelated cache keys while preserving a coherent
+    /// per-shard snapshot for the keys they actually need to rebuild.
+    pub(crate) fn visit_keys_cloned_by_shard_filtered<P>(
+        &self,
+        mut predicate: P,
+        mut visitor: impl FnMut(Vec<K>) -> bool,
+    ) where
         K: Clone,
+        P: FnMut(&K) -> bool,
     {
         let state = self.state.load();
 
@@ -1236,7 +1305,7 @@ where
                 continue;
             }
 
-            let mut keys = Vec::with_capacity(shard_len);
+            let mut keys = Vec::new();
             let bucket_count = shard.buckets();
             for bucket_index in 0..bucket_count {
                 // SAFETY: `bucket_index < bucket_count`; the shard read guard
@@ -1246,7 +1315,9 @@ where
                 }
 
                 let (key, _shared_entry) = unsafe { shard.bucket(bucket_index).as_ref() };
-                keys.push(key.clone());
+                if predicate(key) {
+                    keys.push(key.clone());
+                }
             }
             drop(shard);
 
@@ -1254,6 +1325,15 @@ where
                 break;
             }
         }
+    }
+
+    /// Visit all cache keys one shard at a time.
+    #[cfg(test)]
+    pub(crate) fn visit_keys_cloned_by_shard(&self, visitor: impl FnMut(Vec<K>) -> bool)
+    where
+        K: Clone,
+    {
+        self.visit_keys_cloned_by_shard_filtered(|_| true, visitor);
     }
 
     /// Visit cache entries one shard at a time using stable handles.
@@ -1652,6 +1732,121 @@ mod tests {
 
         assert_eq!(visited, 2);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn filtered_key_visit_clones_only_matching_keys() {
+        let cache = TtlCache::with_capacity(8);
+        for key in ["a", "b", "c", "d"] {
+            cache.insert_or_update(key, 1u32, 0, 100);
+        }
+
+        let mut visited = Vec::new();
+        cache.visit_keys_cloned_by_shard_filtered(
+            |key| matches!(*key, "b" | "d"),
+            |keys| {
+                visited.extend(keys);
+                true
+            },
+        );
+
+        visited.sort_unstable();
+        assert_eq!(visited, vec!["b", "d"]);
+    }
+
+    #[test]
+    fn replace_pre_publish_hook_runs_only_after_generation_validation() {
+        let cache = TtlCache::with_capacity(1);
+        cache.insert_or_update("k", 1u32, 0, 100);
+        let stale = cache
+            .get_retained_handle(&"k", 1, 0)
+            .expect("entry should exist");
+
+        cache.insert_or_update("k", 2u32, 2, 200);
+        let publications = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(!cache.replace_handle_before_publish(
+            "k",
+            &stale,
+            3u32,
+            3,
+            300,
+            3,
+            |_| {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert_eq!(publications.load(Ordering::Relaxed), 0);
+
+        let current = cache
+            .get_retained_handle(&"k", 3, 0)
+            .expect("current entry should exist");
+        assert!(cache.replace_handle_before_publish(
+            "k",
+            &current,
+            4u32,
+            4,
+            400,
+            4,
+            |_| {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert_eq!(publications.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn conditional_move_pre_publish_hook_runs_only_for_vacant_target_commit() {
+        let cache = TtlCache::with_capacity(4);
+        cache.insert_or_update("source", 1u32, 0, 100);
+        let stale = cache
+            .get_retained_handle(&"source", 1, 0)
+            .expect("source should exist");
+
+        cache.insert_or_update("source", 2u32, 2, 200);
+        let publications = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(
+            cache.conditional_move_handle_if_before_publish(
+                &"source",
+                "target",
+                &stale,
+                3u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 3,
+                    expire_at_ms: 300,
+                    last_access_ms: 3,
+                },
+                |_target, _expire_at_ms| true,
+                |_| {
+                    publications.fetch_add(1, Ordering::Relaxed);
+                },
+            ),
+            TtlCacheConditionalMoveResult::SourceChanged
+        );
+        assert_eq!(publications.load(Ordering::Relaxed), 0);
+
+        let current = cache
+            .get_retained_handle(&"source", 3, 0)
+            .expect("current source should exist");
+        assert_eq!(
+            cache.conditional_move_handle_if_before_publish(
+                &"source",
+                "target",
+                &current,
+                4u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 4,
+                    expire_at_ms: 400,
+                    last_access_ms: 4,
+                },
+                |_target, _expire_at_ms| true,
+                |_| {
+                    publications.fetch_add(1, Ordering::Relaxed);
+                },
+            ),
+            TtlCacheConditionalMoveResult::Moved
+        );
+        assert_eq!(publications.load(Ordering::Relaxed), 1);
     }
 
     #[test]
