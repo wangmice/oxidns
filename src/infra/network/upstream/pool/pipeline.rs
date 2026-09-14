@@ -352,12 +352,13 @@ impl<C: Connection> PipelinePool<C> {
         let inserted = AtomicBool::new(false);
         self.slots.rcu(|old_slots| {
             let mut new_slots = Vec::with_capacity(old_slots.len() + 1);
-            new_slots.extend(
-                old_slots
-                    .iter()
-                    .filter(|slot| !slot.is_drained_unusable())
-                    .cloned(),
-            );
+            for existing in old_slots.iter() {
+                if existing.is_drained_unusable() {
+                    existing.close();
+                } else {
+                    new_slots.push(existing.clone());
+                }
+            }
             let current_len = new_slots.len();
             if current_len >= self.max_size {
                 inserted.store(false, Ordering::Relaxed);
@@ -395,11 +396,17 @@ impl<C: Connection> PipelinePool<C> {
 
     fn usable_or_inflight_slot_count(&self) -> usize {
         let slots = self.slots.load();
-        let active = slots
-            .iter()
-            .filter(|slot| !slot.is_drained_unusable())
-            .count();
-        if active == slots.len() {
+        let mut active = 0usize;
+        let mut has_drained = false;
+        for slot in slots.iter() {
+            if slot.is_drained_unusable() {
+                slot.close();
+                has_drained = true;
+            } else {
+                active += 1;
+            }
+        }
+        if !has_drained {
             return active;
         }
 
@@ -560,7 +567,7 @@ impl<C: Connection> PipelineSlot<C> {
     }
 
     fn is_drained_unusable(&self) -> bool {
-        self.state() != SLOT_ACTIVE && self.inflight() == 0
+        self.inflight() == 0 && (self.state() != SLOT_ACTIVE || !self.conn.available())
     }
 }
 
@@ -639,6 +646,11 @@ impl<C: Connection> Drop for PipelinePool<C> {
             .and_then(|mut guard| guard.take());
         if let Some(task_id) = task_id {
             task_center::stop_task_detached(task_id);
+        }
+
+        let slots = self.slots.load();
+        for slot in slots.iter() {
+            slot.close();
         }
     }
 }
@@ -1125,5 +1137,48 @@ mod tests {
         assert_eq!(conn.close_calls(), 0);
         assert_eq!(pool.slots.load().len(), 1);
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_replaces_unavailable_idle_active_slot_at_capacity() {
+        AppClock::start();
+        let stale = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        let replacement = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        let pool = make_pool(
+            0,
+            1,
+            1,
+            10,
+            MockBuilder::new(vec![Ok(replacement.clone())]),
+            vec![stale.clone()],
+        );
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_millis(100)))
+            .await
+            .expect("unavailable idle slot should be replaced immediately");
+
+        assert!(Arc::ptr_eq(&lease.slot.conn, &replacement));
+        assert_eq!(stale.close_calls(), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[test]
+    fn test_drop_closes_all_pipeline_connections() {
+        let first = Arc::new(MockConnection::new(true, 0, 0));
+        let second = Arc::new(MockConnection::new(true, 0, 0));
+        let pool = make_pool(
+            0,
+            2,
+            1,
+            10,
+            MockBuilder::new(vec![]),
+            vec![first.clone(), second.clone()],
+        );
+
+        drop(pool);
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(second.close_calls(), 1);
     }
 }

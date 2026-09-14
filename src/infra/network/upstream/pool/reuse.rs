@@ -513,6 +513,10 @@ impl<C: Connection> Drop for ReusePool<C> {
         if let Some(task_id) = task_id {
             task_center::stop_task_detached(task_id);
         }
+
+        while let Some(conn) = self.connections.pop() {
+            conn.close();
+        }
     }
 }
 
@@ -932,5 +936,24 @@ mod tests {
 
         assert!(matched);
         assert_eq!(pool.active_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_drop_closes_all_idle_reuse_connections() {
+        let pool = make_pool(0, 2, 10, MockBuilder::new(vec![]));
+        let first = Arc::new(MockConnection::new(true, 0, 0));
+        let second = Arc::new(MockConnection::new(true, 0, 0));
+        pool.connections
+            .push(first.clone())
+            .expect("queue should accept first connection");
+        pool.connections
+            .push(second.clone())
+            .expect("queue should accept second connection");
+        pool.active_count.store(2, Ordering::Relaxed);
+
+        drop(pool);
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(second.close_calls(), 1);
     }
 }
