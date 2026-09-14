@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::infra::error::Result;
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::config::{ConnectionInfo, ConnectionType};
 use crate::infra::network::upstream::pool::{DeadlineOutcome, QueryDeadline};
 use crate::proto::Message;
@@ -70,7 +71,12 @@ pub trait Upstream: Send + Sync + Debug {
                 timeout_secs = self.timeout().as_secs_f64(),
                 "Upstream DNS query timeout"
             );
-            return Err(deadline.timeout_error());
+            let stage = if self.handles_query_deadline() {
+                UpstreamTimeoutStage::PoolAcquire
+            } else {
+                UpstreamTimeoutStage::QueryIo
+            };
+            return Err(deadline.timeout_error_for(stage));
         }
         if self.handles_query_deadline() {
             return self.inner_query(message, deadline).await;
@@ -82,7 +88,7 @@ pub trait Upstream: Send + Sync + Debug {
                     timeout_secs = self.timeout().as_secs_f64(),
                     "Upstream DNS query timeout"
                 );
-                Err(deadline.timeout_error())
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo))
             }
         }
     }

@@ -90,7 +90,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         if slots.is_empty() {
             drop(slots);
             if self.min_size > 0 {
-                let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+                let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
             }
             return;
         }
@@ -157,7 +157,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         }
 
         if new_len < self.min_size {
-            let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+            let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
         }
     }
 
@@ -196,7 +196,7 @@ impl<C: Connection> PipelinePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::new(arc.connect_timeout)).await {
+                if let Err(e) = arc.expand(QueryDeadline::background(arc.connect_timeout)).await {
                     warn!("Failed to prefill PipelinePool: {:?}", e);
                 }
             });
@@ -223,7 +223,7 @@ impl<C: Connection> PipelinePool<C> {
                     }
                     Err(e) => {
                         if deadline.remaining().is_none() {
-                            return Err(deadline.timeout_error());
+                            return Err(e);
                         }
                         debug!("Failed to create pipeline-pool connection: {:?}", e);
                         self.wait_backoff(deadline).await?;
@@ -255,7 +255,7 @@ impl<C: Connection> PipelinePool<C> {
                         }
                         Err(e) => {
                             if deadline.remaining().is_none() {
-                                return Err(deadline.timeout_error());
+                                return Err(e);
                             }
                             debug!("Failed to create pipeline-pool connection: {:?}", e);
                             self.wait_backoff(deadline).await?;
@@ -428,7 +428,7 @@ impl<C: Connection> PipelinePool<C> {
 
     async fn wait_backoff(&self, deadline: QueryDeadline) -> Result<()> {
         let Some(remaining) = deadline.remaining() else {
-            return Err(deadline.timeout_error());
+            return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
         };
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {

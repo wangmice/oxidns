@@ -16,6 +16,7 @@ use tracing::{debug, error, trace, warn};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::udp::{UdpReadError, UdpTransport};
 use crate::infra::network::upstream::ConnectionInfo;
@@ -105,7 +106,7 @@ impl Connection for UdpConnection {
 
         for attempt in 0..2 {
             let Some(remaining) = deadline.remaining() else {
-                return Err(deadline.timeout_error());
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo));
             };
             let current_timeout = if attempt == 0 {
                 remaining.min(RETRY_TIMEOUT)

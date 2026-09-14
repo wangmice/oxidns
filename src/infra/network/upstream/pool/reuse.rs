@@ -112,7 +112,7 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         if check_count == 0 {
             if self.active_count.load(Ordering::Relaxed) < self.min_size {
                 debug!("Reuse pool expanding to maintain minimum size");
-                let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+                let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
             }
             return;
         }
@@ -181,7 +181,7 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         // Expand if below min_size
         if self.active_count.load(Ordering::Relaxed) < self.min_size {
             debug!("Reuse pool expanding to maintain minimum size");
-            let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+            let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
         }
     }
 
@@ -225,7 +225,7 @@ impl<C: Connection> ReusePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::new(arc.connect_timeout)).await {
+                if let Err(e) = arc.expand(QueryDeadline::background(arc.connect_timeout)).await {
                     warn!("Failed to prefill ReusePool: {:?}", e);
                 }
             });
@@ -252,7 +252,7 @@ impl<C: Connection> ReusePool<C> {
                     Ok(conn) => return Ok(BorrowedConnection::new(self, conn)),
                     Err(e) => {
                         if deadline.remaining().is_none() {
-                            return Err(deadline.timeout_error());
+                            return Err(e);
                         }
                         debug!("Failed to create reuse-pool connection: {:?}", e);
                         self.wait_backoff(deadline).await?;
@@ -282,7 +282,7 @@ impl<C: Connection> ReusePool<C> {
                         Ok(conn) => return Ok(BorrowedConnection::new(self, conn)),
                         Err(e) => {
                             if deadline.remaining().is_none() {
-                                return Err(deadline.timeout_error());
+                                return Err(e);
                             }
                             debug!("Failed to create reuse-pool connection: {:?}", e);
                             self.wait_backoff(deadline).await?;
@@ -416,7 +416,7 @@ impl<C: Connection> ReusePool<C> {
 
     async fn wait_backoff(&self, deadline: QueryDeadline) -> Result<()> {
         let Some(remaining) = deadline.remaining() else {
-            return Err(deadline.timeout_error());
+            return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
         };
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {

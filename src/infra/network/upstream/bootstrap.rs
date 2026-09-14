@@ -293,15 +293,7 @@ impl BootstrapUpstream<H3Connection> {
 }
 
 fn bootstrap_deadline(deadline: QueryDeadline, timeout: Option<Duration>) -> QueryDeadline {
-    let Some(timeout) = timeout else {
-        return deadline;
-    };
-    let timeout_deadline = QueryDeadline::new(timeout);
-    if timeout_deadline.expires_at_ms < deadline.expires_at_ms {
-        timeout_deadline
-    } else {
-        deadline
-    }
+    timeout.map_or(deadline, |timeout| deadline.capped(timeout))
 }
 
 #[async_trait]
