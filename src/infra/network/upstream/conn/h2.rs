@@ -40,6 +40,7 @@ pub struct H2Connection {
     sender: SendRequest<Bytes>,
     using_count: AtomicU32,
     closed: AtomicBool,
+    transport_error_reported: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
     close_notify: Notify,
@@ -86,6 +87,24 @@ impl Connection for H2Connection {
 }
 
 impl H2Connection {
+    fn report_transport_error(&self, raw_id: u16, error: &DnsError) {
+        if !self.transport_error_reported.swap(true, Ordering::AcqRel) {
+            warn!(
+                conn_id = self.id,
+                raw_id,
+                ?error,
+                "H2 connection transport error"
+            );
+        } else {
+            debug!(
+                conn_id = self.id,
+                raw_id,
+                ?error,
+                "H2 stream failed after connection transport error"
+            );
+        }
+    }
+
     async fn query_inner(&self, request: Message) -> Result<Message> {
         let raw_id = request.id();
         let mut body_bytes = wire_buffer_pool().acquire();
@@ -99,8 +118,10 @@ impl H2Connection {
         drop(body_bytes);
 
         let mut sender = self.sender.clone().ready().await.map_err(|e| {
+            let error = DnsError::protocol(format!("H2 sender readiness error: {e}"));
             self.close();
-            DnsError::protocol(format!("H2 sender readiness error: {e}"))
+            self.report_transport_error(raw_id, &error);
+            error
         })?;
 
         // DoH GET carries the DNS payload in the URI, so the request body is
@@ -108,8 +129,10 @@ impl H2Connection {
         // otherwise some servers will wait for an end-of-stream signal
         // and never produce a response.
         let (response_future, _send_stream) = sender.send_request(request, true).map_err(|e| {
+            let error = DnsError::protocol(format!("H2 send_request error: {e}"));
             self.close();
-            DnsError::protocol(format!("H2 send_request error: {e}"))
+            self.report_transport_error(raw_id, &error);
+            error
         })?;
 
         match recv(response_future).await {
@@ -123,7 +146,7 @@ impl H2Connection {
             }
             Err(H2RecvError::Transport(e)) => {
                 self.close();
-                warn!(conn_id = self.id, raw_id, ?e, "H2 request error");
+                self.report_transport_error(raw_id, &e);
                 Err(e)
             }
             Err(H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
@@ -207,6 +230,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             id: conn_id,
             sender,
             closed: AtomicBool::new(false),
+            transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
