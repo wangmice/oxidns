@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
@@ -37,8 +37,8 @@ use crate::proto::Message;
 pub struct TcpConnection {
     /// Unique connection ID for logging/tracing.
     id: u16,
-    /// Sender for the unbounded outgoing TCP message channel.
-    sender: UnboundedSender<QueuedQuery>,
+    /// Bounded sender for outbound TCP messages.
+    sender: Sender<QueuedQuery>,
     /// Latched cancellation signal for background read/write tasks.
     close_token: CancellationToken,
     /// Map of active DNS queries (query_id → response channel sender).
@@ -54,10 +54,47 @@ pub struct TcpConnection {
 #[cfg(test)]
 const DEFAULT_REQUEST_MAP_CAPACITY: u16 = 64;
 
+const WRITE_STATE_QUEUED: u8 = 0;
+const WRITE_STATE_WRITING: u8 = 1;
+const WRITE_STATE_CANCELED: u8 = 2;
+
 #[derive(Debug)]
 struct QueuedQuery {
     message: Message,
     query_id: u16,
+    write_state: Arc<AtomicU8>,
+}
+
+#[derive(Debug)]
+struct QueuedWriteGuard {
+    write_state: Arc<AtomicU8>,
+}
+
+impl QueuedWriteGuard {
+    fn new() -> Self {
+        Self {
+            write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
+        }
+    }
+
+    fn state(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.write_state)
+    }
+}
+
+impl Drop for QueuedWriteGuard {
+    fn drop(&mut self) {
+        // Cancellation may suppress only work that has not started writing.
+        // Once the sender owns WRITING, the full DNS-over-TCP frame must be
+        // completed (or the connection closed) so a partial frame cannot
+        // corrupt subsequent messages on the byte stream.
+        let _ = self.write_state.compare_exchange(
+            WRITE_STATE_QUEUED,
+            WRITE_STATE_CANCELED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 #[async_trait]
@@ -124,12 +161,20 @@ impl Connection for TcpConnection {
 
         let raw_id = request.id();
 
-        // Queue Message for background sender task (TcpTransportWriter will
-        // frame it)
-        if let Err(e) = self.sender.send(QueuedQuery {
-            message: request,
-            query_id,
-        }) {
+        // Queue the message for the background sender task. The bounded
+        // channel applies backpressure if the socket writer falls behind. A
+        // per-query atomic state lets cancellation suppress queued work without
+        // relying on the reusable 16-bit DNS ID as a generation token.
+        let write_guard = QueuedWriteGuard::new();
+        if let Err(e) = self
+            .sender
+            .send(QueuedQuery {
+                message: request,
+                query_id,
+                write_state: write_guard.state(),
+            })
+            .await
+        {
             let _ = query_guard.remove();
             self.close();
             error!(
@@ -185,8 +230,8 @@ impl TcpConnection {
     ///
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging and debugging
-    /// * `sender` - Unbounded channel for queuing outbound DNS messages
-    fn new(conn_id: u16, sender: UnboundedSender<QueuedQuery>, request_map_capacity: u16) -> Self {
+    /// * `sender` - Bounded channel for queuing outbound DNS messages
+    fn new(conn_id: u16, sender: Sender<QueuedQuery>, request_map_capacity: u16) -> Self {
         debug!(
             conn_id,
             "Initialized TCP connection wrapper with async I/O tasks"
@@ -213,7 +258,7 @@ impl TcpConnection {
     async fn send_dns_request<S: AsyncWrite + Unpin>(
         self: Arc<Self>,
         mut writer: TcpTransportWriter<S>,
-        mut receiver: UnboundedReceiver<QueuedQuery>,
+        mut receiver: Receiver<QueuedQuery>,
     ) {
         debug!(
             conn_id = self.id,
@@ -235,6 +280,24 @@ impl TcpConnection {
                     None => break,
                 },
             };
+
+            if queued
+                .write_state
+                .compare_exchange(
+                    WRITE_STATE_QUEUED,
+                    WRITE_STATE_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                trace!(
+                    conn_id = self.id,
+                    query_id = queued.query_id,
+                    "Skipping canceled queued TCP query"
+                );
+                continue;
+            }
 
             let write_result = select! {
                 biased;
@@ -407,7 +470,7 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
             "Established TCP connection to DNS server"
         );
 
-        let (sender, receiver) = unbounded_channel();
+        let (sender, receiver) = channel(usize::from(self.request_map_capacity));
         let connection = TcpConnection::new(conn_id, sender, self.request_map_capacity);
         let arc = Arc::new(connection);
 
@@ -490,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_returns_error_when_connection_is_closed() {
         AppClock::start();
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let connection = TcpConnection::new(7, sender, DEFAULT_REQUEST_MAP_CAPACITY);
         connection.close();
 
@@ -509,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_before_listener_start_is_latched() {
         AppClock::start();
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let connection = Arc::new(TcpConnection::new(9, sender, DEFAULT_REQUEST_MAP_CAPACITY));
         connection.close();
 
@@ -531,7 +594,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         AppClock::start();
-        let (sender, receiver) = unbounded_channel();
+        let (sender, receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let queue = sender.clone();
         let connection = Arc::new(TcpConnection::new(10, sender, DEFAULT_REQUEST_MAP_CAPACITY));
         let (client, mut server) = tokio::io::duplex(1);
@@ -546,7 +609,9 @@ mod tests {
             .send(QueuedQuery {
                 message: Message::new(),
                 query_id: 1,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
             })
+            .await
             .expect("sender task should still own the receiver");
 
         // Observe one byte to prove write_all() has started. With a one-byte
@@ -565,9 +630,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sender_skips_query_cancelled_before_write() {
+        AppClock::start();
+        let (sender, receiver) = channel(2);
+        let queue = sender.clone();
+        let connection = Arc::new(TcpConnection::new(11, sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        let (client, server) = tokio::io::duplex(1024);
+        let writer = TcpTransportWriter::new(client);
+        let task = tokio::spawn(TcpConnection::send_dns_request(
+            Arc::clone(&connection),
+            writer,
+            receiver,
+        ));
+
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 1,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_CANCELED)),
+            })
+            .await
+            .expect("sender task should still own the receiver");
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 2,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
+            })
+            .await
+            .expect("sender task should still own the receiver");
+
+        let mut reader = TcpTransportReader::new(server);
+        let message = tokio::time::timeout(Duration::from_millis(100), reader.read_message())
+            .await
+            .expect("live queued query should be written")
+            .expect("live queued query should decode");
+        assert_eq!(message.id(), 2);
+
+        connection.close();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("close must stop sender task")
+            .expect("sender task should not panic");
+    }
+
+    #[tokio::test]
     async fn test_query_removes_request_when_cancelled() {
         AppClock::start();
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let connection = TcpConnection::new(8, sender, DEFAULT_REQUEST_MAP_CAPACITY);
 
         let result = tokio::time::timeout(
