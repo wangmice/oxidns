@@ -531,17 +531,26 @@ impl EcsPrefixBitmap {
     }
 }
 
-/// Advisory reusable-ECS prefix index partitioned by the non-ECS cache key.
+/// Conservative reusable-ECS prefix side index partitioned by non-ECS cache key.
 ///
-/// Each base DNS key owns its own IPv4/IPv6 prefix bitmap, so an ECS lookup is
-/// never forced to probe prefixes that were observed only for unrelated names,
-/// record types, classes, or DNSSEC flags. The main cache map remains
-/// authoritative. Publications take a shared rebuild guard while setting the
-/// per-key bit and publishing the cache entry. Maintenance installs a shadow
-/// generation under the exclusive gate, scans the authoritative cache without
-/// that gate, and mirrors concurrent publications into the shadow. The final
-/// exclusive section only swaps the completed generation. Concurrent removals
-/// may leave conservative false positives and schedule a later cleanup pass.
+/// The main cache map is authoritative for whether a concrete cache entry
+/// exists. This index is intentionally only a *candidate* index, but lookup
+/// correctness depends on a stronger completeness invariant than an ordinary
+/// advisory hint: every live reusable ECS cache entry MUST have its scope
+/// prefix represented here before that entry becomes visible in the main map.
+/// False positives are allowed (for example after a concurrent removal), while
+/// false negatives for live reusable entries are not. In set terms, each
+/// per-base-key bitmap must remain a conservative superset of the reusable
+/// prefixes currently present in the authoritative cache.
+///
+/// Publications therefore take a shared rebuild guard, publish the index bit
+/// first, and only then make the authoritative cache entry visible. Maintenance
+/// installs a shadow generation under the exclusive gate, scans the cache
+/// without that gate, and mirrors concurrent publications into the shadow. The
+/// final exclusive section swaps the completed generation only after in-flight
+/// publishers have left the shared gate. Concurrent removals may leave stale
+/// false-positive bits and schedule a later cleanup pass; they must never create
+/// a window where a live reusable cache entry is absent from the active index.
 #[derive(Debug)]
 pub(super) struct EcsLookupIndex {
     entries: ArcSwap<DashMap<EcsBaseKey, EcsPrefixBitmap>>,
@@ -656,10 +665,12 @@ impl EcsLookupIndex {
 
     /// Record a key only when it is reusable by ECS scope.
     ///
-    /// While a rebuild is active, publications are mirrored into its shadow
-    /// snapshot. Callers that publish authoritative cache entries hold the
-    /// shared `publication_guard`, so rebuild commit cannot detach the shadow
-    /// between this observation and publication of the corresponding cache
+    /// For authoritative publications this observation is part of the
+    /// no-false-negative contract: callers hold `publication_guard`, invoke this
+    /// before making the cache entry visible, and keep the guard until that
+    /// publication completes. While a rebuild is active, the same membership is
+    /// mirrored into its shadow, so rebuild commit cannot detach the shadow
+    /// between index observation and publication of the corresponding cache
     /// generation.
     #[inline]
     pub(super) fn observe_cache_key(&self, key: &CacheKey) {
@@ -861,9 +872,16 @@ impl EcsPrefixMask {
 
 /// Lazily return cache lookup candidates in RFC 7871 order.
 ///
-/// For ECS requests, only reusable scope prefixes present in the advisory hint
-/// per-base-key bitmap are materialized, longest-prefix first. The exact-SOURCE
-/// request-specific key is always yielded last. For non-ECS requests, only the
+/// For ECS requests, reusable scope prefixes represented by the conservative
+/// per-base-key index are materialized longest-prefix first. The authoritative
+/// cache map still decides whether each candidate actually exists, so stale
+/// index bits merely cause harmless extra probes. Conversely, a missing bit for
+/// a live reusable entry would be a correctness bug because that covering entry
+/// would never be probed; `EcsLookupIndex` publication/rebuild logic therefore
+/// guarantees a no-false-negative superset invariant.
+///
+/// The exact-SOURCE request-specific key is yielded only after all reusable
+/// covering scopes, as the RFC 7871 fallback. For non-ECS requests, only the
 /// ordinary request key is returned.
 pub(super) struct CacheLookupKeys<'a> {
     key: &'a CacheKey,

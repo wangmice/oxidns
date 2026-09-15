@@ -731,6 +731,85 @@ mod tests {
         (store, mutations, metrics)
     }
 
+    fn assert_ecs_index_covers_all_live_reusable_keys(store: &DnsCacheStore) {
+        let mut live_keys = Vec::new();
+        store.cache_map().visit_keys_cloned_by_shard_filtered(
+            EcsLookupIndex::tracks_cache_key,
+            |keys| {
+                live_keys.extend(keys);
+                true
+            },
+        );
+
+        for key in live_keys {
+            let ecs = key
+                .ecs_scope
+                .as_ref()
+                .expect("tracked reusable key should carry ECS");
+            let expected_prefix = ecs.scope_prefix;
+            let max_prefix = match ecs.family {
+                1 => 32,
+                2 => 128,
+                family => panic!("unexpected ECS family in cache key: {family}"),
+            };
+
+            // Probe from a request prefix that covers every reusable scope for
+            // this address. We only assert the reusable candidate shape here;
+            // the authoritative cache map remains responsible for existence.
+            let mut request_key = key.clone();
+            let request_ecs = request_key
+                .ecs_scope
+                .as_mut()
+                .expect("tracked reusable key should carry ECS");
+            request_ecs.source_prefix = max_prefix;
+            request_ecs.scope_prefix = 0;
+            request_ecs.network_len = max_prefix / 8;
+
+            let covered = cache_lookup_keys(&request_key, store.ecs_lookup_index()).any(
+                |candidate| {
+                    candidate
+                        .as_ref()
+                        .ecs_scope
+                        .as_ref()
+                        .is_some_and(|candidate_ecs| {
+                            candidate_ecs.source_prefix == expected_prefix
+                                && candidate_ecs.scope_prefix == expected_prefix
+                        })
+                },
+            );
+
+            assert!(
+                covered,
+                "live reusable ECS cache entry is missing from lookup index: domain={}, family={}, scope=/{}",
+                key.domain, ecs.family, expected_prefix
+            );
+        }
+    }
+
+    #[test]
+    fn published_reusable_ecs_entries_remain_covered_by_lookup_index() {
+        AppClock::start();
+        let (store, _mutations, _metrics) = test_store(8);
+        let now = AppClock::elapsed_millis();
+
+        for key in [
+            test_ecs_key("same-base.example", 24),
+            test_ecs_key("same-base.example", 16),
+            test_ecs_key("other-base.example", 20),
+        ] {
+            assert!(store.insert_or_update(
+                key,
+                CacheItem::new_validated(Message::new(), 60, now.saturating_add(60_000)),
+                now,
+                now.saturating_add(60_000),
+                now,
+            ));
+        }
+
+        assert_eq!(store.cache_map().entry_count(), 3);
+        assert_ecs_index_covers_all_live_reusable_keys(&store);
+    }
+
     #[test]
     fn insert_and_remove_keep_mutation_bookkeeping_together() {
         AppClock::start();
@@ -872,6 +951,7 @@ mod tests {
             metrics.insert_total.load(Ordering::Relaxed),
             before_inserts.saturating_add(1)
         );
+        assert_ecs_index_covers_all_live_reusable_keys(&store);
     }
 
     #[test]
@@ -1023,15 +1103,20 @@ mod tests {
         let (expired_removed, _, _) = store.prune(TtlCachePruneMode::Exact { max_size: 4 }, now);
 
         assert_eq!(expired_removed, 1);
+        assert_eq!(store.cache_map().entry_count(), 1);
         assert!(store.ecs_lookup_index_needs_rebuild());
+        // Removal is allowed to leave a conservative false-positive hint, but
+        // every still-live reusable entry must remain covered at all times.
         assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 2);
         assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 2);
+        assert_ecs_index_covers_all_live_reusable_keys(&store);
 
         store.rebuild_ecs_lookup_index_if_needed();
 
         assert!(!store.ecs_lookup_index_needs_rebuild());
         assert_eq!(store.ecs_lookup_index().observed_ipv4_prefixes(), 1);
         assert_eq!(store.ecs_lookup_index().indexed_base_keys(), 1);
+        assert_ecs_index_covers_all_live_reusable_keys(&store);
     }
 
     #[test]
