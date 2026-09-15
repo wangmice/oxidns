@@ -14,7 +14,9 @@ use std::{fmt, io};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue, LOCATION};
+use http::header::{
+    AUTHORIZATION, CONTENT_LENGTH, COOKIE, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
+};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -255,7 +257,13 @@ impl HttpClient {
                     })?
                     .to_string();
                 drain_response_body(response.into_body()).await?;
-                options.url = resolve_redirect_url(options.url.as_str(), location.as_str())?;
+                let next_url = resolve_redirect_url(options.url.as_str(), location.as_str())?;
+                apply_redirect_security_policy(
+                    options.url.as_str(),
+                    next_url.as_str(),
+                    &mut options.headers,
+                )?;
+                options.url = next_url;
                 continue;
             }
 
@@ -551,6 +559,46 @@ fn parse_uri_host_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
+fn apply_redirect_security_policy(
+    current_url: &str,
+    next_url: &str,
+    headers: &mut Vec<(HeaderName, HeaderValue)>,
+) -> Result<()> {
+    let current = Url::parse(current_url).map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to parse redirect source url '{}': {}",
+            current_url, err
+        ))
+    })?;
+    let next = Url::parse(next_url).map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to parse redirect target url '{}': {}",
+            next_url, err
+        ))
+    })?;
+
+    if current.scheme() == "https" && next.scheme() == "http" {
+        return Err(DnsError::plugin(format!(
+            "refusing insecure redirect downgrade from '{}' to '{}'",
+            current_url, next_url
+        )));
+    }
+
+    if !same_origin(&current, &next) {
+        headers.retain(|(name, _)| {
+            name != AUTHORIZATION && name != COOKIE && name != PROXY_AUTHORIZATION
+        });
+    }
+
+    Ok(())
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 pub fn resolve_redirect_url(current_url: &str, location: &str) -> Result<String> {
     let base = Url::parse(current_url).map_err(|err| {
         DnsError::plugin(format!(
@@ -597,6 +645,68 @@ mod tests {
         )
         .expect("relative redirect should resolve");
         assert_eq!(resolved, "https://example.com/assets/file.dat");
+    }
+
+    #[test]
+    fn test_redirect_security_strips_sensitive_headers_cross_origin() {
+        let mut headers = vec![
+            (AUTHORIZATION, HeaderValue::from_static("Bearer secret")),
+            (COOKIE, HeaderValue::from_static("session=secret")),
+            (
+                PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic c2VjcmV0"),
+            ),
+            (
+                HeaderName::from_static("x-test"),
+                HeaderValue::from_static("keep"),
+            ),
+        ];
+
+        apply_redirect_security_policy(
+            "https://api.example.com/start",
+            "https://cdn.example.net/result",
+            &mut headers,
+        )
+        .expect("cross-origin HTTPS redirect should remain allowed");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, HeaderName::from_static("x-test"));
+    }
+
+    #[test]
+    fn test_redirect_security_preserves_sensitive_headers_same_origin() {
+        let mut headers = vec![(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        )];
+
+        apply_redirect_security_policy(
+            "https://example.com/start",
+            "https://example.com:443/result",
+            &mut headers,
+        )
+        .expect("same-origin redirect should remain allowed");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, AUTHORIZATION);
+    }
+
+    #[test]
+    fn test_redirect_security_rejects_https_downgrade() {
+        let mut headers = vec![(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        )];
+
+        let error = apply_redirect_security_policy(
+            "https://example.com/start",
+            "http://example.com/result",
+            &mut headers,
+        )
+        .expect_err("HTTPS to HTTP redirect must be rejected");
+
+        assert!(error.to_string().contains("insecure redirect downgrade"));
+        assert_eq!(headers.len(), 1, "rejected redirects must not mutate headers");
     }
 
     #[test]
