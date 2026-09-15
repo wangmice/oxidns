@@ -465,40 +465,84 @@ where
         ))
     })?;
     temp_file.close();
+    let replace_path = temp_file.take_path();
+    replace_target_file(replace_path, path.to_path_buf()).await
+}
 
-    if let Err(err) = fs::rename(&tmp_path, path).await {
-        let rename_fallback = matches!(
-            err.kind(),
-            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-        );
-        if !rename_fallback {
-            return Err(DnsError::plugin(format!(
-                "failed to replace target file '{}': {}",
-                path.display(),
-                err
-            )));
-        }
-
-        if fs::try_exists(path).await.unwrap_or(false)
-            && let Err(err) = fs::remove_file(path).await
+async fn replace_target_file(temp_path: PathBuf, target_path: PathBuf) -> Result<()> {
+    let target_label = target_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = replace_file_sync(&temp_path, &target_path);
+        if result.is_err()
+            && let Err(cleanup_error) = std::fs::remove_file(&temp_path)
+            && cleanup_error.kind() != io::ErrorKind::NotFound
         {
-            return Err(DnsError::plugin(format!(
-                "failed to remove existing target file '{}': {}",
-                path.display(),
-                err
-            )));
+            tracing::warn!(
+                path = %temp_path.display(),
+                error = %cleanup_error,
+                "failed to remove temp file after replacement failure"
+            );
         }
-        fs::rename(&tmp_path, path).await.map_err(|err| {
-            DnsError::plugin(format!(
-                "failed to replace target file '{}' after fallback: {}",
-                path.display(),
-                err
-            ))
-        })?;
-    }
-    temp_file.persisted();
+        result
+    })
+    .await
+    .map_err(|err| DnsError::plugin(format!("file replacement task failed: {err}")))?
+    .map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to atomically replace target file '{}': {}",
+            target_label.display(),
+            err
+        ))
+    })
+}
 
-    Ok(())
+#[cfg(not(windows))]
+fn replace_file_sync(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    std::fs::rename(temp_path, target_path)
+}
+
+#[cfg(windows)]
+fn replace_file_sync(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    use windows::core::PCWSTR;
+
+    match std::fs::rename(temp_path, target_path) {
+        Ok(()) => return Ok(()),
+        Err(err)
+            if !matches!(
+                err.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Err(err);
+        }
+        Err(_) => {}
+    }
+
+    let replaced = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replacement = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(replaced.as_ptr()),
+            PCWSTR(replacement.as_ptr()),
+            PCWSTR::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+    }
+    .map_err(io::Error::other)
 }
 
 /// Owns an incomplete download until it has been atomically persisted.
@@ -534,8 +578,10 @@ impl TemporaryDownloadFile {
         self.file.take();
     }
 
-    fn persisted(&mut self) {
-        self.path.take();
+    fn take_path(&mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("temporary download file path must exist before replacement")
     }
 }
 
@@ -912,6 +958,39 @@ mod tests {
 
         assert!(error.to_string().contains("exceeds configured 6-byte limit"));
         server.await.expect("test HTTP server should exit normally");
+    }
+
+    #[test]
+    fn test_atomic_replace_preserves_old_target_when_source_is_missing() {
+        let dir = TempDir::new().expect("temp directory should be created");
+        let target = dir.path().join("rules.dat");
+        let missing = dir.path().join("missing.tmp");
+        std::fs::write(&target, b"old rules").expect("old target should be written");
+
+        let result = replace_file_sync(&missing, &target);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("old target must remain readable"),
+            b"old rules"
+        );
+    }
+
+    #[test]
+    fn test_atomic_replace_updates_existing_target() {
+        let dir = TempDir::new().expect("temp directory should be created");
+        let target = dir.path().join("rules.dat");
+        let replacement = dir.path().join("replacement.tmp");
+        std::fs::write(&target, b"old rules").expect("old target should be written");
+        std::fs::write(&replacement, b"new rules").expect("replacement should be written");
+
+        replace_file_sync(&replacement, &target).expect("target replacement should succeed");
+
+        assert_eq!(
+            std::fs::read(&target).expect("new target must be readable"),
+            b"new rules"
+        );
+        assert!(!replacement.exists());
     }
 
     #[tokio::test]
