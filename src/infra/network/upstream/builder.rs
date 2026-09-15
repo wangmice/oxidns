@@ -334,6 +334,8 @@ mod tests {
     #[test]
     fn multiplexed_connection_load_is_lower_than_generic_pipeline_load() {
         assert_eq!(MULTIPLEXED_MAX_CONNS_LOAD, 32);
-        assert!(MULTIPLEXED_MAX_CONNS_LOAD < ConnectionInfo::DEFAULT_MAX_CONNS_LOAD);
+        const {
+            assert!(MULTIPLEXED_MAX_CONNS_LOAD < ConnectionInfo::DEFAULT_MAX_CONNS_LOAD);
+        }
     }
 }

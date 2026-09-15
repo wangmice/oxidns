@@ -409,6 +409,7 @@ where
     /// This is intended for conservative side indexes that must be published
     /// before the authoritative entry without leaving speculative state behind
     /// when admission is rejected.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_insert_or_update_with_limit_before_publish<F>(
         &self,
         key: K,
@@ -500,6 +501,7 @@ where
     /// Replace an existing generation while publishing a conservative side
     /// index only after the expected generation has been validated, but before
     /// the replacement node becomes visible.
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_handle_before_publish<F>(
         &self,
         key: K,
@@ -699,6 +701,7 @@ where
     /// authoritative membership, so consolidation/replacement needs no new
     /// hint. The callback runs while the source/target write lock(s) are held,
     /// immediately before the new target node becomes visible.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn conditional_move_handle_if_before_publish<F, P>(
         &self,
         source_key: &K,
