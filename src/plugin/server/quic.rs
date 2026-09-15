@@ -25,7 +25,7 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::parse_listen_addr;
 use crate::infra::network::tls_config::load_tls_config;
 use crate::infra::network::transport::quic::{
-    QuicTransport, QuicTransportReader, QuicTransportWriter,
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::infra::system::deserialize_duration_option;
@@ -37,6 +37,10 @@ use crate::plugin::server::{
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
+
+const DOQ_INTERNAL_ERROR: u32 = 0x1;
+const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
 
 /// QUIC server configuration
 #[derive(Deserialize)]
@@ -322,11 +326,13 @@ async fn handle_quic_connection(
         let handler = handler.clone();
         let server_name = server_name.clone();
         let task_cancel = stream_cancel.clone();
+        let task_transport = transport.clone();
         stream_tasks.spawn(async move {
             let _permit = permit;
             tokio::select! {
                 _ = task_cancel.cancelled() => {}
                 result = handle_doq_bi_stream(
+                    task_transport,
                     reader,
                     writer,
                     handler,
@@ -345,33 +351,98 @@ async fn handle_quic_connection(
 /// Handle a single DNS over QUIC (DoQ) bidirectional stream.
 /// Format: 2-byte big-endian length prefix followed by the DNS message payload.
 async fn handle_doq_bi_stream(
+    transport: QuicTransport,
     mut reader: QuicTransportReader,
     mut writer: QuicTransportWriter,
     handler: Arc<RequestHandle>,
     remote_addr: std::net::SocketAddr,
     server_name: Option<Arc<str>>,
 ) -> Result<()> {
-    match reader.read_message().await {
-        Ok(request_msg) => {
-            let response = handler
-                .handle_request(
-                    request_msg,
-                    remote_addr,
-                    RequestMeta {
-                        server_name,
-                        url_path: None,
-                    },
-                )
-                .await;
-            if let Err(e) = writer.write_message(&response.response).await {
-                warn!("Failed to send DoQ response to {}: {}", remote_addr, e);
-                return Ok(());
-            }
-            let _ = writer.finish();
+    let request_msg = match reader.read_message_doq().await {
+        Ok(request_msg) => request_msg,
+        Err(QuicReadError::Protocol(message)) => {
+            warn!(
+                client = %remote_addr,
+                error = %message,
+                "Fatal DoQ protocol error while reading request"
+            );
+            transport.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
+            return Ok(());
         }
-        Err(e) => {
-            warn!("Failed to read DoQ request from {}: {}", remote_addr, e);
+        Err(QuicReadError::StreamReset(code)) => {
+            debug!(
+                client = %remote_addr,
+                %code,
+                "DoQ request stream reset by client"
+            );
+            writer.reset(DOQ_REQUEST_CANCELLED);
+            return Ok(());
         }
+        Err(QuicReadError::ConnectionLost(error)) => {
+            debug!(
+                client = %remote_addr,
+                error = ?error,
+                "QUIC connection lost while reading DoQ request"
+            );
+            return Ok(());
+        }
+        Err(QuicReadError::Stream(message)) => {
+            debug!(
+                client = %remote_addr,
+                error = %message,
+                "DoQ request stream read error"
+            );
+            writer.reset(DOQ_INTERNAL_ERROR);
+            return Ok(());
+        }
+    };
+
+    let response = handler
+        .handle_request(
+            request_msg,
+            remote_addr,
+            RequestMeta {
+                server_name,
+                url_path: None,
+            },
+        )
+        .await;
+
+    match writer.write_message_doq(&response.response).await {
+        Ok(()) => {}
+        Err(QuicWriteError::Stopped(code)) => {
+            debug!(
+                client = %remote_addr,
+                %code,
+                "DoQ transaction cancelled by client with STOP_SENDING"
+            );
+            return Ok(());
+        }
+        Err(QuicWriteError::ConnectionLost(error)) => {
+            debug!(
+                client = %remote_addr,
+                error = ?error,
+                "QUIC connection lost while writing DoQ response"
+            );
+            return Ok(());
+        }
+        Err(QuicWriteError::Stream(message) | QuicWriteError::Encode(message)) => {
+            warn!(
+                client = %remote_addr,
+                error = %message,
+                "Failed to write DoQ response"
+            );
+            writer.reset(DOQ_INTERNAL_ERROR);
+            return Ok(());
+        }
+    }
+
+    if let Err(error) = writer.finish() {
+        debug!(
+            client = %remote_addr,
+            error = %error,
+            "Failed to finish DoQ response stream"
+        );
     }
     Ok(())
 }
