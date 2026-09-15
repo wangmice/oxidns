@@ -15,7 +15,9 @@ use std::{fmt, io};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, COOKIE, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION,
+    CONTENT_TYPE, COOKIE, HeaderName, HeaderValue, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION,
+    TRANSFER_ENCODING,
 };
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
@@ -211,7 +213,7 @@ impl HttpClient {
 
     async fn request_following_redirects(
         &self,
-        method: Method,
+        mut method: Method,
         mut options: HttpRequestOptions,
     ) -> Result<hyper::Response<Incoming>> {
         let label = request_label(&method, options.url.as_str());
@@ -263,6 +265,7 @@ impl HttpClient {
                     next_url.as_str(),
                     &mut options.headers,
                 )?;
+                apply_redirect_method_policy(status, &mut method, &mut options);
                 options.url = next_url;
                 continue;
             }
@@ -559,6 +562,35 @@ fn parse_uri_host_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
+fn apply_redirect_method_policy(
+    status: StatusCode,
+    method: &mut Method,
+    options: &mut HttpRequestOptions,
+) {
+    if status != StatusCode::SEE_OTHER {
+        return;
+    }
+
+    if *method != Method::HEAD {
+        *method = Method::GET;
+    }
+    options.body = Bytes::new();
+    options
+        .headers
+        .retain(|(name, _)| !is_content_specific_redirect_header(name));
+}
+
+fn is_content_specific_redirect_header(name: &HeaderName) -> bool {
+    name == CONTENT_ENCODING
+        || name == CONTENT_LANGUAGE
+        || name == CONTENT_LENGTH
+        || name == CONTENT_LOCATION
+        || name == CONTENT_TYPE
+        || name == LAST_MODIFIED
+        || name == TRANSFER_ENCODING
+        || name.as_str() == "digest"
+}
+
 fn apply_redirect_security_policy(
     current_url: &str,
     next_url: &str,
@@ -645,6 +677,60 @@ mod tests {
         )
         .expect("relative redirect should resolve");
         assert_eq!(resolved, "https://example.com/assets/file.dat");
+    }
+
+    #[test]
+    fn test_303_redirect_switches_post_to_get_and_clears_content() {
+        let mut method = Method::POST;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![
+                (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                (CONTENT_LENGTH, HeaderValue::from_static("7")),
+                (
+                    HeaderName::from_static("x-test"),
+                    HeaderValue::from_static("keep"),
+                ),
+            ])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(StatusCode::SEE_OTHER, &mut method, &mut options);
+
+        assert_eq!(method, Method::GET);
+        assert!(options.body.is_empty());
+        assert_eq!(options.headers.len(), 1);
+        assert_eq!(options.headers[0].0, HeaderName::from_static("x-test"));
+    }
+
+    #[test]
+    fn test_303_redirect_preserves_head_but_clears_content() {
+        let mut method = Method::HEAD;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![(CONTENT_LENGTH, HeaderValue::from_static("7"))])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(StatusCode::SEE_OTHER, &mut method, &mut options);
+
+        assert_eq!(method, Method::HEAD);
+        assert!(options.body.is_empty());
+        assert!(options.headers.is_empty());
+    }
+
+    #[test]
+    fn test_307_redirect_preserves_method_and_body() {
+        let mut method = Method::POST;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(
+            StatusCode::TEMPORARY_REDIRECT,
+            &mut method,
+            &mut options,
+        );
+
+        assert_eq!(method, Method::POST);
+        assert_eq!(options.body, Bytes::from_static(b"payload"));
+        assert_eq!(options.headers.len(), 1);
     }
 
     #[test]
