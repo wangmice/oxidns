@@ -397,16 +397,55 @@ async fn handle_doq_bi_stream(
         }
     };
 
-    let response = handler
-        .handle_request(
+    // A DoQ client can abandon the response direction with STOP_SENDING after
+    // it has already sent a complete request and FIN. Do not keep executing the
+    // DNS transaction (and holding the global inbound-request permit) until the
+    // eventual response write notices `WriteError::Stopped`.
+    //
+    // `SendStream::stopped()` is woken by STOP_SENDING. If this branch wins,
+    // dropping the `handle_request()` future propagates cancellation through
+    // the executor/upstream future chain. The surrounding stream task then
+    // returns and releases its `InboundRequestLimiter` permit.
+    let peer_stopped = writer.stopped();
+    tokio::pin!(peer_stopped);
+    let response = tokio::select! {
+        biased;
+
+        stopped = &mut peer_stopped => {
+            match stopped {
+                Ok(Some(code)) => {
+                    debug!(
+                        client = %remote_addr,
+                        %code,
+                        "Cancelling DoQ transaction after client STOP_SENDING"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        client = %remote_addr,
+                        "DoQ response send stream closed while request was executing"
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        client = %remote_addr,
+                        error = ?error,
+                        "QUIC connection lost while executing DoQ request"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        response = handler.handle_request(
             request_msg,
             remote_addr,
             RequestMeta {
                 server_name,
                 url_path: None,
             },
-        )
-        .await;
+        ) => response,
+    };
 
     match writer.write_message_doq(&response.response).await {
         Ok(()) => {}

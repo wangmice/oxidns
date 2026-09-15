@@ -105,6 +105,21 @@ impl QuicTransportWriter {
             .map_err(map_write_error)
     }
 
+    /// Wait until the peer stops accepting data on this send stream.
+    ///
+    /// Quinn's `SendStream::stopped()` future is independent of the borrow of
+    /// `self`, so callers can race it against request execution and still use
+    /// this writer afterwards when execution wins.
+    #[inline]
+    pub(crate) fn stopped(
+        &self,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<VarInt>, quinn::StoppedError>>
+    + Send
+    + Sync
+    + 'static {
+        self.send.stopped()
+    }
+
     /// Half-close the send stream (finish) to signal end of request.
     #[inline]
     pub fn finish(&mut self) -> Result<()> {
