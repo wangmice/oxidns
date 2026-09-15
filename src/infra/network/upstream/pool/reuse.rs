@@ -112,7 +112,9 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         if check_count == 0 {
             if self.active_count.load(Ordering::Relaxed) < self.min_size {
                 debug!("Reuse pool expanding to maintain minimum size");
-                let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
+                let _ = self
+                    .expand(QueryDeadline::background(self.connect_timeout))
+                    .await;
             }
             return;
         }
@@ -181,7 +183,9 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         // Expand if below min_size
         if self.active_count.load(Ordering::Relaxed) < self.min_size {
             debug!("Reuse pool expanding to maintain minimum size");
-            let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
+            let _ = self
+                .expand(QueryDeadline::background(self.connect_timeout))
+                .await;
         }
     }
 
@@ -225,7 +229,10 @@ impl<C: Connection> ReusePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::background(arc.connect_timeout)).await {
+                if let Err(e) = arc
+                    .expand(QueryDeadline::background(arc.connect_timeout))
+                    .await
+                {
                     warn!("Failed to prefill ReusePool: {:?}", e);
                 }
             });
@@ -294,7 +301,7 @@ impl<C: Connection> ReusePool<C> {
                     DeadlineOutcome::Completed(()) => {}
                     DeadlineOutcome::Expired => {
                         return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
-                    },
+                    }
                 }
             }
         }

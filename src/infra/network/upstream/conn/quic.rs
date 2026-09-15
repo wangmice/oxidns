@@ -153,12 +153,12 @@ impl Connection for QuicConnection {
                 QuicWriteError::Stopped(code) => {
                     self.close_with_code(DOQ_PROTOCOL_ERROR, b"peer sent STOP_SENDING");
                     warn!(
-                        conn_id = self.id,
-            upstream = %self.upstream,
-                        query_id = raw_id,
-                        %code,
-                        "DoQ peer sent forbidden STOP_SENDING"
-                    );
+                                conn_id = self.id,
+                    upstream = %self.upstream,
+                                query_id = raw_id,
+                                %code,
+                                "DoQ peer sent forbidden STOP_SENDING"
+                            );
                     return Err(DnsError::protocol(format!(
                         "DoQ peer sent STOP_SENDING with code {code}"
                     )));
@@ -202,21 +202,21 @@ impl Connection for QuicConnection {
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
                 trace!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = raw_id,
-                    "Successfully received DNS response over QUIC"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        "Successfully received DNS response over QUIC"
+                    );
                 Ok(resp)
             }
             Err(QuicReadError::StreamReset(code)) => {
                 warn!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = raw_id,
-                    %code,
-                    "DoQ transaction reset by server"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        %code,
+                        "DoQ transaction reset by server"
+                    );
                 Err(DnsError::protocol(format!(
                     "DoQ transaction reset by server with code {code}"
                 )))
@@ -224,33 +224,33 @@ impl Connection for QuicConnection {
             Err(QuicReadError::Protocol(message)) => {
                 self.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
                 warn!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = raw_id,
-                    error = %message,
-                    "Fatal DoQ protocol error"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = %message,
+                        "Fatal DoQ protocol error"
+                    );
                 Err(DnsError::protocol(message))
             }
             Err(QuicReadError::ConnectionLost(e)) => {
                 self.close();
                 warn!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = raw_id,
-                    error = ?e,
-                    "QUIC connection lost while reading DoQ response"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = ?e,
+                        "QUIC connection lost while reading DoQ response"
+                    );
                 Err(DnsError::protocol(format!("QUIC connection lost: {e}")))
             }
             Err(QuicReadError::Stream(message)) => {
                 debug!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = raw_id,
-                    error = %message,
-                    "DoQ stream read error"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = %message,
+                        "DoQ stream read error"
+                    );
                 Err(DnsError::protocol(message))
             }
         }
@@ -324,9 +324,9 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
         let dial_options = QuicDialOptions::new(
             self.target.clone(),
             self.insecure_skip_verify,
-            deadline
-                .remaining()
-                .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
+            deadline.remaining().ok_or_else(|| {
+                deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+            })?,
             quic_idle_timeout(self.timeout),
             vec![b"doq".to_vec()],
         )

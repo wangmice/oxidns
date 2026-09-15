@@ -90,7 +90,9 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         if slots.is_empty() {
             drop(slots);
             if self.min_size > 0 {
-                let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
+                let _ = self
+                    .expand(QueryDeadline::background(self.connect_timeout))
+                    .await;
             }
             return;
         }
@@ -157,7 +159,9 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         }
 
         if new_len < self.min_size {
-            let _ = self.expand(QueryDeadline::background(self.connect_timeout)).await;
+            let _ = self
+                .expand(QueryDeadline::background(self.connect_timeout))
+                .await;
         }
     }
 
@@ -196,7 +200,10 @@ impl<C: Connection> PipelinePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::background(arc.connect_timeout)).await {
+                if let Err(e) = arc
+                    .expand(QueryDeadline::background(arc.connect_timeout))
+                    .await
+                {
                     warn!("Failed to prefill PipelinePool: {:?}", e);
                 }
             });
@@ -267,7 +274,7 @@ impl<C: Connection> PipelinePool<C> {
                     DeadlineOutcome::Completed(()) => {}
                     DeadlineOutcome::Expired => {
                         return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
-                    },
+                    }
                 }
             }
         }

@@ -203,18 +203,18 @@ impl Connection for TcpConnection {
                 query_guard.disarm();
                 res.set_id(raw_id); // Restore original query ID
                 trace!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id, "Successfully received DNS response over TCP"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id, "Successfully received DNS response over TCP"
+                    );
                 Ok(res)
             }
             Err(_) => {
                 warn!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id, "DNS query canceled (response channel dropped)"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id, "DNS query canceled (response channel dropped)"
+                    );
                 Err(DnsError::protocol("request canceled"))
             }
         }
@@ -309,11 +309,11 @@ impl TcpConnection {
                 .is_err()
             {
                 trace!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    query_id = queued.query_id,
-                    "Skipping canceled queued TCP query"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = queued.query_id,
+                        "Skipping canceled queued TCP query"
+                    );
                 continue;
             }
 
@@ -332,11 +332,11 @@ impl TcpConnection {
 
             if let Err(e) = write_result {
                 error!(
-                    conn_id = self.id,
-            upstream = %self.upstream,
-                    error = ?e,
-                    "TCP write failed, marking connection as non-writable"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        error = ?e,
+                        "TCP write failed, marking connection as non-writable"
+                    );
                 self.writeable.store(false, Ordering::Release);
                 self.close();
                 break;
@@ -391,27 +391,27 @@ impl TcpConnection {
                         self.last_used
                             .store(AppClock::elapsed_millis(), Ordering::Relaxed);
                         trace!(
-                            conn_id = self.id,
-            upstream = %self.upstream,
-                            query_id = id,
-                            "Matched and delivered DNS response to waiting query"
-                        );
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id = id,
+                                        "Matched and delivered DNS response to waiting query"
+                                    );
                     } else {
                         trace!(
-                            conn_id = self.id,
-            upstream = %self.upstream,
-                            query_id = id,
-                            "Discarded DNS response (no matching query or fingerprint mismatch)"
-                        );
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id = id,
+                                        "Discarded DNS response (no matching query or fingerprint mismatch)"
+                                    );
                     }
                 }
                 Err(e) => {
                     debug!(
-                        conn_id = self.id,
-            upstream = %self.upstream,
-                        error = ?e,
-                        "TCP read error or EOF, closing connection"
-                    );
+                                conn_id = self.id,
+                    upstream = %self.upstream,
+                                error = ?e,
+                                "TCP read error or EOF, closing connection"
+                            );
                     self.close();
                     break;
                 }
@@ -490,7 +490,7 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
             DeadlineOutcome::Completed(result) => result?,
             DeadlineOutcome::Expired => {
                 return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
-            },
+            }
         };
 
         debug!(
@@ -519,9 +519,9 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
                     TlsDialOptions::new(
                         self.target.clone(),
                         self.insecure_skip_verify,
-                        deadline
-                            .remaining()
-                            .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
+                        deadline.remaining().ok_or_else(|| {
+                            deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+                        })?,
                         vec![b"dot".to_vec()],
                     )
                     .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
@@ -592,7 +592,8 @@ mod tests {
     async fn test_query_returns_error_when_connection_is_closed() {
         AppClock::start();
         let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
-        let connection = TcpConnection::new(7, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY);
+        let connection =
+            TcpConnection::new(7, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY);
         connection.close();
 
         let result = connection
@@ -611,7 +612,12 @@ mod tests {
     async fn test_close_before_listener_start_is_latched() {
         AppClock::start();
         let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
-        let connection = Arc::new(TcpConnection::new(9, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        let connection = Arc::new(TcpConnection::new(
+            9,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+        ));
         connection.close();
 
         let (client, _server) = tokio::io::duplex(64);
@@ -634,7 +640,12 @@ mod tests {
         AppClock::start();
         let (sender, receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let queue = sender.clone();
-        let connection = Arc::new(TcpConnection::new(10, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        let connection = Arc::new(TcpConnection::new(
+            10,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+        ));
         let (client, mut server) = tokio::io::duplex(1);
         let writer = TcpTransportWriter::new(client);
         let task = tokio::spawn(TcpConnection::send_dns_request(
@@ -672,7 +683,12 @@ mod tests {
         AppClock::start();
         let (sender, receiver) = channel(2);
         let queue = sender.clone();
-        let connection = Arc::new(TcpConnection::new(11, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY));
+        let connection = Arc::new(TcpConnection::new(
+            11,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+        ));
         let (client, server) = tokio::io::duplex(1024);
         let writer = TcpTransportWriter::new(client);
         let task = tokio::spawn(TcpConnection::send_dns_request(
@@ -716,7 +732,8 @@ mod tests {
     async fn test_query_removes_request_when_cancelled() {
         AppClock::start();
         let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
-        let connection = TcpConnection::new(8, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY);
+        let connection =
+            TcpConnection::new(8, "test".to_string(), sender, DEFAULT_REQUEST_MAP_CAPACITY);
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),

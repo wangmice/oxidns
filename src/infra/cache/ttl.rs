@@ -1765,33 +1765,21 @@ mod tests {
         cache.insert_or_update("k", 2u32, 2, 200);
         let publications = std::sync::atomic::AtomicUsize::new(0);
 
-        assert!(!cache.replace_handle_before_publish(
-            "k",
-            &stale,
-            3u32,
-            3,
-            300,
-            3,
-            |_| {
+        assert!(
+            !cache.replace_handle_before_publish("k", &stale, 3u32, 3, 300, 3, |_| {
                 publications.fetch_add(1, Ordering::Relaxed);
-            },
-        ));
+            },)
+        );
         assert_eq!(publications.load(Ordering::Relaxed), 0);
 
         let current = cache
             .get_retained_handle(&"k", 3, 0)
             .expect("current entry should exist");
-        assert!(cache.replace_handle_before_publish(
-            "k",
-            &current,
-            4u32,
-            4,
-            400,
-            4,
-            |_| {
+        assert!(
+            cache.replace_handle_before_publish("k", &current, 4u32, 4, 400, 4, |_| {
                 publications.fetch_add(1, Ordering::Relaxed);
-            },
-        ));
+            },)
+        );
         assert_eq!(publications.load(Ordering::Relaxed), 1);
     }
 

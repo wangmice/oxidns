@@ -367,12 +367,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    run_probe_blocking_with_timeout_on(
-        timeout,
-        BLOCKING_PROBE_SEMAPHORE.clone(),
-        operation,
-    )
-    .await
+    run_probe_blocking_with_timeout_on(timeout, BLOCKING_PROBE_SEMAPHORE.clone(), operation).await
 }
 
 async fn run_probe_blocking_with_timeout_on<T, F>(

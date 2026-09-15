@@ -55,10 +55,8 @@ impl QueryDeadline {
     /// Return the earlier of this deadline and a new relative timeout while
     /// preserving whether upstream timeout metrics are tracked.
     pub(crate) fn capped(self, timeout: Duration) -> Self {
-        let timeout_deadline = Self::new_with_metric_tracking(
-            timeout,
-            self.track_upstream_timeout_metrics,
-        );
+        let timeout_deadline =
+            Self::new_with_metric_tracking(timeout, self.track_upstream_timeout_metrics);
         if timeout_deadline.expires_at_ms < self.expires_at_ms {
             timeout_deadline
         } else {

@@ -8,9 +8,9 @@ use rand::RngExt;
 use tokio::task::JoinSet;
 use tracing::{Level, debug, event_enabled, info, warn};
 
-use super::{contextualize_upstream_error, is_timeout_error};
 use super::metrics::ForwardMetrics;
 use super::selection::{ResponseSelectionMode, SelectedResponse, select_response};
+use super::{contextualize_upstream_error, is_timeout_error};
 use crate::core::context::DnsContext;
 use crate::core::response::ResponseDisposition;
 use crate::infra::error::{DnsError, Result};

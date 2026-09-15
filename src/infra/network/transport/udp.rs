@@ -510,7 +510,11 @@ mod tests {
             .await
             .expect("sender should bind");
         sender
-            .connect(receiver.local_addr().expect("receiver should have an address"))
+            .connect(
+                receiver
+                    .local_addr()
+                    .expect("receiver should have an address"),
+            )
             .await
             .expect("sender should connect");
 

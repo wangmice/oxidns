@@ -340,9 +340,8 @@ async fn handle_dns_stream<S>(
 
     let (sender, receiver) = tokio::sync::mpsc::channel::<Message>(128);
 
-    let _writer_task = AbortOnDropHandle::new(tokio::spawn(write_tcp_responses(
-        writer, receiver, src,
-    )));
+    let _writer_task =
+        AbortOnDropHandle::new(tokio::spawn(write_tcp_responses(writer, receiver, src)));
 
     let sender = Arc::new(sender);
 

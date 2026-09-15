@@ -32,10 +32,7 @@ fn contextualize_upstream_error(info: &ConnectionInfo, err: DnsError) -> DnsErro
             "upstream '{tag}' ({}) query failed: {err}",
             info.raw_addr
         )),
-        None => DnsError::plugin(format!(
-            "upstream '{}' query failed: {err}",
-            info.raw_addr
-        )),
+        None => DnsError::plugin(format!("upstream '{}' query failed: {err}", info.raw_addr)),
     }
 }
 

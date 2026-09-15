@@ -408,16 +408,18 @@ async fn connect_quic_endpoint(
     if let Some((deadline, stage)) = options.query_timeout {
         return match deadline.run(connecting).await {
             DeadlineOutcome::Completed(Ok(connection)) => Ok(connection),
-            DeadlineOutcome::Completed(Err(error)) => {
-                Err(DnsError::protocol(format!("QUIC connection error: {error}")))
-            }
+            DeadlineOutcome::Completed(Err(error)) => Err(DnsError::protocol(format!(
+                "QUIC connection error: {error}"
+            ))),
             DeadlineOutcome::Expired => Err(deadline.timeout_error_for(stage)),
         };
     }
 
     match timeout(options.handshake_timeout, connecting).await {
         Ok(Ok(connection)) => Ok(connection),
-        Ok(Err(error)) => Err(DnsError::protocol(format!("QUIC connection error: {error}"))),
+        Ok(Err(error)) => Err(DnsError::protocol(format!(
+            "QUIC connection error: {error}"
+        ))),
         Err(_) => Err(DnsError::protocol("QUIC handshake timeout")),
     }
 }

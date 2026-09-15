@@ -797,15 +797,7 @@ fn nftset_operate(
     let set_flags = nftset_get_flags(family, table, setname).unwrap_or(0);
     let is_interval = (set_flags & NFT_SET_INTERVAL) != 0;
     let socket = NetlinkSocket::new()?;
-    nftset_operate_prepared(
-        nf_family,
-        table,
-        setname,
-        entry,
-        cmd,
-        is_interval,
-        &socket,
-    )
+    nftset_operate_prepared(nf_family, table, setname, entry, cmd, is_interval, &socket)
 }
 
 /// Add an IP address to an nftables set.
@@ -834,7 +826,6 @@ pub fn nftset_add<E: Into<IpEntry>>(
 ) -> Result<()> {
     nftset_operate(family, table, setname, &entry.into(), NFT_MSG_NEWSETELEM)
 }
-
 
 /// Outcome of a bulk nftables set insertion.
 ///

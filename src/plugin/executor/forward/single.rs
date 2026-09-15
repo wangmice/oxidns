@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use super::{contextualize_upstream_error, is_timeout_error};
 use super::metrics::ForwardMetrics;
+use super::{contextualize_upstream_error, is_timeout_error};
 use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::upstream::Upstream;

@@ -15,9 +15,9 @@ use tracing::{debug, trace, warn};
 use super::UsingCountGuard;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
@@ -195,7 +195,11 @@ impl H2Connection {
                 self.report_transport_error(raw_id, &e);
                 Err(e)
             }
-            Err(H2RecvError::Stream(e) | H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
+            Err(
+                H2RecvError::Stream(e)
+                | H2RecvError::HttpStatus(e)
+                | H2RecvError::InvalidResponse(e),
+            ) => Err(e),
         }
     }
 }
@@ -249,7 +253,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             DeadlineOutcome::Completed(result) => result?,
             DeadlineOutcome::Expired => {
                 return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
-            },
+            }
         };
 
         let tls_stream = connect_tls(
@@ -257,9 +261,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             TlsDialOptions::new(
                 self.target.clone(),
                 self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
+                deadline.remaining().ok_or_else(|| {
+                    deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+                })?,
                 vec![b"h2".to_vec()],
             )
             .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
@@ -328,8 +332,7 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
     let mut truncated = false;
 
     while let Some(partial_bytes) = body.data().await {
-        let partial_bytes = partial_bytes
-            .map_err(|e| classify_h2_error("H2 body error", e))?;
+        let partial_bytes = partial_bytes.map_err(|e| classify_h2_error("H2 body error", e))?;
         let chunk_len = partial_bytes.len();
         let remaining = body_limit.saturating_sub(response_bytes.len());
         let exceeds_limit = chunk_len > remaining;

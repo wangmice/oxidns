@@ -157,21 +157,21 @@ impl Connection for UdpConnection {
                     }
                     Err(_canceled) => {
                         trace!(
-                            conn_id = self.id,
-            upstream = %self.upstream,
-                            query_id, "Listener dropped channel, retrying"
-                        );
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id, "Listener dropped channel, retrying"
+                                    );
                         continue;
                     }
                 },
                 Err(_elapsed) => {
                     trace!(
-                        conn_id = self.id,
-            upstream = %self.upstream,
-                        query_id,
-                        timeout_ms = current_timeout.as_millis(),
-                        "UDP response timeout"
-                    );
+                                conn_id = self.id,
+                    upstream = %self.upstream,
+                                query_id,
+                                timeout_ms = current_timeout.as_millis(),
+                                "UDP response timeout"
+                            );
                     continue;
                 }
             }

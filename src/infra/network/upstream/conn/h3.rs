@@ -17,12 +17,12 @@ use tracing::{debug, trace, warn};
 use super::{UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
     DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
     connect_quic_abstract, connect_udp,
 };
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
@@ -161,7 +161,11 @@ impl H3Connection {
                 self.close();
                 Err(e)
             }
-            Err(H3RecvError::Stream(e) | H3RecvError::HttpStatus(e) | H3RecvError::InvalidResponse(e)) => Err(e),
+            Err(
+                H3RecvError::Stream(e)
+                | H3RecvError::HttpStatus(e)
+                | H3RecvError::InvalidResponse(e),
+            ) => Err(e),
         }
     }
 }
@@ -209,9 +213,9 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         let dial_options = QuicDialOptions::new(
             self.target.clone(),
             self.insecure_skip_verify,
-            deadline
-                .remaining()
-                .ok_or_else(|| deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))?,
+            deadline.remaining().ok_or_else(|| {
+                deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+            })?,
             quic_idle_timeout(self.timeout),
             vec![b"h3".to_vec()],
         )

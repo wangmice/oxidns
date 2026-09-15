@@ -798,11 +798,7 @@ mod tests {
             .with_headers(vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))])
             .with_body(Bytes::from_static(b"payload"));
 
-        apply_redirect_method_policy(
-            StatusCode::TEMPORARY_REDIRECT,
-            &mut method,
-            &mut options,
-        );
+        apply_redirect_method_policy(StatusCode::TEMPORARY_REDIRECT, &mut method, &mut options);
 
         assert_eq!(method, Method::POST);
         assert_eq!(options.body, Bytes::from_static(b"payload"));
@@ -837,10 +833,7 @@ mod tests {
 
     #[test]
     fn test_redirect_security_preserves_sensitive_headers_same_origin() {
-        let mut headers = vec![(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer secret"),
-        )];
+        let mut headers = vec![(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))];
 
         apply_redirect_security_policy(
             "https://example.com/start",
@@ -855,10 +848,7 @@ mod tests {
 
     #[test]
     fn test_redirect_security_rejects_https_downgrade() {
-        let mut headers = vec![(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer secret"),
-        )];
+        let mut headers = vec![(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))];
 
         let error = apply_redirect_security_policy(
             "https://example.com/start",
@@ -868,7 +858,11 @@ mod tests {
         .expect_err("HTTPS to HTTP redirect must be rejected");
 
         assert!(error.to_string().contains("insecure redirect downgrade"));
-        assert_eq!(headers.len(), 1, "rejected redirects must not mutate headers");
+        assert_eq!(
+            headers.len(),
+            1,
+            "rejected redirects must not mutate headers"
+        );
     }
 
     #[test]
@@ -956,7 +950,11 @@ mod tests {
             .await
             .expect_err("streamed body beyond the configured limit must fail");
 
-        assert!(error.to_string().contains("exceeds configured 6-byte limit"));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds configured 6-byte limit")
+        );
         server.await.expect("test HTTP server should exit normally");
     }
 
