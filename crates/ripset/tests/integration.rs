@@ -22,9 +22,9 @@ use std::net::IpAddr;
 
 use harness::{NftCleanup, ensure_nft_available, run_nft, unique_name};
 use ripset::{
-    IpCidr, IpEntry, IpSetError, NftSetCreateOptions, NftSetType, nftset_add, nftset_add_many, nftset_create_set,
-    nftset_create_table, nftset_del, nftset_delete_set, nftset_delete_table, nftset_list,
-    nftset_list_tables, nftset_test,
+    IpCidr, IpEntry, IpSetError, NftSetCreateOptions, NftSetType, nftset_add, nftset_add_many,
+    nftset_create_set, nftset_create_table, nftset_del, nftset_delete_set, nftset_delete_table,
+    nftset_list, nftset_list_tables, nftset_test,
 };
 
 /// Smoke test for OxiDNS's primary nftset use case: add /32 entries to a

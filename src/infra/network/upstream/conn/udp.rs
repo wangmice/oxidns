@@ -16,14 +16,17 @@ use tracing::{debug, error, trace, warn};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
-use crate::infra::network::transport::udp::UdpTransport;
+use crate::infra::network::transport::udp::{UdpReadError, UdpTransport};
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
 use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, QueryDeadline};
 use crate::proto::Message;
 
 const UDP_RECV_BUFFER_SIZE: usize = 8_196;
+const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
+const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
 
 /// Represents a single UDP connection used in DNS upstream queries.
 /// Each connection manages its own socket and maintains a mapping
@@ -32,6 +35,8 @@ const UDP_RECV_BUFFER_SIZE: usize = 8_196;
 pub struct UdpConnection {
     /// Unique connection ID (for debugging/tracing)
     id: u16,
+    /// Stable upstream identity used to disambiguate per-pool connection IDs.
+    upstream: String,
     /// The underlying UDP transport bound to a local address
     transport: UdpTransport,
     /// Notifier used to signal connection closure
@@ -70,6 +75,7 @@ impl Connection for UdpConnection {
         let cleared = self.request_map.clear();
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             canceled_queries = cleared,
             "Closing UDP connection and signaling listener task"
         );
@@ -100,7 +106,7 @@ impl Connection for UdpConnection {
 
         for attempt in 0..2 {
             let Some(remaining) = deadline.remaining() else {
-                return Err(deadline.timeout_error());
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo));
             };
             let current_timeout = if attempt == 0 {
                 remaining.min(RETRY_TIMEOUT)
@@ -117,6 +123,7 @@ impl Connection for UdpConnection {
 
             trace!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 attempt,
                 query_id,
                 timeout_ms = current_timeout.as_millis(),
@@ -131,7 +138,8 @@ impl Connection for UdpConnection {
             {
                 Ok(()) => {}
                 Err(e) => {
-                    error!(conn_id = self.id, err = %e, "Failed to send UDP query");
+                    error!(conn_id = self.id,
+            upstream = %self.upstream, err = %e, "Failed to send UDP query");
                     self.close();
                     return Err(e);
                 }
@@ -143,24 +151,27 @@ impl Connection for UdpConnection {
                     Ok(mut response) => {
                         query_guard.disarm();
                         response.set_id(raw_id);
-                        trace!(conn_id = self.id, query_id, raw_id, "Received UDP response");
+                        trace!(conn_id = self.id,
+            upstream = %self.upstream, query_id, raw_id, "Received UDP response");
                         return Ok(response);
                     }
                     Err(_canceled) => {
                         trace!(
-                            conn_id = self.id,
-                            query_id, "Listener dropped channel, retrying"
-                        );
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id, "Listener dropped channel, retrying"
+                                    );
                         continue;
                     }
                 },
                 Err(_elapsed) => {
                     trace!(
-                        conn_id = self.id,
-                        query_id,
-                        timeout_ms = current_timeout.as_millis(),
-                        "UDP response timeout"
-                    );
+                                conn_id = self.id,
+                    upstream = %self.upstream,
+                                query_id,
+                                timeout_ms = current_timeout.as_millis(),
+                                "UDP response timeout"
+                            );
                     continue;
                 }
             }
@@ -195,9 +206,15 @@ impl UdpConnection {
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging
     /// * `transport` - Pre-configured direct or SOCKS5 UDP transport
-    fn new(conn_id: u16, transport: UdpTransport, request_map_capacity: u16) -> UdpConnection {
+    fn new(
+        conn_id: u16,
+        upstream: String,
+        transport: UdpTransport,
+        request_map_capacity: u16,
+    ) -> UdpConnection {
         Self {
             id: conn_id,
+            upstream,
             transport,
             close_notify: Notify::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
@@ -220,15 +237,18 @@ impl UdpConnection {
     async fn listen_dns_response(self: Arc<Self>) {
         let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
         let mut closing = false;
+        let mut consecutive_recv_errors = 0u32;
 
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             "UDP listener task started, waiting for DNS responses"
         );
 
         loop {
             if (closing || self.closed.load(Ordering::Acquire)) && self.request_map.is_empty() {
-                debug!(conn_id = self.id, "Listener exiting (connection dropped)");
+                debug!(conn_id = self.id,
+            upstream = %self.upstream, "Listener exiting (connection dropped)");
                 break;
             }
 
@@ -237,38 +257,81 @@ impl UdpConnection {
                 _ = self.transport.control_closed(), if !closing => {
                     warn!(
                         conn_id = self.id,
+            upstream = %self.upstream,
                         "SOCKS5 UDP control connection closed; retiring UDP connection"
                     );
                     self.close();
                     closing = true;
                     continue;
                 }
-                recv = self.transport.read_message(&mut buf) => {
+                recv = self.transport.read_message_classified(&mut buf) => {
                     match recv {
                         Ok(msg) => {
+                            consecutive_recv_errors = 0;
                             let id = msg.id();
                             if let Some(sender) = self.request_map.take_for_response(id, &msg) {
                                 let _ = sender.send(msg);
                                 self.last_used.store(AppClock::elapsed_millis(), Ordering::Relaxed);
                                 trace!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     id,
                                     "Delivered UDP response to waiting query"
                                 );
                             } else {
                                 trace!(
                                     conn_id = self.id,
+            upstream = %self.upstream,
                                     id,
                                     "No pending query or response fingerprint mismatch"
                                 );
                             }
                         }
-                        Err(e) => {
+                        Err(UdpReadError::InvalidDatagram(e)) => {
+                            consecutive_recv_errors = 0;
+                            debug!(
+                                conn_id = self.id,
+                                upstream = %self.upstream,
+                                err = %e,
+                                "Dropping invalid UDP response datagram"
+                            );
+                            continue;
+                        }
+                        Err(e @ UdpReadError::Receive(_)) => {
                             if self.closed.load(Ordering::Acquire) {
                                 closing = true; // graceful shutdown path
                                 continue;
                             }
-                            warn!(conn_id = self.id, err = %e, "UDP listener error");
+                            debug_assert!(e.should_backoff());
+                            consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                            let backoff = udp_recv_error_backoff(consecutive_recv_errors);
+                            if consecutive_recv_errors == 1 || consecutive_recv_errors.is_power_of_two() {
+                                warn!(
+                                    conn_id = self.id,
+                                    upstream = %self.upstream,
+                                    err = %e,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    backoff_ms = backoff.as_millis(),
+                                    "UDP listener receive error; backing off"
+                                );
+                            } else {
+                                debug!(
+                                    conn_id = self.id,
+                                    upstream = %self.upstream,
+                                    err = %e,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    backoff_ms = backoff.as_millis(),
+                                    "UDP listener receive error; backing off"
+                                );
+                            }
+
+                            select! {
+                                biased;
+                                _ = self.close_notify.notified() => {
+                                    closing = true;
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
                             continue;
                         }
                     }
@@ -281,10 +344,17 @@ impl UdpConnection {
     }
 }
 
+fn udp_recv_error_backoff(consecutive_errors: u32) -> Duration {
+    let shift = consecutive_errors.saturating_sub(1).min(5);
+    let delay_ms = (UDP_RECV_ERROR_BACKOFF_BASE_MS << shift).min(UDP_RECV_ERROR_BACKOFF_MAX_MS);
+    Duration::from_millis(delay_ms)
+}
+
 /// Builder for creating new `UdpConnection` instances.
 #[derive(Debug)]
 pub struct UdpConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     socks5: Option<Socks5Opt>,
     request_map_capacity: u16,
@@ -294,6 +364,7 @@ impl UdpConnectionBuilder {
     /// Initialize a new builder using upstream connection info.
     pub fn new(connection_info: &ConnectionInfo, request_map_capacity: u16) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -337,6 +408,7 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
             .await?;
             debug!(
                 conn_id,
+                upstream = %self.upstream,
                 local_addr = ?socket.local_addr(),
                 remote_addr = ?socket.peer_addr(),
                 "Established UDP connection to DNS server"
@@ -344,7 +416,12 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
             UdpTransport::new(UdpSocket::from_std(socket)?)
         };
 
-        let connection = UdpConnection::new(conn_id, transport, self.request_map_capacity);
+        let connection = UdpConnection::new(
+            conn_id,
+            self.upstream.clone(),
+            transport,
+            self.request_map_capacity,
+        );
         let arc = Arc::new(connection);
 
         // Spawn background task for listening responses
@@ -357,6 +434,15 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
+
+    #[test]
+    fn udp_receive_error_backoff_is_bounded_and_exponential() {
+        assert_eq!(udp_recv_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(udp_recv_error_backoff(2), Duration::from_millis(20));
+        assert_eq!(udp_recv_error_backoff(5), Duration::from_millis(160));
+        assert_eq!(udp_recv_error_backoff(6), Duration::from_millis(250));
+        assert_eq!(udp_recv_error_backoff(64), Duration::from_millis(250));
+    }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

@@ -17,9 +17,9 @@ pub use ipset::{
 };
 #[cfg(target_os = "linux")]
 pub use nftset::{
-    NftSetAddManyOutcome, NftSetCreateOptions, NftSetType, nftset_add, nftset_add_many, nftset_create_set, nftset_create_table,
-    nftset_del, nftset_delete_set, nftset_delete_table, nftset_list, nftset_list_tables,
-    nftset_test,
+    NftSetAddManyOutcome, NftSetCreateOptions, NftSetType, nftset_add, nftset_add_many,
+    nftset_create_set, nftset_create_table, nftset_del, nftset_delete_set, nftset_delete_table,
+    nftset_list, nftset_list_tables, nftset_test,
 };
 #[cfg(not(target_os = "linux"))]
 pub use stub::*;

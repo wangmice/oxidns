@@ -17,6 +17,7 @@ use serde::Deserialize;
 use socket2::Socket;
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
@@ -27,7 +28,10 @@ use crate::infra::network::listen::{self, parse_listen_addr};
 use crate::infra::network::transport::udp::UdpTransport;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
-use crate::plugin::server::{RequestHandle, Server, ServerMetrics};
+use crate::plugin::server::{
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundRequestLimiter, RequestHandle, Server,
+    ServerMetrics,
+};
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
 
@@ -173,30 +177,70 @@ async fn run_server(
     if let Some(tx) = startup_tx.take() {
         let _ = tx.send(Ok(()));
     }
-    info!(listen = %addr, "UDP server listening");
+    info!(
+        listen = %addr,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        "UDP server listening"
+    );
     debug!("UDP server event loop started on {}", addr);
 
     let transport = Arc::new(UdpTransport::new(socket));
     let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
     let tasks = TaskTracker::new();
+    let request_cancel = CancellationToken::new();
+    let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
+
     loop {
-        tokio::select! {
+        // Acquire admission before receiving the next packet. When executors are
+        // saturated this stops draining the socket, so the kernel receive
+        // buffer absorbs short bursts and becomes the bounded overload queue.
+        let permit = tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     break;
                 }
+                continue;
             }
-            recv = transport.read_message_from(&mut buf) => {
-                match recv {
-                    Ok(received) => {
-                        let msg = received.message;
-                        let src_addr = received.source;
-                        let destination = received.destination;
-                        let max_payload = msg.max_payload();
-                        let handler = handler.clone();
-                        let transport = transport.clone();
-                        tasks.spawn(async move {
-                            let response = handler.handle_request(msg, src_addr, RequestMeta{server_name: None, url_path: None}).await;
+            permit = request_limiter.acquire() => permit,
+        };
+
+        let recv = tokio::select! {
+            changed = shutdown_rx.changed() => {
+                drop(permit);
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+            recv = transport.read_message_from(&mut buf) => recv,
+        };
+
+        match recv {
+            Ok(received) => {
+                let msg = received.message;
+                let src_addr = received.source;
+                let destination = received.destination;
+                let max_payload = msg.max_payload();
+                let handler = handler.clone();
+                let transport = transport.clone();
+                let task_cancel = request_cancel.clone();
+                tasks.spawn(async move {
+                    // The permit is moved into the task so admission capacity is
+                    // released exactly when request processing ends.
+                    let _permit = permit;
+                    tokio::select! {
+                        _ = task_cancel.cancelled() => {}
+                        _ = async move {
+                            let response = handler
+                                .handle_request(
+                                    msg,
+                                    src_addr,
+                                    RequestMeta {
+                                        server_name: None,
+                                        url_path: None,
+                                    },
+                                )
+                                .await;
                             // Use requester-advertised UDP payload limit (EDNS) when encoding
                             // response so oversize replies become TC=1 DNS messages, not raw truncation.
                             #[cfg(target_os = "linux")]
@@ -215,16 +259,19 @@ async fn run_server(
                             if let Err(e) = result {
                                 warn!("Failed to send response to {}: {}", src_addr, e);
                             }
-                        });
+                        } => {}
                     }
-                    Err(e) => {
-                        warn!("Error receiving message on UDP socket: {}", e);
-                    }
-                }
+                });
+            }
+            Err(e) => {
+                // No handler task was created, so release the reserved capacity.
+                drop(permit);
+                warn!("Error receiving message on UDP socket: {}", e);
             }
         }
     }
 
+    request_cancel.cancel();
     tasks.close();
     tasks.wait().await;
     info!(listen = %addr, "UDP server stopped");

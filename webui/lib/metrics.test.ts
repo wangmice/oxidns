@@ -7,6 +7,7 @@ import {
 } from "./dashboard-traffic";
 import {
   formatMetricValue,
+  parsePrometheusMetrics,
   selectCardMetrics,
   type PluginMetricsMap,
 } from "./metrics";
@@ -116,6 +117,42 @@ describe("plugin metric formatting", () => {
         metricName: "ros_route_write_success_total",
       }),
     ).toBe("1,784,701,820");
+  });
+});
+
+describe("Prometheus network metric parsing", () => {
+  it("keeps global timeout-stage metrics separate from outbound profiles", () => {
+    const parsed = parsePrometheusMetrics(`
+# HELP network_upstream_timeout_total Total upstream query deadline expirations by network stage.
+# TYPE network_upstream_timeout_total counter
+network_upstream_timeout_total{stage="pool_acquire"} 3
+network_upstream_timeout_total{stage="query_io"} 7
+network_resolver_cache_hit_total{outbound_profile="remote"} 11
+cache_hit_total{plugin_tag="cache"} 13
+`);
+
+    expect(parsed.network).toEqual([
+      expect.objectContaining({
+        name: "network_upstream_timeout_total",
+        labels: { stage: "pool_acquire" },
+        value: 3,
+      }),
+      expect.objectContaining({
+        name: "network_upstream_timeout_total",
+        labels: { stage: "query_io" },
+        value: 7,
+      }),
+    ]);
+    expect(parsed.outbound.remote).toEqual([
+      expect.objectContaining({
+        name: "network_resolver_cache_hit_total",
+        labels: {},
+        value: 11,
+      }),
+    ]);
+    expect(parsed.byTag.cache).toEqual([
+      expect.objectContaining({ name: "cache_hit_total", value: 13 }),
+    ]);
   });
 });
 

@@ -2,8 +2,9 @@
 //
 // The backend exposes a single Prometheus endpoint (`/metrics`). Plugin series
 // carry a `plugin_tag` label and are associated with the matching
-// `PluginInstance` (whose `name` is the tag). Global network series are grouped
-// separately by their `outbound_profile` label.
+// `PluginInstance` (whose `name` is the tag). Network series are split between
+// profile-scoped metrics (`outbound_profile`) and explicitly curated global
+// network metrics that do not belong to a single outbound profile.
 //
 // Metric labels, card-priority lists, and derived metric specs are defined
 // alongside each plugin kind in `lib/plugin-definitions/` — this file derives
@@ -46,10 +47,12 @@ export interface MetricGroup {
 /** Plugin tag -> flat list of its series. */
 export type PluginMetricsMap = Record<string, MetricSeries[]>;
 export type OutboundMetricsMap = Record<string, MetricSeries[]>;
+export type GlobalNetworkMetrics = MetricSeries[];
 
 export interface ParsedMetrics {
   byTag: PluginMetricsMap;
   outbound: OutboundMetricsMap;
+  network: GlobalNetworkMetrics;
   help: Record<string, string>;
   kind: Record<string, MetricKind>;
 }
@@ -64,6 +67,7 @@ const OUTBOUND_NETWORK_METRICS = new Set([
   "network_upstream_pool_refresh_total",
   "network_upstream_pool_refresh_latency_ms_total",
 ]);
+const GLOBAL_NETWORK_METRICS = new Set(["network_upstream_timeout_total"]);
 
 function unescapeLabelValue(raw: string): string {
   return raw.replace(/\\(["\\n])/g, (_m, ch) => (ch === "n" ? "\n" : ch));
@@ -96,6 +100,7 @@ function parseValue(raw: string): number {
 export function parsePrometheusMetrics(text: string): ParsedMetrics {
   const byTag: PluginMetricsMap = {};
   const outbound: OutboundMetricsMap = {};
+  const network: GlobalNetworkMetrics = [];
   const help: Record<string, string> = {};
   const kind: Record<string, MetricKind> = {};
 
@@ -132,10 +137,14 @@ export function parsePrometheusMetrics(text: string): ParsedMetrics {
     }
     if (outboundProfile && OUTBOUND_NETWORK_METRICS.has(name)) {
       (outbound[outboundProfile] ??= []).push(series);
+      continue;
+    }
+    if (!outboundProfile && GLOBAL_NETWORK_METRICS.has(name)) {
+      network.push(series);
     }
   }
 
-  return { byTag, outbound, help, kind };
+  return { byTag, outbound, network, help, kind };
 }
 
 function normalizeMetricKind(raw: string): MetricKind {

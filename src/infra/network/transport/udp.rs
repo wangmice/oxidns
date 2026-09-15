@@ -48,6 +48,34 @@ enum UdpTransportSocket {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum UdpReadError {
+    Receive(DnsError),
+    InvalidDatagram(DnsError),
+}
+
+impl UdpReadError {
+    #[inline]
+    pub(crate) fn should_backoff(&self) -> bool {
+        matches!(self, Self::Receive(_))
+    }
+
+    #[inline]
+    fn into_dns_error(self) -> DnsError {
+        match self {
+            Self::Receive(err) | Self::InvalidDatagram(err) => err,
+        }
+    }
+}
+
+impl std::fmt::Display for UdpReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Receive(err) | Self::InvalidDatagram(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 impl UdpTransport {
     pub fn new(socket: UdpSocket) -> Self {
         Self {
@@ -95,30 +123,53 @@ impl UdpTransport {
     #[inline]
     #[hotpath::measure]
     pub async fn read_message(&self, buf: &mut [u8]) -> Result<Message> {
+        self.read_message_classified(buf)
+            .await
+            .map_err(UdpReadError::into_dns_error)
+    }
+
+    /// Receive one UDP datagram while preserving whether a failure came from
+    /// the receive path itself or from validating/decoding one datagram.
+    ///
+    /// Callers that implement receive-error backoff must only back off on
+    /// [`UdpReadError::Receive`]. Invalid datagrams are packet-scoped and must
+    /// not throttle the shared listener.
+    #[inline]
+    pub(crate) async fn read_message_classified(
+        &self,
+        buf: &mut [u8],
+    ) -> std::result::Result<Message, UdpReadError> {
         let n = match &self.socket {
-            UdpTransportSocket::Direct(socket) => socket
-                .recv(buf)
-                .await
-                .map_err(|e| DnsError::protocol(format!("UDP recv error: {e}")))?,
+            UdpTransportSocket::Direct(socket) => socket.recv(buf).await.map_err(|e| {
+                UdpReadError::Receive(DnsError::protocol(format!("UDP recv error: {e}")))
+            })?,
             UdpTransportSocket::Socks5 {
                 association,
                 target,
             } => {
-                let (n, source) = association
-                    .recv_from(buf)
-                    .await
-                    .map_err(|e| DnsError::protocol(format!("SOCKS5 UDP recv error: {e}")))?;
+                let (n, source) = association.recv_from(buf).await.map_err(|e| {
+                    let err = DnsError::protocol(format!("SOCKS5 UDP recv error: {e}"));
+                    match e.kind() {
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported => {
+                            UdpReadError::InvalidDatagram(err)
+                        }
+                        _ => UdpReadError::Receive(err),
+                    }
+                })?;
                 if !response_source_matches(target, &source) {
-                    return Err(DnsError::protocol(format!(
+                    return Err(UdpReadError::InvalidDatagram(DnsError::protocol(format!(
                         "SOCKS5 UDP response source mismatch: expected {target}, received {source}"
-                    )));
+                    ))));
                 }
                 n
             }
         };
 
-        Message::from_bytes(&buf[..n])
-            .map_err(|e| DnsError::protocol(format!("Failed to parse DNS message from UDP: {e}")))
+        Message::from_bytes(&buf[..n]).map_err(|e| {
+            UdpReadError::InvalidDatagram(DnsError::protocol(format!(
+                "Failed to parse DNS message from UDP: {e}"
+            )))
+        })
     }
 
     /// Receive one UDP datagram from any peer and decode it as a DNS message.
@@ -449,6 +500,39 @@ mod tests {
 
     use super::*;
     use crate::proto::{DNSClass, Name, Question, RecordType};
+
+    #[tokio::test]
+    async fn malformed_direct_datagram_is_packet_scoped() {
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("receiver should bind");
+        let sender = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sender should bind");
+        sender
+            .connect(
+                receiver
+                    .local_addr()
+                    .expect("receiver should have an address"),
+            )
+            .await
+            .expect("sender should connect");
+
+        let transport = UdpTransport::new(receiver);
+        sender
+            .send(&[0x00, 0x01, 0x02])
+            .await
+            .expect("malformed datagram should send");
+
+        let mut buf = [0u8; 512];
+        let err = transport
+            .read_message_classified(&mut buf)
+            .await
+            .expect_err("malformed DNS datagram should fail decoding");
+
+        assert!(matches!(&err, UdpReadError::InvalidDatagram(_)));
+        assert!(!err.should_backoff());
+    }
 
     #[test]
     fn socks5_response_source_rejects_wrong_upstream() {

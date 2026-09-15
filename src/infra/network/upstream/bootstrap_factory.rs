@@ -6,7 +6,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::infra::network::upstream::builder::{
-    main_pool_min_conns, pipeline_request_map_capacity, reuse_request_map_capacity,
+    MULTIPLEXED_MAX_CONNS_LOAD, main_pool_min_conns, pipeline_request_map_capacity,
+    reuse_request_map_capacity,
 };
 use crate::infra::network::upstream::config::ConnectionInfo;
 #[cfg(feature = "upstream-doh")]
@@ -104,10 +105,10 @@ impl BootstrapPoolFactory<QuicConnection> for QuicBootstrapPoolFactory {
         PipelinePool::new(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }
@@ -129,10 +130,10 @@ impl BootstrapPoolFactory<H2Connection> for H2BootstrapPoolFactory {
         PipelinePool::new(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }
@@ -154,10 +155,10 @@ impl BootstrapPoolFactory<H3Connection> for H3BootstrapPoolFactory {
         PipelinePool::new(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }

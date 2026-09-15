@@ -6,13 +6,14 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -34,6 +35,10 @@ const ERROR_KIND_MISMATCH: &str = "mismatch";
 const ERROR_KIND_PROTOCOL: &str = "protocol";
 const ERROR_KIND_QUERY: &str = "query";
 const MAX_PROBE_SAMPLES: usize = 4096;
+const MAX_BLOCKING_PROBE_TASKS: usize = 4;
+
+static BLOCKING_PROBE_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_BLOCKING_PROBE_TASKS)));
 
 #[derive(Clone, Debug)]
 pub struct UpstreamProbeConfig {
@@ -362,13 +367,34 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(operation());
-    });
-    match tokio::time::timeout(timeout, receiver).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err(BlockingProbeError::Canceled),
+    run_probe_blocking_with_timeout_on(timeout, BLOCKING_PROBE_SEMAPHORE.clone(), operation).await
+}
+
+async fn run_probe_blocking_with_timeout_on<T, F>(
+    timeout: Duration,
+    semaphore: Arc<Semaphore>,
+    operation: F,
+) -> std::result::Result<T, BlockingProbeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let blocking = async move {
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| BlockingProbeError::Canceled)?;
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .map_err(|_| BlockingProbeError::Canceled)
+    };
+
+    match tokio::time::timeout(timeout, blocking).await {
+        Ok(result) => result,
         Err(_) => Err(BlockingProbeError::TimedOut),
     }
 }
@@ -1848,6 +1874,59 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(150));
         assert!(error.contains("SOCKS5 proxy resolution timed out"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_probe_keeps_concurrency_permit_until_worker_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let first_semaphore = semaphore.clone();
+        let first = tokio::spawn(async move {
+            run_probe_blocking_with_timeout_on(
+                Duration::from_millis(100),
+                first_semaphore,
+                move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    1usize
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("blocking worker should start");
+        assert!(matches!(
+            first.await.expect("probe task should join"),
+            Err(BlockingProbeError::TimedOut)
+        ));
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_started_worker = second_started.clone();
+        let second = run_probe_blocking_with_timeout_on(
+            Duration::from_millis(20),
+            semaphore.clone(),
+            move || {
+                second_started_worker.store(true, Ordering::Release);
+                2usize
+            },
+        )
+        .await;
+
+        assert!(matches!(second, Err(BlockingProbeError::TimedOut)));
+        assert!(!second_started.load(Ordering::Acquire));
+
+        release_tx
+            .send(())
+            .expect("blocking worker release should succeed");
+        let permit = tokio::time::timeout(Duration::from_secs(1), semaphore.acquire())
+            .await
+            .expect("blocking worker should eventually release its permit")
+            .expect("semaphore should stay open");
+        drop(permit);
     }
 
     #[tokio::test]

@@ -8,9 +8,9 @@ use rand::RngExt;
 use tokio::task::JoinSet;
 use tracing::{Level, debug, event_enabled, info, warn};
 
-use super::is_timeout_error;
 use super::metrics::ForwardMetrics;
 use super::selection::{ResponseSelectionMode, SelectedResponse, select_response};
+use super::{contextualize_upstream_error, is_timeout_error};
 use crate::core::context::DnsContext;
 use crate::core::response::ResponseDisposition;
 use crate::infra::error::{DnsError, Result};
@@ -112,13 +112,23 @@ impl ConcurrentForwarder {
             let metrics = self.metrics.clone();
             join_set.spawn(async move {
                 let up_start = metrics.record_upstream_start(selected_idx);
-                let result: Result<Message> = upstream.query(message).await;
-                match &result {
-                    Ok(_) => metrics.record_upstream_success(selected_idx, up_start),
-                    Err(e) => {
-                        metrics.record_upstream_error(selected_idx, up_start, is_timeout_error(e))
+                let result: Result<Message> = match upstream.query(message).await {
+                    Ok(response) => {
+                        metrics.record_upstream_success(selected_idx, up_start);
+                        Ok(response)
                     }
-                }
+                    Err(err) => {
+                        metrics.record_upstream_error(
+                            selected_idx,
+                            up_start,
+                            is_timeout_error(&err),
+                        );
+                        Err(contextualize_upstream_error(
+                            upstream.connection_info(),
+                            err,
+                        ))
+                    }
+                };
                 if event_enabled!(Level::DEBUG) {
                     debug!(
                         "DNS ConcurrentForwarder received message {}, remote_addr: {}",

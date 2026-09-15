@@ -15,7 +15,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
-use crate::plugin::server::{ConnectionGuard, quic_endpoint};
+use crate::plugin::server::{
+    ConnectionGuard, DEFAULT_QUIC_MAX_BIDI_STREAMS, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+    InboundRequestLimiter, quic_endpoint,
+};
 
 const MAX_HTTP3_BODY_SIZE: usize = 64 * 1024;
 
@@ -38,13 +41,16 @@ const MAX_HTTP3_BODY_SIZE: usize = 64 * 1024;
 /// - `server_config`: TLS server config (required for HTTP/3)
 /// - `idle_timeout`: Connection idle timeout in seconds (transport-level)
 /// - `src_ip_header`: HTTP header name to extract real client IP
+/// - `request_limiter`: Shared server-wide request admission budget
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     addr: SocketAddr,
     dispatcher: Arc<HttpDispatcher>,
     mut server_config: ServerConfig,
     idle_timeout: Duration,
     src_ip_header: Option<String>,
+    request_limiter: InboundRequestLimiter,
     mut shutdown_rx: watch::Receiver<bool>,
     startup_tx: Option<oneshot::Sender<Result<(), String>>>,
 ) {
@@ -69,6 +75,8 @@ pub async fn run_server(
     info!(
         listen = %addr,
         idle_timeout_secs = idle_timeout.as_secs(),
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        max_bidi_streams = DEFAULT_QUIC_MAX_BIDI_STREAMS,
         "HTTP/3 server listening"
     );
 
@@ -93,13 +101,30 @@ pub async fn run_server(
                     let src_ip_header = src_ip_header.clone();
                     let task_shutdown = shutdown_token.clone();
                     let active_connections = active_connections.clone();
+                    let request_limiter = request_limiter.clone();
                     tasks.spawn(async move {
                         let _connection_guard =
                             ConnectionGuard::new(active_connections.clone(), connecting.remote_address(), "HTTP/3");
+                        let request_tasks = TaskTracker::new();
+                        let request_cancel = CancellationToken::new();
+                        let connection_request_tasks = request_tasks.clone();
+                        let connection_request_cancel = request_cancel.clone();
+
                         tokio::select! {
                             _ = task_shutdown.cancelled() => {}
-                            _ = handle_h3_connection(connecting, dispatcher, src_ip_header) => {}
+                            _ = handle_h3_connection(
+                                connecting,
+                                dispatcher,
+                                src_ip_header,
+                                request_limiter,
+                                connection_request_tasks,
+                                connection_request_cancel,
+                            ) => {}
                         }
+
+                        request_cancel.cancel();
+                        request_tasks.close();
+                        request_tasks.wait().await;
                     });
                     debug!("New QUIC connection started (active: {})", active);
                 }
@@ -119,6 +144,9 @@ async fn handle_h3_connection(
     connecting: quinn::Incoming,
     dispatcher: Arc<HttpDispatcher>,
     src_ip_header: Option<Arc<str>>,
+    request_limiter: InboundRequestLimiter,
+    request_tasks: TaskTracker,
+    request_cancel: CancellationToken,
 ) {
     let src = connecting.remote_address();
 
@@ -131,6 +159,7 @@ async fn handle_h3_connection(
     };
 
     let server_name = extract_tls_server_name(&connection).map(Arc::<str>::from);
+    let connection_liveness = connection.clone();
 
     debug!("HTTP/3 connection established with {}", src);
 
@@ -144,14 +173,25 @@ async fn handle_h3_connection(
         };
 
     loop {
-        let (request, stream) = match h3_conn.accept().await {
-            Ok(Some(request)) => match request.resolve_request().await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    warn!("Failed to resolve HTTP/3 request from {}: {}", src, e);
-                    continue;
+        let accepted = tokio::select! {
+            _ = request_cancel.cancelled() => return,
+            accepted = h3_conn.accept() => accepted,
+        };
+
+        let (request, stream) = match accepted {
+            Ok(Some(request)) => {
+                let resolved = tokio::select! {
+                    _ = request_cancel.cancelled() => return,
+                    resolved = request.resolve_request() => resolved,
+                };
+                match resolved {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        warn!("Failed to resolve HTTP/3 request from {}: {}", src, e);
+                        continue;
+                    }
                 }
-            },
+            }
             Ok(None) => {
                 debug!("HTTP/3 connection closed by {}", src);
                 return;
@@ -159,19 +199,39 @@ async fn handle_h3_connection(
             Err(e) => {
                 warn!("HTTP/3 connection accept error from {}: {}", src, e);
                 // `h3::server::Connection::accept` reports connection-level
-                // errors. The h3 crate caches handled
-                // connection errors, so retrying accept can complete
-                // immediately with the same error and spin the task.
+                // errors. The h3 crate caches handled connection errors, so
+                // retrying accept can complete immediately with the same error.
                 return;
             }
+        };
+
+        // Acquire capacity before spawning the request task. While saturated,
+        // stop accepting additional H3 streams and let QUIC/H3 flow control
+        // provide bounded backpressure rather than accumulating waiter tasks.
+        let permit = tokio::select! {
+            _ = request_cancel.cancelled() => return,
+            _ = connection_liveness.closed() => return,
+            permit = request_limiter.acquire() => permit,
         };
 
         let dispatcher = dispatcher.clone();
         let src_ip_header = src_ip_header.clone();
         let server_name = server_name.clone();
+        let task_cancel = request_cancel.clone();
 
-        tokio::spawn(async move {
-            handle_h3_request(request, stream, dispatcher, src, src_ip_header, server_name).await;
+        request_tasks.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = task_cancel.cancelled() => {}
+                _ = handle_h3_request(
+                    request,
+                    stream,
+                    dispatcher,
+                    src,
+                    src_ip_header,
+                    server_name,
+                ) => {}
+            }
         });
     }
 }

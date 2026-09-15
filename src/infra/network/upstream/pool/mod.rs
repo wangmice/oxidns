@@ -88,6 +88,16 @@ pub trait Connection: Send + Sized + Debug + Sync + 'static {
     /// Returns false if the connection is closed or experiencing errors
     fn available(&self) -> bool;
 
+    /// Return the protocol-level concurrent-query limit currently advertised
+    /// for this connection.
+    ///
+    /// Pipeline pools still apply their configured local cap, so this value
+    /// can only reduce the effective load assigned to one connection.
+    /// Protocols without a dynamic peer limit keep the default.
+    fn max_concurrent_queries(&self) -> u16 {
+        u16::MAX
+    }
+
     /// Get the timestamp of the last successful activity (in milliseconds)
     ///
     /// Used for idle connection detection and cleanup

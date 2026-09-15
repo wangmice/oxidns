@@ -606,10 +606,9 @@ fn write_nftset_prefixes(set: &ResolvedSet, prefixes: &[IpPrefix]) -> WriteOutco
             // A setup/protocol failure applies to the whole bulk operation.
             outcome.failed_total += canonical.len() as u64;
             if outcome.failed.len() < NFTSET_FAILURE_SAMPLE_CAP {
-                outcome.failed.push((
-                    format!("{} entries", canonical.len()),
-                    error.to_string(),
-                ));
+                outcome
+                    .failed
+                    .push((format!("{} entries", canonical.len()), error.to_string()));
             }
         }
     }

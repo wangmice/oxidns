@@ -158,9 +158,9 @@ import Admonition from "@theme/Admonition";
 
 #### `idle_timeout`
 
-- 类型：`integer`；必填：否；默认值：`10`
+- 类型：`integer`；必填：否；默认值：`30`
 - 单位：秒
-- 作用：指定连接空闲超时设置。
+- 作用：TCP/DoT 连接在持续没有传输层读写活动达到该时长后关闭。
 - 示例：`idle_timeout: 30`
 - 运行影响：
   - 影响长连接保活与空闲连接生命周期。

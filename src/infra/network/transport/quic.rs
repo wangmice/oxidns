@@ -11,6 +11,7 @@ use crate::proto::Message;
 
 /// QUIC connection transport that can accept or open bidirectional streams
 /// and yield reader/writer wrappers compatible with TCP transport interface.
+#[derive(Clone)]
 pub struct QuicTransport {
     conn: Connection,
 }
@@ -85,9 +86,10 @@ impl QuicTransportWriter {
 
     /// Write one DoQ message while preserving QUIC write error semantics.
     ///
-    /// In particular, RFC 9250 treats a server-to-client STOP_SENDING as a
-    /// fatal DoQ protocol error, so callers must be able to distinguish
-    /// `WriteError::Stopped` from ordinary stream or connection failures.
+    /// DoQ clients treat a server-originated STOP_SENDING as a fatal protocol
+    /// error, while DoQ servers treat a client-originated STOP_SENDING as
+    /// transaction cancellation. Preserve `WriteError::Stopped` so callers can
+    /// apply the direction-specific RFC 9250 semantics.
     #[inline]
     #[hotpath::measure]
     pub(crate) async fn write_message_doq(
@@ -101,6 +103,21 @@ impl QuicTransportWriter {
             .write_all(write_buf.as_slice())
             .await
             .map_err(map_write_error)
+    }
+
+    /// Wait until the peer stops accepting data on this send stream.
+    ///
+    /// Quinn's `SendStream::stopped()` future is independent of the borrow of
+    /// `self`, so callers can race it against request execution and still use
+    /// this writer afterwards when execution wins.
+    #[inline]
+    pub(crate) fn stopped(
+        &self,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<VarInt>, quinn::StoppedError>>
+    + Send
+    + Sync
+    + 'static {
+        self.send.stopped()
     }
 
     /// Half-close the send stream (finish) to signal end of request.
@@ -219,19 +236,14 @@ impl QuicTransportReader {
         let message = Message::from_bytes(&read_buf[..msg_len])
             .map_err(|e| QuicReadError::Protocol(format!("invalid DNS message: {e}")))?;
         drop(read_buf);
-        if message.id() != 0 {
-            return Err(QuicReadError::Protocol(format!(
-                "received non-zero DNS message ID {}",
-                message.id()
-            )));
-        }
+        validate_doq_message(&message)?;
 
         let mut extra = [0u8; 1];
         match self.recv.read(&mut extra).await {
-            Ok(None) => Ok(message),
-            Ok(Some(_)) => Err(QuicReadError::Protocol(
-                "received more than one DNS message on a DoQ stream".to_string(),
-            )),
+            Ok(read) => {
+                validate_doq_stream_end(read)?;
+                Ok(message)
+            }
             Err(err) => Err(map_read_error(err)),
         }
     }
@@ -248,11 +260,38 @@ impl QuicTransportReader {
     ) -> std::result::Result<(), QuicReadError> {
         match self.recv.read_exact(buf).await {
             Ok(()) => Ok(()),
-            Err(ReadExactError::FinishedEarly(read)) => Err(QuicReadError::Protocol(format!(
-                "stream finished before complete {what} ({read} bytes read)"
-            ))),
-            Err(ReadExactError::ReadError(err)) => Err(map_read_error(err)),
+            Err(err) => Err(map_read_exact_error(err, what)),
         }
+    }
+}
+
+#[inline]
+fn validate_doq_message(message: &Message) -> std::result::Result<(), QuicReadError> {
+    if message.id() != 0 {
+        return Err(QuicReadError::Protocol(format!(
+            "received non-zero DNS message ID {}",
+            message.id()
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_doq_stream_end(read: Option<usize>) -> std::result::Result<(), QuicReadError> {
+    match read {
+        None => Ok(()),
+        Some(_) => Err(QuicReadError::Protocol(
+            "received extra data after the DNS message on a DoQ stream".to_string(),
+        )),
+    }
+}
+
+fn map_read_exact_error(err: ReadExactError, what: &str) -> QuicReadError {
+    match err {
+        ReadExactError::FinishedEarly(read) => QuicReadError::Protocol(format!(
+            "stream finished before complete {what} ({read} bytes read)"
+        )),
+        ReadExactError::ReadError(err) => map_read_error(err),
     }
 }
 
@@ -276,6 +315,47 @@ mod tests {
         match error {
             QuicWriteError::Stopped(actual) => assert_eq!(actual, code),
             other => panic!("expected stopped error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doq_rejects_non_zero_dns_message_id() {
+        let mut message = Message::new();
+        message.set_id(7);
+
+        let error = validate_doq_message(&message).expect_err("non-zero DoQ ID must fail");
+        assert!(matches!(error, QuicReadError::Protocol(_)));
+        assert!(error.to_string().contains("non-zero DNS message ID 7"));
+    }
+
+    #[test]
+    fn doq_requires_fin_immediately_after_one_dns_message() {
+        assert!(validate_doq_stream_end(None).is_ok());
+
+        let error = validate_doq_stream_end(Some(1)).expect_err("extra DoQ data must fail");
+        assert!(matches!(error, QuicReadError::Protocol(_)));
+        assert!(error.to_string().contains("extra data"));
+    }
+
+    #[test]
+    fn doq_early_fin_is_a_protocol_error() {
+        let error = map_read_exact_error(ReadExactError::FinishedEarly(3), "DNS body");
+        assert!(matches!(error, QuicReadError::Protocol(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("finished before complete DNS body")
+        );
+    }
+
+    #[test]
+    fn doq_peer_reset_stays_stream_local() {
+        let code = VarInt::from_u32(0x3);
+        let error = map_read_error(ReadError::Reset(code));
+
+        match error {
+            QuicReadError::StreamReset(actual) => assert_eq!(actual, code),
+            other => panic!("expected stream reset, got {other:?}"),
         }
     }
 }

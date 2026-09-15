@@ -948,6 +948,13 @@ export const zhCNWebui = {
     outboundMetricsProtocols: "协议",
     outboundMetricsSystemProfile: "系统解析 / 直连",
     outboundMetricsLocalProfile: "本地 bootstrap",
+    networkTimeoutMetricsTitle: "上游超时阶段",
+    networkTimeoutMetricsDesc:
+      "全局统计上游查询 deadline 在网络栈各阶段耗尽的次数，不归属于单个 outbound profile",
+    networkTimeoutPoolAcquire: "连接池等待",
+    networkTimeoutConnectionCreate: "连接创建",
+    networkTimeoutProtocolHandshake: "协议握手",
+    networkTimeoutQueryIo: "查询 I/O",
     mgmtApiCard: "管理 API",
     mgmtApiDesc: "HTTP 管理接口配置（api.http）",
     listenSection: "监听地址 (listen)",

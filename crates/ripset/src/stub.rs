@@ -126,7 +126,6 @@ pub fn nftset_add<E: Into<IpEntry>>(
     Err(IpSetError::UnsupportedPlatform)
 }
 
-
 #[derive(Debug, Default)]
 pub struct NftSetAddManyOutcome {
     pub added: usize,

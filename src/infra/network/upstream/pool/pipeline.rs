@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
     QueryDeadline, QueryTimeoutPolicy, start_maintenance,
@@ -72,12 +73,13 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 result
             }
             DeadlineOutcome::Expired => {
+                let timeout_error = deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo);
                 match self.timeout_policy {
                     QueryTimeoutPolicy::Reuse => {}
                     QueryTimeoutPolicy::Retire => lease.retire(),
                     QueryTimeoutPolicy::Close => lease.close(),
                 }
-                Err(deadline.timeout_error())
+                Err(timeout_error)
             }
         }
     }
@@ -88,7 +90,9 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         if slots.is_empty() {
             drop(slots);
             if self.min_size > 0 {
-                let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+                let _ = self
+                    .expand(QueryDeadline::background(self.connect_timeout))
+                    .await;
             }
             return;
         }
@@ -155,7 +159,9 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         }
 
         if new_len < self.min_size {
-            let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+            let _ = self
+                .expand(QueryDeadline::background(self.connect_timeout))
+                .await;
         }
     }
 
@@ -194,7 +200,10 @@ impl<C: Connection> PipelinePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::new(arc.connect_timeout)).await {
+                if let Err(e) = arc
+                    .expand(QueryDeadline::background(arc.connect_timeout))
+                    .await
+                {
                     warn!("Failed to prefill PipelinePool: {:?}", e);
                 }
             });
@@ -221,7 +230,7 @@ impl<C: Connection> PipelinePool<C> {
                     }
                     Err(e) => {
                         if deadline.remaining().is_none() {
-                            return Err(deadline.timeout_error());
+                            return Err(e);
                         }
                         debug!("Failed to create pipeline-pool connection: {:?}", e);
                         self.wait_backoff(deadline).await?;
@@ -253,7 +262,7 @@ impl<C: Connection> PipelinePool<C> {
                         }
                         Err(e) => {
                             if deadline.remaining().is_none() {
-                                return Err(deadline.timeout_error());
+                                return Err(e);
                             }
                             debug!("Failed to create pipeline-pool connection: {:?}", e);
                             self.wait_backoff(deadline).await?;
@@ -263,7 +272,9 @@ impl<C: Connection> PipelinePool<C> {
                 }
                 match deadline.run(notified.as_mut()).await {
                     DeadlineOutcome::Completed(()) => {}
-                    DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+                    DeadlineOutcome::Expired => {
+                        return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                    }
                 }
             }
         }
@@ -338,7 +349,9 @@ impl<C: Connection> PipelinePool<C> {
                 }
             }
             DeadlineOutcome::Completed(Err(e)) => Err(e),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
+            }
         }
     }
 
@@ -346,12 +359,13 @@ impl<C: Connection> PipelinePool<C> {
         let inserted = AtomicBool::new(false);
         self.slots.rcu(|old_slots| {
             let mut new_slots = Vec::with_capacity(old_slots.len() + 1);
-            new_slots.extend(
-                old_slots
-                    .iter()
-                    .filter(|slot| !slot.is_drained_unusable())
-                    .cloned(),
-            );
+            for existing in old_slots.iter() {
+                if existing.is_drained_unusable() {
+                    existing.close();
+                } else {
+                    new_slots.push(existing.clone());
+                }
+            }
             let current_len = new_slots.len();
             if current_len >= self.max_size {
                 inserted.store(false, Ordering::Relaxed);
@@ -389,11 +403,17 @@ impl<C: Connection> PipelinePool<C> {
 
     fn usable_or_inflight_slot_count(&self) -> usize {
         let slots = self.slots.load();
-        let active = slots
-            .iter()
-            .filter(|slot| !slot.is_drained_unusable())
-            .count();
-        if active == slots.len() {
+        let mut active = 0usize;
+        let mut has_drained = false;
+        for slot in slots.iter() {
+            if slot.is_drained_unusable() {
+                slot.close();
+                has_drained = true;
+            } else {
+                active += 1;
+            }
+        }
+        if !has_drained {
             return active;
         }
 
@@ -422,12 +442,14 @@ impl<C: Connection> PipelinePool<C> {
 
     async fn wait_backoff(&self, deadline: QueryDeadline) -> Result<()> {
         let Some(remaining) = deadline.remaining() else {
-            return Err(deadline.timeout_error());
+            return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
         };
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {
             DeadlineOutcome::Completed(()) => Ok(()),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire))
+            }
         }
     }
 }
@@ -465,9 +487,10 @@ impl<C: Connection> PipelineSlot<C> {
             return false;
         }
 
+        let effective_max_load = max_load.min(self.conn.max_concurrent_queries());
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
-            if current >= max_load {
+            if current >= effective_max_load {
                 return false;
             }
             match self.inflight.compare_exchange_weak(
@@ -552,7 +575,7 @@ impl<C: Connection> PipelineSlot<C> {
     }
 
     fn is_drained_unusable(&self) -> bool {
-        self.state() != SLOT_ACTIVE && self.inflight() == 0
+        self.inflight() == 0 && (self.state() != SLOT_ACTIVE || !self.conn.available())
     }
 }
 
@@ -632,6 +655,11 @@ impl<C: Connection> Drop for PipelinePool<C> {
         if let Some(task_id) = task_id {
             task_center::stop_task_detached(task_id);
         }
+
+        let slots = self.slots.load();
+        for slot in slots.iter() {
+            slot.close();
+        }
     }
 }
 
@@ -639,7 +667,7 @@ impl<C: Connection> Drop for PipelinePool<C> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
 
     use async_trait::async_trait;
 
@@ -652,6 +680,7 @@ mod tests {
         using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
+        max_concurrent_queries: AtomicU16,
         query_delay: Duration,
     }
 
@@ -662,6 +691,7 @@ mod tests {
                 using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
+                max_concurrent_queries: AtomicU16::new(u16::MAX),
                 query_delay: Duration::ZERO,
             }
         }
@@ -673,6 +703,10 @@ mod tests {
 
         fn close_calls(&self) -> usize {
             self.close_calls.load(Ordering::Relaxed)
+        }
+
+        fn set_max_concurrent_queries(&self, max: u16) {
+            self.max_concurrent_queries.store(max, Ordering::Release);
         }
     }
 
@@ -698,6 +732,10 @@ mod tests {
 
         fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed)
+        }
+
+        fn max_concurrent_queries(&self) -> u16 {
+            self.max_concurrent_queries.load(Ordering::Acquire)
         }
 
         fn last_used(&self) -> u64 {
@@ -741,6 +779,26 @@ mod tests {
         builder: MockBuilder,
         initial_connections: Vec<Arc<MockConnection>>,
     ) -> PipelinePool<MockConnection> {
+        make_pool_with_timeout_policy(
+            min_size,
+            max_size,
+            max_load,
+            idle_secs,
+            builder,
+            initial_connections,
+            QueryTimeoutPolicy::Retire,
+        )
+    }
+
+    fn make_pool_with_timeout_policy(
+        min_size: usize,
+        max_size: usize,
+        max_load: u16,
+        idle_secs: u64,
+        builder: MockBuilder,
+        initial_connections: Vec<Arc<MockConnection>>,
+        timeout_policy: QueryTimeoutPolicy,
+    ) -> PipelinePool<MockConnection> {
         AppClock::start();
         let slots = initial_connections
             .into_iter()
@@ -755,7 +813,7 @@ mod tests {
             max_load: max_load.max(1),
             max_idle: Duration::from_secs(idle_secs),
             connection_builder: Box::new(builder),
-            timeout_policy: QueryTimeoutPolicy::Retire,
+            timeout_policy,
             connect_timeout: Duration::from_secs(5),
             next_id: AtomicU16::new(1),
             release_notified: Notify::new(),
@@ -940,6 +998,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_timeout_reuse_keeps_available_slot_active() {
+        AppClock::start();
+        let conn = Arc::new(
+            MockConnection::new(true, 0, AppClock::elapsed_millis())
+                .with_query_delay(Duration::from_secs(60)),
+        );
+        let pool = make_pool_with_timeout_policy(
+            0,
+            1,
+            2,
+            10,
+            MockBuilder::new(vec![]),
+            vec![conn.clone()],
+            QueryTimeoutPolicy::Reuse,
+        );
+
+        let result = pool
+            .query(
+                Message::new(),
+                QueryDeadline::new(Duration::from_millis(10)),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(conn.close_calls(), 0);
+        assert_eq!(pool.slots.load()[0].state(), SLOT_ACTIVE);
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("available connection should remain reusable after a stream-local timeout");
+        assert!(Arc::ptr_eq(&lease.slot.conn, &conn));
+    }
+
+    #[tokio::test]
     async fn test_maintain_removes_retired_drained_slot() {
         AppClock::start();
         let conn = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
@@ -1062,5 +1155,68 @@ mod tests {
         assert_eq!(conn.close_calls(), 0);
         assert_eq!(pool.slots.load().len(), 1);
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_replaces_unavailable_idle_active_slot_at_capacity() {
+        AppClock::start();
+        let stale = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        let replacement = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        let pool = make_pool(
+            0,
+            1,
+            1,
+            10,
+            MockBuilder::new(vec![Ok(replacement.clone())]),
+            vec![stale.clone()],
+        );
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_millis(100)))
+            .await
+            .expect("unavailable idle slot should be replaced immediately");
+
+        assert!(Arc::ptr_eq(&lease.slot.conn, &replacement));
+        assert_eq!(stale.close_calls(), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[test]
+    fn test_drop_closes_all_pipeline_connections() {
+        let first = Arc::new(MockConnection::new(true, 0, 0));
+        let second = Arc::new(MockConnection::new(true, 0, 0));
+        let pool = make_pool(
+            0,
+            2,
+            1,
+            10,
+            MockBuilder::new(vec![]),
+            vec![first.clone(), second.clone()],
+        );
+
+        drop(pool);
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(second.close_calls(), 1);
+    }
+    #[test]
+    fn test_pipeline_slot_tracks_dynamic_connection_load_limit() {
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        conn.set_max_concurrent_queries(2);
+        let slot = PipelineSlot::new(conn.clone());
+
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        conn.set_max_concurrent_queries(4);
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
     }
 }

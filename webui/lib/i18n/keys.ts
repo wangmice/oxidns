@@ -924,6 +924,14 @@ export const WEBUI = {
     outboundMetricsProtocols: "webui.settings.outboundMetricsProtocols",
     outboundMetricsSystemProfile: "webui.settings.outboundMetricsSystemProfile",
     outboundMetricsLocalProfile: "webui.settings.outboundMetricsLocalProfile",
+    networkTimeoutMetricsTitle: "webui.settings.networkTimeoutMetricsTitle",
+    networkTimeoutMetricsDesc: "webui.settings.networkTimeoutMetricsDesc",
+    networkTimeoutPoolAcquire: "webui.settings.networkTimeoutPoolAcquire",
+    networkTimeoutConnectionCreate:
+      "webui.settings.networkTimeoutConnectionCreate",
+    networkTimeoutProtocolHandshake:
+      "webui.settings.networkTimeoutProtocolHandshake",
+    networkTimeoutQueryIo: "webui.settings.networkTimeoutQueryIo",
     mgmtApiCard: "webui.settings.mgmtApiCard",
     mgmtApiDesc: "webui.settings.mgmtApiDesc",
     listenSection: "webui.settings.listenSection",

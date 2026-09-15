@@ -48,7 +48,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::hint::spin_loop;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::oneshot::Sender;
 
@@ -60,6 +60,7 @@ const MIN_SLOT_COUNT: usize = 8;
 const SLOT_FACTOR: usize = 4;
 const ID_HASH_DOMAIN: u64 = u64::from_be_bytes(*b"IDPERMUT");
 const ID_PERMUTATION_ROUNDS: usize = 4;
+const MIN_TOMBSTONES_BEFORE_RESET: usize = 4;
 
 // High bit reserves exclusive access for tombstone reset / clear. The lower
 // bits count active store operations that may be probing through tombstones.
@@ -93,18 +94,46 @@ const fn meta_id(meta: u32) -> u16 {
 
 #[derive(Debug)]
 struct Slot {
+    mutation_lock: AtomicBool,
     meta: AtomicU32,
     fingerprint: AtomicU64,
+    generation: AtomicU64,
     sender: UnsafeCell<MaybeUninit<Sender<Message>>>,
 }
 
 impl Slot {
     fn empty() -> Self {
         Self {
+            mutation_lock: AtomicBool::new(false),
             meta: AtomicU32::new(META_EMPTY),
             fingerprint: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             sender: UnsafeCell::new(MaybeUninit::uninit()),
         }
+    }
+}
+
+struct SlotMutationGuard<'a> {
+    lock: &'a AtomicBool,
+}
+
+impl Drop for SlotMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
+#[inline(always)]
+fn lock_slot(slot: &Slot) -> SlotMutationGuard<'_> {
+    while slot
+        .mutation_lock
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spin_loop();
+    }
+    SlotMutationGuard {
+        lock: &slot.mutation_lock,
     }
 }
 
@@ -116,6 +145,7 @@ unsafe impl Sync for Slot {}
 pub struct RequestGuard<'a> {
     request_map: &'a RequestMap,
     query_id: u16,
+    generation: u64,
     armed: bool,
 }
 
@@ -136,14 +166,16 @@ impl RequestGuard<'_> {
             return false;
         }
         self.armed = false;
-        self.request_map.remove(self.query_id)
+        self.request_map
+            .remove_generation(self.query_id, self.generation)
     }
 }
 
 impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.request_map.remove(self.query_id);
+            self.request_map
+                .remove_generation(self.query_id, self.generation);
         }
     }
 }
@@ -188,8 +220,10 @@ pub struct RequestMap {
     slots: Box<[Slot]>,
     mask: usize,
     id_sequence: AtomicU16,
+    generation_sequence: AtomicU64,
     id_rounds: [[u8; 256]; ID_PERMUTATION_ROUNDS],
     size: AtomicU16,
+    tombstones: AtomicU16,
     insert_state: AtomicU32,
     hash_state: RandomState,
 }
@@ -200,6 +234,7 @@ impl std::fmt::Debug for RequestMap {
             .field("slot_count", &self.slots.len())
             .field("mask", &self.mask)
             .field("id_sequence", &self.id_sequence)
+            .field("generation_sequence", &self.generation_sequence)
             .field("size", &self.size)
             .field("insert_state", &self.insert_state)
             .finish_non_exhaustive()
@@ -231,8 +266,10 @@ impl RequestMap {
             slots: slots.into_boxed_slice(),
             mask: slot_count - 1,
             id_sequence: AtomicU16::new(0),
+            generation_sequence: AtomicU64::new(1),
             id_rounds,
             size: AtomicU16::new(0),
+            tombstones: AtomicU16::new(0),
             insert_state: AtomicU32::new(0),
             hash_state,
         }
@@ -268,15 +305,17 @@ impl RequestMap {
         // EMPTY while this insertion is still probing/publishing a later slot.
         // This is one atomic increment/decrement per store, not per probe.
         let _insert_guard = self.enter_insert();
+        let generation = self.generation_sequence.fetch_add(1, Ordering::Relaxed);
         let mut tx = Some(tx);
 
         for _ in 0..ID_SPACE_SIZE {
             let id = self.next_start_id();
-            match self.try_store_candidate(id, fingerprint, &mut tx) {
+            match self.try_store_candidate(id, fingerprint, generation, &mut tx) {
                 StoreResult::Stored(id) => {
                     return Ok(RequestGuard {
                         request_map: self,
                         query_id: id,
+                        generation,
                         armed: true,
                     });
                 }
@@ -312,9 +351,19 @@ impl RequestMap {
         self.detach_matching(id, self.fingerprint(response))
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn remove(&self, id: u16) -> bool {
         let Some(sender) = self.detach(id) else {
+            return false;
+        };
+        drop(sender);
+        true
+    }
+
+    #[inline(always)]
+    fn remove_generation(&self, id: u16, generation: u64) -> bool {
+        let Some(sender) = self.detach_generation(id, generation) else {
             return false;
         };
         drop(sender);
@@ -337,56 +386,28 @@ impl RequestMap {
         let _exclusive = self.enter_exclusive();
         let mut removed = 0u16;
         for (idx, slot) in self.slots.iter().enumerate() {
-            loop {
-                let meta = slot.meta.load(Ordering::Acquire);
-                match meta_state(meta) {
-                    STATE_EMPTY => break,
-                    STATE_TOMBSTONE => {
-                        let _ = slot.meta.compare_exchange(
-                            meta,
-                            META_EMPTY,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        break;
+            let _slot_lock = lock_slot(slot);
+            match meta_state(slot.meta.load(Ordering::Acquire)) {
+                STATE_EMPTY => {}
+                STATE_TOMBSTONE => slot.meta.store(META_EMPTY, Ordering::Release),
+                STATE_RESERVED => unreachable!("slot reserved without mutation lock"),
+                STATE_FULL => {
+                    unsafe {
+                        (*slot.sender.get()).assume_init_drop();
                     }
-                    STATE_RESERVED => {
-                        spin_loop();
-                    }
-                    STATE_FULL => {
-                        if slot
-                            .meta
-                            .compare_exchange(
-                                meta,
-                                pack_meta(STATE_RESERVED, meta_id(meta)),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
-                        {
-                            continue;
-                        }
-
-                        unsafe {
-                            (*slot.sender.get()).assume_init_drop();
-                        }
-                        // Every published FULL slot has already incremented
-                        // `size` before becoming observable. Decrement exactly
-                        // the entry we successfully claimed instead of
-                        // resetting the whole counter
-                        // after the scan: a concurrent insert
-                        // into an earlier slot may legitimately survive this
-                        // clear pass.
-                        self.size.fetch_sub(1, Ordering::Relaxed);
-                        removed = removed.saturating_add(1);
-                        slot.meta.store(META_EMPTY, Ordering::Release);
-                        break;
-                    }
-                    _ => unreachable!("invalid request map slot state"),
+                    // Every published FULL slot has already incremented
+                    // `size` before becoming observable. Decrement exactly
+                    // the entry we successfully claimed instead of resetting
+                    // the whole counter after the scan.
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    removed = removed.saturating_add(1);
+                    slot.meta.store(META_EMPTY, Ordering::Release);
                 }
+                _ => unreachable!("invalid request map slot state"),
             }
             after_slot(idx);
         }
+        self.tombstones.store(0, Ordering::Relaxed);
         removed
     }
 
@@ -398,11 +419,23 @@ impl RequestMap {
         self.size() == 0
     }
 
+    #[inline]
+    fn should_reset_tombstones(&self) -> bool {
+        let threshold = self
+            .slots
+            .len()
+            .saturating_div(2)
+            .max(MIN_TOMBSTONES_BEFORE_RESET)
+            .min(usize::from(u16::MAX)) as u16;
+        self.tombstones.load(Ordering::Relaxed) >= threshold
+    }
+
     #[inline(always)]
     fn try_store_candidate(
         &self,
         id: u16,
         fingerprint: u64,
+        generation: u64,
         tx: &mut Option<Sender<Message>>,
     ) -> StoreResult {
         let mut tombstone = None;
@@ -415,7 +448,7 @@ impl RequestMap {
                     // We can stop probing at the first EMPTY slot. If we saw an
                     // earlier TOMBSTONE, reuse it; otherwise insert here.
                     let target = tombstone.unwrap_or(idx);
-                    return if self.claim_slot(target, id, fingerprint, tx) {
+                    return if self.claim_slot(target, id, fingerprint, generation, tx) {
                         StoreResult::Stored(id)
                     } else {
                         StoreResult::Retry
@@ -439,7 +472,7 @@ impl RequestMap {
         }
 
         if let Some(target) = tombstone {
-            if self.claim_slot(target, id, fingerprint, tx) {
+            if self.claim_slot(target, id, fingerprint, generation, tx) {
                 StoreResult::Stored(id)
             } else {
                 StoreResult::Retry
@@ -455,48 +488,34 @@ impl RequestMap {
         idx: usize,
         id: u16,
         fingerprint: u64,
+        generation: u64,
         tx: &mut Option<Sender<Message>>,
     ) -> bool {
         let slot = &self.slots[idx];
-
-        loop {
-            let meta = slot.meta.load(Ordering::Acquire);
-            match meta_state(meta) {
-                STATE_EMPTY | STATE_TOMBSTONE => {
-                    // Claim the slot first, then publish the inline sender,
-                    // then mark the slot FULL. Readers treat RESERVED as busy
-                    // and will never observe a half-published entry.
-                    if slot
-                        .meta
-                        .compare_exchange(
-                            meta,
-                            pack_meta(STATE_RESERVED, id),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    let tx = tx.take().expect("sender present after slot claim");
-                    unsafe {
-                        (*slot.sender.get()).write(tx);
-                    }
-                    slot.fingerprint.store(fingerprint, Ordering::Relaxed);
-                    // Account for the live request before publishing FULL. A
-                    // concurrent clear() treats RESERVED as in-flight and waits
-                    // until publication completes, so any thread that observes
-                    // FULL is guaranteed that the slot is already included in
-                    // `size`.
-                    self.size.fetch_add(1, Ordering::Relaxed);
-                    slot.meta
-                        .store(pack_meta(STATE_FULL, id), Ordering::Release);
-                    return true;
+        let _slot_lock = lock_slot(slot);
+        let meta = slot.meta.load(Ordering::Acquire);
+        match meta_state(meta) {
+            STATE_EMPTY | STATE_TOMBSTONE => {
+                // The mutation lock prevents a detach from observing the old
+                // generation and then claiming a newly reused slot.
+                if meta_state(meta) == STATE_TOMBSTONE {
+                    self.tombstones.fetch_sub(1, Ordering::Relaxed);
                 }
-                STATE_RESERVED | STATE_FULL => return false,
-                _ => unreachable!("invalid request map slot state"),
+                let tx = tx.take().expect("sender present after slot claim");
+                slot.meta
+                    .store(pack_meta(STATE_RESERVED, id), Ordering::Release);
+                unsafe {
+                    (*slot.sender.get()).write(tx);
+                }
+                slot.fingerprint.store(fingerprint, Ordering::Relaxed);
+                slot.generation.store(generation, Ordering::Relaxed);
+                self.size.fetch_add(1, Ordering::Relaxed);
+                slot.meta
+                    .store(pack_meta(STATE_FULL, id), Ordering::Release);
+                true
             }
+            STATE_RESERVED | STATE_FULL => false,
+            _ => unreachable!("invalid request map slot state"),
         }
     }
 
@@ -514,27 +533,24 @@ impl RequestMap {
                         continue;
                     }
 
+                    let _slot_lock = lock_slot(slot);
+                    let current_meta = slot.meta.load(Ordering::Acquire);
+                    if meta_state(current_meta) != STATE_FULL || meta_id(current_meta) != id {
+                        continue;
+                    }
+
                     if slot.fingerprint.load(Ordering::Relaxed) != fingerprint {
                         return None;
                     }
 
-                    if slot
-                        .meta
-                        .compare_exchange(
-                            meta,
-                            pack_meta(STATE_RESERVED, id),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        continue;
-                    }
-
+                    slot.meta
+                        .store(pack_meta(STATE_RESERVED, id), Ordering::Release);
                     let sender = unsafe { (*slot.sender.get()).assume_init_read() };
                     slot.meta.store(META_TOMBSTONE, Ordering::Release);
                     self.size.fetch_sub(1, Ordering::Relaxed);
-                    if self.is_empty() {
+                    self.tombstones.fetch_add(1, Ordering::Relaxed);
+                    drop(_slot_lock);
+                    if self.is_empty() && self.should_reset_tombstones() {
                         self.reset_tombstones();
                     }
                     return Some(sender);
@@ -545,6 +561,47 @@ impl RequestMap {
         None
     }
 
+    #[inline(always)]
+    fn detach_generation(&self, id: u16, generation: u64) -> Option<Sender<Message>> {
+        for step in 0..self.slots.len() {
+            let idx = self.probe_index(id, step);
+            let slot = &self.slots[idx];
+            let meta = slot.meta.load(Ordering::Acquire);
+            match meta_state(meta) {
+                STATE_EMPTY => return None,
+                STATE_RESERVED | STATE_TOMBSTONE => continue,
+                STATE_FULL => {
+                    if meta_id(meta) != id {
+                        continue;
+                    }
+                    let _slot_lock = lock_slot(slot);
+                    let current_meta = slot.meta.load(Ordering::Acquire);
+                    if meta_state(current_meta) != STATE_FULL || meta_id(current_meta) != id {
+                        continue;
+                    }
+                    if slot.generation.load(Ordering::Relaxed) != generation {
+                        return None;
+                    }
+
+                    slot.meta
+                        .store(pack_meta(STATE_RESERVED, id), Ordering::Release);
+                    let sender = unsafe { (*slot.sender.get()).assume_init_read() };
+                    slot.meta.store(META_TOMBSTONE, Ordering::Release);
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    self.tombstones.fetch_add(1, Ordering::Relaxed);
+                    drop(_slot_lock);
+                    if self.is_empty() && self.should_reset_tombstones() {
+                        self.reset_tombstones();
+                    }
+                    return Some(sender);
+                }
+                _ => unreachable!("invalid request map slot state"),
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
     #[inline(always)]
     fn detach(&self, id: u16) -> Option<Sender<Message>> {
         for step in 0..self.slots.len() {
@@ -560,24 +617,16 @@ impl RequestMap {
                         continue;
                     }
 
-                    // Move the slot back to RESERVED to become the sole owner
-                    // of the inline sender before moving it out.
-                    if slot
-                        .meta
-                        .compare_exchange(
-                            meta,
-                            pack_meta(STATE_RESERVED, id),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
+                    let _slot_lock = lock_slot(slot);
+                    if meta_state(slot.meta.load(Ordering::Acquire)) != STATE_FULL {
                         continue;
                     }
 
                     let sender = unsafe { (*slot.sender.get()).assume_init_read() };
                     slot.meta.store(META_TOMBSTONE, Ordering::Release);
                     self.size.fetch_sub(1, Ordering::Relaxed);
+                    self.tombstones.fetch_add(1, Ordering::Relaxed);
+                    drop(_slot_lock);
                     if self.is_empty() {
                         // Once the map drains completely, we can safely turn
                         // all tombstones back into
@@ -700,6 +749,7 @@ impl RequestMap {
                 );
             }
         }
+        self.tombstones.store(0, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -886,6 +936,46 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_guard_cannot_remove_reused_query_id_generation() {
+        let map = RequestMap::with_capacity(8);
+        let (tx1, _rx1) = oneshot::channel();
+        let guard1 = map.store(tx1).expect("first store should succeed");
+        let reused_id = guard1.query_id();
+
+        let _ = map
+            .take(reused_id)
+            .expect("first request should be detached by its response");
+        assert!(map.is_empty());
+
+        // Simulate a complete 16-bit allocation cycle so the next request
+        // reuses the same wire ID while the old guard is still armed.
+        map.id_sequence.store(0, Ordering::Relaxed);
+        let (tx2, rx2) = oneshot::channel();
+        let mut guard2 = map.store(tx2).expect("second store should succeed");
+        assert_eq!(guard2.query_id(), reused_id);
+        assert_eq!(map.size(), 1);
+
+        drop(guard1);
+
+        assert_eq!(
+            map.size(),
+            1,
+            "dropping the stale guard must not remove the new request"
+        );
+        let sender = map
+            .take(reused_id)
+            .expect("new generation must remain present after stale guard drop");
+        guard2.disarm();
+        assert!(sender.send(make_message(42)).is_ok());
+        assert_eq!(
+            rx2.blocking_recv()
+                .expect("new request receiver should remain connected")
+                .id(),
+            42
+        );
+    }
+
+    #[test]
     fn test_store_after_take_keeps_map_usable() {
         let map = RequestMap::with_capacity(8);
         let (tx1, _rx1) = oneshot::channel();
@@ -1033,12 +1123,12 @@ mod tests {
         let map = RequestMap::with_capacity(1);
         let (first_tx, _first_rx) = oneshot::channel::<Message>();
         let mut first_tx = Some(first_tx);
-        assert!(map.claim_slot(0, 1, 0, &mut first_tx));
+        assert!(map.claim_slot(0, 1, 0, 1, &mut first_tx));
         assert!(first_tx.is_none());
 
         let (retry_tx, _retry_rx) = oneshot::channel::<Message>();
         let mut retry_tx = Some(retry_tx);
-        assert!(!map.claim_slot(0, 2, 0, &mut retry_tx));
+        assert!(!map.claim_slot(0, 2, 0, 2, &mut retry_tx));
         assert!(retry_tx.is_some(), "failed claim must preserve sender");
 
         assert_eq!(map.clear(), 1);
@@ -1082,10 +1172,21 @@ mod tests {
     #[test]
     fn test_tombstones_reset_when_map_becomes_empty() {
         let map = RequestMap::with_capacity(1);
-        let (tx, _rx) = oneshot::channel();
-        let mut guard = map.store(tx).expect("store should succeed");
+        let threshold = map
+            .slots
+            .len()
+            .saturating_div(2)
+            .max(MIN_TOMBSTONES_BEFORE_RESET);
 
-        assert!(guard.remove());
+        let mut guards = Vec::with_capacity(threshold);
+        for _ in 0..threshold {
+            let (tx, _rx) = oneshot::channel();
+            guards.push(map.store(tx).expect("store should succeed"));
+        }
+        for mut guard in guards {
+            assert!(guard.remove());
+        }
+
         assert!(map.is_empty());
         assert!(
             map.slots

@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 use std::task::{Context, Poll};
 use std::{fmt, io};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue, LOCATION};
+use http::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION,
+    CONTENT_TYPE, COOKIE, HeaderName, HeaderValue, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION,
+    TRANSFER_ENCODING,
+};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -35,6 +39,7 @@ use crate::infra::network::proxy::{Socks5Opt, connect_tcp, parse_optional_socks5
 use crate::infra::network::tls_config::{insecure_client_config, secure_client_config};
 
 pub const DEFAULT_MAX_REDIRECTS: usize = 5;
+pub const DEFAULT_MAX_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 type InnerClient = HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -76,6 +81,7 @@ pub struct HttpRequestOptions {
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub body: Bytes,
     pub max_redirects: usize,
+    pub max_response_body_size: usize,
 }
 
 impl HttpRequestOptions {
@@ -85,6 +91,7 @@ impl HttpRequestOptions {
             headers: Vec::new(),
             body: Bytes::new(),
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
         }
     }
 
@@ -100,6 +107,11 @@ impl HttpRequestOptions {
 
     pub fn with_max_redirects(mut self, max_redirects: usize) -> Self {
         self.max_redirects = max_redirects;
+        self
+    }
+
+    pub fn with_max_response_body_size(mut self, max_response_body_size: usize) -> Self {
+        self.max_response_body_size = max_response_body_size;
         self
     }
 }
@@ -167,15 +179,18 @@ impl HttpClient {
         method: Method,
         options: HttpRequestOptions,
     ) -> Result<HttpResponse> {
+        let max_response_body_size = options.max_response_body_size;
         let response = self.request_following_redirects(method, options).await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|err| DnsError::plugin(format!("failed to read response body: {err}")))?
-            .to_bytes();
+        if content_length(&headers).is_some_and(|length| length > max_response_body_size as u64) {
+            return Err(DnsError::plugin(format!(
+                "http response body exceeds configured {}-byte limit",
+                max_response_body_size
+            )));
+        }
+        let body =
+            collect_response_body_limited(response.into_body(), max_response_body_size).await?;
         Ok(HttpResponse {
             status,
             headers,
@@ -209,7 +224,7 @@ impl HttpClient {
 
     async fn request_following_redirects(
         &self,
-        method: Method,
+        mut method: Method,
         mut options: HttpRequestOptions,
     ) -> Result<hyper::Response<Incoming>> {
         let label = request_label(&method, options.url.as_str());
@@ -255,7 +270,14 @@ impl HttpClient {
                     })?
                     .to_string();
                 drain_response_body(response.into_body()).await?;
-                options.url = resolve_redirect_url(options.url.as_str(), location.as_str())?;
+                let next_url = resolve_redirect_url(options.url.as_str(), location.as_str())?;
+                apply_redirect_security_policy(
+                    options.url.as_str(),
+                    next_url.as_str(),
+                    &mut options.headers,
+                )?;
+                apply_redirect_method_policy(status, &mut method, &mut options);
+                options.url = next_url;
                 continue;
             }
 
@@ -351,6 +373,25 @@ impl Service<Uri> for HttpConnector {
     }
 }
 
+async fn collect_response_body_limited(mut body: Incoming, limit: usize) -> Result<Bytes> {
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|err| DnsError::plugin(format!("failed to read response body: {err}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.len() > limit.saturating_sub(collected.len()) {
+            return Err(DnsError::plugin(format!(
+                "http response body exceeds configured {}-byte limit",
+                limit
+            )));
+        }
+        collected.extend_from_slice(&data);
+    }
+    Ok(collected.freeze())
+}
+
 pub async fn drain_response_body(mut body: Incoming) -> Result<()> {
     while let Some(frame) = body.frame().await {
         frame.map_err(|err| {
@@ -424,40 +465,84 @@ where
         ))
     })?;
     temp_file.close();
+    let replace_path = temp_file.take_path();
+    replace_target_file(replace_path, path.to_path_buf()).await
+}
 
-    if let Err(err) = fs::rename(&tmp_path, path).await {
-        let rename_fallback = matches!(
-            err.kind(),
-            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-        );
-        if !rename_fallback {
-            return Err(DnsError::plugin(format!(
-                "failed to replace target file '{}': {}",
-                path.display(),
-                err
-            )));
-        }
-
-        if fs::try_exists(path).await.unwrap_or(false)
-            && let Err(err) = fs::remove_file(path).await
+async fn replace_target_file(temp_path: PathBuf, target_path: PathBuf) -> Result<()> {
+    let target_label = target_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = replace_file_sync(&temp_path, &target_path);
+        if result.is_err()
+            && let Err(cleanup_error) = std::fs::remove_file(&temp_path)
+            && cleanup_error.kind() != io::ErrorKind::NotFound
         {
-            return Err(DnsError::plugin(format!(
-                "failed to remove existing target file '{}': {}",
-                path.display(),
-                err
-            )));
+            tracing::warn!(
+                path = %temp_path.display(),
+                error = %cleanup_error,
+                "failed to remove temp file after replacement failure"
+            );
         }
-        fs::rename(&tmp_path, path).await.map_err(|err| {
-            DnsError::plugin(format!(
-                "failed to replace target file '{}' after fallback: {}",
-                path.display(),
-                err
-            ))
-        })?;
-    }
-    temp_file.persisted();
+        result
+    })
+    .await
+    .map_err(|err| DnsError::plugin(format!("file replacement task failed: {err}")))?
+    .map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to atomically replace target file '{}': {}",
+            target_label.display(),
+            err
+        ))
+    })
+}
 
-    Ok(())
+#[cfg(not(windows))]
+fn replace_file_sync(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    std::fs::rename(temp_path, target_path)
+}
+
+#[cfg(windows)]
+fn replace_file_sync(temp_path: &Path, target_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    use windows::core::PCWSTR;
+
+    match std::fs::rename(temp_path, target_path) {
+        Ok(()) => return Ok(()),
+        Err(err)
+            if !matches!(
+                err.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Err(err);
+        }
+        Err(_) => {}
+    }
+
+    let replaced = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replacement = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(replaced.as_ptr()),
+            PCWSTR(replacement.as_ptr()),
+            PCWSTR::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+    }
+    .map_err(io::Error::other)
 }
 
 /// Owns an incomplete download until it has been atomically persisted.
@@ -493,8 +578,10 @@ impl TemporaryDownloadFile {
         self.file.take();
     }
 
-    fn persisted(&mut self) {
-        self.path.take();
+    fn take_path(&mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("temporary download file path must exist before replacement")
     }
 }
 
@@ -551,6 +638,75 @@ fn parse_uri_host_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
+fn apply_redirect_method_policy(
+    status: StatusCode,
+    method: &mut Method,
+    options: &mut HttpRequestOptions,
+) {
+    if status != StatusCode::SEE_OTHER {
+        return;
+    }
+
+    if *method != Method::HEAD {
+        *method = Method::GET;
+    }
+    options.body = Bytes::new();
+    options
+        .headers
+        .retain(|(name, _)| !is_content_specific_redirect_header(name));
+}
+
+fn is_content_specific_redirect_header(name: &HeaderName) -> bool {
+    name == CONTENT_ENCODING
+        || name == CONTENT_LANGUAGE
+        || name == CONTENT_LENGTH
+        || name == CONTENT_LOCATION
+        || name == CONTENT_TYPE
+        || name == LAST_MODIFIED
+        || name == TRANSFER_ENCODING
+        || name.as_str() == "digest"
+}
+
+fn apply_redirect_security_policy(
+    current_url: &str,
+    next_url: &str,
+    headers: &mut Vec<(HeaderName, HeaderValue)>,
+) -> Result<()> {
+    let current = Url::parse(current_url).map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to parse redirect source url '{}': {}",
+            current_url, err
+        ))
+    })?;
+    let next = Url::parse(next_url).map_err(|err| {
+        DnsError::plugin(format!(
+            "failed to parse redirect target url '{}': {}",
+            next_url, err
+        ))
+    })?;
+
+    if current.scheme() == "https" && next.scheme() == "http" {
+        return Err(DnsError::plugin(format!(
+            "refusing insecure redirect downgrade from '{}' to '{}'",
+            current_url, next_url
+        )));
+    }
+
+    if !same_origin(&current, &next) {
+        headers.retain(|(name, _)| {
+            name != AUTHORIZATION && name != COOKIE && name != PROXY_AUTHORIZATION
+        });
+    }
+
+    Ok(())
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 pub fn resolve_redirect_url(current_url: &str, location: &str) -> Result<String> {
     let base = Url::parse(current_url).map_err(|err| {
         DnsError::plugin(format!(
@@ -600,6 +756,116 @@ mod tests {
     }
 
     #[test]
+    fn test_303_redirect_switches_post_to_get_and_clears_content() {
+        let mut method = Method::POST;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![
+                (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                (CONTENT_LENGTH, HeaderValue::from_static("7")),
+                (
+                    HeaderName::from_static("x-test"),
+                    HeaderValue::from_static("keep"),
+                ),
+            ])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(StatusCode::SEE_OTHER, &mut method, &mut options);
+
+        assert_eq!(method, Method::GET);
+        assert!(options.body.is_empty());
+        assert_eq!(options.headers.len(), 1);
+        assert_eq!(options.headers[0].0, HeaderName::from_static("x-test"));
+    }
+
+    #[test]
+    fn test_303_redirect_preserves_head_but_clears_content() {
+        let mut method = Method::HEAD;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![(CONTENT_LENGTH, HeaderValue::from_static("7"))])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(StatusCode::SEE_OTHER, &mut method, &mut options);
+
+        assert_eq!(method, Method::HEAD);
+        assert!(options.body.is_empty());
+        assert!(options.headers.is_empty());
+    }
+
+    #[test]
+    fn test_307_redirect_preserves_method_and_body() {
+        let mut method = Method::POST;
+        let mut options = HttpRequestOptions::from_url("https://example.com/start")
+            .with_headers(vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))])
+            .with_body(Bytes::from_static(b"payload"));
+
+        apply_redirect_method_policy(StatusCode::TEMPORARY_REDIRECT, &mut method, &mut options);
+
+        assert_eq!(method, Method::POST);
+        assert_eq!(options.body, Bytes::from_static(b"payload"));
+        assert_eq!(options.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_redirect_security_strips_sensitive_headers_cross_origin() {
+        let mut headers = vec![
+            (AUTHORIZATION, HeaderValue::from_static("Bearer secret")),
+            (COOKIE, HeaderValue::from_static("session=secret")),
+            (
+                PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic c2VjcmV0"),
+            ),
+            (
+                HeaderName::from_static("x-test"),
+                HeaderValue::from_static("keep"),
+            ),
+        ];
+
+        apply_redirect_security_policy(
+            "https://api.example.com/start",
+            "https://cdn.example.net/result",
+            &mut headers,
+        )
+        .expect("cross-origin HTTPS redirect should remain allowed");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, HeaderName::from_static("x-test"));
+    }
+
+    #[test]
+    fn test_redirect_security_preserves_sensitive_headers_same_origin() {
+        let mut headers = vec![(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))];
+
+        apply_redirect_security_policy(
+            "https://example.com/start",
+            "https://example.com:443/result",
+            &mut headers,
+        )
+        .expect("same-origin redirect should remain allowed");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, AUTHORIZATION);
+    }
+
+    #[test]
+    fn test_redirect_security_rejects_https_downgrade() {
+        let mut headers = vec![(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))];
+
+        let error = apply_redirect_security_policy(
+            "https://example.com/start",
+            "http://example.com/result",
+            &mut headers,
+        )
+        .expect_err("HTTPS to HTTP redirect must be rejected");
+
+        assert!(error.to_string().contains("insecure redirect downgrade"));
+        assert_eq!(
+            headers.len(),
+            1,
+            "rejected redirects must not mutate headers"
+        );
+    }
+
+    #[test]
     fn test_request_options_builders_set_expected_fields() {
         let options = HttpRequestOptions::from_url("https://example.com")
             .with_headers(vec![(
@@ -607,11 +873,13 @@ mod tests {
                 HeaderValue::from_static("1"),
             )])
             .with_body(Bytes::from_static(b"body"))
-            .with_max_redirects(2);
+            .with_max_redirects(2)
+            .with_max_response_body_size(4096);
         assert_eq!(options.url, "https://example.com");
         assert_eq!(options.headers.len(), 1);
         assert_eq!(options.body, Bytes::from_static(b"body"));
         assert_eq!(options.max_redirects, 2);
+        assert_eq!(options.max_response_body_size, 4096);
     }
 
     #[test]
@@ -640,6 +908,87 @@ mod tests {
         );
         assert_eq!(parse_uri_host_ip_literal("::1"), None);
         assert_eq!(parse_uri_host_ip_literal("example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_streamed_body_over_configured_limit() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("test HTTP listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test HTTP listener should accept a request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("test HTTP request should be readable");
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n",
+                )
+                .await
+                .expect("test HTTP response should be writable");
+        });
+
+        let client = HttpClient::new(HttpClientOptions::new(false, None));
+        let error = client
+            .get_request(
+                HttpRequestOptions::from_url(format!("http://{addr}/large"))
+                    .with_max_response_body_size(6),
+            )
+            .await
+            .expect_err("streamed body beyond the configured limit must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds configured 6-byte limit")
+        );
+        server.await.expect("test HTTP server should exit normally");
+    }
+
+    #[test]
+    fn test_atomic_replace_preserves_old_target_when_source_is_missing() {
+        let dir = TempDir::new().expect("temp directory should be created");
+        let target = dir.path().join("rules.dat");
+        let missing = dir.path().join("missing.tmp");
+        std::fs::write(&target, b"old rules").expect("old target should be written");
+
+        let result = replace_file_sync(&missing, &target);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("old target must remain readable"),
+            b"old rules"
+        );
+    }
+
+    #[test]
+    fn test_atomic_replace_updates_existing_target() {
+        let dir = TempDir::new().expect("temp directory should be created");
+        let target = dir.path().join("rules.dat");
+        let replacement = dir.path().join("replacement.tmp");
+        std::fs::write(&target, b"old rules").expect("old target should be written");
+        std::fs::write(&replacement, b"new rules").expect("replacement should be written");
+
+        replace_file_sync(&replacement, &target).expect("target replacement should succeed");
+
+        assert_eq!(
+            std::fs::read(&target).expect("new target must be readable"),
+            b"new rules"
+        );
+        assert!(!replacement.exists());
     }
 
     #[tokio::test]

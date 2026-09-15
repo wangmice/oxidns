@@ -988,6 +988,13 @@ export const enUSWebui = {
     outboundMetricsProtocols: "Protocols",
     outboundMetricsSystemProfile: "System resolver / direct",
     outboundMetricsLocalProfile: "Local bootstrap",
+    networkTimeoutMetricsTitle: "Upstream Timeout Stages",
+    networkTimeoutMetricsDesc:
+      "Global counts of upstream query deadlines expiring at each network stage; these are not attributed to a single outbound profile.",
+    networkTimeoutPoolAcquire: "Pool Acquire",
+    networkTimeoutConnectionCreate: "Connection Create",
+    networkTimeoutProtocolHandshake: "Protocol Handshake",
+    networkTimeoutQueryIo: "Query I/O",
     mgmtApiCard: "Management API",
     mgmtApiDesc: "HTTP management interface configuration (api.http)",
     listenSection: "Listen Address (listen)",

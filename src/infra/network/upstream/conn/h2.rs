@@ -17,6 +17,7 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
@@ -28,18 +29,36 @@ use crate::proto::Message;
 
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
 
+#[inline]
+fn h2_pool_stream_limit(peer_limit: usize) -> u16 {
+    peer_limit.clamp(1, u16::MAX as usize) as u16
+}
+
 enum H2RecvError {
-    Transport(DnsError),
+    Connection(DnsError),
+    Stream(DnsError),
     HttpStatus(DnsError),
     InvalidResponse(DnsError),
+}
+
+fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
+    let connection_scoped = error.is_go_away() || error.is_io();
+    let error = DnsError::protocol(format!("{context}: {error}"));
+    if connection_scoped {
+        H2RecvError::Connection(error)
+    } else {
+        H2RecvError::Stream(error)
+    }
 }
 
 #[derive(Debug)]
 pub struct H2Connection {
     id: u16,
+    upstream: String,
     sender: SendRequest<Bytes>,
     using_count: AtomicU32,
     closed: AtomicBool,
+    transport_error_reported: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
     close_notify: Notify,
@@ -51,7 +70,8 @@ impl Connection for H2Connection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        debug!(conn_id = self.id, "Closing DoH connection");
+        debug!(conn_id = self.id,
+            upstream = %self.upstream, "Closing DoH connection");
         // A single background driver waits for this signal. `notify_one()`
         // stores a permit when the waiter has not registered yet,
         // avoiding a lost close wakeup.
@@ -80,12 +100,40 @@ impl Connection for H2Connection {
         !self.closed.load(Ordering::Acquire)
     }
 
+    fn max_concurrent_queries(&self) -> u16 {
+        // Read h2's live peer SETTINGS value rather than caching a handshake
+        // snapshot. A floor of one keeps a query parked in `ready()` when the
+        // peer temporarily advertises zero streams so a later SETTINGS update
+        // can wake it without requiring a separate pool notification channel.
+        h2_pool_stream_limit(self.sender.current_max_send_streams())
+    }
+
     fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
     }
 }
 
 impl H2Connection {
+    fn report_transport_error(&self, raw_id: u16, error: &DnsError) {
+        if !self.transport_error_reported.swap(true, Ordering::AcqRel) {
+            warn!(
+                conn_id = self.id,
+            upstream = %self.upstream,
+                raw_id,
+                ?error,
+                "H2 connection transport error"
+            );
+        } else {
+            debug!(
+                conn_id = self.id,
+            upstream = %self.upstream,
+                raw_id,
+                ?error,
+                "H2 stream failed after connection transport error"
+            );
+        }
+    }
+
     async fn query_inner(&self, request: Message) -> Result<Message> {
         let raw_id = request.id();
         let mut body_bytes = wire_buffer_pool().acquire();
@@ -98,19 +146,39 @@ impl H2Connection {
         )?;
         drop(body_bytes);
 
-        let mut sender = self.sender.clone().ready().await.map_err(|e| {
-            self.close();
-            DnsError::protocol(format!("H2 sender readiness error: {e}"))
-        })?;
+        // `ready()` is the authoritative protocol-level backpressure point.
+        // The h2 state machine updates it when peer SETTINGS change during the
+        // connection lifetime, while the pool separately enforces OxiDNS's
+        // local per-connection load cap.
+        let mut sender = match self.sender.clone().ready().await {
+            Ok(sender) => sender,
+            Err(error) => match classify_h2_error("H2 sender readiness error", error) {
+                H2RecvError::Connection(error) => {
+                    self.close();
+                    self.report_transport_error(raw_id, &error);
+                    return Err(error);
+                }
+                H2RecvError::Stream(error) => return Err(error),
+                H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
         // DoH GET carries the DNS payload in the URI, so the request body is
         // empty. Mark the stream as finished when sending headers,
         // otherwise some servers will wait for an end-of-stream signal
         // and never produce a response.
-        let (response_future, _send_stream) = sender.send_request(request, true).map_err(|e| {
-            self.close();
-            DnsError::protocol(format!("H2 send_request error: {e}"))
-        })?;
+        let (response_future, _send_stream) = match sender.send_request(request, true) {
+            Ok(value) => value,
+            Err(error) => match classify_h2_error("H2 send_request error", error) {
+                H2RecvError::Connection(error) => {
+                    self.close();
+                    self.report_transport_error(raw_id, &error);
+                    return Err(error);
+                }
+                H2RecvError::Stream(error) => return Err(error),
+                H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
         match recv(response_future).await {
             Ok(bytes) => {
@@ -118,15 +186,20 @@ impl H2Connection {
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                trace!(conn_id = self.id, raw_id, "Received H2 response");
+                trace!(conn_id = self.id,
+            upstream = %self.upstream, raw_id, "Received H2 response");
                 Ok(resp)
             }
-            Err(H2RecvError::Transport(e)) => {
+            Err(H2RecvError::Connection(e)) => {
                 self.close();
-                warn!(conn_id = self.id, raw_id, ?e, "H2 request error");
+                self.report_transport_error(raw_id, &e);
                 Err(e)
             }
-            Err(H2RecvError::HttpStatus(e) | H2RecvError::InvalidResponse(e)) => Err(e),
+            Err(
+                H2RecvError::Stream(e)
+                | H2RecvError::HttpStatus(e)
+                | H2RecvError::InvalidResponse(e),
+            ) => Err(e),
         }
     }
 }
@@ -135,6 +208,7 @@ impl H2Connection {
 #[derive(Debug)]
 pub struct H2ConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     request_uri: String,
     insecure_skip_verify: bool,
@@ -144,6 +218,7 @@ pub struct H2ConnectionBuilder {
 impl H2ConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -176,7 +251,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             .await
         {
             DeadlineOutcome::Completed(result) => result?,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+            }
         };
 
         let tls_stream = connect_tls(
@@ -184,11 +261,12 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             TlsDialOptions::new(
                 self.target.clone(),
                 self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
+                deadline.remaining().ok_or_else(|| {
+                    deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+                })?,
                 vec![b"h2".to_vec()],
-            ),
+            )
+            .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
         )
         .await?;
 
@@ -200,13 +278,17 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("H2 handshake error: {}", e)));
             }
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ProtocolHandshake));
+            }
         };
 
         let h2_conn = Arc::new(H2Connection {
             id: conn_id,
+            upstream: self.upstream.clone(),
             sender,
             closed: AtomicBool::new(false),
+            transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
@@ -219,12 +301,12 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                 res = connection => {
                     _conn.close();
                     match res {
-                        Ok(()) => debug!(conn_id, "H2 connection closed"),
-                        Err(e) => debug!(conn_id, ?e, "H2 connection error"),
+                        Ok(()) => debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed"),
+                        Err(e) => debug!(conn_id, upstream = %_conn.upstream, ?e, "H2 connection error"),
                     }
                 }
                 _ = _conn.close_notify.notified() => {
-                    debug!(conn_id, "H2 connection closed by notify");
+                    debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed by notify");
                 }
             }
         });
@@ -234,9 +316,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 }
 
 async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2RecvError> {
-    let response = response_future.await.map_err(|e| {
-        H2RecvError::Transport(DnsError::protocol(format!("H2 response error: {}", e)))
-    })?;
+    let response = response_future
+        .await
+        .map_err(|e| classify_h2_error("H2 response error", e))?;
 
     let status_code = response.status();
     let body_limit = if status_code.is_success() {
@@ -250,9 +332,7 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
     let mut truncated = false;
 
     while let Some(partial_bytes) = body.data().await {
-        let partial_bytes = partial_bytes.map_err(|e| {
-            H2RecvError::Transport(DnsError::protocol(format!("H2 body error: {}", e)))
-        })?;
+        let partial_bytes = partial_bytes.map_err(|e| classify_h2_error("H2 body error", e))?;
         let chunk_len = partial_bytes.len();
         let remaining = body_limit.saturating_sub(response_bytes.len());
         let exceeds_limit = chunk_len > remaining;
@@ -273,11 +353,9 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
         // one. Otherwise a response larger than the current
         // stream window can stall indefinitely.
         if chunk_len != 0 {
-            flow_control.release_capacity(chunk_len).map_err(|e| {
-                H2RecvError::Transport(DnsError::protocol(format!(
-                    "H2 flow-control release error: {e}"
-                )))
-            })?;
+            flow_control
+                .release_capacity(chunk_len)
+                .map_err(|e| classify_h2_error("H2 flow-control release error", e))?;
         }
 
         if exceeds_limit {
@@ -376,6 +454,66 @@ mod tests {
         drop(sender);
         client_task.abort();
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn recv_classifies_rst_stream_as_stream_local() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let Some(Ok((_request, mut respond))) = connection.accept().await else {
+                panic!("server should receive one request");
+            };
+            respond.send_reset(h2::Reason::CANCEL);
+
+            while let Some(result) = connection.accept().await {
+                if let Err(error) = result {
+                    panic!("server connection failed: {error}");
+                }
+            }
+        });
+
+        let (mut sender, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        sender = sender
+            .ready()
+            .await
+            .expect("client sender should become ready");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://dns.example.test/dns-query")
+            .body(())
+            .expect("request should build");
+        let (response_future, _send_stream) = sender
+            .send_request(request, true)
+            .expect("request should send");
+
+        match recv(response_future).await {
+            Err(H2RecvError::Stream(_)) => {}
+            Err(_) => panic!("RST_STREAM must remain stream-local"),
+            Ok(_) => panic!("RST_STREAM must fail the request"),
+        }
+
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
+    }
+
+    #[test]
+    fn test_h2_pool_stream_limit_keeps_liveness_floor_and_clamps_large_values() {
+        assert_eq!(h2_pool_stream_limit(0), 1);
+        assert_eq!(h2_pool_stream_limit(1), 1);
+        assert_eq!(h2_pool_stream_limit(8), 8);
+        assert_eq!(h2_pool_stream_limit(u16::MAX as usize), u16::MAX);
+        assert_eq!(h2_pool_stream_limit(usize::MAX), u16::MAX);
     }
 
     #[test]
