@@ -158,12 +158,12 @@ Listens for DNS over TCP. If `cert` and `key` are both configured, it can also s
 
 #### `idle_timeout`
 
-- Type: `integer`; Required: no; Default: `10`
+- Type: `integer`; Required: no; Default: `30`
 - Unit: seconds
-- Purpose: Controls idle connection lifetime.
+- Purpose: Closes TCP/DoT connections after the configured period without transport I/O activity.
 - Example: `idle_timeout: 30`
 - Runtime impact:
-  - Affects keepalive behavior and long-lived connection reuse.
+  - Bounds idle connection lifetime without relying on TCP keepalive probes.
 
 ### Behavior
 

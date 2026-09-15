@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
-use crate::plugin::server::{ConnectionGuard, tcp};
+use crate::plugin::server::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard, tcp};
 
 /// Main HTTP/1.1 + HTTP/2 server loop (over TCP)
 ///
@@ -60,7 +60,7 @@ pub async fn run_server(
 ) {
     let mut startup_tx = startup_tx;
 
-    let listener = match tcp::build_tcp_listener(addr, idle_timeout) {
+    let listener = match tcp::build_tcp_listener(addr) {
         Ok(s) => s,
         Err(e) => {
             if let Some(tx) = startup_tx.take() {
@@ -111,6 +111,8 @@ pub async fn run_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, src)) => {
+                        let activity = Arc::new(ConnectionActivity::new());
+                        let stream = ActivityTrackedIo::new(stream, activity.clone());
                         let dispatcher = dispatcher.clone();
                         let src_ip_header = src_ip_header.clone();
                         let alt_svc = alt_svc.clone();
@@ -126,6 +128,13 @@ pub async fn run_server(
                                 ConnectionGuard::new(active_connections.clone(), src, "HTTP");
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
+                                _ = activity.wait_until_idle(idle_timeout) => {
+                                    debug!(
+                                        client = %src,
+                                        idle_timeout_secs = idle_timeout.as_secs_f64(),
+                                        "Closing idle HTTP connection"
+                                    );
+                                }
                                 _ = async move {
                                     // Handle TLS handshake if TLS is enabled
                                     if let Some(acceptor) = tls_acceptor {

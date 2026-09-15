@@ -20,14 +20,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use socket2::{Socket, TcpKeepalive};
+use socket2::Socket;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 #[cfg(feature = "server-dot")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::PluginConfig;
@@ -40,7 +40,8 @@ use crate::infra::observability::metrics::{register_metric_source, unregister_me
 use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
-    ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT, RequestHandle, RequestMeta, Server, ServerMetrics,
+    ActivityTrackedIo, ConnectionActivity, ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT,
+    RequestHandle, RequestMeta, Server, ServerMetrics,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
@@ -82,8 +83,8 @@ pub struct TcpServerConfig {
 
     /// TCP connection idle timeout in seconds.
     ///
-    /// - Default: 10 seconds if omitted.
-    /// - Applied as TCP keepalive interval for long-lived connections.
+    /// - Default: 30 seconds if omitted.
+    /// - Closes a connection after this much transport inactivity.
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     idle_timeout: Option<Duration>,
 }
@@ -212,7 +213,7 @@ async fn run_server(
     startup_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
 ) {
     let mut startup_tx = startup_tx;
-    let listener = match build_tcp_listener(addr, idle_timeout) {
+    let listener = match build_tcp_listener(addr) {
         Ok(s) => s,
         Err(e) => {
             if let Some(tx) = startup_tx.take() {
@@ -252,6 +253,8 @@ async fn run_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, src)) => {
+                        let activity = Arc::new(ConnectionActivity::new());
+                        let stream = ActivityTrackedIo::new(stream, activity.clone());
                         let handler = handler.clone();
                         #[cfg(feature = "server-dot")]
                         let tls_acceptor = tls_acceptor.clone();
@@ -265,6 +268,13 @@ async fn run_server(
                                 ConnectionGuard::new(active_connections.clone(), src, "TCP");
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
+                                _ = activity.wait_until_idle(idle_timeout) => {
+                                    debug!(
+                                        client = %src,
+                                        idle_timeout_secs = idle_timeout.as_secs_f64(),
+                                        "Closing idle TCP connection"
+                                    );
+                                }
                                 _ = async move {
                                     #[cfg(feature = "server-dot")]
                                     {
@@ -330,7 +340,9 @@ async fn handle_dns_stream<S>(
 
     let (sender, receiver) = tokio::sync::mpsc::channel::<Message>(128);
 
-    let handle = tokio::spawn(write_tcp_responses(writer, receiver, src));
+    let _writer_task = AbortOnDropHandle::new(tokio::spawn(write_tcp_responses(
+        writer, receiver, src,
+    )));
 
     let sender = Arc::new(sender);
 
@@ -360,7 +372,6 @@ async fn handle_dns_stream<S>(
             }
         };
     }
-    handle.abort();
 }
 
 async fn write_tcp_responses<S>(
@@ -380,14 +391,12 @@ async fn write_tcp_responses<S>(
 /// Build a TCP socket with reuse_address and reuse_port options when available
 ///
 /// Creates a socket optimized for DNS server workloads with port reuse enabled.
-pub fn build_tcp_listener(addr: SocketAddr, idle_timeout: Duration) -> Result<TcpListener> {
-    listen::build_tcp_listener(addr, 512, |sock| configure_tcp_socket(sock, idle_timeout))
+pub fn build_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    listen::build_tcp_listener(addr, 512, configure_tcp_socket)
 }
 
-fn configure_tcp_socket(sock: &Socket, idle_timeout: Duration) {
+fn configure_tcp_socket(sock: &Socket) {
     let _ = sock.set_tcp_nodelay(true);
-    let keepalive = TcpKeepalive::new().with_interval(idle_timeout);
-    let _ = sock.set_tcp_keepalive(&keepalive);
     #[cfg(all(
         unix,
         not(any(
@@ -503,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_tcp_listener_accepts_port_only_shorthand() {
-        let listener = build_tcp_listener(parse_listen_addr(":0").unwrap(), Duration::from_secs(5))
+        let listener = build_tcp_listener(parse_listen_addr(":0").unwrap())
             .expect("port-only shorthand should bind");
         let addr = listener
             .local_addr()

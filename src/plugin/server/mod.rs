@@ -15,7 +15,7 @@ mod connection;
 mod metrics;
 mod request;
 
-pub(crate) use connection::ConnectionGuard;
+pub(crate) use connection::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard};
 pub(crate) use metrics::ServerMetrics;
 pub use request::{RequestExit, RequestHandle, RequestMeta, RequestResult};
 
