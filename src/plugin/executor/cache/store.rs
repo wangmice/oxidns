@@ -765,8 +765,8 @@ mod tests {
             request_ecs.scope_prefix = 0;
             request_ecs.network_len = max_prefix / 8;
 
-            let covered = cache_lookup_keys(&request_key, store.ecs_lookup_index()).any(
-                |candidate| {
+            let covered =
+                cache_lookup_keys(&request_key, store.ecs_lookup_index()).any(|candidate| {
                     candidate
                         .as_ref()
                         .ecs_scope
@@ -775,8 +775,7 @@ mod tests {
                             candidate_ecs.source_prefix == expected_prefix
                                 && candidate_ecs.scope_prefix == expected_prefix
                         })
-                },
-            );
+                });
 
             assert!(
                 covered,

@@ -116,6 +116,8 @@ mod tests {
 
     #[test]
     fn capped_deadline_preserves_timeout_metric_scope() {
+        AppClock::start();
+
         let query = QueryDeadline::new(Duration::from_secs(5));
         let query_capped = query.capped(Duration::from_secs(1));
         assert!(query_capped.track_upstream_timeout_metrics);

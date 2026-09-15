@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +10,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use http::header::CONTENT_LENGTH;
 use rustls::ServerConfig;
 use tokio::sync::{oneshot, watch};
+use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -21,6 +23,57 @@ use crate::plugin::server::{
 };
 
 const MAX_HTTP3_BODY_SIZE: usize = 64 * 1024;
+const HTTP3_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP3_REQUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP3_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP3_REQUEST_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct H3RequestDeadline {
+    at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct H3PhaseDeadline {
+    at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct H3RequestTimedOut;
+
+impl H3RequestDeadline {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            at: Instant::now() + HTTP3_REQUEST_LIFETIME_TIMEOUT,
+        }
+    }
+
+    #[inline]
+    fn phase(&self, timeout: Duration) -> H3PhaseDeadline {
+        H3PhaseDeadline {
+            at: self.at.min(Instant::now() + timeout),
+        }
+    }
+}
+
+impl H3PhaseDeadline {
+    #[inline]
+    async fn run<F>(&self, future: F) -> Result<F::Output, H3RequestTimedOut>
+    where
+        F: Future,
+    {
+        timeout_at(self.at, future)
+            .await
+            .map_err(|_| H3RequestTimedOut)
+    }
+}
+
+#[derive(Debug)]
+enum H3BodyReadError {
+    Http(http::StatusCode),
+    Deadline,
+}
 
 /// Main HTTP/3 server loop (over QUIC)
 ///
@@ -218,6 +271,11 @@ async fn handle_h3_connection(
         let src_ip_header = src_ip_header.clone();
         let server_name = server_name.clone();
         let task_cancel = request_cancel.clone();
+        // Start one absolute lifetime deadline after admission. Each phase
+        // applies its own cap within the remaining lifetime budget, preventing
+        // slow body chunks or flow-controlled response writes from extending
+        // the time this request can retain a global admission permit.
+        let request_deadline = H3RequestDeadline::new();
 
         request_tasks.spawn(async move {
             let _permit = permit;
@@ -230,6 +288,7 @@ async fn handle_h3_connection(
                     src,
                     src_ip_header,
                     server_name,
+                    request_deadline,
                 ) => {}
             }
         });
@@ -244,6 +303,7 @@ async fn handle_h3_request(
     src: SocketAddr,
     src_ip_header: Option<Arc<str>>,
     server_name: Option<Arc<str>>,
+    request_deadline: H3RequestDeadline,
 ) {
     let method = request.method().clone();
     let uri = request.uri();
@@ -258,17 +318,31 @@ async fn handle_h3_request(
         method, path, src, client_addr
     );
 
-    let body = match read_h3_body(&mut stream, src).await {
+    let body_deadline = request_deadline.phase(HTTP3_REQUEST_BODY_TIMEOUT);
+    let body = match read_h3_body(&mut stream, src, body_deadline).await {
         Ok(body) => body,
-        Err(status) => {
-            let _ = send_h3_error_response(&mut stream, status, src).await;
+        Err(H3BodyReadError::Http(status)) => {
+            let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
+            let _ = send_h3_error_response(&mut stream, status, src, response_deadline).await;
+            return;
+        }
+        Err(H3BodyReadError::Deadline) => {
+            cancel_h3_stream_on_deadline(&mut stream, src, "request body");
             return;
         }
     };
 
-    let response = dispatcher
-        .handle_request(method, path, query, body, client_addr, server_name)
-        .await;
+    let executor_deadline = request_deadline.phase(HTTP3_REQUEST_EXECUTION_TIMEOUT);
+    let response = match executor_deadline
+        .run(dispatcher.handle_request(method, path, query, body, client_addr, server_name))
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            cancel_h3_stream_on_deadline(&mut stream, src, "executor");
+            return;
+        }
+    };
 
     let (parts, response_bytes) = response.into_parts();
 
@@ -283,26 +357,60 @@ async fn handle_h3_request(
         }
         Err(e) => {
             warn!("Failed to build HTTP/3 response: {}", e);
-            let _ =
-                send_h3_error_response(&mut stream, http::StatusCode::INTERNAL_SERVER_ERROR, src)
-                    .await;
+            let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
+            let _ = send_h3_error_response(
+                &mut stream,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                src,
+                response_deadline,
+            )
+            .await;
             return;
         }
     };
 
-    if let Err(e) = stream.send_response(h3_response).await {
-        warn!("Failed to send HTTP/3 response headers to {}: {}", src, e);
-        return;
+    let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
+
+    match response_deadline
+        .run(stream.send_response(h3_response))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!("Failed to send HTTP/3 response headers to {}: {}", src, e);
+            return;
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(&mut stream, src, "response headers");
+            return;
+        }
     }
 
-    if let Err(e) = stream.send_data(response_bytes).await {
-        warn!("Failed to send HTTP/3 response body to {}: {}", src, e);
-        return;
+    match response_deadline
+        .run(stream.send_data(response_bytes))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!("Failed to send HTTP/3 response body to {}: {}", src, e);
+            return;
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(&mut stream, src, "response body");
+            return;
+        }
     }
 
-    if let Err(e) = stream.finish().await {
-        warn!("Failed to finish HTTP/3 response stream to {}: {}", src, e);
-        return;
+    match response_deadline.run(stream.finish()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!("Failed to finish HTTP/3 response stream to {}: {}", src, e);
+            return;
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(&mut stream, src, "response finish");
+            return;
+        }
     }
 
     debug!("Response sent to {}", src);
@@ -312,12 +420,13 @@ async fn handle_h3_request(
 async fn read_h3_body(
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     src: SocketAddr,
-) -> Result<Bytes, http::StatusCode> {
+    body_deadline: H3PhaseDeadline,
+) -> Result<Bytes, H3BodyReadError> {
     let mut buf = BytesMut::with_capacity(2048);
 
     loop {
-        match stream.recv_data().await {
-            Ok(Some(chunk)) => {
+        match body_deadline.run(stream.recv_data()).await {
+            Ok(Ok(Some(chunk))) => {
                 buf.put(chunk);
                 if buf.len() > MAX_HTTP3_BODY_SIZE {
                     warn!(
@@ -325,14 +434,15 @@ async fn read_h3_body(
                         src,
                         buf.len()
                     );
-                    return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
+                    return Err(H3BodyReadError::Http(http::StatusCode::PAYLOAD_TOO_LARGE));
                 }
             }
-            Ok(None) => return Ok(buf.freeze()),
-            Err(e) => {
+            Ok(Ok(None)) => return Ok(buf.freeze()),
+            Ok(Err(e)) => {
                 warn!("Failed to read HTTP/3 request body from {}: {}", src, e);
-                return Err(http::StatusCode::BAD_REQUEST);
+                return Err(H3BodyReadError::Http(http::StatusCode::BAD_REQUEST));
             }
+            Err(_) => return Err(H3BodyReadError::Deadline),
         }
     }
 }
@@ -342,6 +452,7 @@ async fn send_h3_error_response(
     stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: http::StatusCode,
     src: SocketAddr,
+    response_deadline: H3PhaseDeadline,
 ) -> Result<(), ()> {
     let response = match http::Response::builder()
         .status(status)
@@ -355,23 +466,48 @@ async fn send_h3_error_response(
         }
     };
 
-    if let Err(e) = stream.send_response(response).await {
-        warn!(
-            "Failed to send HTTP/3 error response headers to {}: {}",
-            src, e
-        );
-        return Err(());
+    match response_deadline.run(stream.send_response(response)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(
+                "Failed to send HTTP/3 error response headers to {}: {}",
+                src, e
+            );
+            return Err(());
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(stream, src, "error response headers");
+            return Err(());
+        }
     }
 
-    if let Err(e) = stream.finish().await {
-        warn!(
-            "Failed to finish HTTP/3 error response stream to {}: {}",
-            src, e
-        );
-        return Err(());
+    match response_deadline.run(stream.finish()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(
+                "Failed to finish HTTP/3 error response stream to {}: {}",
+                src, e
+            );
+            return Err(());
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(stream, src, "error response finish");
+            return Err(());
+        }
     }
 
     Ok(())
+}
+
+#[inline]
+fn cancel_h3_stream_on_deadline(
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    src: SocketAddr,
+    phase: &'static str,
+) {
+    warn!(client = %src, phase, "HTTP/3 request deadline exceeded; cancelling stream");
+    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
 }
 
 #[inline]
@@ -424,5 +560,70 @@ mod tests {
         let server_config = http3_server_config(dummy_server_config());
 
         assert_eq!(server_config.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phase_deadline_is_absolute_across_repeated_operations() {
+        let phase_deadline = H3PhaseDeadline {
+            at: Instant::now() + Duration::from_secs(5),
+        };
+
+        let first = phase_deadline
+            .run(tokio::time::sleep(Duration::from_secs(3)))
+            .await;
+        assert!(
+            first.is_ok(),
+            "the first operation should finish before the deadline"
+        );
+
+        let second = phase_deadline
+            .run(tokio::time::sleep(Duration::from_secs(3)))
+            .await;
+        assert!(
+            second.is_err(),
+            "repeated operations must share one absolute phase deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_lifetime_caps_later_phase_deadline() {
+        let request_deadline = H3RequestDeadline::new();
+        tokio::time::advance(Duration::from_secs(28)).await;
+        let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
+
+        let result = response_deadline
+            .run(tokio::time::sleep(Duration::from_secs(3)))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a phase cap must never extend the admitted request lifetime"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_releases_admission_permit_when_work_stalls() {
+        let limiter = InboundRequestLimiter::new(1);
+        let permit = limiter.acquire().await;
+        let request_deadline = H3RequestDeadline::new();
+        let executor_deadline = request_deadline.phase(HTTP3_REQUEST_EXECUTION_TIMEOUT);
+
+        let request = tokio::spawn(async move {
+            let _permit = permit;
+            let timed_out = executor_deadline
+                .run(std::future::pending::<()>())
+                .await
+                .is_err();
+            assert!(
+                timed_out,
+                "stalled request work must hit the request deadline"
+            );
+        });
+
+        request.await.expect("deadline task should complete");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .expect("request deadline must release admission capacity");
     }
 }
