@@ -908,13 +908,13 @@ pub struct Cache {
     ecs_in_key: bool,
 
     /// Periodic dump task id, if dump persistence is enabled.
-    dump_task_id: Mutex<Option<u64>>,
+    dump_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
     /// Periodic cleanup task id.
-    cleanup_task_id: Mutex<Option<u64>>,
+    cleanup_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
     /// Periodic ECS lookup-index maintenance task id.
-    ecs_index_task_id: Mutex<Option<u64>>,
+    ecs_index_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
     /// Deduplicates background refreshes for stale lazy cache hits.
     lazy_refresh_inflight: Arc<DashSet<CacheKey>>,
@@ -971,14 +971,20 @@ impl Cache {
         (dump_interval, check_interval_ms, dirty_age_target_ms)
     }
 
-    fn spawn_dump_task(&self, store: DnsCacheStore, dump_path: String, dump_interval: u64) -> u64 {
+    fn spawn_dump_task(
+        &self,
+        store: DnsCacheStore,
+        dump_path: String,
+        dump_interval: u64,
+    ) -> Result<task_center::ManagedTaskHandle> {
         let (dump_interval, check_interval_ms, dirty_age_target_ms) =
             Self::dump_schedule(dump_interval);
         let ecs_in_key = self.ecs_in_key;
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
-            move || {
+            task_center::TaskOptions::default(),
+            move |_| {
                 let store = store.clone();
                 let dump_path = dump_path.clone();
                 async move {
@@ -1004,14 +1010,15 @@ impl Cache {
         )
     }
 
-    fn spawn_cleanup_task(&self, store: DnsCacheStore) -> u64 {
+    fn spawn_cleanup_task(&self, store: DnsCacheStore) -> Result<task_center::ManagedTaskHandle> {
         let cache_size = store.cache_size();
         let last_cleanup_ms = Arc::new(AtomicU64::new(0));
         let cleanup_in_progress = Arc::new(AtomicBool::new(false));
         task_center::spawn_fixed(
             format!("cache:{}:cleanup", self.tag),
             Duration::from_secs(PRESSURE_CHECK_INTERVAL),
-            move || {
+            task_center::TaskOptions::default(),
+            move |_| {
                 let store = store.clone();
                 let last_cleanup_ms = last_cleanup_ms.clone();
                 let cleanup_in_progress = cleanup_in_progress.clone();
@@ -1063,11 +1070,15 @@ impl Cache {
         )
     }
 
-    fn spawn_ecs_index_maintenance_task(&self, store: DnsCacheStore) -> u64 {
+    fn spawn_ecs_index_maintenance_task(
+        &self,
+        store: DnsCacheStore,
+    ) -> Result<task_center::ManagedTaskHandle> {
         task_center::spawn_fixed(
             format!("cache:{}:ecs-index", self.tag),
             Duration::from_secs(ECS_INDEX_REBUILD_CHECK_INTERVAL),
-            move || {
+            task_center::TaskOptions::default(),
+            move |_| {
                 let store = store.clone();
                 async move {
                     if !store.ecs_lookup_index_needs_rebuild() {
@@ -1788,17 +1799,17 @@ impl Plugin for Cache {
         if let Some(dump_file) = &self.config.dump_file {
             let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
             let task_id =
-                self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval);
+                self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval)?;
             *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
         }
 
-        let cleanup_task_id = self.spawn_cleanup_task(self.store.clone());
+        let cleanup_task_id = self.spawn_cleanup_task(self.store.clone())?;
         *self
             .cleanup_task_id
             .lock()
             .expect("cleanup_task_id poisoned") = Some(cleanup_task_id);
 
-        let ecs_index_task_id = self.spawn_ecs_index_maintenance_task(self.store.clone());
+        let ecs_index_task_id = self.spawn_ecs_index_maintenance_task(self.store.clone())?;
         *self
             .ecs_index_task_id
             .lock()
@@ -1835,14 +1846,14 @@ impl Plugin for Cache {
             .expect("ecs_index_task_id poisoned")
             .take();
 
-        if let Some(task_id) = dump_task_id {
-            task_center::stop_task(task_id).await;
+        if let Some(task_handle) = dump_task_id {
+            task_handle.stop().await;
         }
-        if let Some(task_id) = cleanup_task_id {
-            task_center::stop_task(task_id).await;
+        if let Some(task_handle) = cleanup_task_id {
+            task_handle.stop().await;
         }
-        if let Some(task_id) = ecs_index_task_id {
-            task_center::stop_task(task_id).await;
+        if let Some(task_handle) = ecs_index_task_id {
+            task_handle.stop().await;
         }
 
         // No lazy refresh can be admitted after the gate closes above. Waiting

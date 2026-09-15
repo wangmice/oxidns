@@ -61,7 +61,7 @@ struct QueryRecorder {
     tag: String,
     config: ResolvedRecorderConfig,
     backend: Option<Arc<RecorderBackend>>,
-    cleanup_task_id: Option<u64>,
+    cleanup_task_handle: Option<task_center::ManagedTaskHandle>,
 }
 
 #[async_trait]
@@ -75,8 +75,8 @@ impl Plugin for QueryRecorder {
     }
 
     async fn destroy(&self) -> Result<()> {
-        if let Some(task_id) = self.cleanup_task_id {
-            task_center::stop_task(task_id).await;
+        if let Some(task_handle) = &self.cleanup_task_handle {
+            task_handle.stop().await;
         }
         let join_handle = if let Some(backend) = &self.backend {
             backend.stop_requested.store(true, Ordering::Relaxed);
@@ -146,7 +146,7 @@ impl QueryRecorder {
             tag,
             config,
             backend: None,
-            cleanup_task_id: None,
+            cleanup_task_handle: None,
         }
     }
 
@@ -158,10 +158,11 @@ impl QueryRecorder {
 
         let recorder_backend = backend.clone();
         let retention_ms = self.config.retention_days.saturating_mul(ONE_DAY_MS) as i64;
-        self.cleanup_task_id = Some(task_center::spawn_fixed(
+        self.cleanup_task_handle = Some(task_center::spawn_fixed(
             format!("query_recorder:{}:cleanup", self.tag),
             Duration::from_secs(self.config.cleanup_interval_hours * 60 * 60),
-            move || {
+            task_center::TaskOptions::default(),
+            move |_| {
                 let recorder_backend = recorder_backend.clone();
                 async move {
                     let cutoff_ms = Timestamp::now().as_millisecond() - retention_ms;
@@ -174,7 +175,7 @@ impl QueryRecorder {
                     }
                 }
             },
-        ));
+        )?);
         self.backend.replace(backend);
         Ok(())
     }

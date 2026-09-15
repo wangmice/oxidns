@@ -108,6 +108,52 @@ export interface ProviderReloadResponse {
 
 export class ProviderReloadBusyError extends Error {}
 
+export interface CronJobRunResponse {
+  ok: boolean;
+  job: string;
+  status: "started";
+  trigger: "manual";
+  run_id: number;
+}
+
+export type CronJobRunTrigger = "manual" | "schedule" | "interval";
+export type CronCurrentRunStatus = "pending" | "running";
+export type CronManualRunStatus =
+  | "completed"
+  | "completed_with_errors"
+  | "failed"
+  | "cancelled";
+
+export interface CronCurrentRun {
+  run_id: number;
+  trigger: CronJobRunTrigger;
+  status: CronCurrentRunStatus;
+  started_at_ms: number;
+}
+
+export interface CronManualRunResult {
+  run_id: number;
+  status: CronManualRunStatus;
+  executor_error_count: number;
+  completed_at_ms: number;
+}
+
+export interface CronJobRunSnapshot {
+  current_run: CronCurrentRun | null;
+  last_manual_run: CronManualRunResult | null;
+}
+
+export interface CronJobsStatusResponse {
+  ok: boolean;
+  jobs: Record<string, CronJobRunSnapshot>;
+}
+
+export class CronJobAlreadyRunningError extends Error {}
+
+export class CronJobNotFoundError extends Error {}
+
+export class CronJobUnavailableError extends Error {}
+
 export class ApiResponseError extends Error {
   readonly code?: string;
   readonly status: number;

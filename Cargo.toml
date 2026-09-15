@@ -151,7 +151,7 @@ ripset = { package = "oxidns-ripset", version = "0.1.2", path = "crates/ripset",
 [target.'cfg(windows)'.dependencies]
 zip = { version = "8", optional = true }
 windows-service = "0.8"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 
 # =============================================================================
@@ -305,7 +305,8 @@ plugin-query-recorder = ["api", "_sequence-step-recording", "dep:rusqlite"]
 plugin-ipset = ["dep:ripset"]
 
 # `cron` executor (cron-expression scheduled triggers).
-plugin-cron = ["dep:cronexpr"]
+_task-cron = ["dep:cronexpr"]
+plugin-cron = ["_task-cron"]
 
 # `dynamic_domain_set` provider + `learn_domain` executor (runtime-writable
 # domain rule set with background-flush persistence and pipeline learning).
