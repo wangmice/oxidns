@@ -13,11 +13,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{Endpoint, EndpointConfig, IdleTimeout, TransportConfig};
+use quinn::{Endpoint, EndpointConfig, IdleTimeout, TransportConfig, VarInt};
 use rustls::ServerConfig;
 
 use crate::infra::error::Result;
-use crate::plugin::server::udp;
+use crate::plugin::server::{DEFAULT_QUIC_MAX_BIDI_STREAMS, udp};
 
 /// Bind a QUIC [`Endpoint`] on `addr` using the provided rustls server config.
 ///
@@ -36,6 +36,7 @@ pub fn build_quic_endpoint(
     let mut config = TransportConfig::default();
     let timeout = IdleTimeout::try_from(timeout)?;
     config.max_idle_timeout(Some(timeout));
+    config.max_concurrent_bidi_streams(VarInt::from_u32(DEFAULT_QUIC_MAX_BIDI_STREAMS));
     server_config.transport = Arc::new(config);
 
     Ok(Endpoint::new(

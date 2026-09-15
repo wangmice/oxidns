@@ -23,7 +23,7 @@ use serde::Deserialize;
 use socket2::Socket;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 #[cfg(feature = "server-dot")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,8 @@ use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
     ActivityTrackedIo, ConnectionActivity, ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT,
-    RequestHandle, RequestMeta, Server, ServerMetrics,
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
+    InboundRequestLimiter, RequestHandle, RequestMeta, Server, ServerMetrics,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
@@ -235,12 +236,15 @@ async fn run_server(
         listen = %addr,
         idle_timeout_secs = idle_timeout.as_secs(),
         tls = %tls_mode,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        max_inflight_per_connection = DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
         "TCP server bound successfully"
     );
 
     let tasks = TaskTracker::new();
     let shutdown_token = CancellationToken::new();
     let active_connections = Arc::new(AtomicU64::new(0));
+    let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
 
     loop {
         tokio::select! {
@@ -260,12 +264,18 @@ async fn run_server(
                         let tls_acceptor = tls_acceptor.clone();
                         let task_shutdown = shutdown_token.clone();
                         let active_connections = active_connections.clone();
+                        let request_limiter = request_limiter.clone();
 
                         let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
                         debug!("New connection from {} (active: {})", src, active);
                         tasks.spawn(async move {
                             let _connection_guard =
                                 ConnectionGuard::new(active_connections.clone(), src, "TCP");
+                            let request_tasks = TaskTracker::new();
+                            let request_cancel = CancellationToken::new();
+                            let stream_request_tasks = request_tasks.clone();
+                            let stream_request_cancel = request_cancel.clone();
+
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
                                 _ = activity.wait_until_idle(idle_timeout) => {
@@ -288,8 +298,16 @@ async fn run_server(
                                                         .server_name()
                                                         .map(Arc::from);
                                                     debug!("TLS handshake completed for client {}", src);
-                                                    handle_dns_stream(tls_stream, src, handler, server_name)
-                                                        .await;
+                                                    handle_dns_stream(
+                                                        tls_stream,
+                                                        src,
+                                                        handler,
+                                                        server_name,
+                                                        request_limiter,
+                                                        stream_request_tasks,
+                                                        stream_request_cancel,
+                                                    )
+                                                    .await;
                                                 }
                                                 Err(e) => {
                                                     warn!("TLS handshake failed for {}: {}", src, e);
@@ -298,17 +316,42 @@ async fn run_server(
                                         } else {
                                             // Plain TCP connection
                                             debug!("TCP server connected to client {}", src);
-                                            handle_dns_stream(stream, src, handler, None).await;
+                                            handle_dns_stream(
+                                                stream,
+                                                src,
+                                                handler,
+                                                None,
+                                                request_limiter,
+                                                stream_request_tasks,
+                                                stream_request_cancel,
+                                            )
+                                            .await;
                                         }
                                     }
                                     #[cfg(not(feature = "server-dot"))]
                                     {
                                         // Plain TCP connection only (DoT requires --features server-dot).
                                         debug!("TCP server connected to client {}", src);
-                                        handle_dns_stream(stream, src, handler, None).await;
+                                        handle_dns_stream(
+                                            stream,
+                                            src,
+                                            handler,
+                                            None,
+                                            request_limiter,
+                                            stream_request_tasks,
+                                            stream_request_cancel,
+                                        )
+                                        .await;
                                     }
                                 } => {}
                             }
+
+                            // Request handlers belong to the connection. Cancel and join them
+                            // before releasing the connection task so executor futures cannot
+                            // continue detached after disconnect, idle timeout, or shutdown.
+                            request_cancel.cancel();
+                            request_tasks.close();
+                            request_tasks.wait().await;
                         });
                     }
                     Err(e) => {
@@ -332,44 +375,73 @@ async fn handle_dns_stream<S>(
     src: SocketAddr,
     handler: Arc<RequestHandle>,
     server_name: Option<Arc<str>>,
+    request_limiter: InboundRequestLimiter,
+    request_tasks: TaskTracker,
+    request_cancel: CancellationToken,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
     let transport = TcpTransport::new(stream);
     let (mut reader, writer) = transport.into_split();
 
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Message>(128);
+    let (sender, receiver) =
+        tokio::sync::mpsc::channel::<Message>(DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION);
 
     let _writer_task =
         AbortOnDropHandle::new(tokio::spawn(write_tcp_responses(writer, receiver, src)));
 
     let sender = Arc::new(sender);
+    let connection_limiter = Arc::new(Semaphore::new(DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION));
 
     loop {
+        let req_msg = tokio::select! {
+            _ = request_cancel.cancelled() => break,
+            result = reader.read_message() => match result {
+                Ok(req_msg) => req_msg,
+                Err(e) => {
+                    debug!("TCP client {} disconnected or read error: {}", src, e);
+                    break;
+                }
+            }
+        };
+
+        // Admission happens before task creation. If this connection already
+        // has 128 active handlers, stop reading and let TCP flow control push
+        // back on the client instead of accumulating more futures in memory.
+        let connection_permit = tokio::select! {
+            _ = request_cancel.cancelled() => break,
+            permit = connection_limiter.clone().acquire_owned() => {
+                permit.expect("TCP connection request limiter is never closed")
+            }
+        };
+        let server_permit = tokio::select! {
+            _ = request_cancel.cancelled() => break,
+            permit = request_limiter.acquire() => permit,
+        };
+
         let handler = handler.clone();
         let sender = sender.clone();
         let server_name = server_name.clone();
-        match reader.read_message().await {
-            Ok(req_msg) => tokio::spawn(async move {
-                let response = handler
-                    .handle_request(
-                        req_msg,
-                        src,
-                        RequestMeta {
-                            server_name,
-                            url_path: None,
-                        },
-                    )
-                    .await;
-                if let Err(e) = sender.send(response.response).await {
-                    warn!("Failed to write TCP response to {}: {}", src, e);
+        let task_cancel = request_cancel.clone();
+        request_tasks.spawn(async move {
+            let _connection_permit = connection_permit;
+            let _server_permit = server_permit;
+            tokio::select! {
+                _ = task_cancel.cancelled() => {}
+                response = handler.handle_request(
+                    req_msg,
+                    src,
+                    RequestMeta {
+                        server_name,
+                        url_path: None,
+                    },
+                ) => {
+                    if let Err(e) = sender.send(response.response).await {
+                        debug!("TCP response channel closed for {}: {}", src, e);
+                    }
                 }
-            }),
-            Err(e) => {
-                debug!("TCP client {} disconnected or read error: {}", src, e);
-                break;
             }
-        };
+        });
     }
 }
 

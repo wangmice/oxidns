@@ -25,7 +25,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
-use crate::plugin::server::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard, tcp};
+use crate::plugin::server::{
+    ActivityTrackedIo, ConnectionActivity, ConnectionGuard,
+    DEFAULT_HTTP2_MAX_INFLIGHT_PER_CONNECTION, InboundRequestLimiter, tcp,
+};
 
 /// Main HTTP/1.1 + HTTP/2 server loop (over TCP)
 ///
@@ -46,6 +49,7 @@ use crate::plugin::server::{ActivityTrackedIo, ConnectionActivity, ConnectionGua
 /// - `server_config`: Optional TLS server config for HTTPS
 /// - `idle_timeout`: Connection idle timeout in seconds
 /// - `src_ip_header`: HTTP header name to extract real client IP
+/// - `request_limiter`: Shared server-wide request admission budget
 #[hotpath::measure]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
@@ -55,6 +59,7 @@ pub async fn run_server(
     alt_svc: Option<http::HeaderValue>,
     idle_timeout: Duration,
     src_ip_header: Option<String>,
+    request_limiter: InboundRequestLimiter,
     mut shutdown_rx: watch::Receiver<bool>,
     startup_tx: Option<oneshot::Sender<Result<(), String>>>,
 ) {
@@ -83,6 +88,8 @@ pub async fn run_server(
         idle_timeout_secs = idle_timeout.as_secs(),
         has_tls = %server_config.is_some(),
         alt_svc = alt_svc.as_ref().and_then(|value| value.to_str().ok()),
+        max_inflight_requests = crate::plugin::server::DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        http2_max_concurrent_streams = DEFAULT_HTTP2_MAX_INFLIGHT_PER_CONNECTION,
         "HTTP server listening"
     );
 
@@ -119,6 +126,7 @@ pub async fn run_server(
                         let tls_acceptor = tls_acceptor.clone();
                         let task_shutdown = shutdown_token.clone();
                         let active_connections = active_connections.clone();
+                        let request_limiter = request_limiter.clone();
 
                         let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
                         debug!("New connection from {} (active: {})", src, active);
@@ -153,6 +161,7 @@ pub async fn run_server(
                                                     src_ip_header,
                                                     server_name,
                                                     alt_svc,
+                                                    request_limiter,
                                                 )
                                                 .await;
                                             }
@@ -163,8 +172,16 @@ pub async fn run_server(
                                     } else {
                                         // Plain HTTP connection
                                         debug!("HTTP server connected to client {}", src);
-                                        handle_http_stream(stream, src, dispatcher, src_ip_header, None, alt_svc)
-                                            .await;
+                                        handle_http_stream(
+                                            stream,
+                                            src,
+                                            dispatcher,
+                                            src_ip_header,
+                                            None,
+                                            alt_svc,
+                                            request_limiter,
+                                        )
+                                        .await;
                                     }
                                 } => {}
                             }
@@ -204,6 +221,7 @@ async fn handle_http_stream<S>(
     src_ip_header: Option<Arc<str>>,
     tls_server_name: Option<Arc<str>>,
     alt_svc: Option<Arc<http::HeaderValue>>,
+    request_limiter: InboundRequestLimiter,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
@@ -212,6 +230,7 @@ async fn handle_http_stream<S>(
         let src_ip_header = src_ip_header.clone();
         let tls_server_name = tls_server_name.clone();
         let alt_svc = alt_svc.clone();
+        let request_limiter = request_limiter.clone();
         async move {
             handle_hyper_request(
                 request,
@@ -220,13 +239,17 @@ async fn handle_http_stream<S>(
                 src_ip_header,
                 tls_server_name,
                 alt_svc,
+                request_limiter,
             )
             .await
         }
     });
 
     let io = TokioIo::new(stream);
-    let builder = AutoBuilder::new(TokioExecutor::new());
+    let mut builder = AutoBuilder::new(TokioExecutor::new());
+    builder
+        .http2()
+        .max_concurrent_streams(DEFAULT_HTTP2_MAX_INFLIGHT_PER_CONNECTION);
     if let Err(err) = builder.serve_connection(io, service).await {
         debug!("HTTP connection error from {}: {}", src, err);
     }
@@ -243,7 +266,12 @@ async fn handle_hyper_request(
     src_ip_header: Option<Arc<str>>,
     tls_server_name: Option<Arc<str>>,
     alt_svc: Option<Arc<http::HeaderValue>>,
+    request_limiter: InboundRequestLimiter,
 ) -> StdResult<Response<Full<Bytes>>, Infallible> {
+    // Hyper owns request-future lifecycle, but admission still happens before
+    // body buffering or executor work. HTTP/2 additionally advertises a
+    // per-connection stream ceiling above, so waiter futures remain bounded.
+    let _permit = request_limiter.acquire().await;
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let uri = parts.uri;
@@ -350,8 +378,8 @@ mod tests {
     use crate::infra::error::Result;
     use crate::plugin::Plugin;
     use crate::plugin::executor::{ExecStep, Executor};
-    use crate::plugin::server::RequestHandle;
     use crate::plugin::server::http::entry::HttpDnsEntry;
+    use crate::plugin::server::{DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, RequestHandle};
     use crate::proto::{Message, Name, Question, Rcode, RecordType};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +488,7 @@ mod tests {
             Some(Arc::new(http::HeaderValue::from_static(
                 "h3=\":443\"; ma=86400",
             ))),
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         ));
 
         let (mut sender, connection) = http1::handshake(TokioIo::new(client))
@@ -519,6 +548,7 @@ mod tests {
             Some(Arc::new(http::HeaderValue::from_static(
                 "h3=\":443\"; ma=86400",
             ))),
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         ));
 
         let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
@@ -577,6 +607,7 @@ mod tests {
             None,
             None,
             None,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         ));
 
         let (mut sender, connection) = http1::handshake(TokioIo::new(client))

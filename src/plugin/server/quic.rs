@@ -31,8 +31,9 @@ use crate::infra::observability::metrics::{register_metric_source, unregister_me
 use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
-    ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT, RequestHandle, RequestMeta, Server,
-    ServerMetrics, quic_endpoint,
+    ConnectionGuard, DEFAULT_QUIC_MAX_BIDI_STREAMS, DEFAULT_SERVER_IDLE_TIMEOUT,
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundRequestLimiter, RequestHandle, RequestMeta,
+    Server, ServerMetrics, quic_endpoint,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
@@ -203,13 +204,19 @@ async fn run_server(
     if let Some(tx) = startup_tx.take() {
         let _ = tx.send(Ok(()));
     }
-    info!(listen = %addr, "QUIC server listening");
+    info!(
+        listen = %addr,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        max_bidi_streams = DEFAULT_QUIC_MAX_BIDI_STREAMS,
+        "QUIC server listening"
+    );
     // QUIC endpoint created successfully; enter the accept loop.
     debug!("QUIC server event loop started on {}", addr);
 
     let tasks = TaskTracker::new();
     let shutdown_token = CancellationToken::new();
     let active_connections = Arc::new(AtomicU64::new(0));
+    let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
 
     // Accept QUIC connections and spawn a task per connection.
     loop {
@@ -226,13 +233,29 @@ async fn run_server(
                         let handler_clone = handler.clone();
                         let task_shutdown = shutdown_token.clone();
                         let active_connections = active_connections.clone();
+                        let request_limiter = request_limiter.clone();
                         tasks.spawn(async move {
                             let _connection_guard =
                                 ConnectionGuard::new(active_connections.clone(), connecting.remote_address(), "QUIC");
+                            let stream_tasks = TaskTracker::new();
+                            let stream_cancel = CancellationToken::new();
+                            let connection_stream_tasks = stream_tasks.clone();
+                            let connection_stream_cancel = stream_cancel.clone();
+
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
-                                _ = handle_quic_connection(connecting, handler_clone) => {}
+                                _ = handle_quic_connection(
+                                    connecting,
+                                    handler_clone,
+                                    request_limiter,
+                                    connection_stream_tasks,
+                                    connection_stream_cancel,
+                                ) => {}
                             }
+
+                            stream_cancel.cancel();
+                            stream_tasks.close();
+                            stream_tasks.wait().await;
                         });
                         debug!("New QUIC connection started (active: {})", active);
                     }
@@ -252,7 +275,13 @@ async fn run_server(
 /// QUIC). Each bi-directional stream represents a single DNS query/response
 /// exchange.
 #[hotpath::measure]
-async fn handle_quic_connection(connecting: quinn::Incoming, handler: Arc<RequestHandle>) {
+async fn handle_quic_connection(
+    connecting: quinn::Incoming,
+    handler: Arc<RequestHandle>,
+    request_limiter: InboundRequestLimiter,
+    stream_tasks: TaskTracker,
+    stream_cancel: CancellationToken,
+) {
     let remote_addr = connecting.remote_address();
     let connection = match connecting.await {
         Ok(c) => c,
@@ -270,29 +299,46 @@ async fn handle_quic_connection(connecting: quinn::Incoming, handler: Arc<Reques
     let server_name = server_name.map(Arc::from);
 
     loop {
-        match transport.accept_bi().await {
-            Ok((reader, writer)) => {
-                let handler = handler.clone();
-                let server_name = server_name.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_doq_bi_stream(
-                        reader,
-                        writer,
-                        handler.clone(),
-                        remote_addr,
-                        server_name,
-                    )
-                    .await
-                    {
+        let (reader, writer) = tokio::select! {
+            _ = stream_cancel.cancelled() => return,
+            result = transport.accept_bi() => match result {
+                Ok(streams) => streams,
+                Err(e) => {
+                    debug!("QUIC connection closed by {}: {}", remote_addr, e);
+                    return;
+                }
+            }
+        };
+
+        // Wait for server-wide capacity before creating a stream handler task.
+        // While saturated we stop accepting more streams from this connection,
+        // allowing QUIC's stream limit and flow control to provide backpressure.
+        let permit = tokio::select! {
+            _ = stream_cancel.cancelled() => return,
+            _ = transport.closed() => return,
+            permit = request_limiter.acquire() => permit,
+        };
+
+        let handler = handler.clone();
+        let server_name = server_name.clone();
+        let task_cancel = stream_cancel.clone();
+        stream_tasks.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = task_cancel.cancelled() => {}
+                result = handle_doq_bi_stream(
+                    reader,
+                    writer,
+                    handler,
+                    remote_addr,
+                    server_name,
+                ) => {
+                    if let Err(e) = result {
                         warn!("DoQ stream error ({}): {}", remote_addr, e);
                     }
-                });
+                }
             }
-            Err(e) => {
-                debug!("QUIC connection closed by {}: {}", remote_addr, e);
-                return;
-            }
-        }
+        });
     }
 }
 

@@ -11,10 +11,19 @@ use std::time::Duration;
 
 use crate::plugin::Plugin;
 
+mod admission;
 mod connection;
 mod metrics;
 mod request;
 
+#[cfg(feature = "server-doh")]
+pub(crate) use admission::DEFAULT_HTTP2_MAX_INFLIGHT_PER_CONNECTION;
+#[cfg(any(feature = "server-doq", feature = "server-doh3"))]
+pub(crate) use admission::DEFAULT_QUIC_MAX_BIDI_STREAMS;
+pub(crate) use admission::{
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
+    InboundRequestLimiter,
+};
 pub(crate) use connection::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard};
 pub(crate) use metrics::ServerMetrics;
 pub use request::{RequestExit, RequestHandle, RequestMeta, RequestResult};
