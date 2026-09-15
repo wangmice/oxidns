@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::task::{Context, Poll};
 use std::{fmt, io};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION,
@@ -39,6 +39,7 @@ use crate::infra::network::proxy::{Socks5Opt, connect_tcp, parse_optional_socks5
 use crate::infra::network::tls_config::{insecure_client_config, secure_client_config};
 
 pub const DEFAULT_MAX_REDIRECTS: usize = 5;
+pub const DEFAULT_MAX_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 type InnerClient = HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -80,6 +81,7 @@ pub struct HttpRequestOptions {
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub body: Bytes,
     pub max_redirects: usize,
+    pub max_response_body_size: usize,
 }
 
 impl HttpRequestOptions {
@@ -89,6 +91,7 @@ impl HttpRequestOptions {
             headers: Vec::new(),
             body: Bytes::new(),
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
         }
     }
 
@@ -104,6 +107,11 @@ impl HttpRequestOptions {
 
     pub fn with_max_redirects(mut self, max_redirects: usize) -> Self {
         self.max_redirects = max_redirects;
+        self
+    }
+
+    pub fn with_max_response_body_size(mut self, max_response_body_size: usize) -> Self {
+        self.max_response_body_size = max_response_body_size;
         self
     }
 }
@@ -171,15 +179,18 @@ impl HttpClient {
         method: Method,
         options: HttpRequestOptions,
     ) -> Result<HttpResponse> {
+        let max_response_body_size = options.max_response_body_size;
         let response = self.request_following_redirects(method, options).await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|err| DnsError::plugin(format!("failed to read response body: {err}")))?
-            .to_bytes();
+        if content_length(&headers).is_some_and(|length| length > max_response_body_size as u64) {
+            return Err(DnsError::plugin(format!(
+                "http response body exceeds configured {}-byte limit",
+                max_response_body_size
+            )));
+        }
+        let body =
+            collect_response_body_limited(response.into_body(), max_response_body_size).await?;
         Ok(HttpResponse {
             status,
             headers,
@@ -360,6 +371,25 @@ impl Service<Uri> for HttpConnector {
             Ok(TokioIo::new(stream))
         })
     }
+}
+
+async fn collect_response_body_limited(mut body: Incoming, limit: usize) -> Result<Bytes> {
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|err| DnsError::plugin(format!("failed to read response body: {err}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.len() > limit.saturating_sub(collected.len()) {
+            return Err(DnsError::plugin(format!(
+                "http response body exceeds configured {}-byte limit",
+                limit
+            )));
+        }
+        collected.extend_from_slice(&data);
+    }
+    Ok(collected.freeze())
 }
 
 pub async fn drain_response_body(mut body: Incoming) -> Result<()> {
@@ -803,11 +833,13 @@ mod tests {
                 HeaderValue::from_static("1"),
             )])
             .with_body(Bytes::from_static(b"body"))
-            .with_max_redirects(2);
+            .with_max_redirects(2)
+            .with_max_response_body_size(4096);
         assert_eq!(options.url, "https://example.com");
         assert_eq!(options.headers.len(), 1);
         assert_eq!(options.body, Bytes::from_static(b"body"));
         assert_eq!(options.max_redirects, 2);
+        assert_eq!(options.max_response_body_size, 4096);
     }
 
     #[test]
@@ -836,6 +868,50 @@ mod tests {
         );
         assert_eq!(parse_uri_host_ip_literal("::1"), None);
         assert_eq!(parse_uri_host_ip_literal("example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_streamed_body_over_configured_limit() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("test HTTP listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test HTTP listener should have an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test HTTP listener should accept a request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("test HTTP request should be readable");
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n",
+                )
+                .await
+                .expect("test HTTP response should be writable");
+        });
+
+        let client = HttpClient::new(HttpClientOptions::new(false, None));
+        let error = client
+            .get_request(
+                HttpRequestOptions::from_url(format!("http://{addr}/large"))
+                    .with_max_response_body_size(6),
+            )
+            .await
+            .expect_err("streamed body beyond the configured limit must fail");
+
+        assert!(error.to_string().contains("exceeds configured 6-byte limit"));
+        server.await.expect("test HTTP server should exit normally");
     }
 
     #[tokio::test]
