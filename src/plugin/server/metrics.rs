@@ -21,6 +21,7 @@ pub(crate) struct ServerMetrics {
     completed_total: AtomicU64,
     controlled_total: AtomicU64,
     failed_total: AtomicU64,
+    admission_rejected_total: AtomicU64,
     inflight: AtomicU64,
     latency_count: AtomicU64,
     latency_sum_ms: AtomicU64,
@@ -35,6 +36,7 @@ impl ServerMetrics {
             completed_total: AtomicU64::new(0),
             controlled_total: AtomicU64::new(0),
             failed_total: AtomicU64::new(0),
+            admission_rejected_total: AtomicU64::new(0),
             inflight: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
@@ -46,6 +48,12 @@ impl ServerMetrics {
         self.request_total.fetch_add(1, Ordering::Relaxed);
         self.inflight.fetch_add(1, Ordering::Relaxed);
         AppClock::elapsed_millis()
+    }
+
+    #[inline]
+    pub(super) fn on_admission_rejected(&self) {
+        self.admission_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -100,6 +108,12 @@ impl MetricSource for ServerMetrics {
             "Total requests that produced a SERVFAIL because the entry executor failed.",
             &labels,
             self.failed_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "server_admission_rejected_total",
+            "Total inbound requests dropped before handler spawn because the server admission limit was full.",
+            &labels,
+            self.admission_rejected_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::gauge(
             "server_inflight",

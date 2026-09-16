@@ -27,7 +27,9 @@ use crate::infra::network::listen::{self, parse_listen_addr};
 use crate::infra::network::transport::udp::UdpServerTransport;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
-use crate::plugin::server::{RequestHandle, Server, ServerMetrics};
+use crate::plugin::server::{
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, RequestHandle, Server, ServerMetrics,
+};
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
 
@@ -213,7 +215,12 @@ async fn run_server(
     if let Some(tx) = startup_tx.take() {
         let _ = tx.send(Ok(()));
     }
-    info!(listen = %addr, recv_buffer_size, "UDP server listening");
+    info!(
+        listen = %addr,
+        recv_buffer_size,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        "UDP server listening"
+    );
     debug!("UDP server event loop started on {}", addr);
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
@@ -229,6 +236,15 @@ async fn run_server(
             recv = transport.read_message_from(&mut buf) => {
                 match recv {
                     Ok((msg, reply_target)) => {
+                        // UDP has a single handler-spawn producer. Reuse the task tracker's
+                        // existing count instead of adding a semaphore to the hot path.
+                        if !udp_has_request_capacity(&tasks, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS) {
+                            if let Some(metrics) = handler.metrics.as_ref() {
+                                metrics.on_admission_rejected();
+                            }
+                            continue;
+                        }
+
                         let src_addr = reply_target.peer_addr();
                         let max_payload = msg.max_payload();
                         let handler = handler.clone();
@@ -267,6 +283,11 @@ async fn run_server(
         );
     }
     info!(listen = %addr, "UDP server stopped");
+}
+
+#[inline]
+fn udp_has_request_capacity(tasks: &TaskTracker, limit: usize) -> bool {
+    tasks.len() < limit
 }
 
 async fn drain_udp_tasks(
@@ -443,6 +464,22 @@ recv_buffer_size: 262144
         .unwrap();
 
         assert_eq!(config.recv_buffer_size, Some(262_144));
+    }
+
+    #[test]
+    fn test_udp_admission_uses_existing_task_tracker_count() {
+        let tasks = TaskTracker::new();
+
+        assert!(udp_has_request_capacity(&tasks, 2));
+        let first = tasks.token();
+        assert!(udp_has_request_capacity(&tasks, 2));
+        let second = tasks.token();
+        assert!(!udp_has_request_capacity(&tasks, 2));
+
+        drop(first);
+        assert!(udp_has_request_capacity(&tasks, 2));
+        drop(second);
+        assert_eq!(tasks.len(), 0);
     }
 
     #[tokio::test]
