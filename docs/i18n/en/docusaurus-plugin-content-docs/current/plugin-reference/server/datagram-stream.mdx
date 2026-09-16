@@ -22,6 +22,8 @@ Listens for DNS over UDP and forwards requests to `entry`.
     entry: "seq_main"
     # Can be written as ip:port, [ipv6]:port, or :port
     listen: ":53"
+    # Optional kernel UDP receive buffer in bytes; defaults to 1 MiB
+    recv_buffer_size: 1048576
 ```
 
 ### Configuration Details
@@ -53,6 +55,22 @@ Listens for DNS over UDP and forwards requests to `entry`.
   - Determines the bound address and port.
   - `:port` means dual-stack `[::]:port`; use `0.0.0.0:port` for IPv4-only.
   - Invalid addresses, port conflicts, or bind failures prevent startup.
+
+#### `recv_buffer_size`
+
+- Type: `integer`; Required: no; Default: `1048576` (1 MiB)
+- Purpose: Requests the kernel receive-buffer size for the UDP socket, in bytes.
+- Example: `recv_buffer_size: 2097152`
+- Valid range: `262144`–`16777216` bytes (256 KiB–16 MiB).
+- Guidance:
+  - Default/recommended: `1048576` (1 MiB); most deployments do not need to change it.
+  - Home or light workloads: 256–512 KiB.
+  - Higher concurrency or bursty traffic: 2–4 MiB; increase further only when kernel drops justify it, up to 16 MiB.
+  - Clearly undersized values such as `32`, `64`, or `65536` are rejected during plugin initialization; values above 16 MiB are rejected as well.
+- Runtime impact:
+  - A larger buffer reduces kernel drops during high-PPS bursts or short periods when the event loop is busy.
+  - The operating system may clamp the effective size to its global socket-buffer limit.
+  - If the requested buffer size cannot be set, listener startup fails with an error.
 
 ### Behavior
 

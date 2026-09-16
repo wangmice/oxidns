@@ -9,12 +9,14 @@
 
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use socket2::Socket;
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
@@ -30,7 +32,10 @@ use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
 
 const UDP_RECV_BUFFER_SIZE: usize = 65_535;
-const UDP_SOCKET_BUFFER_SIZE: usize = 64 * 1024;
+const MIN_UDP_SOCKET_BUFFER_SIZE: usize = 256 * 1024;
+const DEFAULT_UDP_SOCKET_BUFFER_SIZE: usize = 1024 * 1024;
+const MAX_UDP_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+const UDP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// UDP server configuration
 #[derive(Deserialize)]
@@ -49,6 +54,14 @@ pub struct UdpServerConfig {
     /// - Must be a valid listen address or validation will fail.
     /// - Ensure the port is not occupied by other UDP listeners.
     listen: String,
+
+    /// Requested kernel receive-buffer size in bytes.
+    ///
+    /// Valid range is 256 KiB through 16 MiB; defaults to the recommended 1 MiB.
+    /// The operating system may clamp the effective value to its configured
+    /// socket-buffer limit.
+    #[serde(default)]
+    recv_buffer_size: Option<usize>,
 }
 
 /// UDP DNS server plugin
@@ -56,6 +69,7 @@ pub struct UdpServerConfig {
 pub struct UdpServer {
     tag: String,
     listen: SocketAddr,
+    recv_buffer_size: usize,
     request_handle: Arc<RequestHandle>,
     metrics: Arc<ServerMetrics>,
     shutdown_tx: watch::Sender<bool>,
@@ -67,6 +81,7 @@ impl std::fmt::Debug for UdpServer {
         f.debug_struct("UdpServer")
             .field("tag", &self.tag)
             .field("listen", &self.listen)
+            .field("recv_buffer_size", &self.recv_buffer_size)
             .finish()
     }
 }
@@ -89,10 +104,12 @@ impl UdpServer {
         }
 
         let addr = self.listen;
+        let recv_buffer_size = self.recv_buffer_size;
         let handler = self.request_handle.clone();
         let shutdown_rx = self.shutdown_tx.subscribe();
         *task_slot = Some(tokio::spawn(run_server(
             addr,
+            recv_buffer_size,
             handler,
             shutdown_rx,
             startup_tx,
@@ -161,12 +178,13 @@ impl Server for UdpServer {
 #[hotpath::measure]
 async fn run_server(
     addr: SocketAddr,
+    recv_buffer_size: usize,
     handler: Arc<RequestHandle>,
     mut shutdown_rx: watch::Receiver<bool>,
     startup_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
 ) {
     let mut startup_tx = startup_tx;
-    let socket = match build_udp_socket(addr) {
+    let socket = match build_udp_socket_with_recv_buffer_size(addr, recv_buffer_size) {
         Ok(s) => s,
         Err(e) => {
             if let Some(tx) = startup_tx.take() {
@@ -195,11 +213,12 @@ async fn run_server(
     if let Some(tx) = startup_tx.take() {
         let _ = tx.send(Ok(()));
     }
-    info!(listen = %addr, "UDP server listening");
+    info!(listen = %addr, recv_buffer_size, "UDP server listening");
     debug!("UDP server event loop started on {}", addr);
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
     let tasks = TaskTracker::new();
+    let request_cancel = CancellationToken::new();
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -214,14 +233,21 @@ async fn run_server(
                         let max_payload = msg.max_payload();
                         let handler = handler.clone();
                         let transport = transport.clone();
+                        let task_cancel = request_cancel.clone();
                         tasks.spawn(async move {
-                            let response = handler.handle_request(msg, src_addr, RequestMeta{server_name: None, url_path: None}).await;
-                            // Use requester-advertised UDP payload limit (EDNS) when encoding
-                            // response so oversize replies become TC=1 DNS messages, not raw truncation.
-                            if let Err(e) =
-                                transport.write_message_to(&response.response, reply_target, max_payload).await
-                            {
-                                warn!("Failed to send response to {}: {}", src_addr, e);
+                            tokio::select! {
+                                biased;
+                                _ = task_cancel.cancelled() => {}
+                                _ = async {
+                                    let response = handler.handle_request(msg, src_addr, RequestMeta{server_name: None, url_path: None}).await;
+                                    // Use requester-advertised UDP payload limit (EDNS) when encoding
+                                    // response so oversize replies become TC=1 DNS messages, not raw truncation.
+                                    if let Err(e) =
+                                        transport.write_message_to(&response.response, reply_target, max_payload).await
+                                    {
+                                        warn!("Failed to send response to {}: {}", src_addr, e);
+                                    }
+                                } => {}
                             }
                         });
                     }
@@ -233,19 +259,47 @@ async fn run_server(
         }
     }
 
-    tasks.close();
-    tasks.wait().await;
+    if !drain_udp_tasks(&tasks, &request_cancel, UDP_SHUTDOWN_DRAIN_TIMEOUT).await {
+        warn!(
+            listen = %addr,
+            drain_timeout_secs = UDP_SHUTDOWN_DRAIN_TIMEOUT.as_secs_f64(),
+            "UDP request drain timed out; cancelling remaining handlers"
+        );
+    }
     info!(listen = %addr, "UDP server stopped");
+}
+
+async fn drain_udp_tasks(
+    tasks: &TaskTracker,
+    request_cancel: &CancellationToken,
+    drain_timeout: Duration,
+) -> bool {
+    tasks.close();
+    if tokio::time::timeout(drain_timeout, tasks.wait()).await.is_ok() {
+        return true;
+    }
+
+    request_cancel.cancel();
+    false
 }
 
 /// Build a UDP socket with reuse_address and reuse_port options when available
 ///
 /// Creates a socket optimized for DNS server workloads with port reuse enabled.
 pub fn build_udp_socket(addr: SocketAddr) -> Result<StdUdpSocket> {
-    listen::build_udp_socket(addr, configure_udp_socket)
+    build_udp_socket_with_recv_buffer_size(addr, DEFAULT_UDP_SOCKET_BUFFER_SIZE)
 }
 
-fn configure_udp_socket(sock: &Socket) -> Result<()> {
+fn build_udp_socket_with_recv_buffer_size(
+    addr: SocketAddr,
+    recv_buffer_size: usize,
+) -> Result<StdUdpSocket> {
+    listen::build_udp_socket(addr, |sock| {
+        configure_udp_socket(sock, recv_buffer_size)
+    })
+}
+
+fn configure_udp_socket(sock: &Socket, recv_buffer_size: usize) -> Result<()> {
     #[cfg(all(
         unix,
         not(any(
@@ -256,8 +310,23 @@ fn configure_udp_socket(sock: &Socket) -> Result<()> {
         ))
     ))]
     let _ = sock.set_reuse_port(true);
-    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE);
+    sock.set_recv_buffer_size(recv_buffer_size)?;
     Ok(())
+}
+
+fn resolve_udp_recv_buffer_size(configured: Option<usize>) -> Result<usize> {
+    let recv_buffer_size = configured.unwrap_or(DEFAULT_UDP_SOCKET_BUFFER_SIZE);
+    if !(MIN_UDP_SOCKET_BUFFER_SIZE..=MAX_UDP_SOCKET_BUFFER_SIZE)
+        .contains(&recv_buffer_size)
+    {
+        return Err(DnsError::plugin(format!(
+            "UDP server recv_buffer_size must be between {} bytes (256 KiB) and {} bytes (16 MiB); recommended/default is {} bytes (1 MiB)",
+            MIN_UDP_SOCKET_BUFFER_SIZE,
+            MAX_UDP_SOCKET_BUFFER_SIZE,
+            DEFAULT_UDP_SOCKET_BUFFER_SIZE,
+        )));
+    }
+    Ok(recv_buffer_size)
 }
 
 /// Factory for creating UDP server plugin instances
@@ -295,6 +364,7 @@ impl PluginFactory for UdpServerFactory {
                 udp_config.listen, e
             ))
         })?;
+        let recv_buffer_size = resolve_udp_recv_buffer_size(udp_config.recv_buffer_size)?;
 
         // Resolve and type-check the entry executor using contextual
         // diagnostics.
@@ -306,6 +376,7 @@ impl PluginFactory for UdpServerFactory {
             UdpServer {
                 tag: plugin_config.tag.clone(),
                 listen,
+                recv_buffer_size,
                 request_handle: Arc::new(RequestHandle {
                     entry_executor,
                     metrics: Some(metrics.clone()),
@@ -330,6 +401,70 @@ mod tests {
         let factory = UdpServerFactory {};
         let cfg = plugin_config("udp", "udp_server", None);
         assert!(crate::plugin::test_utils::create_plugin_for_test(&factory, &cfg).is_err());
+    }
+
+    #[test]
+    fn test_udp_recv_buffer_size_defaults_and_enforces_supported_range() {
+        assert_eq!(
+            resolve_udp_recv_buffer_size(None).unwrap(),
+            DEFAULT_UDP_SOCKET_BUFFER_SIZE
+        );
+        assert_eq!(
+            resolve_udp_recv_buffer_size(Some(MIN_UDP_SOCKET_BUFFER_SIZE)).unwrap(),
+            MIN_UDP_SOCKET_BUFFER_SIZE
+        );
+        assert_eq!(
+            resolve_udp_recv_buffer_size(Some(MAX_UDP_SOCKET_BUFFER_SIZE)).unwrap(),
+            MAX_UDP_SOCKET_BUFFER_SIZE
+        );
+
+        for invalid in [
+            0,
+            32,
+            64,
+            MIN_UDP_SOCKET_BUFFER_SIZE - 1,
+            MAX_UDP_SOCKET_BUFFER_SIZE + 1,
+        ] {
+            let error = resolve_udp_recv_buffer_size(Some(invalid)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("recv_buffer_size"));
+            assert!(message.contains("256 KiB"));
+            assert!(message.contains("16 MiB"));
+            assert!(message.contains("1 MiB"));
+        }
+    }
+
+    #[test]
+    fn test_udp_config_deserializes_recv_buffer_size() {
+        let config: UdpServerConfig = serde_yaml_ng::from_str(
+            r#"
+entry: seq_main
+listen: ":53"
+recv_buffer_size: 262144
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.recv_buffer_size, Some(262_144));
+    }
+
+    #[tokio::test]
+    async fn test_udp_task_drain_cancels_after_timeout() {
+        use std::time::Duration;
+
+        let tasks = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        tasks.spawn(async move {
+            task_cancel.cancelled().await;
+        });
+
+        let graceful =
+            drain_udp_tasks(&tasks, &cancel, Duration::from_millis(1)).await;
+        assert!(!graceful);
+        tokio::time::timeout(Duration::from_secs(1), tasks.wait())
+            .await
+            .expect("cancelled UDP task should stop promptly");
     }
 
     #[test]
@@ -395,6 +530,7 @@ mod tests {
         let mut server = UdpServer {
             tag: tag.clone(),
             listen: blocker.local_addr().unwrap().as_socket().unwrap(),
+            recv_buffer_size: DEFAULT_UDP_SOCKET_BUFFER_SIZE,
             request_handle: Arc::new(RequestHandle {
                 entry_executor: executor.into(),
                 metrics: None,

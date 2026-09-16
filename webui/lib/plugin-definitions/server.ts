@@ -62,6 +62,16 @@ export const serverPluginDefinitions: PluginKindDefinition[] = [
         example: "0.0.0.0:53",
         required: true,
       },
+      {
+        key: "recv_buffer_size",
+        description:
+          "UDP socket 内核接收缓冲区，范围 262144–16777216 字节（256 KiB–16 MiB），默认/推荐 1048576（1 MiB）。",
+        label: "接收缓冲区(字节)",
+        type: "number",
+        example: "1048576",
+        default: 1048576,
+        advanced: true,
+      },
     ],
   },
   {

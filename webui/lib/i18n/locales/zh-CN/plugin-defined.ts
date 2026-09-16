@@ -33,6 +33,11 @@ export const zhCNPluginDefined = {
           description: "指定 UDP 监听地址。",
           example: "0.0.0.0:53",
         },
+        recv_buffer_size: {
+          label: "接收缓冲区(字节)",
+          description:
+            "范围 256 KiB–16 MiB；默认/推荐 1 MiB。过小或过大的值会被配置校验拒绝。",
+        },
       },
       metrics: {
         labels: {
