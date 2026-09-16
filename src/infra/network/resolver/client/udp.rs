@@ -14,10 +14,8 @@ use super::{NameserverClient, effective_deadline};
 use crate::infra::error::Result;
 use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
 use crate::infra::network::dial::{SocketOptions, UdpDialOptions, connect_udp};
-use crate::infra::network::transport::udp::UdpTransport;
+use crate::infra::network::transport::udp::{UDP_MAX_DATAGRAM_SIZE, UdpTransport};
 use crate::proto::Message;
-
-const UDP_RECV_BUFFER_SIZE: usize = 8_196;
 
 #[derive(Debug)]
 pub(super) struct UdpNameserverClient {
@@ -73,7 +71,7 @@ async fn query_udp_config(
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     }
 
-    let mut buf = [0u8; UDP_RECV_BUFFER_SIZE];
+    let mut buf = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
     let response = match deadline.run(transport.read_message(&mut buf)).await {
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),

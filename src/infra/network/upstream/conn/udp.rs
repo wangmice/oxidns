@@ -18,13 +18,14 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
-use crate::infra::network::transport::udp::{UdpReadError, UdpTransport};
+use crate::infra::network::transport::udp::{
+    UDP_MAX_DATAGRAM_SIZE, UdpReadError, UdpTransport,
+};
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
 use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, QueryDeadline};
 use crate::proto::Message;
 
-const UDP_RECV_BUFFER_SIZE: usize = 8_196;
 const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
 const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
 
@@ -133,15 +134,23 @@ impl Connection for UdpConnection {
             // Send UDP datagram via transport
             match self
                 .transport
-                .write_message_with_id(&request, query_id)
+                .write_message_with_id_classified(&request, query_id)
                 .await
             {
                 Ok(()) => {}
                 Err(e) => {
-                    error!(conn_id = self.id,
-            upstream = %self.upstream, err = %e, "Failed to send UDP query");
-                    self.close();
-                    return Err(e);
+                    let retire_connection = e.should_close_connection();
+                    error!(
+                        conn_id = self.id,
+                        upstream = %self.upstream,
+                        err = %e,
+                        retire_connection,
+                        "Failed to send UDP query"
+                    );
+                    if retire_connection {
+                        self.close();
+                    }
+                    return Err(e.into_dns_error());
                 }
             }
 
@@ -231,11 +240,10 @@ impl UdpConnection {
     /// the connection closes.
     ///
     /// # Buffer Size
-    /// Direct UDP keeps the bounded DNS-sized buffer. SOCKS5 uses a full UDP
-    /// datagram buffer so the SOCKS5 header and the maximum DNS payload can be
-    /// received and decoded in place without a separate temporary allocation.
+    /// Use a full UDP datagram buffer so a valid large DNS response is never
+    /// truncated locally before the DNS parser can inspect it.
     async fn listen_dns_response(self: Arc<Self>) {
-        let mut buf = vec![0u8; self.transport.recv_buffer_size(UDP_RECV_BUFFER_SIZE)];
+        let mut buf = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
         let mut closing = false;
         let mut consecutive_recv_errors = 0u32;
 
