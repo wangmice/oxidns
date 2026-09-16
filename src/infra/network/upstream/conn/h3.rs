@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
@@ -12,6 +14,7 @@ use h3_quinn::{BidiStream, OpenStreams};
 use http::{Request, Version};
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
 use super::{UsingCountGuard, quic_idle_timeout};
@@ -32,6 +35,18 @@ use crate::infra::network::upstream::conn::doh::{
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
+
+const H3_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn run_bounded_h3_shutdown<F, C>(timeout_duration: Duration, graceful: F, force_close: C)
+where
+    F: Future<Output = ()>,
+    C: FnOnce(),
+{
+    if timeout(timeout_duration, graceful).await.is_err() {
+        force_close();
+    }
+}
 
 enum H3RecvError {
     Connection(DnsError),
@@ -251,6 +266,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             connect_quic(socket, dial_options).await?
         };
 
+        let force_close_conn = quic_conn.clone();
         let h3_conn = h3_quinn::Connection::new(quic_conn);
 
         let (mut driver, send_request) = match deadline.run(h3::client::new(h3_conn)).await {
@@ -284,10 +300,31 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
                 }
                 _ = _conn.close_notify.notified() => {
                     debug!(conn_id, upstream = %_conn.upstream, "H3 connection shutdown requested");
-                    if let Err(e) = driver.shutdown(0).await {
-                        warn!(conn_id, upstream = %_conn.upstream, error = ?e, "H3 graceful shutdown failed");
-                    }
-                    let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+                    let graceful_upstream = _conn.upstream.clone();
+                    let force_close_upstream = _conn.upstream.clone();
+                    run_bounded_h3_shutdown(
+                        H3_GRACEFUL_SHUTDOWN_TIMEOUT,
+                        async {
+                            if let Err(e) = driver.shutdown(0).await {
+                                warn!(conn_id, upstream = %graceful_upstream, error = ?e, "H3 graceful shutdown failed");
+                            }
+                            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+                        },
+                        move || {
+                            warn!(
+                                conn_id,
+                                upstream = %force_close_upstream,
+                                timeout_secs = H3_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                                "H3 graceful shutdown deadline exceeded; force closing QUIC transport"
+                            );
+                            force_close_conn.close(
+                                quinn::VarInt::from_u64(h3::error::Code::H3_NO_ERROR.value())
+                                    .expect("H3_NO_ERROR must fit in a QUIC varint"),
+                                b"h3 graceful shutdown deadline",
+                            );
+                        },
+                    )
+                    .await;
                 }
             }
         });
@@ -356,6 +393,26 @@ mod tests {
             h3::error::StreamError::RemoteClosing,
         );
         assert!(matches!(error, H3RecvError::Connection(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_h3_shutdown_forces_transport_close_after_deadline() {
+        let forced = Arc::new(AtomicBool::new(false));
+        let forced_for_close = forced.clone();
+
+        run_bounded_h3_shutdown(
+            Duration::from_secs(1),
+            std::future::pending::<()>(),
+            move || {
+                forced_for_close.store(true, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert!(
+            forced.load(Ordering::Acquire),
+            "stalled graceful shutdown must force-close the QUIC transport"
+        );
     }
 
     #[test]

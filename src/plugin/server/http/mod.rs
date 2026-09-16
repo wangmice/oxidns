@@ -43,6 +43,8 @@ use crate::plugin_factory;
 
 mod entry;
 #[cfg(feature = "server-doh3")]
+mod http3_quinn;
+#[cfg(feature = "server-doh3")]
 mod http3_server;
 mod http_dispatcher;
 mod http_server;

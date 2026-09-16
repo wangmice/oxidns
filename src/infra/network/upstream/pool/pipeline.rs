@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -102,8 +102,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         let mut close_after_swap = Vec::new();
 
         for slot in slots.iter() {
-            let state = slot.state();
-            let inflight = slot.inflight();
+            let (state, inflight) = slot.snapshot();
             if state == SLOT_ACTIVE && slot.connection().available() {
                 let idle = now.saturating_sub(slot.connection().last_used());
                 if inflight == 0 && idle >= self.max_idle.as_millis() as u64 {
@@ -457,16 +456,35 @@ impl<C: Connection> PipelinePool<C> {
 #[derive(Debug)]
 struct PipelineSlot<C: Connection> {
     conn: Arc<C>,
-    inflight: AtomicU16,
-    state: AtomicU8,
+    /// Slot lifecycle state and in-flight borrow count share one atomic word so
+    /// idle retirement and new borrows cannot observe or publish split state.
+    /// Low 16 bits hold the in-flight count; bits 16..=17 hold the state.
+    state_and_inflight: AtomicU32,
+}
+
+const SLOT_INFLIGHT_MASK: u32 = u16::MAX as u32;
+const SLOT_STATE_SHIFT: u32 = 16;
+
+#[inline]
+const fn pack_slot_state(state: u8, inflight: u16) -> u32 {
+    ((state as u32) << SLOT_STATE_SHIFT) | inflight as u32
+}
+
+#[inline]
+const fn unpack_slot_state(word: u32) -> u8 {
+    ((word >> SLOT_STATE_SHIFT) & 0b11) as u8
+}
+
+#[inline]
+const fn unpack_slot_inflight(word: u32) -> u16 {
+    (word & SLOT_INFLIGHT_MASK) as u16
 }
 
 impl<C: Connection> PipelineSlot<C> {
     fn new(conn: Arc<C>) -> Self {
         Self {
             conn,
-            inflight: AtomicU16::new(0),
-            state: AtomicU8::new(SLOT_ACTIVE),
+            state_and_inflight: AtomicU32::new(pack_slot_state(SLOT_ACTIVE, 0)),
         }
     }
 
@@ -474,91 +492,164 @@ impl<C: Connection> PipelineSlot<C> {
         &self.conn
     }
 
-    fn inflight(&self) -> u16 {
-        self.inflight.load(Ordering::Acquire)
+    #[inline]
+    fn snapshot(&self) -> (u8, u16) {
+        let word = self.state_and_inflight.load(Ordering::Acquire);
+        (unpack_slot_state(word), unpack_slot_inflight(word))
     }
 
+    #[cfg(test)]
+    fn inflight(&self) -> u16 {
+        self.snapshot().1
+    }
+
+    #[cfg(test)]
     fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+        self.snapshot().0
     }
 
     fn try_acquire(&self, max_load: u16) -> bool {
-        if self.state() != SLOT_ACTIVE || !self.conn.available() {
+        if !self.conn.available() {
             return false;
         }
 
         let effective_max_load = max_load.min(self.conn.max_concurrent_queries());
-        let mut current = self.inflight.load(Ordering::Acquire);
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
-            if current >= effective_max_load {
+            if unpack_slot_state(current) != SLOT_ACTIVE {
                 return false;
             }
-            match self.inflight.compare_exchange_weak(
+
+            let inflight = unpack_slot_inflight(current);
+            if inflight >= effective_max_load {
+                return false;
+            }
+
+            let next = pack_slot_state(SLOT_ACTIVE, inflight + 1);
+            match self.state_and_inflight.compare_exchange_weak(
                 current,
-                current + 1,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if self.state() == SLOT_ACTIVE && self.conn.available() {
+                    // Connection availability is maintained outside the slot
+                    // state word, so close the tiny race where the transport
+                    // becomes unusable immediately after the atomic borrow.
+                    if self.conn.available() {
                         return true;
                     }
                     self.release_without_notify();
                     return false;
                 }
-                Err(next) => current = next,
+                Err(observed) => current = observed,
             }
         }
     }
 
     fn release(&self, notify: &Notify) {
-        let previous = self.inflight.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "pipeline slot inflight underflow");
-        if previous == 1 && self.state() != SLOT_ACTIVE {
-            self.close();
-        }
+        self.release_inner();
         // Releasing one in-flight query frees exactly one unit of load on this
         // slot, so wake a single waiter instead of stampeding all of them.
-        // `Notify` stores one permit if no waiter is currently parked, and the
-        // freed capacity is in any case visible to other acquirers via
-        // `try_acquire_existing`, so this cannot strand a waiter.
         notify.notify_one();
     }
 
     fn release_without_notify(&self) {
-        let previous = self.inflight.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "pipeline slot inflight underflow");
-        if previous == 1 && self.state() != SLOT_ACTIVE {
-            self.close();
+        self.release_inner();
+    }
+
+    fn release_inner(&self) {
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            let state = unpack_slot_state(current);
+            let inflight = unpack_slot_inflight(current);
+            debug_assert!(inflight > 0, "pipeline slot inflight underflow");
+            if inflight == 0 {
+                return;
+            }
+
+            let next = pack_slot_state(state, inflight - 1);
+            match self.state_and_inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if inflight == 1 && state != SLOT_ACTIVE {
+                        self.close();
+                    }
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
     fn retire(&self) {
-        let _ = self.state.compare_exchange(
-            SLOT_ACTIVE,
-            SLOT_RETIRING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if self.inflight() == 0 {
-            self.close();
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            match unpack_slot_state(current) {
+                SLOT_ACTIVE => {
+                    let inflight = unpack_slot_inflight(current);
+                    let next = pack_slot_state(SLOT_RETIRING, inflight);
+                    match self.state_and_inflight.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            if inflight == 0 {
+                                self.close();
+                            }
+                            return;
+                        }
+                        Err(observed) => current = observed,
+                    }
+                }
+                SLOT_RETIRING => {
+                    if unpack_slot_inflight(current) == 0 {
+                        self.close();
+                    }
+                    return;
+                }
+                SLOT_CLOSED => return,
+                _ => return,
+            }
         }
     }
 
     fn close(&self) {
-        if self.state.swap(SLOT_CLOSED, Ordering::AcqRel) != SLOT_CLOSED {
-            self.conn.close();
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            if unpack_slot_state(current) == SLOT_CLOSED {
+                return;
+            }
+            let next = pack_slot_state(SLOT_CLOSED, unpack_slot_inflight(current));
+            match self.state_and_inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.conn.close();
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
     fn close_if_idle(&self) -> bool {
-        if self.inflight() != 0 {
-            return false;
-        }
-
-        match self.state.compare_exchange(
-            SLOT_ACTIVE,
-            SLOT_CLOSED,
+        // Idle close competes with borrow on the exact same atomic word. If a
+        // borrower changes ACTIVE/0 -> ACTIVE/1 first, this CAS fails and the
+        // healthy connection stays reusable. If maintenance wins, no later
+        // borrower can enter a CLOSED slot.
+        match self.state_and_inflight.compare_exchange(
+            pack_slot_state(SLOT_ACTIVE, 0),
+            pack_slot_state(SLOT_CLOSED, 0),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -566,16 +657,15 @@ impl<C: Connection> PipelineSlot<C> {
                 self.conn.close();
                 true
             }
-            Err(SLOT_RETIRING | SLOT_CLOSED) if self.inflight() == 0 => {
-                self.close();
-                true
+            Err(current) => {
+                unpack_slot_state(current) == SLOT_CLOSED && unpack_slot_inflight(current) == 0
             }
-            Err(_) => false,
         }
     }
 
     fn is_drained_unusable(&self) -> bool {
-        self.inflight() == 0 && (self.state() != SLOT_ACTIVE || !self.conn.available())
+        let (state, inflight) = self.snapshot();
+        inflight == 0 && (state != SLOT_ACTIVE || !self.conn.available())
     }
 }
 
@@ -1138,6 +1228,52 @@ mod tests {
 
         assert_eq!(conn.close_calls(), 0);
         assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[test]
+    fn test_close_if_idle_preserves_connection_when_borrower_wins_race() {
+        AppClock::start();
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        let slot = PipelineSlot::new(conn.clone());
+
+        // Model the real race: maintenance selected an apparently idle slot,
+        // but a borrower atomically claimed it before maintenance committed
+        // the idle close. The borrower wins, so maintenance must leave this
+        // healthy connection active instead of retiring it after it became
+        // useful again.
+        assert!(slot.try_acquire(4));
+
+        assert!(
+            !slot.close_if_idle(),
+            "idle close must lose when a borrower already owns the slot"
+        );
+        assert_eq!(
+            slot.state(),
+            SLOT_ACTIVE,
+            "a racing successful borrow must keep the connection reusable"
+        );
+        assert_eq!(conn.close_calls(), 0);
+
+        slot.release_without_notify();
+        assert_eq!(slot.state(), SLOT_ACTIVE);
+        assert_eq!(conn.close_calls(), 0);
+        assert!(
+            slot.try_acquire(4),
+            "the healthy connection should remain reusable after the racing lease drains"
+        );
+        slot.release_without_notify();
+    }
+
+    #[test]
+    fn test_close_if_idle_winner_blocks_late_borrower() {
+        AppClock::start();
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        let slot = PipelineSlot::new(conn.clone());
+
+        assert!(slot.close_if_idle());
+        assert_eq!(slot.state(), SLOT_CLOSED);
+        assert!(!slot.try_acquire(4));
+        assert_eq!(conn.close_calls(), 1);
     }
 
     #[tokio::test]

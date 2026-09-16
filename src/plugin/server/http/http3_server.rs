@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use http::header::CONTENT_LENGTH;
 use rustls::ServerConfig;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -17,12 +19,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::plugin::server::http::extract_client_ip;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
+use crate::plugin::server::http::http3_quinn::{
+    H3PeerStopQueue, H3PeerStoppedFuture, H3PeerStoppedResult, ServerBidiStream,
+    ServerQuinnConnection,
+};
 use crate::plugin::server::{
     ConnectionGuard, DEFAULT_QUIC_MAX_BIDI_STREAMS, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
     InboundRequestLimiter, quic_endpoint,
 };
 
 const MAX_HTTP3_BODY_SIZE: usize = 64 * 1024;
+const HTTP3_REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP3_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP3_REQUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP3_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +47,13 @@ struct H3PhaseDeadline {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct H3RequestTimedOut;
+
+#[derive(Debug)]
+enum H3PhaseOutcome<T> {
+    Completed(T),
+    PeerStopped(H3PeerStoppedResult),
+    Deadline,
+}
 
 impl H3RequestDeadline {
     #[inline]
@@ -59,6 +73,13 @@ impl H3RequestDeadline {
 
 impl H3PhaseDeadline {
     #[inline]
+    fn after(timeout: Duration) -> Self {
+        Self {
+            at: Instant::now() + timeout,
+        }
+    }
+
+    #[inline]
     async fn run<F>(&self, future: F) -> Result<F::Output, H3RequestTimedOut>
     where
         F: Future,
@@ -69,10 +90,64 @@ impl H3PhaseDeadline {
     }
 }
 
+#[inline]
+async fn run_h3_phase<F>(
+    peer_stopped: &mut H3PeerStoppedFuture,
+    deadline: H3PhaseDeadline,
+    future: F,
+) -> H3PhaseOutcome<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        stopped = peer_stopped.as_mut() => H3PhaseOutcome::PeerStopped(stopped),
+        result = deadline.run(future) => match result {
+            Ok(value) => H3PhaseOutcome::Completed(value),
+            Err(_) => H3PhaseOutcome::Deadline,
+        },
+    }
+}
+
 #[derive(Debug)]
 enum H3BodyReadError {
     Http(http::StatusCode),
+}
+
+type H3ServerRequestStream = h3::server::RequestStream<ServerBidiStream<Bytes>, Bytes>;
+
+enum H3HeaderOutcome {
+    Resolved {
+        request: http::Request<()>,
+        stream: H3ServerRequestStream,
+        peer_stopped: H3PeerStoppedFuture,
+    },
+    Failed(h3::error::StreamError),
+    PeerStopped(H3PeerStoppedResult),
     Deadline,
+}
+
+async fn resolve_h3_headers(
+    resolver: h3::server::RequestResolver<ServerQuinnConnection, Bytes>,
+    mut peer_stopped: H3PeerStoppedFuture,
+    header_deadline: H3PhaseDeadline,
+) -> H3HeaderOutcome {
+    match run_h3_phase(
+        &mut peer_stopped,
+        header_deadline,
+        resolver.resolve_request(),
+    )
+    .await
+    {
+        H3PhaseOutcome::Completed(Ok((request, stream))) => H3HeaderOutcome::Resolved {
+            request,
+            stream,
+            peer_stopped,
+        },
+        H3PhaseOutcome::Completed(Err(error)) => H3HeaderOutcome::Failed(error),
+        H3PhaseOutcome::PeerStopped(stopped) => H3HeaderOutcome::PeerStopped(stopped),
+        H3PhaseOutcome::Deadline => H3HeaderOutcome::Deadline,
+    }
 }
 
 /// Main HTTP/3 server loop (over QUIC)
@@ -216,8 +291,10 @@ async fn handle_h3_connection(
 
     debug!("HTTP/3 connection established with {}", src);
 
-    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
-        match h3::server::Connection::new(h3_quinn::Connection::new(connection)).await {
+    let peer_stops = H3PeerStopQueue::default();
+    let transport = ServerQuinnConnection::new(connection, peer_stops.clone());
+    let mut h3_conn: h3::server::Connection<ServerQuinnConnection, Bytes> =
+        match h3::server::Connection::new(transport).await {
             Ok(conn) => conn,
             Err(e) => {
                 debug!("HTTP/3 handshake error from {}: {}", src, e);
@@ -225,85 +302,138 @@ async fn handle_h3_connection(
             }
         };
 
-    loop {
-        let accepted = tokio::select! {
-            _ = request_cancel.cancelled() => return,
-            accepted = h3_conn.accept() => accepted,
-        };
+    // Header resolution stays inside the connection task instead of spawning
+    // one Tokio task per incomplete request. `FuturesUnordered` lets later
+    // streams make progress while one peer withholds HEADERS, while QUIC's
+    // max-bidi-stream limit still bounds this set per connection.
+    let mut pending_headers = FuturesUnordered::new();
 
-        let (request, stream) = match accepted {
-            Ok(Some(request)) => {
-                let resolved = tokio::select! {
-                    _ = request_cancel.cancelled() => return,
-                    resolved = request.resolve_request() => resolved,
+    loop {
+        tokio::select! {
+            biased;
+            _ = request_cancel.cancelled() => return,
+            resolved = pending_headers.next(), if !pending_headers.is_empty() => {
+                let Some(resolved) = resolved else {
+                    continue;
                 };
-                match resolved {
-                    Ok(resolved) => resolved,
-                    Err(e) => {
-                        warn!("Failed to resolve HTTP/3 request from {}: {}", src, e);
+
+                let (request, mut stream, mut peer_stopped) = match resolved {
+                    H3HeaderOutcome::Resolved {
+                        request,
+                        stream,
+                        peer_stopped,
+                    } => (request, stream, peer_stopped),
+                    H3HeaderOutcome::Failed(error) => {
+                        warn!("Failed to resolve HTTP/3 request from {}: {}", src, error);
                         continue;
                     }
-                }
-            }
-            Ok(None) => {
-                debug!("HTTP/3 connection closed by {}", src);
-                return;
-            }
-            Err(e) => {
-                warn!("HTTP/3 connection accept error from {}: {}", src, e);
-                // `h3::server::Connection::accept` reports connection-level
-                // errors. The h3 crate caches handled connection errors, so
-                // retrying accept can complete immediately with the same error.
-                return;
-            }
-        };
+                    H3HeaderOutcome::PeerStopped(stopped) => {
+                        log_h3_peer_stop(src, "request headers", &stopped);
+                        continue;
+                    }
+                    H3HeaderOutcome::Deadline => {
+                        warn!(
+                            client = %src,
+                            "HTTP/3 request header deadline exceeded; dropping stream"
+                        );
+                        continue;
+                    }
+                };
 
-        // Acquire capacity before spawning the request task. While saturated,
-        // stop accepting additional H3 streams and let QUIC/H3 flow control
-        // provide bounded backpressure rather than accumulating waiter tasks.
-        let permit = tokio::select! {
-            _ = request_cancel.cancelled() => return,
-            _ = connection_liveness.closed() => return,
-            permit = request_limiter.acquire() => permit,
-        };
+                // Preserve the global admission invariant: a fully resolved
+                // request obtains capacity before its handler task is spawned.
+                // When the server is saturated, stopping accept on this
+                // connection is intentional bounded backpressure.
+                let permit = tokio::select! {
+                    biased;
+                    stopped = peer_stopped.as_mut() => {
+                        cancel_h3_stream_after_peer_stop(
+                            &mut stream,
+                            src,
+                            "admission",
+                            stopped,
+                        );
+                        continue;
+                    }
+                    _ = request_cancel.cancelled() => return,
+                    _ = connection_liveness.closed() => return,
+                    permit = request_limiter.acquire() => permit,
+                };
 
-        let dispatcher = dispatcher.clone();
-        let src_ip_header = src_ip_header.clone();
-        let server_name = server_name.clone();
-        let task_cancel = request_cancel.clone();
-        // Start one absolute lifetime deadline after admission. Each phase
-        // applies its own cap within the remaining lifetime budget, preventing
-        // slow body chunks or flow-controlled response writes from extending
-        // the time this request can retain a global admission permit.
-        let request_deadline = H3RequestDeadline::new();
+                let dispatcher = dispatcher.clone();
+                let src_ip_header = src_ip_header.clone();
+                let server_name = server_name.clone();
+                let task_cancel = request_cancel.clone();
+                let request_deadline = H3RequestDeadline::new();
 
-        request_tasks.spawn(async move {
-            let _permit = permit;
-            tokio::select! {
-                _ = task_cancel.cancelled() => {}
-                _ = handle_h3_request(
-                    request,
-                    stream,
-                    dispatcher,
-                    src,
-                    src_ip_header,
-                    server_name,
-                    request_deadline,
-                ) => {}
+                request_tasks.spawn(async move {
+                    tokio::select! {
+                        _ = task_cancel.cancelled() => {}
+                        _ = handle_h3_request(
+                            request,
+                            stream,
+                            dispatcher,
+                            src,
+                            src_ip_header,
+                            server_name,
+                            request_deadline,
+                            peer_stopped,
+                            permit,
+                        ) => {}
+                    }
+                });
             }
-        });
+            accepted = h3_conn.accept() => {
+                let resolver = match accepted {
+                    Ok(Some(request)) => request,
+                    Ok(None) => {
+                        debug!("HTTP/3 connection closed by {}", src);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("HTTP/3 connection accept error from {}: {}", src, e);
+                        // `h3::server::Connection::accept` reports
+                        // connection-level errors. The h3 crate caches handled
+                        // connection errors, so retrying can spin on the same
+                        // terminal error.
+                        return;
+                    }
+                };
+
+                // `ServerQuinnConnection::poll_accept_bidi` publishes the
+                // passive STOP_SENDING watcher immediately before h3 returns
+                // this resolver. One accept loop per connection keeps the
+                // lock-free FIFO aligned with accepted stream order.
+                let Some(peer_stopped) = peer_stops.pop_front() else {
+                    warn!(
+                        client = %src,
+                        "HTTP/3 accepted request missing peer STOP_SENDING watcher"
+                    );
+                    return;
+                };
+
+                let header_deadline = H3PhaseDeadline::after(HTTP3_REQUEST_HEADER_TIMEOUT);
+                pending_headers.push(resolve_h3_headers(
+                    resolver,
+                    peer_stopped,
+                    header_deadline,
+                ));
+            }
+        }
     }
 }
 
 /// Handle a single HTTP/3 request stream
 async fn handle_h3_request(
     request: http::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    mut stream: H3ServerRequestStream,
     dispatcher: Arc<HttpDispatcher>,
     src: SocketAddr,
     src_ip_header: Option<Arc<str>>,
     server_name: Option<Arc<str>>,
     request_deadline: H3RequestDeadline,
+    mut peer_stopped: H3PeerStoppedFuture,
+    permit: OwnedSemaphorePermit,
 ) {
     let method = request.method().clone();
     let uri = request.uri();
@@ -318,31 +448,59 @@ async fn handle_h3_request(
         method, path, src, client_addr
     );
 
+    // One timer covers the entire body phase. Individual DATA frames do not
+    // refresh it, and the peer STOP_SENDING watcher can still cancel the
+    // admitted request immediately while the body is incomplete.
     let body_deadline = request_deadline.phase(HTTP3_REQUEST_BODY_TIMEOUT);
-    let body = match read_h3_body(&mut stream, src, body_deadline).await {
-        Ok(body) => body,
-        Err(H3BodyReadError::Http(status)) => {
+    let body = match run_h3_phase(
+        &mut peer_stopped,
+        body_deadline,
+        read_h3_body(&mut stream, src),
+    )
+    .await
+    {
+        H3PhaseOutcome::Completed(Ok(body)) => body,
+        H3PhaseOutcome::Completed(Err(H3BodyReadError::Http(status))) => {
+            // Error response flow control belongs to the transport, not the
+            // shared executor admission budget.
+            drop(permit);
             let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
             let _ = send_h3_error_response(&mut stream, status, src, response_deadline).await;
             return;
         }
-        Err(H3BodyReadError::Deadline) => {
+        H3PhaseOutcome::Deadline => {
             cancel_h3_stream_on_deadline(&mut stream, src, "request body");
+            return;
+        }
+        H3PhaseOutcome::PeerStopped(stopped) => {
+            cancel_h3_stream_after_peer_stop(&mut stream, src, "request body", stopped);
             return;
         }
     };
 
     let executor_deadline = request_deadline.phase(HTTP3_REQUEST_EXECUTION_TIMEOUT);
-    let response = match executor_deadline
-        .run(dispatcher.handle_request(method, path, query, body, client_addr, server_name))
-        .await
+    let response = match run_h3_phase(
+        &mut peer_stopped,
+        executor_deadline,
+        dispatcher.handle_request(method, path, query, body, client_addr, server_name),
+    )
+    .await
     {
-        Ok(response) => response,
-        Err(_) => {
+        H3PhaseOutcome::Completed(response) => response,
+        H3PhaseOutcome::PeerStopped(stopped) => {
+            cancel_h3_stream_after_peer_stop(&mut stream, src, "executor", stopped);
+            return;
+        }
+        H3PhaseOutcome::Deadline => {
             cancel_h3_stream_on_deadline(&mut stream, src, "executor");
             return;
         }
     };
+
+    // The admission budget protects request parsing/execution and upstream
+    // work. Once the DNS response exists, slow client flow control must not
+    // consume one of the shared HTTP/2 + HTTP/3 request permits.
+    drop(permit);
 
     let (parts, response_bytes) = response.into_parts();
 
@@ -370,63 +528,26 @@ async fn handle_h3_request(
     };
 
     let response_deadline = request_deadline.phase(HTTP3_RESPONSE_SEND_TIMEOUT);
-
-    match response_deadline
-        .run(stream.send_response(h3_response))
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!("Failed to send HTTP/3 response headers to {}: {}", src, e);
-            return;
-        }
-        Err(_) => {
-            cancel_h3_stream_on_deadline(&mut stream, src, "response headers");
-            return;
-        }
-    }
-
-    match response_deadline
-        .run(stream.send_data(response_bytes))
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!("Failed to send HTTP/3 response body to {}: {}", src, e);
-            return;
-        }
-        Err(_) => {
-            cancel_h3_stream_on_deadline(&mut stream, src, "response body");
-            return;
-        }
-    }
-
-    match response_deadline.run(stream.finish()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!("Failed to finish HTTP/3 response stream to {}: {}", src, e);
-            return;
-        }
-        Err(_) => {
-            cancel_h3_stream_on_deadline(&mut stream, src, "response finish");
-            return;
-        }
-    }
-
-    debug!("Response sent to {}", src);
+    let _ = send_h3_response(
+        &mut stream,
+        h3_response,
+        response_bytes,
+        src,
+        response_deadline,
+    )
+    .await;
 }
 
 #[inline]
 async fn read_h3_body(
-    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: &mut H3ServerRequestStream,
     src: SocketAddr,
-    body_deadline: H3PhaseDeadline,
 ) -> Result<Bytes, H3BodyReadError> {
     let mut buf = BytesMut::with_capacity(2048);
 
     loop {
-        match body_deadline.run(stream.recv_data()).await {
-            Ok(Ok(Some(chunk))) => {
+        match stream.recv_data().await {
+            Ok(Some(chunk)) => {
                 buf.put(chunk);
                 if buf.len() > MAX_HTTP3_BODY_SIZE {
                     warn!(
@@ -437,19 +558,51 @@ async fn read_h3_body(
                     return Err(H3BodyReadError::Http(http::StatusCode::PAYLOAD_TOO_LARGE));
                 }
             }
-            Ok(Ok(None)) => return Ok(buf.freeze()),
-            Ok(Err(e)) => {
+            Ok(None) => return Ok(buf.freeze()),
+            Err(e) => {
                 warn!("Failed to read HTTP/3 request body from {}: {}", src, e);
                 return Err(H3BodyReadError::Http(http::StatusCode::BAD_REQUEST));
             }
-            Err(_) => return Err(H3BodyReadError::Deadline),
+        }
+    }
+}
+
+#[inline]
+async fn send_h3_response(
+    stream: &mut H3ServerRequestStream,
+    response: http::Response<()>,
+    response_bytes: Bytes,
+    src: SocketAddr,
+    response_deadline: H3PhaseDeadline,
+) -> Result<(), ()> {
+    let send = async {
+        stream.send_response(response).await?;
+        stream.send_data(response_bytes).await?;
+        stream.finish().await
+    };
+
+    match response_deadline.run(send).await {
+        Ok(Ok(())) => {
+            debug!("Response sent to {}", src);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            // A peer STOP_SENDING is surfaced by the Quinn-backed send path as
+            // a stream error, so the response phase does not need a second
+            // passive stopped watcher/select on every write step.
+            debug!("HTTP/3 response stream ended for {}: {}", src, e);
+            Err(())
+        }
+        Err(_) => {
+            cancel_h3_stream_on_deadline(stream, src, "response send");
+            Err(())
         }
     }
 }
 
 #[inline]
 async fn send_h3_error_response(
-    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: &mut H3ServerRequestStream,
     status: http::StatusCode,
     src: SocketAddr,
     response_deadline: H3PhaseDeadline,
@@ -466,48 +619,67 @@ async fn send_h3_error_response(
         }
     };
 
-    match response_deadline.run(stream.send_response(response)).await {
-        Ok(Ok(())) => {}
+    let send = async {
+        stream.send_response(response).await?;
+        stream.finish().await
+    };
+
+    match response_deadline.run(send).await {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
-            warn!(
-                "Failed to send HTTP/3 error response headers to {}: {}",
-                src, e
-            );
-            return Err(());
+            debug!("HTTP/3 error response stream ended for {}: {}", src, e);
+            Err(())
         }
         Err(_) => {
-            cancel_h3_stream_on_deadline(stream, src, "error response headers");
-            return Err(());
+            cancel_h3_stream_on_deadline(stream, src, "error response send");
+            Err(())
         }
     }
+}
 
-    match response_deadline.run(stream.finish()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!(
-                "Failed to finish HTTP/3 error response stream to {}: {}",
-                src, e
-            );
-            return Err(());
-        }
-        Err(_) => {
-            cancel_h3_stream_on_deadline(stream, src, "error response finish");
-            return Err(());
-        }
+#[inline]
+fn log_h3_peer_stop(src: SocketAddr, phase: &'static str, stopped: &H3PeerStoppedResult) {
+    match stopped {
+        Ok(code) => debug!(
+            client = %src,
+            phase,
+            %code,
+            "Cancelling HTTP/3 request after client STOP_SENDING"
+        ),
+        Err(error) => debug!(
+            client = %src,
+            phase,
+            error = ?error,
+            "QUIC connection lost while HTTP/3 request was active"
+        ),
     }
+}
 
-    Ok(())
+#[inline]
+fn cancel_h3_stream(stream: &mut h3::server::RequestStream<ServerBidiStream<Bytes>, Bytes>) {
+    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+}
+
+#[inline]
+fn cancel_h3_stream_after_peer_stop(
+    stream: &mut h3::server::RequestStream<ServerBidiStream<Bytes>, Bytes>,
+    src: SocketAddr,
+    phase: &'static str,
+    stopped: H3PeerStoppedResult,
+) {
+    log_h3_peer_stop(src, phase, &stopped);
+    cancel_h3_stream(stream);
 }
 
 #[inline]
 fn cancel_h3_stream_on_deadline(
-    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: &mut h3::server::RequestStream<ServerBidiStream<Bytes>, Bytes>,
     src: SocketAddr,
     phase: &'static str,
 ) {
     warn!(client = %src, phase, "HTTP/3 request deadline exceeded; cancelling stream");
-    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    cancel_h3_stream(stream);
 }
 
 #[inline]
@@ -599,6 +771,50 @@ mod tests {
             result.is_err(),
             "a phase cap must never extend the admitted request lifetime"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_stop_cancels_stalled_phase_and_releases_admission_permit() {
+        let limiter = InboundRequestLimiter::new(1);
+        let permit = limiter.acquire().await;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+
+        let request = tokio::spawn(async move {
+            struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropSignal {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+
+            let _permit = permit;
+            let mut peer_stopped: H3PeerStoppedFuture = Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(quinn::VarInt::from_u32(0x10C))
+            });
+            let phase_deadline = H3PhaseDeadline {
+                at: Instant::now() + Duration::from_secs(30),
+            };
+            let stalled = async move {
+                let _drop_signal = DropSignal(dropped_in_task);
+                std::future::pending::<()>().await;
+            };
+
+            assert!(matches!(
+                run_h3_phase(&mut peer_stopped, phase_deadline, stalled).await,
+                H3PhaseOutcome::PeerStopped(Ok(_))
+            ));
+        });
+
+        request.await.expect("peer-stop task should complete");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "dropping the stalled executor future must propagate cancellation"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .expect("peer STOP_SENDING must release admission capacity");
     }
 
     #[tokio::test(start_paused = true)]
