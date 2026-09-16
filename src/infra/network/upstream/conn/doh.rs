@@ -10,7 +10,7 @@ use bytes::BytesMut;
 #[cfg(feature = "_http-client")]
 use http::header::CONTENT_LENGTH;
 #[cfg(feature = "_http-client")]
-use http::{HeaderValue, Method, Request, Response, Version, header};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, Version, header};
 
 #[cfg(feature = "_http-client")]
 use crate::infra::error::{DnsError, Result};
@@ -21,6 +21,39 @@ use crate::infra::network::upstream::{ConnectionInfo, ConnectionType};
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 const DNS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/dns-message");
+
+/// Validate the media type of a successful DNS-over-HTTPS response.
+///
+/// OxiDNS currently implements only the RFC 8484 `application/dns-message`
+/// wire format. Successful responses using any other (or no) media type must
+/// not be passed to the DNS message decoder.
+#[cfg(feature = "_http-client")]
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn validate_doh_content_type(headers: &HeaderMap) -> Result<()> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .ok_or_else(|| DnsError::protocol("DoH response is missing Content-Type"))?;
+    let content_type = content_type
+        .to_str()
+        .map_err(|_| DnsError::protocol("DoH response contains an invalid Content-Type"))?;
+
+    // Media type type/subtype tokens are case-insensitive and parameters do
+    // not change the representation's media type. Extract only the essence
+    // (the portion before the first parameter delimiter) without allocating.
+    let media_type = content_type
+        .split_once(';')
+        .map_or(content_type, |(media_type, _)| media_type)
+        .trim_matches(&[' ', '\t'][..]);
+
+    if !media_type.eq_ignore_ascii_case("application/dns-message") {
+        return Err(DnsError::protocol(format!(
+            "unsupported DoH response Content-Type: {content_type}"
+        )));
+    }
+
+    Ok(())
+}
 
 /// Build a DoH GET request with base64url-encoded DNS query
 ///
@@ -183,6 +216,53 @@ mod tests {
             "https://dns.example.test/dns-query?dns=AAECAw"
         );
         assert_eq!(request.headers()[header::CONTENT_TYPE], DNS_HEADER_VALUE);
+    }
+
+    #[test]
+    fn test_validate_doh_content_type_accepts_dns_message() {
+        let response = Response::builder()
+            .header(header::CONTENT_TYPE, "application/dns-message")
+            .body(())
+            .expect("response should build");
+
+        validate_doh_content_type(response.headers())
+            .expect("DoH DNS media type should be accepted");
+    }
+
+    #[test]
+    fn test_validate_doh_content_type_accepts_case_and_parameters() {
+        for content_type in [
+            "Application/DNS-Message",
+            "application/dns-message; foo=bar",
+            "Application/DNS-Message; foo=\"bar;baz\"",
+            "application/dns-message ; charset=utf-8",
+        ] {
+            let response = Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .body(())
+                .expect("response should build");
+
+            validate_doh_content_type(response.headers())
+                .expect("media type case and parameters should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_doh_content_type_rejects_missing_or_wrong_type() {
+        let missing = Response::builder().body(()).expect("response should build");
+        assert!(validate_doh_content_type(missing.headers()).is_err());
+
+        for content_type in [
+            "application/octet-stream",
+            "application/dns-message-bogus",
+            "application/dns-message garbage",
+        ] {
+            let wrong = Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .body(())
+                .expect("response should build");
+            assert!(validate_doh_content_type(wrong.headers()).is_err());
+        }
     }
 
     #[test]

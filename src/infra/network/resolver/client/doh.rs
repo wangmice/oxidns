@@ -29,6 +29,8 @@ use crate::infra::network::dial::{SocketOptions, TlsDialOptions, connect_tls};
 use crate::infra::network::proxy::connect_tcp as proxy_connect_tcp;
 #[cfg(feature = "resolver-doh")]
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+#[cfg(feature = "resolver-doh")]
+use crate::infra::network::upstream::validate_doh_content_type;
 use crate::proto::Message;
 
 #[cfg(feature = "resolver-doh")]
@@ -137,11 +139,15 @@ async fn query_doh_config(
         }
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
+    let status_code = response.status();
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers())?;
+    }
     let response_bytes = read_h2_response_body(&mut response, deadline).await?;
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         return Err(DnsError::protocol(format!(
             "http unsuccessful code: {}",
-            response.status()
+            status_code
         )));
     }
     let mut message = Message::from_bytes(&response_bytes)?;
@@ -358,6 +364,7 @@ mod tests {
 
             let response = http::Response::builder()
                 .status(200)
+                .header(http::header::CONTENT_TYPE, "application/dns-message")
                 .body(())
                 .expect("response should build");
             let mut send_stream = respond

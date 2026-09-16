@@ -22,7 +22,7 @@ use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
-    get_cap_buf_with_context_len,
+    get_cap_buf_with_context_len, validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -323,6 +323,9 @@ async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2R
         .map_err(|e| classify_h2_error("H2 response error", e))?;
 
     let status_code = response.status();
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers()).map_err(H2RecvError::InvalidResponse)?;
+    }
     let body_limit = if status_code.is_success() {
         MAX_DOH_DNS_BODY_SIZE
     } else {
@@ -400,6 +403,7 @@ mod tests {
 
             let response = http::Response::builder()
                 .status(200)
+                .header(http::header::CONTENT_TYPE, "application/dns-message")
                 .body(())
                 .expect("response should build");
             let mut send_stream = respond

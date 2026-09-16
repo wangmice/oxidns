@@ -31,7 +31,7 @@ use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_d
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
-    get_cap_buf_with_context_len,
+    get_cap_buf_with_context_len, validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -344,6 +344,9 @@ async fn recv(
         .map_err(|e| classify_h3_stream_error("H3 response error", e))?;
 
     let status_code = response.status();
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers()).map_err(H3RecvError::InvalidResponse)?;
+    }
     let body_limit = if status_code.is_success() {
         MAX_DOH_DNS_BODY_SIZE
     } else {

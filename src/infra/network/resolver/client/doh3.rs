@@ -25,6 +25,8 @@ use crate::infra::network::dial::{
 };
 #[cfg(feature = "resolver-doh3")]
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+#[cfg(feature = "resolver-doh3")]
+use crate::infra::network::upstream::validate_doh_content_type;
 use crate::proto::Message;
 
 #[derive(Debug)]
@@ -126,6 +128,11 @@ async fn query_doh3_config(
         }
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
+    let status_code = response.status();
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers())?;
+    }
+
     let mut response_bytes = response_buffer(&response);
     loop {
         let data = match deadline.run(stream.recv_data()).await {
@@ -140,10 +147,10 @@ async fn query_doh3_config(
         };
         append_response_chunk(&mut response_bytes, partial_bytes)?;
     }
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         return Err(DnsError::protocol(format!(
             "http unsuccessful code: {}",
-            response.status()
+            status_code
         )));
     }
     let mut message = Message::from_bytes(&response_bytes)?;

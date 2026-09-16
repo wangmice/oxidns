@@ -19,6 +19,8 @@ mod traits;
 
 pub use builder::UpstreamBuilder;
 pub use config::{ConnectionInfo, ConnectionType, UpstreamConfig};
+#[cfg(feature = "_http-client")]
+pub(crate) use conn::doh::validate_doh_content_type;
 #[cfg(any(
     feature = "upstream-doh",
     feature = "upstream-doh3",
