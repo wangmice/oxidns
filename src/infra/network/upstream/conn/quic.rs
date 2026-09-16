@@ -19,6 +19,7 @@ use crate::infra::network::dial::{
 };
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::quic::{
     QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
@@ -198,6 +199,7 @@ impl Connection for QuicConnection {
         match stream.reader.read_message_doq().await {
             Ok(mut resp) => {
                 stream.completed = true;
+                validate_dns_response(&request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);

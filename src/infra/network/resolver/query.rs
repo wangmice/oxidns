@@ -116,18 +116,6 @@ pub(super) fn select_answer(
     None
 }
 
-pub(super) fn validate_response_id(response: &Message, query_id: u16) -> Result<()> {
-    if response.id() == query_id {
-        Ok(())
-    } else {
-        Err(DnsError::protocol(format!(
-            "nameserver DNS response ID mismatch: expected {}, got {}",
-            query_id,
-            response.id()
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -229,16 +217,6 @@ mod tests {
 
         assert_eq!(selected.ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(selected.record_type, RecordType::AAAA);
-    }
-
-    #[test]
-    fn test_validate_response_id_rejects_mismatch() {
-        let mut response = Message::new();
-        response.set_id(2);
-
-        let err = validate_response_id(&response, 1).expect_err("ID should mismatch");
-
-        assert!(err.to_string().contains("DNS response ID mismatch"));
     }
 
     #[test]

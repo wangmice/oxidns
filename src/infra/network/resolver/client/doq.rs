@@ -16,6 +16,8 @@ use crate::infra::network::dial::{
     QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
 };
 #[cfg(feature = "resolver-doq")]
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+#[cfg(feature = "resolver-doq")]
 use crate::infra::network::transport::quic::{
     QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
@@ -153,6 +155,7 @@ async fn query_doq_config(
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
     stream.completed = true;
+    validate_dns_response(&request, &response, DnsResponseIdPolicy::Exact(0))?;
     response.set_id(query_id);
     transport.close(b"resolver query complete");
     Ok(response)

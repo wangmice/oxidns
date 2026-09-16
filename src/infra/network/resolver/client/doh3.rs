@@ -23,6 +23,8 @@ use crate::infra::network::deadline::QueryDeadline;
 use crate::infra::network::dial::{
     QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
 };
+#[cfg(feature = "resolver-doh3")]
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::proto::Message;
 
 #[derive(Debug)]
@@ -145,6 +147,7 @@ async fn query_doh3_config(
         )));
     }
     let mut message = Message::from_bytes(&response_bytes)?;
+    validate_dns_response(&request, &message, DnsResponseIdPolicy::Exact(0))?;
     message.set_id(raw_id);
     Ok(message)
 }

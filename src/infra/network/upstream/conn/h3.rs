@@ -27,6 +27,7 @@ use crate::infra::network::dial::{
 };
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
@@ -124,7 +125,6 @@ impl Connection for H3Connection {
 
 impl H3Connection {
     async fn query_inner(&self, request: Message) -> Result<Message> {
-        let raw_id = request.id();
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
 
@@ -135,10 +135,11 @@ impl H3Connection {
         )?;
         drop(body_bytes);
 
-        self.do_request(http_request, raw_id).await
+        self.do_request(http_request, &request).await
     }
 
-    async fn do_request(&self, http_request: Request<()>, raw_id: u16) -> Result<Message> {
+    async fn do_request(&self, http_request: Request<()>, request: &Message) -> Result<Message> {
+        let raw_id = request.id();
         let mut request_stream = match self.sender.clone().send_request(http_request).await {
             Ok(stream) => stream,
             Err(error) => match classify_h3_stream_error("H3 send_request error", error) {
@@ -165,6 +166,7 @@ impl H3Connection {
         match recv(request_stream).await {
             Ok(bytes) => {
                 let mut resp = Message::from_bytes(&bytes)?;
+                validate_dns_response(request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);

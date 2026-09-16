@@ -27,6 +27,8 @@ use crate::infra::network::deadline::QueryDeadline;
 use crate::infra::network::dial::{SocketOptions, TlsDialOptions, connect_tls};
 #[cfg(feature = "resolver-doh")]
 use crate::infra::network::proxy::connect_tcp as proxy_connect_tcp;
+#[cfg(feature = "resolver-doh")]
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::proto::Message;
 
 #[cfg(feature = "resolver-doh")]
@@ -143,6 +145,7 @@ async fn query_doh_config(
         )));
     }
     let mut message = Message::from_bytes(&response_bytes)?;
+    validate_dns_response(&request, &message, DnsResponseIdPolicy::Exact(0))?;
     message.set_id(raw_id);
     Ok(message)
 }

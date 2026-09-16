@@ -19,6 +19,7 @@ use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
     get_cap_buf_with_context_len,
@@ -139,7 +140,7 @@ impl H2Connection {
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
 
-        let request = build_dns_get_request(
+        let http_request = build_dns_get_request(
             self.request_uri.as_str(),
             body_bytes.as_slice(),
             Version::HTTP_2,
@@ -167,7 +168,7 @@ impl H2Connection {
         // empty. Mark the stream as finished when sending headers,
         // otherwise some servers will wait for an end-of-stream signal
         // and never produce a response.
-        let (response_future, _send_stream) = match sender.send_request(request, true) {
+        let (response_future, _send_stream) = match sender.send_request(http_request, true) {
             Ok(value) => value,
             Err(error) => match classify_h2_error("H2 send_request error", error) {
                 H2RecvError::Connection(error) => {
@@ -183,6 +184,7 @@ impl H2Connection {
         match recv(response_future).await {
             Ok(bytes) => {
                 let mut resp = Message::from_bytes(&bytes)?;
+                validate_dns_response(&request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);

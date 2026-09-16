@@ -8,12 +8,12 @@ use tokio::net::UdpSocket;
 use tracing::debug;
 
 use super::super::endpoint::NameserverConfig;
-use super::super::query::validate_response_id;
 use super::tcp::query_tcp_config;
 use super::{NameserverClient, effective_deadline};
 use crate::infra::error::Result;
 use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
 use crate::infra::network::dial::{SocketOptions, UdpDialOptions, connect_udp};
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::udp::{UDP_MAX_DATAGRAM_SIZE, UdpTransport};
 use crate::proto::Message;
 
@@ -76,7 +76,7 @@ async fn query_udp_config(
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
-    validate_response_id(&response, query_id)?;
+    validate_dns_response(&request, &response, DnsResponseIdPolicy::MatchRequest)?;
     if response.truncated() {
         debug!(
             server = %config.label,
