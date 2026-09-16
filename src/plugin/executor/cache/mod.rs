@@ -1649,6 +1649,8 @@ impl Cache {
                                 TtlCacheConditionalMoveResult::Moved
                                     | TtlCacheConditionalMoveResult::Consolidated
                                     | TtlCacheConditionalMoveResult::ReplacedTarget
+                                    | TtlCacheConditionalMoveResult::RecoveredMissingSource
+                                    | TtlCacheConditionalMoveResult::TargetPreservedAfterSourceMissing
                             )
                         };
                         if inserted {

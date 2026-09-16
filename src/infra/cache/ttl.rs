@@ -25,6 +25,13 @@ const PERIODIC_MAINTENANCE_SAMPLE_SIZE: usize = 4096;
 const PERIODIC_EVICTION_SAMPLE_KILL_DIVISOR: usize = 4;
 const EXACT_COMPACT_CAPACITY_RATIO: usize = 2;
 
+static NEXT_TTL_CACHE_STATE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_ttl_cache_state_id() -> u64 {
+    NEXT_TTL_CACHE_STATE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Immutable cache node stored behind a stable `Arc`.
 ///
 /// Entry replacement always publishes a new node. The only mutable field is
@@ -97,11 +104,13 @@ impl<V> TtlCacheNode<V> {
 
 /// Stable handle to one concrete cache entry generation.
 ///
-/// Replacing a key creates a new node, so pointer identity is sufficient to
-/// detect whether a refresh/remove operation still targets the same entry.
+/// Replacing a key creates a new node, so pointer identity detects generation
+/// changes within one cache state. `state_id` additionally prevents a handle
+/// captured before clear/load/swap from publishing into the replacement state.
 #[derive(Debug)]
 pub struct TtlCacheHandle<V> {
     node: Arc<TtlCacheNode<V>>,
+    state_id: u64,
 }
 
 impl<V> Clone for TtlCacheHandle<V> {
@@ -109,6 +118,7 @@ impl<V> Clone for TtlCacheHandle<V> {
     fn clone(&self) -> Self {
         Self {
             node: self.node.clone(),
+            state_id: self.state_id,
         }
     }
 }
@@ -138,6 +148,11 @@ impl<V> TtlCacheHandle<V> {
     fn same_node(&self, other: &Arc<TtlCacheNode<V>>) -> bool {
         Arc::ptr_eq(&self.node, other)
     }
+
+    #[inline]
+    fn belongs_to_state(&self, state_id: u64) -> bool {
+        self.state_id == state_id
+    }
 }
 
 /// Result of a stable-handle retained-entry lookup.
@@ -160,6 +175,21 @@ pub enum TtlCacheInsertIfNotNewerResult {
     AtCapacity,
 }
 
+/// Outcome of replacing a stable handle for lazy-refresh publication.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TtlCacheReplaceResult {
+    /// The expected source generation was still present and was replaced.
+    Replaced,
+    /// The expected source expired and disappeared in the same cache state, so
+    /// the refreshed value was safely reinserted.
+    RecoveredMissingSource,
+    /// The source belongs to another cache state, is still unexpired but was
+    /// removed, or has been replaced by another generation.
+    SourceChanged,
+    /// The source was recoverably missing, but no cache slot was available.
+    AtCapacity,
+}
+
 /// Outcome of atomically moving a conditionally matched entry to a different
 /// key.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -173,8 +203,18 @@ pub(crate) enum TtlCacheConditionalMoveResult {
     /// replacement predicate. Both old entries were removed and the supplied
     /// value replaced the target atomically.
     ReplacedTarget,
-    /// The source entry was missing or no longer matched the supplied identity.
+    /// The source expired and disappeared, and the refreshed value was
+    /// reinserted at a previously vacant target.
+    RecoveredMissingSource,
+    /// The source expired and disappeared, but a current target was already
+    /// present and was preserved.
+    TargetPreservedAfterSourceMissing,
+    /// The source belongs to another cache state, was removed before expiry,
+    /// or no longer matched the supplied identity.
     SourceChanged,
+    /// The source was recoverably missing and the target vacant, but the cache
+    /// had no free capacity for a new target entry.
+    AtCapacity,
 }
 
 /// Metadata for the entry created by a conditional move.
@@ -215,6 +255,7 @@ where
     map: DashMap<K, Arc<TtlCacheNode<V>>, AHashBuilder>,
     entry_count: AtomicUsize,
     next_generation: AtomicU64,
+    state_id: u64,
 }
 
 impl<K, V> TtlCacheState<K, V>
@@ -226,6 +267,7 @@ where
             map: DashMap::with_capacity_and_hasher(capacity, AHashBuilder::default()),
             entry_count: AtomicUsize::new(0),
             next_generation: AtomicU64::new(0),
+            state_id: next_ttl_cache_state_id(),
         }
     }
 
@@ -251,6 +293,50 @@ where
             last_access_ms,
             self.next_generation(),
         ))
+    }
+}
+
+struct TtlCacheEntryReservation<'a> {
+    entry_count: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl<'a> TtlCacheEntryReservation<'a> {
+    #[inline]
+    fn try_reserve(entry_count: &'a AtomicUsize, max_entries: usize) -> Option<Self> {
+        let mut count = entry_count.load(Ordering::Acquire);
+        loop {
+            if count >= max_entries {
+                return None;
+            }
+            match entry_count.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        entry_count,
+                        committed: false,
+                    });
+                }
+                Err(actual) => count = actual,
+            }
+        }
+    }
+
+    #[inline]
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TtlCacheEntryReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.entry_count.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -529,6 +615,63 @@ where
         true
     }
 
+    /// Replace the expected generation, or recover a refresh whose source
+    /// naturally expired while the upstream request was in flight.
+    ///
+    /// Recovery is allowed only in the same cache state and only after the
+    /// expected handle's retention deadline. This prevents refreshes from
+    /// resurrecting entries removed explicitly before expiry or from writing
+    /// back into a cache state installed by clear/load/swap.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_handle_or_recover_missing_before_publish<F>(
+        &self,
+        key: K,
+        expected: &TtlCacheHandle<V>,
+        value: V,
+        cache_time_ms: u64,
+        expire_at_ms: u64,
+        last_access_ms: u64,
+        max_entries: usize,
+        before_publish: F,
+    ) -> TtlCacheReplaceResult
+    where
+        F: FnOnce(&K),
+    {
+        let state = self.state.load();
+        if !expected.belongs_to_state(state.state_id) {
+            return TtlCacheReplaceResult::SourceChanged;
+        }
+
+        match state.map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                if !expected.same_node(entry.get()) {
+                    return TtlCacheReplaceResult::SourceChanged;
+                }
+
+                let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
+                before_publish(entry.key());
+                entry.insert(node);
+                TtlCacheReplaceResult::Replaced
+            }
+            Entry::Vacant(entry) => {
+                if expected.expire_at_ms() > cache_time_ms {
+                    return TtlCacheReplaceResult::SourceChanged;
+                }
+
+                let Some(reservation) =
+                    TtlCacheEntryReservation::try_reserve(&state.entry_count, max_entries)
+                else {
+                    return TtlCacheReplaceResult::AtCapacity;
+                };
+                let node = state.new_node(value, cache_time_ms, expire_at_ms, last_access_ms);
+                before_publish(entry.key());
+                entry.insert(node);
+                reservation.commit();
+                TtlCacheReplaceResult::RecoveredMissingSource
+            }
+        }
+    }
+
     /// Insert or update an entry unless a newer entry is already present.
     pub fn insert_if_not_newer(
         &self,
@@ -669,9 +812,9 @@ where
     /// order, making the source identity check, target predicate, removals, and
     /// insertion one conditional commit with respect to both keys.
     ///
-    /// Moving an existing entry preserves cache cardinality, so capacity
-    /// accounting does not need a release/reacquire cycle and concurrent
-    /// bounded insertions cannot steal the source entry's slot mid-move.
+    /// Moving an existing source preserves cache cardinality. If the source
+    /// naturally expires before commit, recovery may need one newly reserved
+    /// slot; that exceptional path enforces `max_entries` atomically.
     #[cfg(test)]
     pub(crate) fn conditional_move_handle_if<F>(
         &self,
@@ -691,6 +834,7 @@ where
             expected,
             value,
             metadata,
+            usize::MAX,
             should_replace_target,
             |_| {},
         )
@@ -709,6 +853,7 @@ where
         expected: &TtlCacheHandle<V>,
         value: V,
         metadata: TtlCacheMoveMetadata,
+        max_entries: usize,
         should_replace_target: F,
         before_publish: P,
     ) -> TtlCacheConditionalMoveResult
@@ -718,6 +863,10 @@ where
     {
         let state = self.state.load();
         let mut before_publish = Some(before_publish);
+
+        if !expected.belongs_to_state(state.state_id) {
+            return TtlCacheConditionalMoveResult::SourceChanged;
+        }
 
         if source_key == &target_key {
             return TtlCacheConditionalMoveResult::SourceChanged;
@@ -736,9 +885,65 @@ where
             ($shard:expr) => {{
                 let shard = &mut *$shard;
 
-                let Some(source_bucket) = shard.find(source_hash, |(key, _)| key == source_key)
-                else {
-                    return TtlCacheConditionalMoveResult::SourceChanged;
+                let source_bucket = shard.find(source_hash, |(key, _)| key == source_key);
+                let Some(source_bucket) = source_bucket else {
+                    if expected.expire_at_ms() > metadata.cache_time_ms {
+                        return TtlCacheConditionalMoveResult::SourceChanged;
+                    }
+
+                    let target_bucket = shard.find(target_hash, |(key, _)| key == &target_key);
+                    if let Some(target_bucket) = target_bucket {
+                        let replace_target = unsafe {
+                            let (_, stored) = target_bucket.as_ref();
+                            let target = stored.get();
+                            should_replace_target(&target.value, target.expire_at_ms)
+                        };
+                        if !replace_target {
+                            return TtlCacheConditionalMoveResult::TargetPreservedAfterSourceMissing;
+                        }
+
+                        // SAFETY: the target bucket belongs to this write-locked
+                        // shard and no mutation followed `find`.
+                        let ((_removed_key, removed_value), _) =
+                            unsafe { shard.remove(target_bucket) };
+                        drop(removed_value);
+                        shard.insert(
+                            target_hash,
+                            (
+                                target_key,
+                                SharedValue::new(state.new_node(
+                                    value,
+                                    metadata.cache_time_ms,
+                                    metadata.expire_at_ms,
+                                    metadata.last_access_ms,
+                                )),
+                            ),
+                            |(key, _)| hash_key(key),
+                        );
+                        return TtlCacheConditionalMoveResult::ReplacedTarget;
+                    }
+
+                    let Some(reservation) =
+                        TtlCacheEntryReservation::try_reserve(&state.entry_count, max_entries)
+                    else {
+                        return TtlCacheConditionalMoveResult::AtCapacity;
+                    };
+                    let node = state.new_node(
+                        value,
+                        metadata.cache_time_ms,
+                        metadata.expire_at_ms,
+                        metadata.last_access_ms,
+                    );
+                    if let Some(before_publish) = before_publish.take() {
+                        before_publish(&target_key);
+                    }
+                    shard.insert(
+                        target_hash,
+                        (target_key, SharedValue::new(node)),
+                        |(key, _)| hash_key(key),
+                    );
+                    reservation.commit();
+                    return TtlCacheConditionalMoveResult::RecoveredMissingSource;
                 };
 
                 let source_matches = unsafe {
@@ -818,10 +1023,66 @@ where
                 let source_shard = &mut *$source_shard;
                 let target_shard = &mut *$target_shard;
 
-                let Some(source_bucket) =
-                    source_shard.find(source_hash, |(key, _)| key == source_key)
-                else {
-                    return TtlCacheConditionalMoveResult::SourceChanged;
+                let source_bucket = source_shard.find(source_hash, |(key, _)| key == source_key);
+                let Some(source_bucket) = source_bucket else {
+                    if expected.expire_at_ms() > metadata.cache_time_ms {
+                        return TtlCacheConditionalMoveResult::SourceChanged;
+                    }
+
+                    let target_bucket =
+                        target_shard.find(target_hash, |(key, _)| key == &target_key);
+                    if let Some(target_bucket) = target_bucket {
+                        let replace_target = unsafe {
+                            let (_, stored) = target_bucket.as_ref();
+                            let target = stored.get();
+                            should_replace_target(&target.value, target.expire_at_ms)
+                        };
+                        if !replace_target {
+                            return TtlCacheConditionalMoveResult::TargetPreservedAfterSourceMissing;
+                        }
+
+                        // SAFETY: the target bucket belongs to the target
+                        // shard, whose write guard remains held.
+                        let ((_removed_key, removed_value), _) =
+                            unsafe { target_shard.remove(target_bucket) };
+                        drop(removed_value);
+                        target_shard.insert(
+                            target_hash,
+                            (
+                                target_key,
+                                SharedValue::new(state.new_node(
+                                    value,
+                                    metadata.cache_time_ms,
+                                    metadata.expire_at_ms,
+                                    metadata.last_access_ms,
+                                )),
+                            ),
+                            |(key, _)| hash_key(key),
+                        );
+                        return TtlCacheConditionalMoveResult::ReplacedTarget;
+                    }
+
+                    let Some(reservation) =
+                        TtlCacheEntryReservation::try_reserve(&state.entry_count, max_entries)
+                    else {
+                        return TtlCacheConditionalMoveResult::AtCapacity;
+                    };
+                    let node = state.new_node(
+                        value,
+                        metadata.cache_time_ms,
+                        metadata.expire_at_ms,
+                        metadata.last_access_ms,
+                    );
+                    if let Some(before_publish) = before_publish.take() {
+                        before_publish(&target_key);
+                    }
+                    target_shard.insert(
+                        target_hash,
+                        (target_key, SharedValue::new(node)),
+                        |(key, _)| hash_key(key),
+                    );
+                    reservation.commit();
+                    return TtlCacheConditionalMoveResult::RecoveredMissingSource;
                 };
 
                 let source_matches = unsafe {
@@ -955,7 +1216,10 @@ where
                 }
             }
 
-            return Some(TtlCacheHandleLookup::Hit(TtlCacheHandle { node }));
+            return Some(TtlCacheHandleLookup::Hit(TtlCacheHandle {
+                node,
+                state_id: state.state_id,
+            }));
         }
     }
 
@@ -1277,6 +1541,7 @@ where
         for item in state.map.iter() {
             let handle = TtlCacheHandle {
                 node: item.value().clone(),
+                state_id: state.state_id,
             };
             if !visitor(item.key(), handle) {
                 break;
@@ -1372,6 +1637,7 @@ where
                     key.clone(),
                     TtlCacheHandle {
                         node: shared_entry.get().clone(),
+                        state_id: state.state_id,
                     },
                 ));
             }
@@ -1787,6 +2053,192 @@ mod tests {
     }
 
     #[test]
+    fn refresh_replace_recovers_source_removed_after_retention_expiry() {
+        let cache = TtlCache::with_capacity(2);
+        cache.insert_or_update_with_meta("k", 1u32, 0, 10, 0);
+        let expected = cache
+            .get_retained_handle(&"k", 1, 0)
+            .expect("source should exist before expiry");
+
+        assert!(cache.remove_if_expired(&"k", 10));
+        assert_eq!(cache.entry_count(), 0);
+
+        assert_eq!(
+            cache.replace_handle_or_recover_missing_before_publish(
+                "k",
+                &expected,
+                2u32,
+                11,
+                100,
+                11,
+                1,
+                |_| {},
+            ),
+            TtlCacheReplaceResult::RecoveredMissingSource
+        );
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(
+            *cache
+                .get_retained_handle(&"k", 11, 0)
+                .expect("refresh should be republished")
+                .value(),
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_replace_does_not_resurrect_source_removed_before_expiry() {
+        let cache = TtlCache::with_capacity(2);
+        cache.insert_or_update_with_meta("k", 1u32, 0, 100, 0);
+        let expected = cache
+            .get_retained_handle(&"k", 1, 0)
+            .expect("source should exist");
+
+        assert!(cache.remove(&"k"));
+        assert_eq!(
+            cache.replace_handle_or_recover_missing_before_publish(
+                "k",
+                &expected,
+                2u32,
+                20,
+                200,
+                20,
+                2,
+                |_| {},
+            ),
+            TtlCacheReplaceResult::SourceChanged
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn refresh_replace_does_not_cross_cache_state_replacement() {
+        let cache = TtlCache::with_capacity(2);
+        cache.insert_or_update_with_meta("k", 1u32, 0, 10, 0);
+        let expected = cache
+            .get_retained_handle(&"k", 1, 0)
+            .expect("source should exist");
+
+        let replacement = TtlCache::with_capacity(2);
+        cache.replace_with(&replacement);
+        assert_eq!(
+            cache.replace_handle_or_recover_missing_before_publish(
+                "k",
+                &expected,
+                2u32,
+                20,
+                200,
+                20,
+                2,
+                |_| {},
+            ),
+            TtlCacheReplaceResult::SourceChanged
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn refresh_replace_missing_source_respects_capacity_limit() {
+        let cache = TtlCache::with_capacity(2);
+        cache.insert_or_update_with_meta("source", 1u32, 0, 10, 0);
+        let expected = cache
+            .get_retained_handle(&"source", 1, 0)
+            .expect("source should exist");
+        assert!(cache.remove_if_expired(&"source", 10));
+        cache.insert_or_update_with_meta("other", 9u32, 10, 100, 10);
+
+        assert_eq!(
+            cache.replace_handle_or_recover_missing_before_publish(
+                "source",
+                &expected,
+                2u32,
+                20,
+                200,
+                20,
+                1,
+                |_| {},
+            ),
+            TtlCacheReplaceResult::AtCapacity
+        );
+        assert!(cache.get_retained_handle(&"source", 20, 0).is_none());
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_recovers_source_removed_after_retention_expiry() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 0, 10, 0);
+        let expected = retained_handle(&cache, &source, 1);
+        assert!(cache.remove_if_expired(&source, 10));
+
+        assert_eq!(
+            cache.conditional_move_handle_if_before_publish(
+                &source,
+                target,
+                &expected,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+                4,
+                |_target, _expire_at_ms| true,
+                |_| {},
+            ),
+            TtlCacheConditionalMoveResult::RecoveredMissingSource
+        );
+        assert!(cache.get_retained_handle(&source, 20, 0).is_none());
+        assert_eq!(
+            *cache
+                .get_retained_handle(&target, 20, 0)
+                .expect("refresh should be published at target")
+                .value(),
+            20
+        );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn conditional_move_missing_source_preserves_current_target() {
+        let cache = TtlCache::with_capacity(4);
+        let source = 1u64;
+        let target = key_on_different_shard(&cache, source);
+        cache.insert_or_update_with_meta(source, 10u32, 0, 10, 0);
+        let expected = retained_handle(&cache, &source, 1);
+        assert!(cache.remove_if_expired(&source, 10));
+        cache.insert_or_update_with_meta(target, 99u32, 15, 300, 15);
+
+        assert_eq!(
+            cache.conditional_move_handle_if_before_publish(
+                &source,
+                target,
+                &expected,
+                20u32,
+                TtlCacheMoveMetadata {
+                    cache_time_ms: 20,
+                    expire_at_ms: 200,
+                    last_access_ms: 20,
+                },
+                4,
+                |_target, expire_at_ms| expire_at_ms <= 20,
+                |_| {},
+            ),
+            TtlCacheConditionalMoveResult::TargetPreservedAfterSourceMissing
+        );
+        assert_eq!(
+            *cache
+                .get_retained_handle(&target, 20, 0)
+                .expect("current target should remain")
+                .value(),
+            99
+        );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
     fn conditional_move_pre_publish_hook_runs_only_for_vacant_target_commit() {
         let cache = TtlCache::with_capacity(4);
         cache.insert_or_update("source", 1u32, 0, 100);
@@ -1807,6 +2259,7 @@ mod tests {
                     expire_at_ms: 300,
                     last_access_ms: 3,
                 },
+                usize::MAX,
                 |_target, _expire_at_ms| true,
                 |_| {
                     publications.fetch_add(1, Ordering::Relaxed);
@@ -1830,6 +2283,7 @@ mod tests {
                     expire_at_ms: 400,
                     last_access_ms: 4,
                 },
+                usize::MAX,
                 |_target, _expire_at_ms| true,
                 |_| {
                     publications.fetch_add(1, Ordering::Relaxed);

@@ -20,6 +20,7 @@ use super::{
 };
 use crate::infra::cache::ttl::{
     TtlCacheConditionalMoveResult, TtlCacheHandleLookup, TtlCacheMoveMetadata, TtlCachePruneMode,
+    TtlCacheReplaceResult,
 };
 
 /// Cancellation-safe guard for one in-progress persistence dump.
@@ -532,20 +533,30 @@ impl DnsCacheStore {
         let tracks_ecs_prefix = EcsLookupIndex::tracks_cache_key(&key);
         let _index_publication =
             tracks_ecs_prefix.then(|| self.ecs_lookup_index.publication_guard());
-        let replaced = self.cache_map.replace_handle_before_publish(
-            key,
-            expected,
-            item,
-            cache_time_ms,
-            expire_at_ms,
-            last_access_ms,
-            |key| self.ecs_lookup_index.observe_cache_key(key),
-        );
-        if replaced {
-            self.mutations.mark_dirty(1);
-            self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .cache_map
+            .replace_handle_or_recover_missing_before_publish(
+                key,
+                expected,
+                item,
+                cache_time_ms,
+                expire_at_ms,
+                last_access_ms,
+                self.cache_size,
+                |key| self.ecs_lookup_index.observe_cache_key(key),
+            );
+        match result {
+            TtlCacheReplaceResult::Replaced | TtlCacheReplaceResult::RecoveredMissingSource => {
+                self.mutations.mark_dirty(1);
+                self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            TtlCacheReplaceResult::SourceChanged => false,
+            TtlCacheReplaceResult::AtCapacity => {
+                self.pressure_requested.store(true, Ordering::Release);
+                false
+            }
         }
-        replaced
     }
 
     /// Re-key a stale ECS entry as one atomic freshness-aware mutation.
@@ -567,6 +578,7 @@ impl DnsCacheStore {
             expected,
             item,
             metadata,
+            self.cache_size,
             move |target, _expire_at_ms| target.fresh_until_ms <= refresh_time_ms,
             |key| self.ecs_lookup_index.observe_cache_key(key),
         );
@@ -578,11 +590,16 @@ impl DnsCacheStore {
             TtlCacheConditionalMoveResult::Consolidated => {
                 self.mutations.mark_dirty(1);
             }
-            TtlCacheConditionalMoveResult::ReplacedTarget => {
+            TtlCacheConditionalMoveResult::ReplacedTarget
+            | TtlCacheConditionalMoveResult::RecoveredMissingSource => {
                 self.mutations.mark_dirty(1);
                 self.metrics.insert_total.fetch_add(1, Ordering::Relaxed);
             }
-            TtlCacheConditionalMoveResult::SourceChanged => {}
+            TtlCacheConditionalMoveResult::TargetPreservedAfterSourceMissing
+            | TtlCacheConditionalMoveResult::SourceChanged => {}
+            TtlCacheConditionalMoveResult::AtCapacity => {
+                self.pressure_requested.store(true, Ordering::Release);
+            }
         }
         if !matches!(result, TtlCacheConditionalMoveResult::SourceChanged) {
             self.ecs_lookup_index.mark_cache_key_maybe_stale(source_key);
@@ -825,6 +842,55 @@ mod tests {
         assert!(store.remove(&key));
         assert_eq!(mutations.inner.updated_keys.load(Ordering::Relaxed), 2);
         assert_eq!(mutations.inner.dirty_generation.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn replace_handle_recovers_source_removed_after_retention_expiry() {
+        AppClock::start();
+        let (store, mutations, metrics) = test_store(1);
+        let now = AppClock::elapsed_millis();
+        let expire_at = now.saturating_add(10);
+        let commit_time = expire_at.saturating_add(1);
+        let key = test_key("refresh-race.example");
+
+        assert!(store.insert_or_update(
+            key.clone(),
+            CacheItem::new_validated(Message::new(), 1, expire_at),
+            now,
+            expire_at,
+            now,
+        ));
+        let expected = store
+            .cache_map()
+            .get_retained_handle(&key, now, 0)
+            .expect("source should exist before retention expiry");
+        assert!(store.remove_if_expired(&key, commit_time));
+        let before_dirty = mutations.inner.dirty_generation.load(Ordering::Acquire);
+        let before_inserts = metrics.insert_total.load(Ordering::Relaxed);
+
+        assert!(store.replace_handle(
+            key.clone(),
+            &expected,
+            CacheItem::new_validated(Message::new(), 60, commit_time.saturating_add(60_000),),
+            commit_time,
+            commit_time.saturating_add(60_000),
+            commit_time,
+        ));
+
+        let recovered = store
+            .cache_map()
+            .get_retained_handle(&key, commit_time, 0)
+            .expect("successful refresh should be republished");
+        assert_eq!(recovered.value().ttl, 60);
+        assert_eq!(store.cache_map().entry_count(), 1);
+        assert_eq!(
+            mutations.inner.dirty_generation.load(Ordering::Acquire),
+            before_dirty.saturating_add(1)
+        );
+        assert_eq!(
+            metrics.insert_total.load(Ordering::Relaxed),
+            before_inserts.saturating_add(1)
+        );
     }
 
     #[test]
