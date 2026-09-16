@@ -21,7 +21,6 @@ use crossbeam_queue::SegQueue;
 use futures::{Stream, StreamExt, ready, stream};
 use h3::error::Code;
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
-use tokio_util::sync::ReusableBoxFuture;
 
 pub(super) type H3PeerStoppedResult = Result<quinn::VarInt, quinn::StoppedError>;
 
@@ -407,22 +406,12 @@ impl quic::RecvStream for ServerRecvStream {
 }
 
 pub(super) struct DirectRecvStream {
-    stream: Option<quinn::RecvStream>,
-    read_chunk_fut: ReusableBoxFuture<
-        'static,
-        (
-            quinn::RecvStream,
-            Result<Option<quinn::Chunk>, quinn::ReadError>,
-        ),
-    >,
+    stream: quinn::RecvStream,
 }
 
 impl DirectRecvStream {
     fn new(stream: quinn::RecvStream) -> Self {
-        Self {
-            stream: Some(stream),
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
-        }
+        Self { stream }
     }
 }
 
@@ -433,33 +422,27 @@ impl quic::RecvStream for DirectRecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX, true).await;
-                (stream, chunk)
-            });
-        }
+        // Quinn documents `read_chunk` as cancel-safe. Poll a temporary future
+        // directly instead of moving the receive stream into a boxed future.
+        // This keeps the raw stream continuously available to `stop_sending`
+        // when a body deadline or peer cancellation interrupts a pending read.
+        let read_chunk = self.stream.read_chunk(usize::MAX, true);
+        tokio::pin!(read_chunk);
+        let chunk = ready!(read_chunk.as_mut().poll(cx));
 
-        let (stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        self.stream = Some(stream);
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|chunk| chunk.bytes)))
     }
 
     fn stop_sending(&mut self, error_code: u64) {
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(quinn::VarInt::from_u64(error_code).expect("invalid error code"));
-        }
+        let _ = self
+            .stream
+            .stop(quinn::VarInt::from_u64(error_code).expect("invalid error code"));
     }
 
     fn recv_id(&self) -> StreamId {
-        let id: u64 = self
-            .stream
-            .as_ref()
-            .expect("receive stream must be present outside poll_data")
-            .id()
-            .into();
+        let id: u64 = self.stream.id().into();
         id.try_into().expect("invalid stream id")
     }
 }

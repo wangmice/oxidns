@@ -116,16 +116,19 @@ enum H3BodyReadError {
 
 type H3ServerRequestStream = h3::server::RequestStream<ServerBidiStream<Bytes>, Bytes>;
 
-enum H3HeaderOutcome {
-    Resolved {
-        request: http::Request<()>,
-        stream: H3ServerRequestStream,
-        peer_stopped: H3PeerStoppedFuture,
-    },
+struct H3ResolvedRequest {
+    request: http::Request<()>,
+    stream: H3ServerRequestStream,
+    peer_stopped: H3PeerStoppedFuture,
+}
+
+enum H3HeaderError {
     Failed(h3::error::StreamError),
     PeerStopped(H3PeerStoppedResult),
     Deadline,
 }
+
+type H3HeaderOutcome = Result<H3ResolvedRequest, H3HeaderError>;
 
 async fn resolve_h3_headers(
     resolver: h3::server::RequestResolver<ServerQuinnConnection, Bytes>,
@@ -139,14 +142,14 @@ async fn resolve_h3_headers(
     )
     .await
     {
-        H3PhaseOutcome::Completed(Ok((request, stream))) => H3HeaderOutcome::Resolved {
+        H3PhaseOutcome::Completed(Ok((request, stream))) => Ok(H3ResolvedRequest {
             request,
             stream,
             peer_stopped,
-        },
-        H3PhaseOutcome::Completed(Err(error)) => H3HeaderOutcome::Failed(error),
-        H3PhaseOutcome::PeerStopped(stopped) => H3HeaderOutcome::PeerStopped(stopped),
-        H3PhaseOutcome::Deadline => H3HeaderOutcome::Deadline,
+        }),
+        H3PhaseOutcome::Completed(Err(error)) => Err(H3HeaderError::Failed(error)),
+        H3PhaseOutcome::PeerStopped(stopped) => Err(H3HeaderError::PeerStopped(stopped)),
+        H3PhaseOutcome::Deadline => Err(H3HeaderError::Deadline),
     }
 }
 
@@ -287,8 +290,6 @@ async fn handle_h3_connection(
     };
 
     let server_name = extract_tls_server_name(&connection).map(Arc::<str>::from);
-    let connection_liveness = connection.clone();
-
     debug!("HTTP/3 connection established with {}", src);
 
     let peer_stops = H3PeerStopQueue::default();
@@ -317,21 +318,21 @@ async fn handle_h3_connection(
                     continue;
                 };
 
-                let (request, mut stream, mut peer_stopped) = match resolved {
-                    H3HeaderOutcome::Resolved {
-                        request,
-                        stream,
-                        peer_stopped,
-                    } => (request, stream, peer_stopped),
-                    H3HeaderOutcome::Failed(error) => {
+                let H3ResolvedRequest {
+                    request,
+                    mut stream,
+                    peer_stopped,
+                } = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(H3HeaderError::Failed(error)) => {
                         warn!("Failed to resolve HTTP/3 request from {}: {}", src, error);
                         continue;
                     }
-                    H3HeaderOutcome::PeerStopped(stopped) => {
+                    Err(H3HeaderError::PeerStopped(stopped)) => {
                         log_h3_peer_stop(src, "request headers", &stopped);
                         continue;
                     }
-                    H3HeaderOutcome::Deadline => {
+                    Err(H3HeaderError::Deadline) => {
                         warn!(
                             client = %src,
                             "HTTP/3 request header deadline exceeded; dropping stream"
@@ -340,24 +341,14 @@ async fn handle_h3_connection(
                     }
                 };
 
-                // Preserve the global admission invariant: a fully resolved
-                // request obtains capacity before its handler task is spawned.
-                // When the server is saturated, stopping accept on this
-                // connection is intentional bounded backpressure.
-                let permit = tokio::select! {
-                    biased;
-                    stopped = peer_stopped.as_mut() => {
-                        cancel_h3_stream_after_peer_stop(
-                            &mut stream,
-                            src,
-                            "admission",
-                            stopped,
-                        );
-                        continue;
-                    }
-                    _ = request_cancel.cancelled() => return,
-                    _ = connection_liveness.closed() => return,
-                    permit = request_limiter.acquire() => permit,
+                // HTTP/3 has no connection-level flow-control reason to queue
+                // behind the global application budget. Joining the semaphore
+                // wait queue here would freeze this connection task and stop
+                // polling other header deadlines. Shed overload immediately so
+                // the accept/resolver loop remains live under saturation.
+                let Some(permit) = request_limiter.try_acquire() else {
+                    reject_h3_stream_overload(&mut stream, src);
+                    continue;
                 };
 
                 let dispatcher = dispatcher.clone();
@@ -424,6 +415,7 @@ async fn handle_h3_connection(
 }
 
 /// Handle a single HTTP/3 request stream
+#[allow(clippy::too_many_arguments)]
 async fn handle_h3_request(
     request: http::Request<()>,
     mut stream: H3ServerRequestStream,
@@ -653,6 +645,16 @@ fn log_h3_peer_stop(src: SocketAddr, phase: &'static str, stopped: &H3PeerStoppe
             "QUIC connection lost while HTTP/3 request was active"
         ),
     }
+}
+
+#[inline]
+fn reject_h3_stream_overload(stream: &mut H3ServerRequestStream, src: SocketAddr) {
+    debug!(
+        client = %src,
+        "Rejecting HTTP/3 request because the shared request budget is saturated"
+    );
+    stream.stop_sending(h3::error::Code::H3_REQUEST_REJECTED);
+    stream.stop_stream(h3::error::Code::H3_REQUEST_REJECTED);
 }
 
 #[inline]

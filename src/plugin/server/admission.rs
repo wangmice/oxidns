@@ -48,13 +48,19 @@ impl InboundRequestLimiter {
         }
     }
 
+    /// Try to acquire request capacity without joining Tokio's semaphore wait queue.
+    #[inline]
+    pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().try_acquire_owned().ok()
+    }
+
     /// Acquire request capacity before creating a handler task.
     #[inline]
     pub(crate) async fn acquire(&self) -> OwnedSemaphorePermit {
         // Keep the normal path out of Tokio's async semaphore wait queue. DNS
         // servers spend almost all of their time below the overload ceiling,
         // so this reduces admission control to a single atomic fast path.
-        if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
+        if let Some(permit) = self.try_acquire() {
             return permit;
         }
 
@@ -74,6 +80,25 @@ impl InboundRequestLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_acquire_rejects_without_waiting_when_capacity_is_full() {
+        let limiter = InboundRequestLimiter::new(1);
+        let first = limiter
+            .try_acquire()
+            .expect("the first request should acquire capacity");
+
+        assert!(
+            limiter.try_acquire().is_none(),
+            "overload admission must shed immediately instead of entering a semaphore wait queue"
+        );
+
+        drop(first);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "released capacity must be immediately reusable"
+        );
+    }
 
     #[tokio::test]
     async fn limiter_holds_capacity_until_permit_drop() {
