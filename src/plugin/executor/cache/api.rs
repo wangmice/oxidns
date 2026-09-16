@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -39,6 +38,7 @@ use crate::proto::{DNSClass, Record, RecordType};
 use crate::register_plugin_api;
 
 const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
+const CACHE_ENTRIES_SNAPSHOT_TTL_MS: u64 = 120_000;
 
 #[inline]
 fn cache_load_error_code(message: &str) -> &'static str {
@@ -73,6 +73,7 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
         |plugin_api|
         GET "/entries" => CacheEntriesListHandler {
             store: store.clone(),
+            snapshot: Arc::new(StdMutex::new(None)),
         },
         DELETE_PREFIX "/entries/" => CacheEntryDeleteHandler {
             store: store.clone(),
@@ -383,9 +384,21 @@ impl ApiHandler for CacheLoadDumpHandler {
     }
 }
 
+type CacheEntriesSnapshotCell = StdMutex<Option<Arc<CacheEntriesSnapshot>>>;
+type CacheEntriesSnapshotSlot = Arc<CacheEntriesSnapshotCell>;
+
 #[derive(Debug)]
 struct CacheEntriesListHandler {
     store: DnsCacheStore,
+    snapshot: CacheEntriesSnapshotSlot,
+}
+
+#[derive(Debug)]
+struct CacheEntriesSnapshot {
+    created_at_ms: u64,
+    state_id: u64,
+    qname: Option<String>,
+    keys: Box<[CacheKey]>,
 }
 
 #[derive(Debug)]
@@ -476,29 +489,86 @@ struct CacheEntryEcsRow {
     network_hex: String,
 }
 
+#[derive(Debug)]
 struct CacheEntryPageCandidate {
     key: CacheKey,
     entry: TtlCacheHandle<CacheItem>,
 }
 
-impl PartialEq for CacheEntryPageCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        cmp_cache_keys(&self.key, &other.key) == Ordering::Equal
+fn reusable_cache_entries_snapshot(
+    snapshot: &CacheEntriesSnapshotCell,
+    query: &CacheEntriesQuery,
+    now: u64,
+    state_id: u64,
+) -> Option<Arc<CacheEntriesSnapshot>> {
+    query.cursor.as_ref()?;
+
+    let guard = snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current = guard.as_ref()?;
+    if current.state_id != state_id
+        || current.qname != query.qname
+        || now.saturating_sub(current.created_at_ms) > CACHE_ENTRIES_SNAPSHOT_TTL_MS
+    {
+        return None;
     }
+
+    Some(current.clone())
 }
 
-impl Eq for CacheEntryPageCandidate {}
+fn build_cache_entries_snapshot(
+    store: &DnsCacheStore,
+    query: &CacheEntriesQuery,
+    now: u64,
+) -> Arc<CacheEntriesSnapshot> {
+    let mut keys = if query.qname.is_none() {
+        Vec::with_capacity(store.cache_map().entry_count())
+    } else {
+        Vec::new()
+    };
 
-impl PartialOrd for CacheEntryPageCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+    // Clone one shard at a time while its read guard is held. Filtering and
+    // sorting happen after the guard is released, so API work does not extend
+    // shard-lock hold time with substring matching or heap maintenance.
+    let state_id = store
+        .cache_map()
+        .visit_key_expiry_cloned_by_shard(|entries| {
+            for (key, expire_at_ms) in entries {
+                if expire_at_ms > now && cache_entry_matches_query(&key, query) {
+                    keys.push(key);
+                }
+            }
+            true
+        });
+
+    keys.sort_unstable_by(cmp_cache_keys);
+
+    Arc::new(CacheEntriesSnapshot {
+        created_at_ms: now,
+        state_id,
+        qname: query.qname.clone(),
+        keys: keys.into_boxed_slice(),
+    })
 }
 
-impl Ord for CacheEntryPageCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        cmp_cache_keys(&self.key, &other.key)
+fn cache_entries_snapshot(
+    store: &DnsCacheStore,
+    snapshot_cache: &CacheEntriesSnapshotCell,
+    query: &CacheEntriesQuery,
+    now: u64,
+) -> Arc<CacheEntriesSnapshot> {
+    let state_id = store.cache_map().state_id();
+    if let Some(snapshot) = reusable_cache_entries_snapshot(snapshot_cache, query, now, state_id) {
+        return snapshot;
     }
+
+    let built = build_cache_entries_snapshot(store, query, now);
+    let mut guard = snapshot_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(built.clone());
+    built
 }
 
 #[async_trait]
@@ -515,52 +585,31 @@ impl ApiHandler for CacheEntriesListHandler {
         let now = AppClock::elapsed_millis();
         let now_unix_ms = AppClock::now_timestamp();
         let store = self.store.clone();
+        let snapshot_cache = self.snapshot.clone();
 
         match tokio::task::spawn_blocking(move || {
-            // Keep only the smallest `limit + 1` keys after the cursor. This
-            // preserves stable keyset pagination without cloning/sorting the
-            // whole cache or retaining every cached response Arc.
+            // Build once for the first page, then reuse the same sorted key
+            // snapshot for follow-up pages with the same filter. Each returned
+            // key is revalidated against the live cache before serialization.
+            let snapshot = cache_entries_snapshot(&store, &snapshot_cache, &query, now);
+            let total_entries = snapshot.keys.len();
+            let start = cache_entries_cursor_start(&snapshot.keys, query.cursor.as_ref());
             let candidate_limit = query.limit.saturating_add(1);
-            let mut candidates = BinaryHeap::with_capacity(candidate_limit);
-            let mut total_entries = 0usize;
+            let mut entries = Vec::with_capacity(candidate_limit);
 
-            store.cache_map().visit_handles(|key, entry| {
-                if entry.expire_at_ms() <= now || !cache_entry_matches_query(key, &query) {
-                    return true;
+            for key in snapshot.keys[start..].iter() {
+                let Some(entry) = store.cache_map().get_retained_handle(key, now, 0) else {
+                    continue;
+                };
+
+                entries.push(CacheEntryPageCandidate {
+                    key: key.clone(),
+                    entry,
+                });
+                if entries.len() == candidate_limit {
+                    break;
                 }
-
-                total_entries = total_entries.saturating_add(1);
-
-                if query
-                    .cursor
-                    .as_ref()
-                    .is_some_and(|cursor| cmp_cache_keys(key, cursor) != Ordering::Greater)
-                {
-                    return true;
-                }
-
-                let should_keep = candidates.len() < candidate_limit
-                    || candidates
-                        .peek()
-                        .is_some_and(|largest: &CacheEntryPageCandidate| {
-                            cmp_cache_keys(key, &largest.key) == Ordering::Less
-                        });
-
-                if should_keep {
-                    if candidates.len() == candidate_limit {
-                        candidates.pop();
-                    }
-                    candidates.push(CacheEntryPageCandidate {
-                        key: key.clone(),
-                        entry,
-                    });
-                }
-
-                true
-            });
-
-            let mut entries = candidates.into_vec();
-            entries.sort_unstable_by(|left, right| cmp_cache_keys(&left.key, &right.key));
+            }
 
             let has_more = entries.len() > query.limit;
             if has_more {
@@ -740,13 +789,12 @@ fn cmp_cache_keys(left: &CacheKey, right: &CacheKey) -> Ordering {
         })
 }
 
-#[cfg(test)]
-fn cache_entries_cursor_start<T>(entries: &[(CacheKey, T)], cursor: Option<&CacheKey>) -> usize {
+fn cache_entries_cursor_start(entries: &[CacheKey], cursor: Option<&CacheKey>) -> usize {
     let Some(cursor) = cursor else {
         return 0;
     };
 
-    match entries.binary_search_by(|(key, _)| cmp_cache_keys(key, cursor)) {
+    match entries.binary_search_by(|key| cmp_cache_keys(key, cursor)) {
         Ok(index) => index.saturating_add(1),
         Err(index) => index,
     }
@@ -1237,46 +1285,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_entries_keyset_pagination_is_independent_of_last_access() {
+    fn cache_entries_keyset_pagination_uses_cache_key_order() {
         let key_a = test_cache_key("a.example.com");
         let key_b = test_cache_key("b.example.com");
         let key_c = test_cache_key("c.example.com");
         let key_d = test_cache_key("d.example.com");
 
-        let mut entries = vec![
-            (key_a.clone(), 400u64),
-            (key_b.clone(), 300u64),
-            (key_c.clone(), 200u64),
-            (key_d.clone(), 100u64),
-        ];
-
-        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
+        let mut entries = vec![key_a.clone(), key_b.clone(), key_c.clone(), key_d.clone()];
+        entries.sort_unstable_by(cmp_cache_keys);
 
         let page1 = &entries[..2];
+        assert_eq!(page1[0], key_a);
+        assert_eq!(page1[1], key_b);
 
-        assert_eq!(page1[0].0, key_a);
-        assert_eq!(page1[1].0, key_b);
-
-        let cursor = key_b.clone();
-
-        //  D is heavily accessed between page requests.
-        //
-        //  Under the old last_access ordering this would move D to the front
-        // and  shift the offset, causing duplicates/missing rows.
-        for (key, last_access) in &mut entries {
-            if *key == key_d {
-                *last_access = 10_000;
-            }
-        }
-
-        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
-
-        let start = cache_entries_cursor_start(&entries, Some(&cursor));
-
+        let start = cache_entries_cursor_start(&entries, Some(&key_b));
         assert_eq!(start, 2);
-
-        assert_eq!(entries[start].0, key_c);
-        assert_eq!(entries[start + 1].0, key_d);
+        assert_eq!(entries[start], key_c);
+        assert_eq!(entries[start + 1], key_d);
     }
 
     #[test]
@@ -1287,16 +1312,103 @@ mod tests {
         let key_d = test_cache_key("d.example.com");
 
         // Previous page ended at B, but B disappeared before the next request.
-        let cursor = key_b;
+        let mut entries = vec![key_a, key_c.clone(), key_d.clone()];
+        entries.sort_unstable_by(cmp_cache_keys);
 
-        let mut entries = vec![(key_a, ()), (key_c.clone(), ()), (key_d.clone(), ())];
-
-        entries.sort_unstable_by(|(left, _), (right, _)| cmp_cache_keys(left, right));
-
-        let start = cache_entries_cursor_start(&entries, Some(&cursor));
-
+        let start = cache_entries_cursor_start(&entries, Some(&key_b));
         assert_eq!(start, 1);
-        assert_eq!(entries[start].0, key_c);
-        assert_eq!(entries[start + 1].0, key_d);
+        assert_eq!(entries[start], key_c);
+        assert_eq!(entries[start + 1], key_d);
+    }
+
+    #[test]
+    fn cache_entries_snapshot_filters_expired_and_qname_before_pagination() {
+        let cache_map = CacheMap::with_capacity(4);
+        cache_map.insert_or_update(
+            test_cache_key("b.example.com"),
+            CacheItem::new(crate::proto::Message::new(), 60, 10_000),
+            0,
+            10_000,
+        );
+        cache_map.insert_or_update(
+            test_cache_key("a.example.com"),
+            CacheItem::new(crate::proto::Message::new(), 60, 10_000),
+            0,
+            10_000,
+        );
+        cache_map.insert_or_update(
+            test_cache_key("expired.example.com"),
+            CacheItem::new(crate::proto::Message::new(), 60, 500),
+            0,
+            500,
+        );
+        cache_map.insert_or_update(
+            test_cache_key("other.test"),
+            CacheItem::new(crate::proto::Message::new(), 60, 10_000),
+            0,
+            10_000,
+        );
+
+        let store = test_store(cache_map, 4);
+        let query = CacheEntriesQuery {
+            limit: 100,
+            cursor: None,
+            qname: Some("example.com".to_string()),
+        };
+        let snapshot = build_cache_entries_snapshot(&store, &query, 1_000);
+
+        let domains = snapshot
+            .keys
+            .iter()
+            .map(|key| key.domain.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(domains, vec!["a.example.com", "b.example.com"]);
+    }
+    #[test]
+    fn cache_entries_snapshot_is_reused_only_for_followup_pages_with_same_filter() {
+        let cached = Arc::new(CacheEntriesSnapshot {
+            created_at_ms: 1_000,
+            state_id: 7,
+            qname: Some("example.com".to_string()),
+            keys: vec![test_cache_key("a.example.com")].into_boxed_slice(),
+        });
+        let slot = StdMutex::new(Some(cached.clone()));
+
+        let followup = CacheEntriesQuery {
+            limit: 100,
+            cursor: Some(test_cache_key("a.example.com")),
+            qname: Some("example.com".to_string()),
+        };
+        assert!(Arc::ptr_eq(
+            &reusable_cache_entries_snapshot(&slot, &followup, 1_001, 7).unwrap(),
+            &cached
+        ));
+
+        assert!(
+            reusable_cache_entries_snapshot(&slot, &followup, 1_001, 8).is_none(),
+            "cache state replacement must invalidate the pagination snapshot"
+        );
+
+        let first_page = CacheEntriesQuery {
+            cursor: None,
+            ..followup.clone()
+        };
+        assert!(reusable_cache_entries_snapshot(&slot, &first_page, 1_001, 7).is_none());
+
+        let different_filter = CacheEntriesQuery {
+            qname: Some("example.net".to_string()),
+            ..followup.clone()
+        };
+        assert!(reusable_cache_entries_snapshot(&slot, &different_filter, 1_001, 7).is_none());
+
+        assert!(
+            reusable_cache_entries_snapshot(
+                &slot,
+                &followup,
+                1_000 + CACHE_ENTRIES_SNAPSHOT_TTL_MS + 1,
+                7,
+            )
+            .is_none()
+        );
     }
 }

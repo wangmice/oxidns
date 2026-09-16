@@ -1536,6 +1536,7 @@ where
     ///
     /// The callback runs while the corresponding DashMap read guard is held, so
     /// it must stay lightweight and must not call back into this cache.
+    #[cfg(test)]
     pub(crate) fn visit_handles(&self, mut visitor: impl FnMut(&K, TtlCacheHandle<V>) -> bool) {
         let state = self.state.load();
         for item in state.map.iter() {
@@ -1602,6 +1603,49 @@ where
         K: Clone,
     {
         self.visit_keys_cloned_by_shard_filtered(|_| true, visitor);
+    }
+
+    /// Visit cache keys and retention deadlines one shard at a time.
+    ///
+    /// Only the key and scalar expiry are copied while the shard read guard is
+    /// held. Management/observability callers can then perform filtering or
+    /// ordering after releasing the cache shard without retaining value Arcs.
+    pub(crate) fn visit_key_expiry_cloned_by_shard(
+        &self,
+        mut visitor: impl FnMut(Vec<(K, u64)>) -> bool,
+    ) -> u64
+    where
+        K: Clone,
+    {
+        let state = self.state.load();
+
+        for shard_lock in state.map.shards() {
+            let shard = shard_lock.read();
+            let shard_len = shard.len();
+            if shard_len == 0 {
+                continue;
+            }
+
+            let mut entries = Vec::with_capacity(shard_len);
+            let bucket_count = shard.buckets();
+            for bucket_index in 0..bucket_count {
+                // SAFETY: `bucket_index < bucket_count`; the shard read guard
+                // remains held while checking and reading the bucket.
+                if unsafe { !shard.is_bucket_full(bucket_index) } {
+                    continue;
+                }
+
+                let (key, shared_entry) = unsafe { shard.bucket(bucket_index).as_ref() };
+                entries.push((key.clone(), shared_entry.get().expire_at_ms));
+            }
+            drop(shard);
+
+            if !entries.is_empty() && !visitor(entries) {
+                break;
+            }
+        }
+
+        state.state_id
     }
 
     /// Visit cache entries one shard at a time using stable handles.
@@ -1948,6 +1992,11 @@ where
     #[inline]
     pub fn entry_count(&self) -> usize {
         self.state.load().entry_count.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn state_id(&self) -> u64 {
+        self.state.load().state_id
     }
 }
 
