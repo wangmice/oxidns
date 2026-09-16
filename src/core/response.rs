@@ -88,9 +88,7 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
     if qtype == RecordType::ANY {
         return if has_any_answer_at_name(response, question.name(), question.qclass()) {
             ResponseDisposition::CompletePositive
-        } else if response.answers().is_empty()
-            || has_negative_soa_for_name(response, question.name(), question.qclass())
-        {
+        } else if should_classify_as_nodata(response, question.name(), question.qclass()) {
             ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
         } else {
             ResponseDisposition::Other
@@ -104,9 +102,7 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
                 && record.rr_type() == RecordType::CNAME
         }) {
             ResponseDisposition::CompletePositive
-        } else if response.answers().is_empty()
-            || has_negative_soa_for_name(response, question.name(), question.qclass())
-        {
+        } else if should_classify_as_nodata(response, question.name(), question.qclass()) {
             ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
         } else {
             ResponseDisposition::Other
@@ -131,9 +127,7 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
         current = target;
     }
 
-    if response.answers().is_empty()
-        || has_negative_soa_for_name(response, current, question.qclass())
-    {
+    if should_classify_as_nodata(response, current, question.qclass()) {
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
     } else if saw_alias {
         ResponseDisposition::IncompleteAlias
@@ -198,13 +192,42 @@ fn has_any_answer_at_name(response: &Message, name: &Name, dns_class: DNSClass) 
         .any(|record| record.name() == name && record.class() == dns_class)
 }
 
+/// Return whether this response should be treated as NODATA for `name`.
+///
+/// A covering SOA is explicit negative evidence.  For compatibility, an empty
+/// `NOERROR` response without an SOA still uses the configured NODATA fallback,
+/// except when a covering NS RRset identifies the response as a referral.
 #[inline]
-fn has_negative_soa_for_name(response: &Message, name: &Name, dns_class: DNSClass) -> bool {
-    response.authorities().iter().any(|record| {
-        record.class() == dns_class
-            && record.rr_type() == RecordType::SOA
-            && is_name_or_subdomain(name, record.name())
-    })
+fn should_classify_as_nodata(response: &Message, name: &Name, dns_class: DNSClass) -> bool {
+    // Responses with answers cannot be classified as the empty-answer
+    // NODATA fallback. A covering SOA is still explicit negative evidence.
+    if !response.answers().is_empty() {
+        return response.authorities().iter().any(|record| {
+            record.class() == dns_class
+                && record.rr_type() == RecordType::SOA
+                && is_name_or_subdomain(name, record.name())
+        });
+    }
+
+    let mut has_delegation_ns = false;
+
+    for record in response.authorities() {
+        if record.class() != dns_class {
+            continue;
+        }
+
+        match record.rr_type() {
+            RecordType::SOA if is_name_or_subdomain(name, record.name()) => {
+                return true;
+            }
+            RecordType::NS if is_name_or_subdomain(name, record.name()) => {
+                has_delegation_ns = true;
+            }
+            _ => {}
+        }
+    }
+
+    !has_delegation_ns
 }
 
 /// Return whether `name` is equal to or below `ancestor` in the DNS tree.
@@ -221,7 +244,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::proto::rdata::{A, CNAME, SOA};
+    use crate::proto::rdata::{A, CNAME, NS, SOA};
     use crate::proto::{DNSClass, RData, Record};
 
     fn question(name: &str, qtype: RecordType) -> Question {
@@ -240,6 +263,19 @@ mod tests {
             Name::from_ascii(owner).unwrap(),
             60,
             RData::CNAME(CNAME(Name::from_ascii(target).unwrap())),
+        ));
+    }
+
+    fn add_referral(response: &mut Message, zone: &str, nameserver: &str) {
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii(zone).unwrap(),
+            60,
+            RData::NS(NS(Name::from_ascii(nameserver).unwrap())),
+        ));
+        response.add_additional(Record::from_rdata(
+            Name::from_ascii(nameserver).unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 53))),
         ));
     }
 
@@ -388,6 +424,69 @@ mod tests {
         assert_eq!(
             classify_response(&cname_response, Some(&cname_request)),
             ResponseDisposition::CompletePositive
+        );
+    }
+
+    #[test]
+    fn referral_is_not_nodata_for_address_query() {
+        let request = question("www.child.example.com.", RecordType::A);
+        let mut response = response_with_question(request.clone());
+        add_referral(
+            &mut response,
+            "child.example.com.",
+            "ns1.child.example.com.",
+        );
+
+        assert_eq!(
+            classify_response(&response, Some(&request)),
+            ResponseDisposition::Other
+        );
+    }
+
+    #[test]
+    fn referral_is_not_nodata_for_any_or_cname_query() {
+        for qtype in [RecordType::ANY, RecordType::CNAME] {
+            let request = question("www.child.example.com.", qtype);
+            let mut response = response_with_question(request.clone());
+            add_referral(
+                &mut response,
+                "child.example.com.",
+                "ns1.child.example.com.",
+            );
+
+            assert_eq!(
+                classify_response(&response, Some(&request)),
+                ResponseDisposition::Other
+            );
+        }
+    }
+
+    #[test]
+    fn covering_soa_still_wins_over_authority_ns_for_nodata() {
+        let request = question("www.child.example.com.", RecordType::A);
+        let mut response = response_with_question(request.clone());
+        add_referral(
+            &mut response,
+            "child.example.com.",
+            "ns1.child.example.com.",
+        );
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("child.example.com.").unwrap(),
+            120,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.child.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.child.example.com.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                30,
+            )),
+        ));
+
+        assert_eq!(
+            classify_response(&response, Some(&request)),
+            ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData)
         );
     }
 

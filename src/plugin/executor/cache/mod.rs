@@ -2478,7 +2478,7 @@ mod tests {
     use super::*;
     use crate::plugin::executor::Executor;
     use crate::plugin::executor::sequence::chain::ChainProgram;
-    use crate::proto::rdata::{CNAME, SOA};
+    use crate::proto::rdata::{CNAME, NS, SOA};
     use crate::proto::{
         ClientSubnet, DNSClass, Edns, EdnsCode, EdnsOption, Message, Name, Question, RData, Rcode,
         Record, RecordType,
@@ -4611,6 +4611,35 @@ mod tests {
             ),
             CacheTtlDecision::Cache(60)
         );
+    }
+
+    #[test]
+    fn referral_is_not_negative_cacheable() {
+        let cache = test_cache(default_test_config());
+        let mut response = Message::new();
+        response.set_rcode(Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii("www.child.example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("child.example.com.").unwrap(),
+            10,
+            RData::NS(NS(Name::from_ascii("ns1.child.example.com.").unwrap())),
+        ));
+        response.add_additional(Record::from_rdata(
+            Name::from_ascii("ns1.child.example.com.").unwrap(),
+            10,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+
+        let key = cache_key_for_domain("www.child.example.com");
+        assert_eq!(
+            cache.compute_cache_ttl(&response, &key),
+            CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
+        );
+        assert_eq!(cache.compute_negative_ttl(&response, &key), None);
     }
 
     #[test]
