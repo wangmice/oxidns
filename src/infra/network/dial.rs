@@ -663,7 +663,9 @@ mod tests {
             ))
         ))]
         assert!(
-            !socket.reuse_port().expect("SO_REUSEPORT should be readable"),
+            !socket
+                .reuse_port()
+                .expect("SO_REUSEPORT should be readable"),
             "outbound UDP sockets must not enable SO_REUSEPORT"
         );
     }

@@ -275,7 +275,10 @@ async fn drain_udp_tasks(
     drain_timeout: Duration,
 ) -> bool {
     tasks.close();
-    if tokio::time::timeout(drain_timeout, tasks.wait()).await.is_ok() {
+    if tokio::time::timeout(drain_timeout, tasks.wait())
+        .await
+        .is_ok()
+    {
         return true;
     }
 
@@ -294,9 +297,7 @@ fn build_udp_socket_with_recv_buffer_size(
     addr: SocketAddr,
     recv_buffer_size: usize,
 ) -> Result<StdUdpSocket> {
-    listen::build_udp_socket(addr, |sock| {
-        configure_udp_socket(sock, recv_buffer_size)
-    })
+    listen::build_udp_socket(addr, |sock| configure_udp_socket(sock, recv_buffer_size))
 }
 
 fn configure_udp_socket(sock: &Socket, recv_buffer_size: usize) -> Result<()> {
@@ -316,14 +317,10 @@ fn configure_udp_socket(sock: &Socket, recv_buffer_size: usize) -> Result<()> {
 
 fn resolve_udp_recv_buffer_size(configured: Option<usize>) -> Result<usize> {
     let recv_buffer_size = configured.unwrap_or(DEFAULT_UDP_SOCKET_BUFFER_SIZE);
-    if !(MIN_UDP_SOCKET_BUFFER_SIZE..=MAX_UDP_SOCKET_BUFFER_SIZE)
-        .contains(&recv_buffer_size)
-    {
+    if !(MIN_UDP_SOCKET_BUFFER_SIZE..=MAX_UDP_SOCKET_BUFFER_SIZE).contains(&recv_buffer_size) {
         return Err(DnsError::plugin(format!(
             "UDP server recv_buffer_size must be between {} bytes (256 KiB) and {} bytes (16 MiB); recommended/default is {} bytes (1 MiB)",
-            MIN_UDP_SOCKET_BUFFER_SIZE,
-            MAX_UDP_SOCKET_BUFFER_SIZE,
-            DEFAULT_UDP_SOCKET_BUFFER_SIZE,
+            MIN_UDP_SOCKET_BUFFER_SIZE, MAX_UDP_SOCKET_BUFFER_SIZE, DEFAULT_UDP_SOCKET_BUFFER_SIZE,
         )));
     }
     Ok(recv_buffer_size)
@@ -459,8 +456,7 @@ recv_buffer_size: 262144
             task_cancel.cancelled().await;
         });
 
-        let graceful =
-            drain_udp_tasks(&tasks, &cancel, Duration::from_millis(1)).await;
+        let graceful = drain_udp_tasks(&tasks, &cancel, Duration::from_millis(1)).await;
         assert!(!graceful);
         tokio::time::timeout(Duration::from_secs(1), tasks.wait())
             .await

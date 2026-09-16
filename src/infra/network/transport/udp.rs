@@ -187,21 +187,18 @@ impl UdpTransport {
     ) -> std::result::Result<(), UdpWriteError> {
         let mut bytes = wire_buffer_pool().acquire();
         msg.append_to_with_id(id, &mut bytes)
-            .map_err(UdpWriteError::Query)?;
+            .map_err(|e| UdpWriteError::Query(DnsError::from(e)))?;
 
         let n = match &self.socket {
-            UdpTransportSocket::Direct(socket) => socket.send(&bytes).await.map_err(|e| {
-                classify_udp_send_error("UDP send error", e, false)
-            })?,
+            UdpTransportSocket::Direct(socket) => socket
+                .send(&bytes)
+                .await
+                .map_err(|e| classify_udp_send_error("UDP send error", e, false))?,
             UdpTransportSocket::Socks5 {
                 association,
                 target,
             } => association.send_to(&bytes, target).await.map_err(|e| {
-                classify_udp_send_error(
-                    "SOCKS5 UDP send error",
-                    e,
-                    association.is_control_closed(),
-                )
+                classify_udp_send_error("SOCKS5 UDP send error", e, association.is_control_closed())
             })?,
         };
 
@@ -313,35 +310,38 @@ mod tests {
             .expect("sender should bind");
         let receiver_addr = receiver.local_addr().expect("receiver address");
         let sender_addr = sender.local_addr().expect("sender address");
-        receiver.connect(sender_addr).await.expect("receiver should connect");
-        sender.connect(receiver_addr).await.expect("sender should connect");
+        receiver
+            .connect(sender_addr)
+            .await
+            .expect("receiver should connect");
+        sender
+            .connect(receiver_addr)
+            .await
+            .expect("sender should connect");
 
         let mut response = Message::new();
         response.set_id(0xCAFE);
         response.set_message_type(MessageType::Response);
         let name = Name::from_ascii("large.example.com.").unwrap();
-        response.add_question(Question::new(
-            name.clone(),
-            RecordType::A,
-            DNSClass::IN,
-        ));
+        response.add_question(Question::new(name.clone(), RecordType::A, DNSClass::IN));
         for index in 0..700u16 {
             response.add_answer(Record::from_rdata(
                 name.clone(),
                 60,
-                RData::A(A(Ipv4Addr::new(
-                    192,
-                    0,
-                    2,
-                    (index % 250 + 1) as u8,
-                ))),
+                RData::A(A(Ipv4Addr::new(192, 0, 2, (index % 250 + 1) as u8))),
             ));
         }
 
         let wire = response.to_bytes().expect("large response should encode");
-        assert!(wire.len() > 8_196, "test response must exceed legacy buffer");
+        assert!(
+            wire.len() > 8_196,
+            "test response must exceed legacy buffer"
+        );
         assert!(wire.len() < UDP_MAX_DATAGRAM_SIZE);
-        sender.send(&wire).await.expect("large UDP datagram should send");
+        sender
+            .send(&wire)
+            .await
+            .expect("large UDP datagram should send");
 
         let transport = UdpTransport::new(receiver);
         let mut buf = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
@@ -370,7 +370,10 @@ mod tests {
 
         for kind in [io::ErrorKind::NotConnected, io::ErrorKind::BrokenPipe] {
             let error = classify_udp_send_error("UDP send error", io::Error::from(kind), false);
-            assert!(error.should_close_connection(), "{kind:?} must retire the socket");
+            assert!(
+                error.should_close_connection(),
+                "{kind:?} must retire the socket"
+            );
         }
 
         let error = classify_udp_send_error(
