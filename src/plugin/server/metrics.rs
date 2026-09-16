@@ -22,6 +22,7 @@ pub(crate) struct ServerMetrics {
     controlled_total: AtomicU64,
     failed_total: AtomicU64,
     admission_rejected_total: AtomicU64,
+    invalid_datagram_total: AtomicU64,
     inflight: AtomicU64,
     latency_count: AtomicU64,
     latency_sum_ms: AtomicU64,
@@ -37,6 +38,7 @@ impl ServerMetrics {
             controlled_total: AtomicU64::new(0),
             failed_total: AtomicU64::new(0),
             admission_rejected_total: AtomicU64::new(0),
+            invalid_datagram_total: AtomicU64::new(0),
             inflight: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
@@ -54,6 +56,11 @@ impl ServerMetrics {
     pub(super) fn on_admission_rejected(&self) {
         self.admission_rejected_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn on_invalid_datagram(&self) {
+        self.invalid_datagram_total.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -114,6 +121,12 @@ impl MetricSource for ServerMetrics {
             "Total inbound requests dropped before handler spawn because the server admission limit was full.",
             &labels,
             self.admission_rejected_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "server_invalid_datagram_total",
+            "Total malformed inbound UDP datagrams rejected before request handling.",
+            &labels,
+            self.invalid_datagram_total.load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::gauge(
             "server_inflight",

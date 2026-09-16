@@ -39,6 +39,12 @@ pub(crate) enum UdpReadError {
 }
 
 #[derive(Debug)]
+pub(crate) enum UdpServerReadError {
+    Receive(DnsError),
+    InvalidDatagram,
+}
+
+#[derive(Debug)]
 pub(crate) enum UdpWriteError {
     Query(DnsError),
     Connection(DnsError),
@@ -253,16 +259,16 @@ impl UdpServerTransport {
     /// Receive one UDP datagram from any peer and decode it as DNS message.
     #[inline]
     #[hotpath::measure]
-    pub async fn read_message_from(&self, buf: &mut [u8]) -> Result<(Message, UdpReplyTarget)> {
-        let (n, addr) = self
-            .socket
-            .recv_from(buf)
-            .await
-            .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {}", e)))?;
-
-        let msg = Message::from_bytes(&buf[..n]).map_err(|e| {
-            DnsError::protocol(format!("Failed to parse DNS message from UDP: {}", e))
+    pub(crate) async fn read_message_from(
+        &self,
+        buf: &mut [u8],
+    ) -> std::result::Result<(Message, UdpReplyTarget), UdpServerReadError> {
+        let (n, addr) = self.socket.recv_from(buf).await.map_err(|e| {
+            UdpServerReadError::Receive(DnsError::protocol(format!("Failed to recv_from UDP: {e}")))
         })?;
+
+        let msg =
+            Message::from_bytes(&buf[..n]).map_err(|_| UdpServerReadError::InvalidDatagram)?;
         Ok((msg, addr))
     }
 
@@ -299,6 +305,31 @@ mod tests {
 
     use super::*;
     use crate::proto::{A, DNSClass, MessageType, Name, Question, RData, Record, RecordType};
+
+    #[tokio::test]
+    async fn udp_server_transport_classifies_malformed_dns_as_invalid_datagram() {
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("receiver should bind");
+        let receiver_addr = receiver.local_addr().expect("receiver address");
+        let transport = UdpServerTransport::new(receiver).expect("server transport");
+
+        let sender = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sender should bind");
+        sender
+            .send_to(&[0xDE, 0xAD, 0xBE, 0xEF], receiver_addr)
+            .await
+            .expect("malformed datagram should send");
+
+        let mut buf = [0u8; 512];
+        let err = transport
+            .read_message_from(&mut buf)
+            .await
+            .expect_err("malformed DNS datagram must be rejected");
+
+        assert!(matches!(err, UdpServerReadError::InvalidDatagram));
+    }
 
     #[tokio::test]
     async fn direct_udp_transport_receives_dns_datagram_larger_than_legacy_buffer() {

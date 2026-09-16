@@ -24,7 +24,7 @@ use crate::config::types::PluginConfig;
 use crate::core::context::RequestMeta;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::{self, parse_listen_addr};
-use crate::infra::network::transport::udp::UdpServerTransport;
+use crate::infra::network::transport::udp::{UdpServerReadError, UdpServerTransport};
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
@@ -267,7 +267,12 @@ async fn run_server(
                             }
                         });
                     }
-                    Err(e) => {
+                    Err(UdpServerReadError::InvalidDatagram) => {
+                        if let Some(metrics) = handler.metrics.as_ref() {
+                            metrics.on_invalid_datagram();
+                        }
+                    }
+                    Err(UdpServerReadError::Receive(e)) => {
                         warn!("Error receiving message on UDP socket: {}", e);
                     }
                 }
