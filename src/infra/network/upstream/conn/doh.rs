@@ -242,10 +242,9 @@ mod tests {
 
     #[test]
     fn test_build_doh_request_uri_preserves_fixed_query_parameters() {
-        let connection_info = ConnectionInfo::with_addr(
-            "https://dns.example.test/dns-query?token=abc&profile=fast",
-        )
-        .expect("connection info should parse");
+        let connection_info =
+            ConnectionInfo::with_addr("https://dns.example.test/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
 
         let uri = build_doh_request_uri(&connection_info);
 
@@ -279,9 +278,8 @@ mod tests {
 
     #[test]
     fn test_build_doh_request_uri_treats_empty_fixed_query_as_absent() {
-        let mut connection_info =
-            ConnectionInfo::with_addr("https://dns.example.test/dns-query")
-                .expect("connection info should parse");
+        let mut connection_info = ConnectionInfo::with_addr("https://dns.example.test/dns-query")
+            .expect("connection info should parse");
         connection_info.doh_query = Some(String::new());
 
         let uri = build_doh_request_uri(&connection_info);

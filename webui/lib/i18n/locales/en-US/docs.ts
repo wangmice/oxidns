@@ -7,6 +7,8 @@ export const enUSDocs = {
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the entry executor that handles all requests of the listener, usually the sequence plug-in.\n- Configuration requirements:\n  - Must reference a defined executor plugin.\n  - A common value is a `tag` of a certain `sequence`.\n- Operational impact:\n  - All requests entering the current `udp_server` will be handed over to this executor for continued processing.\n  - If the reference does not exist or is of the wrong type, plugin initialization will fail.",
     listen:
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the UDP listening address.\n- Supported formats:\n  - `ip:port`\n  - `:port`\n- Operational impact:\n  - Determine the address and port to which the listener is bound.\n  - The listener cannot be started when the address is invalid, the port conflicts, or the binding fails.",
+    recv_buffer_size:
+      "- Type: `integer`; Required: No; Default: `1048576` (1 MiB)\n- Unit: bytes\n- Function: Request the kernel receive-buffer size for the UDP socket.\n- Requirements:\n  - Valid range: `262144`–`16777216` bytes (256 KiB–16 MiB).\n  - Default/recommended: `1048576` (1 MiB). Use 256–512 KiB for light workloads; consider 2–4 MiB for higher concurrency or bursty traffic.\n  - Values outside the supported range fail plugin initialization instead of being silently adjusted.\n- Operational impact:\n  - A larger buffer can reduce kernel drops during high-PPS bursts.\n  - The operating system may clamp the effective value to its global socket-buffer limit.",
   },
   tcp_server: {
     entry:

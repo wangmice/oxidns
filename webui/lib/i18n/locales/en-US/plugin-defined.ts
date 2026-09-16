@@ -37,6 +37,11 @@ export const enUSPluginDefined = {
           description: "Specify the UDP listening address.",
           example: "0.0.0.0:53",
         },
+        recv_buffer_size: {
+          label: "Receive buffer (bytes)",
+          description:
+            "Valid range: 256 KiB–16 MiB; default/recommended: 1 MiB. Values outside the range are rejected.",
+        },
       },
       metrics: {
         labels: {

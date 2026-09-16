@@ -492,7 +492,8 @@ pub fn try_lookup_server_name(server_name: &str) -> Result<IpAddr> {
 ///
 /// # Notes
 /// - Socket is set to non-blocking mode for async I/O
-/// - SO_REUSEADDR is enabled to allow rapid reconnection
+/// - Address/port reuse is intentionally disabled for outbound UDP sockets so
+///   concurrent connections cannot acquire the same local 4-tuple
 /// - connect() is called to set the default destination (allows using send vs
 ///   send_to)
 pub(crate) async fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
@@ -515,16 +516,6 @@ fn create_udp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result
         Some(Protocol::UDP),
     )?;
     configure_common_socket(&socket, options)?;
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "solaris",
-            target_os = "illumos",
-            target_os = "cygwin",
-            target_os = "wasi"
-        ))
-    ))]
-    let _ = socket.set_reuse_port(true);
     let _ = socket.set_recv_buffer_size(64 * 1024);
     Ok(socket)
 }
@@ -537,6 +528,7 @@ fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result
     )?;
 
     configure_common_socket(&socket, options)?;
+    let _ = socket.set_reuse_address(true);
     let _ = socket.set_tcp_nodelay(true);
     Ok(socket)
 }
@@ -544,7 +536,6 @@ fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result
 fn configure_common_socket(socket: &Socket, options: &SocketOptions) -> Result<()> {
     let _ = options;
     let _ = socket.set_nonblocking(true);
-    let _ = socket.set_reuse_address(true);
 
     #[cfg(target_os = "linux")]
     if let Some(so_mark) = options.so_mark {
@@ -647,6 +638,36 @@ mod tests {
 
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn outbound_udp_socket_does_not_enable_address_or_port_reuse() {
+        let socket_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        let socket = create_udp_socket(socket_addr, &SocketOptions::default())
+            .expect("configured UDP socket should be created");
+
+        assert!(
+            !socket
+                .reuse_address()
+                .expect("SO_REUSEADDR should be readable"),
+            "outbound UDP sockets must not enable SO_REUSEADDR"
+        );
+
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "solaris",
+                target_os = "illumos",
+                target_os = "cygwin",
+                target_os = "wasi"
+            ))
+        ))]
+        assert!(
+            !socket
+                .reuse_port()
+                .expect("SO_REUSEPORT should be readable"),
+            "outbound UDP sockets must not enable SO_REUSEPORT"
+        );
     }
 
     #[test]
