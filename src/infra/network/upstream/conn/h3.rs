@@ -437,4 +437,18 @@ mod tests {
         assert_eq!(builder.socket_options.so_mark(), Some(7));
         assert_eq!(builder.socket_options.bind_to_device(), Some("utun1"));
     }
+
+    #[test]
+    fn test_builder_new_preserves_fixed_doh_query_parameters() {
+        let connection_info =
+            ConnectionInfo::with_addr("h3://dns.example.com/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
+
+        let builder = H3ConnectionBuilder::new(&connection_info);
+
+        assert_eq!(
+            builder.request_uri,
+            "https://dns.example.com/dns-query?token=abc&profile=fast&dns="
+        );
+    }
 }

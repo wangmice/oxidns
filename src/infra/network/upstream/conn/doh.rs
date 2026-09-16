@@ -107,12 +107,12 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 /// Build DoH request URI template from connection info
 ///
 /// Constructs the full HTTPS URI for DoH requests, handling non-standard ports.
-/// The returned URI ends with "?dns=" ready for base64url-encoded query to be
-/// appended.
+/// Configured fixed query parameters are preserved and the returned URI ends
+/// with `dns=` ready for the base64url-encoded DNS message to be appended.
 ///
 /// # Arguments
-/// * `connection_info` - Connection configuration with server name, port, and
-///   path
+/// * `connection_info` - Connection configuration with server name, port,
+///   path, and optional fixed DoH query parameters
 ///
 /// # Returns
 /// String containing "https://server:port/path?dns=" (port omitted if 443)
@@ -120,6 +120,7 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 /// # Examples
 /// - Standard port: `https://dns.example.com/dns-query?dns=`
 /// - Custom port: `https://dns.example.com:8443/dns-query?dns=`
+/// - Fixed query: `https://dns.example.com/dns-query?token=abc&dns=`
 ///
 /// The returned value is an immutable URI template. Per-query capacity for the
 /// Base64 payload is reserved by `build_dns_get_request`.
@@ -127,17 +128,29 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 #[allow(dead_code)]
 pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
     let host = doh_uri_host(&connection_info.server_name);
-    if connection_info.port != ConnectionType::DoH.default_port() {
+    let mut uri = if connection_info.port != ConnectionType::DoH.default_port() {
         // Include port in URI for non-standard ports. IPv6 literals must be
         // enclosed in brackets when used as an URI authority.
         format!(
-            "https://{}:{}{}?dns=",
+            "https://{}:{}{}",
             host, connection_info.port, connection_info.path
         )
     } else {
         // Omit port 443 (standard HTTPS port) from URI.
-        format!("https://{}{}?dns=", host, connection_info.path)
+        format!("https://{}{}", host, connection_info.path)
+    };
+
+    match connection_info.doh_query.as_deref() {
+        Some(query) if !query.is_empty() => {
+            uri.reserve(query.len() + "?&dns=".len());
+            uri.push('?');
+            uri.push_str(query);
+            uri.push_str("&dns=");
+        }
+        _ => uri.push_str("?dns="),
     }
+
+    uri
 }
 
 #[cfg(feature = "_http-client")]
@@ -225,6 +238,55 @@ mod tests {
         let uri = build_doh_request_uri(&connection_info);
 
         assert_eq!(uri, "https://dns.example.test:8443/dns-query?dns=");
+    }
+
+    #[test]
+    fn test_build_doh_request_uri_preserves_fixed_query_parameters() {
+        let connection_info = ConnectionInfo::with_addr(
+            "https://dns.example.test/dns-query?token=abc&profile=fast",
+        )
+        .expect("connection info should parse");
+
+        let uri = build_doh_request_uri(&connection_info);
+
+        assert_eq!(
+            uri,
+            "https://dns.example.test/dns-query?token=abc&profile=fast&dns="
+        );
+    }
+
+    #[test]
+    fn test_build_doh_request_uri_preserves_percent_encoded_query() {
+        let connection_info =
+            ConnectionInfo::with_addr("https://dns.example.test/dns-query?token=a%2Fb%3Dc")
+                .expect("connection info should parse");
+
+        let uri = build_doh_request_uri(&connection_info);
+
+        assert_eq!(
+            uri,
+            "https://dns.example.test/dns-query?token=a%2Fb%3Dc&dns="
+        );
+    }
+
+    #[test]
+    fn test_doh_upstream_rejects_preconfigured_dns_query_parameter() {
+        let result =
+            ConnectionInfo::with_addr("https://dns.example.test/dns-query?token=abc&dns=stale");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_doh_request_uri_treats_empty_fixed_query_as_absent() {
+        let mut connection_info =
+            ConnectionInfo::with_addr("https://dns.example.test/dns-query")
+                .expect("connection info should parse");
+        connection_info.doh_query = Some(String::new());
+
+        let uri = build_doh_request_uri(&connection_info);
+
+        assert_eq!(uri, "https://dns.example.test/dns-query?dns=");
     }
 
     #[test]

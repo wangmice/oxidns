@@ -269,6 +269,12 @@ pub struct ConnectionInfo {
     /// DoH request path (e.g., `/dns-query`), empty for non-HTTP protocols
     pub path: String,
 
+    /// Fixed query string from the configured DoH URL, without the leading
+    /// `?`. This is preserved separately from `path` so the per-request
+    /// RFC 8484 `dns` parameter can be appended without losing configured
+    /// parameters such as authentication tokens.
+    pub doh_query: Option<String>,
+
     /// Server hostname for TLS SNI and certificate validation
     pub server_name: String,
 
@@ -309,7 +315,7 @@ impl ConnectionInfo {
     pub(crate) const MAX_CONFIGURED_CONNS_SIZE: usize = 4096;
 
     pub fn with_addr(addr: &str) -> Result<Self> {
-        let (connection_type, host, port, path, _) = detect_connection_type(addr)?;
+        let (connection_type, host, port, path, doh_query, _) = detect_connection_type(addr)?;
         let port = port.unwrap_or(connection_type.default_port());
 
         debug!(
@@ -328,6 +334,7 @@ impl ConnectionInfo {
             bootstrap: None,
             bootstrap_timeout: None,
             path,
+            doh_query,
             timeout: Self::DEFAULT_QUERY_TIMEOUT,
             server_name: host,
             insecure_skip_verify: false,
@@ -378,7 +385,8 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             so_mark,
             bind_to_device,
         } = upstream_config;
-        let (connection_type, host, port, path, helper_flags) = detect_connection_type(&addr)?;
+        let (connection_type, host, port, path, doh_query, helper_flags) =
+            detect_connection_type(&addr)?;
         let enable_pipeline = if helper_flags.force_pipeline {
             Some(true)
         } else {
@@ -491,6 +499,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             bootstrap,
             bootstrap_timeout,
             path,
+            doh_query,
             timeout: timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT),
             server_name: host,
             insecure_skip_verify: insecure_skip_verify.unwrap_or(false),
@@ -538,9 +547,16 @@ struct HelperFlags {
     force_http3: bool,
 }
 
-fn detect_connection_type(
-    addr: &str,
-) -> Result<(ConnectionType, String, Option<u16>, String, HelperFlags)> {
+type DetectedConnection = (
+    ConnectionType,
+    String,
+    Option<u16>,
+    String,
+    Option<String>,
+    HelperFlags,
+);
+
+fn detect_connection_type(addr: &str) -> Result<DetectedConnection> {
     if !addr.contains("//") {
         return detect_connection_type(&("udp://".to_owned() + addr));
     }
@@ -580,6 +596,20 @@ fn detect_connection_type(
         }
     };
 
+    let doh_query = if connection_type == ConnectionType::DoH {
+        if url.query_pairs().any(|(key, _)| key == "dns") {
+            return Err(DnsError::plugin(
+                "DoH upstream URL must not contain a preconfigured 'dns' query parameter",
+            ));
+        }
+
+        url.query()
+            .filter(|query| !query.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
     debug!(
         "Detected upstream: scheme={}, type={:?}, host={}, port={:?}, path={}",
         url.scheme(),
@@ -594,6 +624,7 @@ fn detect_connection_type(
         host,
         url.port(),
         url.path().to_string(),
+        doh_query,
         helper_flags,
     ))
 }
