@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "oxidns"
-version = "1.5.2"
+version = "1.5.9"
 edition = "2024"
 description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
 repository = "https://github.com/svenshi/oxidns"
