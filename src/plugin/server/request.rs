@@ -13,7 +13,61 @@ use crate::core::context::DnsContext;
 pub use crate::core::context::RequestMeta;
 use crate::infra::network::ip::normalize_ipv4_mapped_socket_addr;
 use crate::plugin::executor::{ExecStep, Executor};
-use crate::proto::{Edns, Message, Rcode};
+use crate::proto::{Edns, Message, MessageType, Opcode, Rcode};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum InboundDnsRequestDisposition {
+    Accept,
+    Drop,
+    Respond(Rcode),
+}
+
+/// Classify a decoded inbound DNS message before it consumes a handler slot.
+///
+/// This intentionally enforces the recursive server contract used by OxiDNS:
+/// one standard QUERY question and no detached SIG(0)/TSIG records. Signed
+/// requests cannot be forwarded transparently because upstream transports may
+/// rewrite the DNS message ID, invalidating the signature or MAC.
+#[inline]
+pub(crate) fn classify_inbound_dns_request(
+    request: &Message,
+) -> InboundDnsRequestDisposition {
+    if request.message_type() != MessageType::Query {
+        return InboundDnsRequestDisposition::Drop;
+    }
+
+    if !request.signature().is_empty() {
+        return InboundDnsRequestDisposition::Drop;
+    }
+
+    if request.opcode() != Opcode::Query {
+        return InboundDnsRequestDisposition::Respond(Rcode::NotImp);
+    }
+
+    if request.questions().len() != 1 {
+        return InboundDnsRequestDisposition::Respond(Rcode::FormErr);
+    }
+
+    InboundDnsRequestDisposition::Accept
+}
+
+/// Build a local protocol error using the same server-level response policy as
+/// executor-generated responses. The malformed/unsupported request sections
+/// are intentionally not cloned, keeping the rejection path constant-cost.
+#[inline]
+pub(crate) fn build_inbound_error_response(request: &Message, rcode: Rcode) -> Message {
+    let mut response = Message::new();
+    response.set_id(request.id());
+    response.set_message_type(MessageType::Response);
+    response.set_opcode(request.opcode());
+    if request.opcode() == Opcode::Query {
+        response.set_recursion_desired(request.recursion_desired());
+        response.set_checking_disabled(request.checking_disabled());
+    }
+    response.set_rcode(rcode);
+    RequestHandle::finalize_response(request, &mut response);
+    response
+}
 
 #[derive(Debug)]
 pub struct RequestHandle {
@@ -172,6 +226,91 @@ mod tests {
             crate::proto::DNSClass::IN,
         ));
         request
+    }
+
+    #[test]
+    fn inbound_dns_request_classifier_accepts_standard_single_question_query() {
+        let request = make_request(7, "example.com.");
+        assert_eq!(
+            classify_inbound_dns_request(&request),
+            InboundDnsRequestDisposition::Accept
+        );
+    }
+
+    #[test]
+    fn inbound_dns_request_classifier_drops_response_packets() {
+        let mut request = make_request(7, "example.com.");
+        request.set_message_type(MessageType::Response);
+        assert_eq!(
+            classify_inbound_dns_request(&request),
+            InboundDnsRequestDisposition::Drop
+        );
+    }
+
+    #[test]
+    fn inbound_dns_request_classifier_drops_detached_signatures() {
+        use crate::proto::{RData, Record};
+        use crate::proto::rdata::TXT;
+
+        let mut request = make_request(7, "example.com.");
+        request.signature_mut().push(Record::from_rdata(
+            Name::from_ascii("sig.example.com.").expect("signature name should be valid"),
+            0,
+            RData::TXT(TXT::new(Box::from([3u8, b's', b'i', b'g']))),
+        ));
+        assert_eq!(
+            classify_inbound_dns_request(&request),
+            InboundDnsRequestDisposition::Drop
+        );
+    }
+
+    #[test]
+    fn inbound_dns_request_classifier_returns_notimp_for_non_query_opcode() {
+        let mut request = make_request(7, "example.com.");
+        request.set_opcode(Opcode::Status);
+        assert_eq!(
+            classify_inbound_dns_request(&request),
+            InboundDnsRequestDisposition::Respond(Rcode::NotImp)
+        );
+    }
+
+    #[test]
+    fn inbound_dns_request_classifier_returns_formerr_for_question_count() {
+        let empty = Message::new();
+        assert_eq!(
+            classify_inbound_dns_request(&empty),
+            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
+        );
+
+        let mut multiple = make_request(7, "example.com.");
+        multiple.add_question(Question::new(
+            Name::from_ascii("example.net.").expect("query name should be valid"),
+            RecordType::AAAA,
+            crate::proto::DNSClass::IN,
+        ));
+        assert_eq!(
+            classify_inbound_dns_request(&multiple),
+            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
+        );
+    }
+
+    #[test]
+    fn inbound_dns_error_response_uses_server_finalize_policy() {
+        let mut request = make_request(0x1234, "example.com.");
+        let mut edns = Edns::new();
+        edns.flags_mut().dnssec_ok = true;
+        request.set_edns(edns);
+
+        let response = build_inbound_error_response(&request, Rcode::FormErr);
+        assert_eq!(response.id(), request.id());
+        assert_eq!(response.message_type(), MessageType::Response);
+        assert_eq!(response.opcode(), Opcode::Query);
+        assert_eq!(response.rcode(), Rcode::FormErr);
+        assert!(response.recursion_available());
+        assert!(response.questions().is_empty());
+        assert_eq!(response.recursion_desired(), request.recursion_desired());
+        assert_eq!(response.checking_disabled(), request.checking_disabled());
+        assert!(response.edns().is_some_and(|edns| edns.flags().dnssec_ok));
     }
 
     fn make_request_handle(executor: Arc<dyn Executor>) -> RequestHandle {

@@ -28,7 +28,8 @@ use crate::infra::network::transport::udp::{UdpServerReadError, UdpServerTranspo
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
-    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, RequestHandle, Server, ServerMetrics,
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundDnsRequestDisposition, RequestHandle, Server,
+    ServerMetrics, build_inbound_error_response, classify_inbound_dns_request,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
@@ -236,6 +237,29 @@ async fn run_server(
             recv = transport.read_message_from(&mut buf) => {
                 match recv {
                     Ok((msg, reply_target)) => {
+                        // Reject semantically invalid DNS messages before they can consume a
+                        // handler slot or upstream request-map entry. Local protocol errors are
+                        // sent inline and never enter the executor pipeline.
+                        match classify_inbound_dns_request(&msg) {
+                            InboundDnsRequestDisposition::Accept => {}
+                            InboundDnsRequestDisposition::Drop => continue,
+                            InboundDnsRequestDisposition::Respond(rcode) => {
+                                let src_addr = reply_target.peer_addr();
+                                let max_payload = msg.max_payload();
+                                let response = build_inbound_error_response(&msg, rcode);
+                                if let Err(e) = transport
+                                    .write_message_to(&response, reply_target, max_payload)
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to send UDP protocol error to {}: {}",
+                                        src_addr, e
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+
                         // UDP has a single handler-spawn producer. Reuse the task tracker's
                         // existing count instead of adding a semaphore to the hot path.
                         if !udp_has_request_capacity(&tasks, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS) {

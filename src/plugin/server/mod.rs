@@ -26,6 +26,9 @@ pub(crate) use admission::{
 };
 pub(crate) use connection::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard};
 pub(crate) use metrics::ServerMetrics;
+pub(crate) use request::{
+    InboundDnsRequestDisposition, build_inbound_error_response, classify_inbound_dns_request,
+};
 pub use request::{RequestExit, RequestHandle, RequestMeta, RequestResult};
 
 #[cfg(feature = "server-doh")]
