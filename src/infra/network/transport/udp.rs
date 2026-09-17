@@ -38,11 +38,8 @@ pub(crate) enum UdpReadError {
     InvalidDatagram(DnsError),
 }
 
-#[derive(Debug)]
-pub(crate) enum UdpServerReadError {
-    Receive(DnsError),
-    InvalidDatagram,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidUdpDatagram;
 
 #[derive(Debug)]
 pub(crate) enum UdpWriteError {
@@ -256,20 +253,27 @@ impl UdpServerTransport {
         })
     }
 
-    /// Receive one UDP datagram from any peer and decode it as DNS message.
+    /// Receive one raw UDP datagram from any peer without decoding DNS.
+    ///
+    /// Keeping socket draining separate from DNS parsing lets the server drop
+    /// datagrams at the admission boundary before paying parser CPU or
+    /// temporary allocation costs while already at capacity.
     #[inline]
     #[hotpath::measure]
-    pub(crate) async fn read_message_from(
+    pub(crate) async fn read_datagram_from(
         &self,
         buf: &mut [u8],
-    ) -> std::result::Result<(Message, UdpReplyTarget), UdpServerReadError> {
-        let (n, addr) = self.socket.recv_from(buf).await.map_err(|e| {
-            UdpServerReadError::Receive(DnsError::protocol(format!("Failed to recv_from UDP: {e}")))
-        })?;
+    ) -> Result<(usize, UdpReplyTarget)> {
+        self.socket
+            .recv_from(buf)
+            .await
+            .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {e}")))
+    }
 
-        let msg =
-            Message::from_bytes(&buf[..n]).map_err(|_| UdpServerReadError::InvalidDatagram)?;
-        Ok((msg, addr))
+    /// Decode a previously received UDP datagram as a DNS message.
+    #[inline]
+    pub(crate) fn parse_datagram(buf: &[u8]) -> std::result::Result<Message, InvalidUdpDatagram> {
+        Message::from_bytes(buf).map_err(|_| InvalidUdpDatagram)
     }
 
     #[inline]
@@ -323,12 +327,14 @@ mod tests {
             .expect("malformed datagram should send");
 
         let mut buf = [0u8; 512];
-        let err = transport
-            .read_message_from(&mut buf)
+        let (n, _) = transport
+            .read_datagram_from(&mut buf)
             .await
-            .expect_err("malformed DNS datagram must be rejected");
+            .expect("raw malformed datagram must still be drained from the socket");
+        assert_eq!(&buf[..n], &[0xDE, 0xAD, 0xBE, 0xEF]);
 
-        assert!(matches!(err, UdpServerReadError::InvalidDatagram));
+        UdpServerTransport::parse_datagram(&buf[..n])
+            .expect_err("malformed DNS datagram must be rejected when parsed");
     }
 
     #[tokio::test]

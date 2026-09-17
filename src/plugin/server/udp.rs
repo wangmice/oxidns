@@ -24,7 +24,7 @@ use crate::config::types::PluginConfig;
 use crate::core::context::RequestMeta;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::{self, parse_listen_addr};
-use crate::infra::network::transport::udp::{UdpServerReadError, UdpServerTransport};
+use crate::infra::network::transport::udp::UdpServerTransport;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
@@ -234,9 +234,30 @@ async fn run_server(
                     break;
                 }
             }
-            recv = transport.read_message_from(&mut buf) => {
+            recv = transport.read_datagram_from(&mut buf) => {
                 match recv {
-                    Ok((msg, reply_target)) => {
+                    Ok((n, reply_target)) => {
+                        // Keep draining the kernel socket while overloaded, but reject before DNS
+                        // parsing. UDP has a single handler-spawn producer, so this one capacity
+                        // check is sufficient: between here and spawn the tracked task count can
+                        // only stay the same or decrease.
+                        if !udp_has_request_capacity(&tasks, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS) {
+                            if let Some(metrics) = handler.metrics.as_ref() {
+                                metrics.on_admission_rejected();
+                            }
+                            continue;
+                        }
+
+                        let msg = match UdpServerTransport::parse_datagram(&buf[..n]) {
+                            Ok(msg) => msg,
+                            Err(_) => {
+                                if let Some(metrics) = handler.metrics.as_ref() {
+                                    metrics.on_invalid_datagram();
+                                }
+                                continue;
+                            }
+                        };
+
                         // Reject semantically invalid DNS messages before they can consume a
                         // handler slot or upstream request-map entry. Local protocol errors are
                         // sent inline and never enter the executor pipeline.
@@ -258,15 +279,6 @@ async fn run_server(
                                 }
                                 continue;
                             }
-                        }
-
-                        // UDP has a single handler-spawn producer. Reuse the task tracker's
-                        // existing count instead of adding a semaphore to the hot path.
-                        if !udp_has_request_capacity(&tasks, DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS) {
-                            if let Some(metrics) = handler.metrics.as_ref() {
-                                metrics.on_admission_rejected();
-                            }
-                            continue;
                         }
 
                         let src_addr = reply_target.peer_addr();
@@ -291,13 +303,8 @@ async fn run_server(
                             }
                         });
                     }
-                    Err(UdpServerReadError::InvalidDatagram) => {
-                        if let Some(metrics) = handler.metrics.as_ref() {
-                            metrics.on_invalid_datagram();
-                        }
-                    }
-                    Err(UdpServerReadError::Receive(e)) => {
-                        warn!("Error receiving message on UDP socket: {}", e);
+                    Err(e) => {
+                        warn!("Error receiving UDP datagram: {}", e);
                     }
                 }
             }

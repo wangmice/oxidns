@@ -48,7 +48,7 @@ const udpServerMetrics: PluginMetricsDef = {
   metricHelp: {
     ...serverMetrics.metricHelp,
     server_admission_rejected_total:
-      "因服务器并发处理上限已满，在创建处理任务前丢弃的 UDP 请求总数。",
+      "因服务器并发处理上限已满，在 DNS 解析前直接丢弃的 UDP 数据报总数。",
     server_invalid_datagram_total:
       "因 DNS 报文格式无效而在进入请求处理链前丢弃的 UDP 数据报总数。",
   },

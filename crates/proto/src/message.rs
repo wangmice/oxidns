@@ -1274,7 +1274,7 @@ mod tests {
         assert!(lens.questions_end_len > 512);
         assert_eq!(lens.trailer_len, 0);
 
-        let mut out = vec![0xaa, 0xbb];
+        let mut out = vec![0xAA, 0xBB];
         let original = out.clone();
         assert!(message.append_to_with_limit(512, &mut out).is_err());
         assert_eq!(out, original);
@@ -1292,7 +1292,7 @@ mod tests {
         let mut edns = Edns::new();
         edns.set_udp_payload_size(512);
         edns.insert(crate::proto::EdnsOption::Local(
-            crate::proto::EdnsLocal::new(65001, vec![0x5a; 480]),
+            crate::proto::EdnsLocal::new(65001, vec![0x5A; 480]),
         ));
         message.set_edns(edns);
 
@@ -1300,7 +1300,7 @@ mod tests {
         assert!(lens.trailer_len <= 512);
         assert!(lens.minimal_len() > 512);
 
-        let mut out = vec![0xcc];
+        let mut out = vec![0xCC];
         let original = out.clone();
         assert!(message.append_to_with_limit(512, &mut out).is_err());
         assert_eq!(out, original);

@@ -29,9 +29,7 @@ pub(crate) enum InboundDnsRequestDisposition {
 /// requests cannot be forwarded transparently because upstream transports may
 /// rewrite the DNS message ID, invalidating the signature or MAC.
 #[inline]
-pub(crate) fn classify_inbound_dns_request(
-    request: &Message,
-) -> InboundDnsRequestDisposition {
+pub(crate) fn classify_inbound_dns_request(request: &Message) -> InboundDnsRequestDisposition {
     if request.message_type() != MessageType::Query {
         return InboundDnsRequestDisposition::Drop;
     }
@@ -249,8 +247,8 @@ mod tests {
 
     #[test]
     fn inbound_dns_request_classifier_drops_detached_signatures() {
-        use crate::proto::{RData, Record};
         use crate::proto::rdata::TXT;
+        use crate::proto::{RData, Record};
 
         let mut request = make_request(7, "example.com.");
         request.signature_mut().push(Record::from_rdata(
@@ -310,7 +308,12 @@ mod tests {
         assert!(response.questions().is_empty());
         assert_eq!(response.recursion_desired(), request.recursion_desired());
         assert_eq!(response.checking_disabled(), request.checking_disabled());
-        assert!(response.edns().as_ref().is_some_and(|edns| edns.flags().dnssec_ok));
+        assert!(
+            response
+                .edns()
+                .as_ref()
+                .is_some_and(|edns| edns.flags().dnssec_ok)
+        );
     }
 
     fn make_request_handle(executor: Arc<dyn Executor>) -> RequestHandle {

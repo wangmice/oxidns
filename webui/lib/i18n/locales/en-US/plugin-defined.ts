@@ -72,7 +72,7 @@ export const enUSPluginDefined = {
           server_latency_sum_ms:
             "Total processing latency (milliseconds) of all completed requests.",
           server_admission_rejected_total:
-            "The total number of UDP requests dropped before spawning a handler because the server concurrency limit was reached.",
+            "The total number of UDP datagrams dropped before DNS parsing because the server concurrency limit was reached.",
           server_invalid_datagram_total:
             "The total number of malformed UDP DNS datagrams dropped before entering the request handling chain.",
         },

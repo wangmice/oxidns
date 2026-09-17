@@ -118,7 +118,7 @@ impl MetricSource for ServerMetrics {
         ));
         sink.emit(MetricSample::counter(
             "server_admission_rejected_total",
-            "Total inbound requests dropped before handler spawn because the server admission limit was full.",
+            "Total inbound requests or datagrams dropped before handler spawn because the server admission limit was full; UDP rejects before DNS parsing.",
             &labels,
             self.admission_rejected_total.load(Ordering::Relaxed),
         ));
