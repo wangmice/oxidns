@@ -37,6 +37,7 @@ export const zhCNPluginDefined = {
           label: "接收缓冲区(字节)",
           description:
             "范围 256 KiB–16 MiB；默认/推荐 1 MiB。过小或过大的值会被配置校验拒绝。",
+          example: "1048576（1 MiB）",
         },
       },
       metrics: {
@@ -48,6 +49,8 @@ export const zhCNPluginDefined = {
           server_inflight: "处理中",
           server_latency_count: "延迟样本",
           server_latency_sum_ms: "延迟累计(ms)",
+          server_admission_rejected_total: "准入丢弃",
+          server_invalid_datagram_total: "非法 UDP 报文",
         },
         help: {
           server_request_total: "服务器接收并处理的入站 DNS 请求总数。",
@@ -58,6 +61,10 @@ export const zhCNPluginDefined = {
           server_inflight: "当前服务器正在处理中的请求数量。",
           server_latency_count: "纳入服务器延迟统计的已完成请求数。",
           server_latency_sum_ms: "所有已完成请求的总处理延迟（毫秒）。",
+          server_admission_rejected_total:
+            "因服务器并发处理上限已满，在创建处理任务前丢弃的 UDP 请求总数。",
+          server_invalid_datagram_total:
+            "因 DNS 报文格式无效而在进入请求处理链前丢弃的 UDP 数据报总数。",
         },
         derived: {
           "latency:server": "平均延迟",

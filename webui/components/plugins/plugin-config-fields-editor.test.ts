@@ -474,6 +474,39 @@ describe("time matcher config form", () => {
   });
 });
 
+describe("number field bounds", () => {
+  const fields: ConfigField[] = [
+    {
+      key: "recv_buffer_size",
+      label: "Receive buffer",
+      type: "number",
+      min: 262144,
+      max: 16777216,
+    },
+  ];
+
+  it("accepts inclusive boundaries and values inside the range", () => {
+    expect(
+      isPluginConfigFormValid(fields, { recv_buffer_size: 262144 }),
+    ).toBe(true);
+    expect(
+      isPluginConfigFormValid(fields, { recv_buffer_size: 1048576 }),
+    ).toBe(true);
+    expect(
+      isPluginConfigFormValid(fields, { recv_buffer_size: 16777216 }),
+    ).toBe(true);
+  });
+
+  it("rejects values outside the configured range", () => {
+    expect(
+      isPluginConfigFormValid(fields, { recv_buffer_size: 262143 }),
+    ).toBe(false);
+    expect(
+      isPluginConfigFormValid(fields, { recv_buffer_size: 16777217 }),
+    ).toBe(false);
+  });
+});
+
 describe("optional object config fields", () => {
   it("does not validate required children when an optional object is omitted", () => {
     const formValues = createPluginConfigFormValues(

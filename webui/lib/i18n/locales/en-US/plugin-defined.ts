@@ -41,6 +41,7 @@ export const enUSPluginDefined = {
           label: "Receive buffer (bytes)",
           description:
             "Valid range: 256 KiB–16 MiB; default/recommended: 1 MiB. Values outside the range are rejected.",
+          example: "1048576 (1 MiB)",
         },
       },
       metrics: {
@@ -52,6 +53,8 @@ export const enUSPluginDefined = {
           server_inflight: "In flight",
           server_latency_count: "Latency samples",
           server_latency_sum_ms: "Total latency (ms)",
+          server_admission_rejected_total: "Admission rejected",
+          server_invalid_datagram_total: "Invalid UDP datagrams",
         },
         help: {
           server_request_total:
@@ -68,6 +71,10 @@ export const enUSPluginDefined = {
             "The number of completed requests included in server latency statistics.",
           server_latency_sum_ms:
             "Total processing latency (milliseconds) of all completed requests.",
+          server_admission_rejected_total:
+            "The total number of UDP requests dropped before spawning a handler because the server concurrency limit was reached.",
+          server_invalid_datagram_total:
+            "The total number of malformed UDP DNS datagrams dropped before entering the request handling chain.",
         },
         derived: {
           "latency:server": "Average latency",

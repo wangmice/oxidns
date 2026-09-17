@@ -95,6 +95,10 @@ export interface ConfigField {
   description?: string;
   docs?: string;
   required?: boolean;
+  /** Inclusive minimum accepted by number fields. */
+  min?: number;
+  /** Inclusive maximum accepted by number fields. */
+  max?: number;
   /** Form value intentionally written for a new config, distinct from a runtime default. */
   initialValue?: unknown;
   default?: unknown;
