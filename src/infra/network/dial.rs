@@ -234,6 +234,11 @@ impl TlsDialOptions {
         self.query_timeout = Some((deadline, stage));
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
+    }
 }
 
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
