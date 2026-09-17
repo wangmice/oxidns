@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use fast_socks5::util::target_addr::TargetAddr;
 use tokio::net::UdpSocket;
@@ -16,6 +17,22 @@ use crate::infra::network::udp_socket::{UdpReplySocket, UdpReplyTarget};
 use crate::proto::Message;
 
 pub(crate) const UDP_MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
+const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
+const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
+
+/// Return the bounded exponential delay used after consecutive UDP receive errors.
+#[inline]
+pub(crate) fn udp_recv_error_backoff(consecutive_errors: u32) -> Duration {
+    let shift = consecutive_errors.saturating_sub(1).min(5);
+    let delay_ms = (UDP_RECV_ERROR_BACKOFF_BASE_MS << shift).min(UDP_RECV_ERROR_BACKOFF_MAX_MS);
+    Duration::from_millis(delay_ms)
+}
+
+/// Keep warning logs sparse during a persistent UDP receive failure.
+#[inline]
+pub(crate) fn should_warn_udp_recv_error(consecutive_errors: u32) -> bool {
+    consecutive_errors == 1 || consecutive_errors.is_power_of_two()
+}
 
 /// Connected UDP client transport for DNS messages.
 #[derive(Debug)]

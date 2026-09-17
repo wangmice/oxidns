@@ -18,14 +18,14 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::{DialTarget, SocketOptions, UdpDialOptions, connect_udp};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::Socks5Opt;
-use crate::infra::network::transport::udp::{UDP_MAX_DATAGRAM_SIZE, UdpReadError, UdpTransport};
+use crate::infra::network::transport::udp::{
+    UDP_MAX_DATAGRAM_SIZE, UdpReadError, UdpTransport, should_warn_udp_recv_error,
+    udp_recv_error_backoff,
+};
 use crate::infra::network::upstream::ConnectionInfo;
 use crate::infra::network::upstream::conn::request_map::RequestMap;
 use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, QueryDeadline};
 use crate::proto::Message;
-
-const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
-const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
 
 /// Represents a single UDP connection used in DNS upstream queries.
 /// Each connection manages its own socket and maintains a mapping
@@ -311,7 +311,7 @@ impl UdpConnection {
                             debug_assert!(e.should_backoff());
                             consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
                             let backoff = udp_recv_error_backoff(consecutive_recv_errors);
-                            if consecutive_recv_errors == 1 || consecutive_recv_errors.is_power_of_two() {
+                            if should_warn_udp_recv_error(consecutive_recv_errors) {
                                 warn!(
                                     conn_id = self.id,
                                     upstream = %self.upstream,
@@ -348,12 +348,6 @@ impl UdpConnection {
             }
         }
     }
-}
-
-fn udp_recv_error_backoff(consecutive_errors: u32) -> Duration {
-    let shift = consecutive_errors.saturating_sub(1).min(5);
-    let delay_ms = (UDP_RECV_ERROR_BACKOFF_BASE_MS << shift).min(UDP_RECV_ERROR_BACKOFF_MAX_MS);
-    Duration::from_millis(delay_ms)
 }
 
 /// Builder for creating new `UdpConnection` instances.
@@ -448,6 +442,17 @@ mod tests {
         assert_eq!(udp_recv_error_backoff(5), Duration::from_millis(160));
         assert_eq!(udp_recv_error_backoff(6), Duration::from_millis(250));
         assert_eq!(udp_recv_error_backoff(64), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn udp_receive_error_warning_cadence_is_exponential() {
+        assert!(should_warn_udp_recv_error(1));
+        assert!(should_warn_udp_recv_error(2));
+        assert!(!should_warn_udp_recv_error(3));
+        assert!(should_warn_udp_recv_error(4));
+        assert!(!should_warn_udp_recv_error(5));
+        assert!(should_warn_udp_recv_error(8));
+        assert!(!should_warn_udp_recv_error(9));
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

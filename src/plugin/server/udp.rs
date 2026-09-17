@@ -24,7 +24,9 @@ use crate::config::types::PluginConfig;
 use crate::core::context::RequestMeta;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::{self, parse_listen_addr};
-use crate::infra::network::transport::udp::UdpServerTransport;
+use crate::infra::network::transport::udp::{
+    UdpServerTransport, should_warn_udp_recv_error, udp_recv_error_backoff,
+};
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
@@ -226,6 +228,7 @@ async fn run_server(
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
     let tasks = TaskTracker::new();
+    let mut consecutive_recv_errors = 0u32;
     let request_cancel = CancellationToken::new();
     loop {
         tokio::select! {
@@ -237,6 +240,8 @@ async fn run_server(
             recv = transport.read_datagram_from(&mut buf) => {
                 match recv {
                     Ok((n, reply_target)) => {
+                        consecutive_recv_errors = 0;
+
                         // Keep draining the kernel socket while overloaded, but reject before DNS
                         // parsing. UDP has a single handler-spawn producer, so this one capacity
                         // check is sufficient: between here and spawn the tracked task count can
@@ -304,7 +309,34 @@ async fn run_server(
                         });
                     }
                     Err(e) => {
-                        warn!("Error receiving UDP datagram: {}", e);
+                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                        let backoff = udp_recv_error_backoff(consecutive_recv_errors);
+
+                        if should_warn_udp_recv_error(consecutive_recv_errors) {
+                            warn!(
+                                err = %e,
+                                consecutive_errors = consecutive_recv_errors,
+                                backoff_ms = backoff.as_millis(),
+                                "UDP server receive error; backing off"
+                            );
+                        } else {
+                            debug!(
+                                err = %e,
+                                consecutive_errors = consecutive_recv_errors,
+                                backoff_ms = backoff.as_millis(),
+                                "UDP server receive error; backing off"
+                            );
+                        }
+
+                        tokio::select! {
+                            biased;
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() || *shutdown_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
                     }
                 }
             }
