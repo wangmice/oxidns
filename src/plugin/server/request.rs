@@ -310,7 +310,7 @@ mod tests {
         assert!(response.questions().is_empty());
         assert_eq!(response.recursion_desired(), request.recursion_desired());
         assert_eq!(response.checking_disabled(), request.checking_disabled());
-        assert!(response.edns().is_some_and(|edns| edns.flags().dnssec_ok));
+        assert!(response.edns().as_ref().is_some_and(|edns| edns.flags().dnssec_ok));
     }
 
     fn make_request_handle(executor: Arc<dyn Executor>) -> RequestHandle {

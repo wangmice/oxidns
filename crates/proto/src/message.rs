@@ -282,10 +282,9 @@ impl Message {
         // Even the smallest valid truncated response must keep the header,
         // questions, and the trailer block (OPT plus detached signature
         // records).
-        let minimal_len = lens.questions_end_len + lens.trailer_len;
-        if minimal_len > size {
+        if lens.minimal_len() > size {
             return Err(DnsError::protocol(
-                "dns message cannot fit within UDP payload while preserving EDNS/signature trailer",
+                "dns message cannot fit within UDP payload while preserving questions and trailer",
             ));
         }
 
@@ -878,6 +877,15 @@ pub(crate) struct TruncationLens {
     pub total_len: usize,
 }
 
+impl TruncationLens {
+    /// Smallest encoded message that preserves the complete question section
+    /// and the mandatory trailer block.
+    #[inline]
+    pub(crate) const fn minimal_len(&self) -> usize {
+        self.questions_end_len + self.trailer_len
+    }
+}
+
 impl Default for Message {
     fn default() -> Self {
         Self::new()
@@ -1244,6 +1252,83 @@ mod tests {
             panic!("expected response local edns option");
         };
         assert_eq!(local.data(), &[9, 9, 9]);
+    }
+
+    #[test]
+    fn append_to_with_limit_rejects_oversized_question_section_without_writing() {
+        let mut message = Message::new();
+        let mut index = 0usize;
+        while message.compute_truncation_lens(true).questions_end_len <= 512 {
+            message.add_question(Question::new(
+                Name::from_ascii(&format!(
+                    "question-{index:03}.unique-{index:03}.example.invalid."
+                ))
+                .unwrap(),
+                RecordType::TXT,
+                DNSClass::IN,
+            ));
+            index += 1;
+        }
+
+        let lens = message.compute_truncation_lens(true);
+        assert!(lens.questions_end_len > 512);
+        assert_eq!(lens.trailer_len, 0);
+
+        let mut out = vec![0xaa, 0xbb];
+        let original = out.clone();
+        assert!(message.append_to_with_limit(512, &mut out).is_err());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn append_to_with_limit_rejects_questions_plus_trailer_over_budget() {
+        let mut message = Message::new();
+        message.add_question(Question::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::TXT,
+            DNSClass::IN,
+        ));
+
+        let mut edns = Edns::new();
+        edns.set_udp_payload_size(512);
+        edns.insert(crate::proto::EdnsOption::Local(
+            crate::proto::EdnsLocal::new(65001, vec![0x5a; 480]),
+        ));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        assert!(lens.trailer_len <= 512);
+        assert!(lens.minimal_len() > 512);
+
+        let mut out = vec![0xcc];
+        let original = out.clone();
+        assert!(message.append_to_with_limit(512, &mut out).is_err());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn append_to_with_limit_accepts_exact_minimal_budget() {
+        let mut message = Message::new();
+        message.add_question(Question::new(
+            Name::from_ascii("boundary.example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+
+        let mut edns = Edns::new();
+        edns.set_udp_payload_size(1232);
+        edns.insert(crate::proto::EdnsOption::Local(
+            crate::proto::EdnsLocal::new(65001, vec![1, 2, 3, 4]),
+        ));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        let limit = lens.minimal_len();
+        assert_eq!(limit, lens.total_len);
+
+        let mut out = Vec::new();
+        message.append_to_with_limit(limit, &mut out).unwrap();
+        assert_eq!(out.len(), limit);
     }
 
     #[test]

@@ -458,6 +458,16 @@ pub(crate) fn encode_message_with_limit(
             return Ok(());
         }
 
+        // The question section and detached trailer are mandatory. If they do
+        // not fit together, no valid size-limited encoding can be produced
+        // without changing DNS message semantics. Reject before touching the
+        // caller-owned output buffer.
+        if lens.minimal_len() > limit {
+            return Err(DnsError::protocol(
+                "dns message cannot fit within UDP payload while preserving questions and trailer",
+            ));
+        }
+
         let header_offset = prepare_output_buffer_append(out);
         let mut compression = CompressionState::new(true);
 
@@ -470,11 +480,6 @@ pub(crate) fn encode_message_with_limit(
         // The main sections may consume only the remaining space after
         // reserving the fixed trailer block calculated by
         // `compute_truncation_lens`.
-        if lens.trailer_len > limit {
-            return Err(DnsError::protocol(
-                "dns message cannot fit within UDP payload while preserving EDNS/signature trailer",
-            ));
-        }
         let with_trailer_limit = limit - lens.trailer_len;
 
         let mut ancount = 0u16;
