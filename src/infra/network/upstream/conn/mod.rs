@@ -6,8 +6,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(feature = "upstream-doq", feature = "upstream-doh3"))]
 use std::time::Duration;
-
-#[cfg(any(feature = "upstream-doh", feature = "upstream-doh3"))]
+#[cfg(feature = "_http-client")]
 pub(crate) mod doh;
 #[cfg(feature = "upstream-doh")]
 pub(crate) mod h2;

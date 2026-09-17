@@ -28,31 +28,171 @@ const DNS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/dns-
 /// wire format. Successful responses using any other (or no) media type must
 /// not be passed to the DNS message decoder.
 #[cfg(feature = "_http-client")]
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn validate_doh_content_type(headers: &HeaderMap) -> Result<()> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .ok_or_else(|| DnsError::protocol("DoH response is missing Content-Type"))?;
-    let content_type = content_type
-        .to_str()
-        .map_err(|_| DnsError::protocol("DoH response contains an invalid Content-Type"))?;
 
-    // Media type type/subtype tokens are case-insensitive and parameters do
-    // not change the representation's media type. Extract only the essence
-    // (the portion before the first parameter delimiter) without allocating.
-    let media_type = content_type
-        .split_once(';')
-        .map_or(content_type, |(media_type, _)| media_type)
-        .trim_matches(&[' ', '\t'][..]);
-
-    if !media_type.eq_ignore_ascii_case("application/dns-message") {
+    if !is_dns_message_media_type(content_type.as_bytes()) {
+        let content_type = content_type.to_str().unwrap_or("<non-ASCII>");
         return Err(DnsError::protocol(format!(
-            "unsupported DoH response Content-Type: {content_type}"
+            "unsupported or malformed DoH response Content-Type: {content_type}"
         )));
     }
 
     Ok(())
+}
+
+/// Parse the HTTP media type without allocating.
+///
+/// RFC 9110 defines media-type parameters as `token=(token / quoted-string)`
+/// with no whitespace around `=`. Empty semicolon-delimited parameter slots
+/// are allowed by the generic `parameters` grammar and are accepted here.
+#[cfg(feature = "_http-client")]
+#[inline]
+fn is_dns_message_media_type(value: &[u8]) -> bool {
+    let mut pos = 0;
+
+    let type_start = pos;
+    consume_token(value, &mut pos);
+    if pos == type_start
+        || !value[type_start..pos].eq_ignore_ascii_case(b"application")
+        || value.get(pos) != Some(&b'/')
+    {
+        return false;
+    }
+    pos += 1;
+
+    let subtype_start = pos;
+    consume_token(value, &mut pos);
+    if pos == subtype_start || !value[subtype_start..pos].eq_ignore_ascii_case(b"dns-message") {
+        return false;
+    }
+
+    loop {
+        consume_ows(value, &mut pos);
+        if pos == value.len() {
+            return true;
+        }
+        if value[pos] != b';' {
+            return false;
+        }
+        pos += 1;
+        consume_ows(value, &mut pos);
+
+        // RFC 9110: parameters = *( OWS ";" OWS [ parameter ] )
+        if pos == value.len() || value[pos] == b';' {
+            continue;
+        }
+
+        let name_start = pos;
+        consume_token(value, &mut pos);
+        if pos == name_start || value.get(pos) != Some(&b'=') {
+            return false;
+        }
+        pos += 1;
+
+        match value.get(pos) {
+            Some(b'"') => {
+                if !consume_quoted_string(value, &mut pos) {
+                    return false;
+                }
+            }
+            Some(_) => {
+                let value_start = pos;
+                consume_token(value, &mut pos);
+                if pos == value_start {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+fn consume_ows(value: &[u8], pos: &mut usize) {
+    while matches!(value.get(*pos), Some(b' ' | b'\t')) {
+        *pos += 1;
+    }
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+fn consume_token(value: &[u8], pos: &mut usize) {
+    while value.get(*pos).is_some_and(|byte| is_tchar(*byte)) {
+        *pos += 1;
+    }
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+const fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+fn consume_quoted_string(value: &[u8], pos: &mut usize) -> bool {
+    debug_assert_eq!(value.get(*pos), Some(&b'"'));
+    *pos += 1;
+
+    while let Some(&byte) = value.get(*pos) {
+        match byte {
+            b'"' => {
+                *pos += 1;
+                return true;
+            }
+            b'\\' => {
+                *pos += 1;
+                let Some(&escaped) = value.get(*pos) else {
+                    return false;
+                };
+                if !is_quoted_pair_char(escaped) {
+                    return false;
+                }
+                *pos += 1;
+            }
+            _ if is_qdtext(byte) => *pos += 1,
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+const fn is_qdtext(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\t' | b' ' | b'!' | 0x23..=0x5b | 0x5d..=0x7e | 0x80..=u8::MAX
+    )
+}
+
+#[cfg(feature = "_http-client")]
+#[inline]
+const fn is_quoted_pair_char(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | 0x21..=0x7e | 0x80..=u8::MAX)
 }
 
 /// Build a DoH GET request with base64url-encoded DNS query
@@ -230,12 +370,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_doh_content_type_accepts_case_and_parameters() {
+    fn test_validate_doh_content_type_accepts_case_and_valid_parameters() {
         for content_type in [
             "Application/DNS-Message",
             "application/dns-message; foo=bar",
             "Application/DNS-Message; foo=\"bar;baz\"",
             "application/dns-message ; charset=utf-8",
+            "application/dns-message; empty=\"\"",
+            "application/dns-message; escaped=\"a\\\"b\\\\c\"",
+            "application/dns-message; ; foo=bar;",
         ] {
             let response = Response::builder()
                 .header(header::CONTENT_TYPE, content_type)
@@ -243,12 +386,12 @@ mod tests {
                 .expect("response should build");
 
             validate_doh_content_type(response.headers())
-                .expect("media type case and parameters should be accepted");
+                .expect("valid media type parameters should be accepted");
         }
     }
 
     #[test]
-    fn test_validate_doh_content_type_rejects_missing_or_wrong_type() {
+    fn test_validate_doh_content_type_rejects_missing_wrong_or_malformed_type() {
         let missing = Response::builder().body(()).expect("response should build");
         assert!(validate_doh_content_type(missing.headers()).is_err());
 
@@ -256,6 +399,12 @@ mod tests {
             "application/octet-stream",
             "application/dns-message-bogus",
             "application/dns-message garbage",
+            "application/dns-message; foo",
+            "application/dns-message; foo =bar",
+            "application/dns-message; foo= bar",
+            "application/dns-message; foo=bad/value",
+            "application/dns-message; foo=\"unterminated",
+            "application/dns-message; =bar",
         ] {
             let wrong = Response::builder()
                 .header(header::CONTENT_TYPE, content_type)
