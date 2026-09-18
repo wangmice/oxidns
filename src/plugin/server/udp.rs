@@ -347,7 +347,7 @@ async fn run_server(
         warn!(
             listen = %addr,
             drain_timeout_secs = UDP_SHUTDOWN_DRAIN_TIMEOUT.as_secs_f64(),
-            "UDP request drain timed out; cancelling remaining handlers"
+            "UDP request drain timed out; remaining handlers were cancelled"
         );
     }
     info!(listen = %addr, "UDP server stopped");
@@ -372,6 +372,8 @@ async fn drain_udp_tasks(
     }
 
     request_cancel.cancel();
+    tasks.wait().await;
+    debug_assert_eq!(tasks.len(), 0);
     false
 }
 
@@ -561,11 +563,15 @@ recv_buffer_size: 262144
             task_cancel.cancelled().await;
         });
 
-        let graceful = drain_udp_tasks(&tasks, &cancel, Duration::from_millis(1)).await;
+        let graceful = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_udp_tasks(&tasks, &cancel, Duration::from_millis(1)),
+        )
+        .await
+        .expect("cancelled UDP task should stop promptly");
         assert!(!graceful);
-        tokio::time::timeout(Duration::from_secs(1), tasks.wait())
-            .await
-            .expect("cancelled UDP task should stop promptly");
+        assert!(cancel.is_cancelled());
+        assert_eq!(tasks.len(), 0);
     }
 
     #[test]
