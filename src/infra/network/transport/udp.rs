@@ -15,6 +15,7 @@ use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::transport::socks5_udp::{Socks5UdpAssociation, response_source_matches};
 use crate::infra::network::udp_socket::{UdpReplySocket, UdpReplyTarget};
 use crate::proto::Message;
+use crate::proto::wire::WireHeader;
 
 pub(crate) const UDP_MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
@@ -287,10 +288,14 @@ impl UdpServerTransport {
             .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {e}")))
     }
 
-    /// Decode a previously received UDP datagram as a DNS message.
+    /// Decode a datagram while reusing a fixed header already parsed from the
+    /// same bytes by the UDP ingress prefilter.
     #[inline]
-    pub(crate) fn parse_datagram(buf: &[u8]) -> std::result::Result<Message, InvalidUdpDatagram> {
-        Message::from_bytes(buf).map_err(|_| InvalidUdpDatagram)
+    pub(crate) fn parse_datagram_with_wire_header(
+        buf: &[u8],
+        header: &WireHeader,
+    ) -> std::result::Result<Message, InvalidUdpDatagram> {
+        Message::from_bytes_with_wire_header(buf, header).map_err(|_| InvalidUdpDatagram)
     }
 
     #[inline]
@@ -328,7 +333,7 @@ mod tests {
     use crate::proto::{A, DNSClass, MessageType, Name, Question, RData, Record, RecordType};
 
     #[tokio::test]
-    async fn udp_server_transport_classifies_malformed_dns_as_invalid_datagram() {
+    async fn udp_server_transport_drains_short_dns_before_header_rejection() {
         let receiver = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("receiver should bind");
@@ -350,8 +355,8 @@ mod tests {
             .expect("raw malformed datagram must still be drained from the socket");
         assert_eq!(&buf[..n], &[0xDE, 0xAD, 0xBE, 0xEF]);
 
-        UdpServerTransport::parse_datagram(&buf[..n])
-            .expect_err("malformed DNS datagram must be rejected when parsed");
+        crate::proto::wire::decode_header(&buf[..n])
+            .expect_err("short DNS datagram must be rejected by the ingress header decoder");
     }
 
     #[tokio::test]

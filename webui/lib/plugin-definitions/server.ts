@@ -44,6 +44,7 @@ const udpServerMetrics: PluginMetricsDef = {
     ...serverMetrics.metricLabels,
     server_admission_rejected_total: "准入丢弃",
     server_invalid_datagram_total: "非法 UDP 报文",
+    server_protocol_error_send_failed_total: "协议错误响应发送失败",
   },
   metricHelp: {
     ...serverMetrics.metricHelp,
@@ -51,6 +52,8 @@ const udpServerMetrics: PluginMetricsDef = {
       "因服务器并发处理上限已满，在 DNS 解析前直接丢弃的 UDP 数据报总数。",
     server_invalid_datagram_total:
       "因 DNS 报文格式无效而在进入请求处理链前丢弃的 UDP 数据报总数。",
+    server_protocol_error_send_failed_total:
+      "本地生成的 UDP DNS 协议错误响应发送失败总数。",
   },
 };
 

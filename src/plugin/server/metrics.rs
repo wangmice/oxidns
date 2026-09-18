@@ -23,6 +23,7 @@ pub(crate) struct ServerMetrics {
     failed_total: AtomicU64,
     admission_rejected_total: AtomicU64,
     invalid_datagram_total: AtomicU64,
+    protocol_error_send_failed_total: AtomicU64,
     inflight: AtomicU64,
     latency_count: AtomicU64,
     latency_sum_ms: AtomicU64,
@@ -39,6 +40,7 @@ impl ServerMetrics {
             failed_total: AtomicU64::new(0),
             admission_rejected_total: AtomicU64::new(0),
             invalid_datagram_total: AtomicU64::new(0),
+            protocol_error_send_failed_total: AtomicU64::new(0),
             inflight: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
@@ -61,6 +63,12 @@ impl ServerMetrics {
     #[inline]
     pub(super) fn on_invalid_datagram(&self) {
         self.invalid_datagram_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn on_protocol_error_send_failed(&self) {
+        self.protocol_error_send_failed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -127,6 +135,13 @@ impl MetricSource for ServerMetrics {
             "Total malformed inbound UDP datagrams rejected before request handling.",
             &labels,
             self.invalid_datagram_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "server_protocol_error_send_failed_total",
+            "Total locally generated DNS protocol-error responses that could not be sent.",
+            &labels,
+            self.protocol_error_send_failed_total
+                .load(Ordering::Relaxed),
         ));
         sink.emit(MetricSample::gauge(
             "server_inflight",

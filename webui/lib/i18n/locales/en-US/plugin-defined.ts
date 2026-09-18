@@ -55,6 +55,7 @@ export const enUSPluginDefined = {
           server_latency_sum_ms: "Total latency (ms)",
           server_admission_rejected_total: "Admission rejected",
           server_invalid_datagram_total: "Invalid UDP datagrams",
+          server_protocol_error_send_failed_total: "Protocol error send failures",
         },
         help: {
           server_request_total:
@@ -75,6 +76,8 @@ export const enUSPluginDefined = {
             "The total number of UDP datagrams dropped before DNS parsing because the server concurrency limit was reached.",
           server_invalid_datagram_total:
             "The total number of malformed UDP DNS datagrams dropped before entering the request handling chain.",
+          server_protocol_error_send_failed_total:
+            "The total number of locally generated UDP DNS protocol-error responses that could not be sent.",
         },
         derived: {
           "latency:server": "Average latency",

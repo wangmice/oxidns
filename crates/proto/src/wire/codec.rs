@@ -146,15 +146,25 @@ fn set_header(
 /// follows RFC 6891, while SIG0/TSIG placement checks follow RFC 2931 / RFC
 /// 8945.
 pub(crate) fn decode_message(packet: &[u8]) -> Result<Message> {
-    let (
-        mut header,
-        mut offset,
-        low_rcode,
-        question_count,
-        answer_count,
-        authority_count,
-        additional_count,
-    ) = parse_header(packet)?;
+    let wire_header = super::decode_header(packet)?;
+    decode_message_with_wire_header(packet, &wire_header)
+}
+
+pub(crate) fn decode_message_with_wire_header(
+    packet: &[u8],
+    wire_header: &super::WireHeader,
+) -> Result<Message> {
+    if packet.len() < DNS_HEADER_LEN {
+        return Err(DnsError::protocol("dns packet shorter than header"));
+    }
+
+    let mut header = *wire_header.header();
+    let mut offset = DNS_HEADER_LEN;
+    let low_rcode = wire_header.low_rcode;
+    let question_count = wire_header.question_count();
+    let answer_count = wire_header.answer_count();
+    let authority_count = wire_header.authority_count();
+    let additional_count = wire_header.additional_count();
 
     let mut questions = Vec::with_capacity(bounded_section_capacity(
         packet.len().saturating_sub(offset),
@@ -267,7 +277,7 @@ fn bounded_section_capacity(
 }
 
 /// Decode the fixed 12-byte DNS header defined by RFC 1035 section 4.1.1.
-fn parse_header(packet: &[u8]) -> Result<(Header, usize, u16, u16, u16, u16, u16)> {
+pub(crate) fn parse_header(packet: &[u8]) -> Result<(Header, usize, u16, u16, u16, u16, u16)> {
     if packet.len() < DNS_HEADER_LEN {
         return Err(DnsError::protocol("dns packet shorter than header"));
     }

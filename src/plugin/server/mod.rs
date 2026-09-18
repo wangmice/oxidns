@@ -27,7 +27,8 @@ pub(crate) use admission::{
 pub(crate) use connection::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard};
 pub(crate) use metrics::ServerMetrics;
 pub(crate) use request::{
-    InboundDnsRequestDisposition, build_inbound_error_response, classify_inbound_dns_request,
+    InboundDnsRequestDisposition, build_inbound_error_response_from_wire_header,
+    classify_inbound_dns_request_after_wire_header, classify_inbound_dns_wire_header,
 };
 pub use request::{RequestExit, RequestHandle, RequestMeta, RequestResult};
 

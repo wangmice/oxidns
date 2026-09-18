@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::core::error::{DnsError, Result};
 use crate::proto::rdata::{A, AAAA, Edns};
 use crate::proto::wire::{
-    DNS_HEADER_LEN, decode_message, edns_record_len, encode_message_into, encode_message_with_limit,
+    DNS_HEADER_LEN, WireHeader, decode_message, decode_message_with_wire_header, edns_record_len,
+    encode_message_into, encode_message_with_limit,
 };
 use crate::proto::{
     DNSClass, Header, MessageType, Name, Opcode, Question, RData, Rcode, Record, RecordType,
@@ -81,6 +82,14 @@ impl Message {
     #[hotpath::measure]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         decode_message(bytes)
+    }
+
+    /// Decode a DNS message while reusing a fixed header already decoded from
+    /// the same byte slice. This avoids parsing the 12-byte header twice on
+    /// ingress paths that perform header-only preclassification.
+    #[hotpath::measure]
+    pub fn from_bytes_with_wire_header(bytes: &[u8], header: &WireHeader) -> Result<Self> {
+        decode_message_with_wire_header(bytes, header)
     }
 
     /// Encode the message into a newly allocated byte vector.

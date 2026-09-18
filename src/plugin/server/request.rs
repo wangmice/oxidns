@@ -13,6 +13,7 @@ use crate::core::context::DnsContext;
 pub use crate::core::context::RequestMeta;
 use crate::infra::network::ip::normalize_ipv4_mapped_socket_addr;
 use crate::plugin::executor::{ExecStep, Executor};
+use crate::proto::wire::WireHeader;
 use crate::proto::{Edns, Message, MessageType, Opcode, Rcode};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -22,49 +23,83 @@ pub(crate) enum InboundDnsRequestDisposition {
     Respond(Rcode),
 }
 
-/// Classify a decoded inbound DNS message before it consumes a handler slot.
+/// Classify an inbound request using only the fixed DNS wire header.
 ///
-/// This intentionally enforces the recursive server contract used by OxiDNS:
-/// one standard QUERY question and no detached SIG(0)/TSIG records. Signed
-/// requests cannot be forwarded transparently because upstream transports may
-/// rewrite the DNS message ID, invalidating the signature or MAC.
+/// This rejects packet classes that do not require variable-length section
+/// parsing, preventing oversized response packets, unsupported opcodes, and
+/// invalid question counts from consuming full DNS parser CPU or allocations.
 #[inline]
-pub(crate) fn classify_inbound_dns_request(request: &Message) -> InboundDnsRequestDisposition {
-    if request.message_type() != MessageType::Query {
+pub(crate) fn classify_inbound_dns_wire_header(
+    request: &WireHeader,
+) -> InboundDnsRequestDisposition {
+    let header = request.header();
+    if header.message_type() != MessageType::Query {
         return InboundDnsRequestDisposition::Drop;
     }
 
-    if !request.signature().is_empty() {
-        return InboundDnsRequestDisposition::Drop;
+    if header.opcode() != Opcode::Query {
+        return if request.additional_count() == 0 {
+            InboundDnsRequestDisposition::Respond(Rcode::NotImp)
+        } else {
+            // Additional records may contain TSIG/SIG(0). Avoid emitting an
+            // unauthenticated error without paying the full signature parser
+            // cost on an already-invalid request.
+            InboundDnsRequestDisposition::Drop
+        };
     }
 
-    if request.opcode() != Opcode::Query {
-        return InboundDnsRequestDisposition::Respond(Rcode::NotImp);
-    }
-
-    if request.questions().len() != 1 {
-        return InboundDnsRequestDisposition::Respond(Rcode::FormErr);
+    if request.question_count() != 1 {
+        return if request.additional_count() == 0 {
+            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
+        } else {
+            // Preserve the signed-request silent-drop policy for malformed
+            // queries whose additional section has not been authenticated.
+            InboundDnsRequestDisposition::Drop
+        };
     }
 
     InboundDnsRequestDisposition::Accept
 }
 
-/// Build a local protocol error using the same server-level response policy as
-/// executor-generated responses. The malformed/unsupported request sections
-/// are intentionally not cloned, keeping the rejection path constant-cost.
+/// Build a constant-cost protocol error from the fixed DNS header only.
+///
+/// The response deliberately omits questions and EDNS because those sections
+/// have not been parsed. UDP callers therefore send it with the legacy 512-byte
+/// payload ceiling.
 #[inline]
-pub(crate) fn build_inbound_error_response(request: &Message, rcode: Rcode) -> Message {
+pub(crate) fn build_inbound_error_response_from_wire_header(
+    request: &WireHeader,
+    rcode: Rcode,
+) -> Message {
+    let header = request.header();
     let mut response = Message::new();
-    response.set_id(request.id());
+    response.set_id(header.id());
     response.set_message_type(MessageType::Response);
-    response.set_opcode(request.opcode());
-    if request.opcode() == Opcode::Query {
-        response.set_recursion_desired(request.recursion_desired());
-        response.set_checking_disabled(request.checking_disabled());
+    response.set_opcode(header.opcode());
+    if header.opcode() == Opcode::Query {
+        response.set_recursion_desired(header.recursion_desired());
+        response.set_checking_disabled(header.checking_disabled());
     }
     response.set_rcode(rcode);
-    RequestHandle::finalize_response(request, &mut response);
+    response.set_recursion_available(true);
     response
+}
+
+/// Finish inbound validation after the fixed wire header has already been
+/// accepted. Only properties that require full section decoding remain.
+#[inline]
+pub(crate) fn classify_inbound_dns_request_after_wire_header(
+    request: &Message,
+) -> InboundDnsRequestDisposition {
+    debug_assert_eq!(request.message_type(), MessageType::Query);
+    debug_assert_eq!(request.opcode(), Opcode::Query);
+    debug_assert_eq!(request.questions().len(), 1);
+
+    if !request.signature().is_empty() {
+        InboundDnsRequestDisposition::Drop
+    } else {
+        InboundDnsRequestDisposition::Accept
+    }
 }
 
 #[derive(Debug)]
@@ -227,93 +262,95 @@ mod tests {
     }
 
     #[test]
-    fn inbound_dns_request_classifier_accepts_standard_single_question_query() {
+    fn inbound_dns_post_header_classifier_only_rejects_detached_signatures() {
         let request = make_request(7, "example.com.");
         assert_eq!(
-            classify_inbound_dns_request(&request),
+            classify_inbound_dns_request_after_wire_header(&request),
             InboundDnsRequestDisposition::Accept
         );
-    }
 
-    #[test]
-    fn inbound_dns_request_classifier_drops_response_packets() {
-        let mut request = make_request(7, "example.com.");
-        request.set_message_type(MessageType::Response);
-        assert_eq!(
-            classify_inbound_dns_request(&request),
-            InboundDnsRequestDisposition::Drop
-        );
-    }
-
-    #[test]
-    fn inbound_dns_request_classifier_drops_detached_signatures() {
         use crate::proto::rdata::TXT;
         use crate::proto::{RData, Record};
 
-        let mut request = make_request(7, "example.com.");
-        request.signature_mut().push(Record::from_rdata(
+        let mut signed = request;
+        signed.signature_mut().push(Record::from_rdata(
             Name::from_ascii("sig.example.com.").expect("signature name should be valid"),
             0,
             RData::TXT(TXT::new(Box::from([3u8, b's', b'i', b'g']))),
         ));
         assert_eq!(
-            classify_inbound_dns_request(&request),
+            classify_inbound_dns_request_after_wire_header(&signed),
+            InboundDnsRequestDisposition::Drop
+        );
+    }
+
+    fn decode_test_wire_header(
+        id: u16,
+        flags: u16,
+        question_count: u16,
+        additional_count: u16,
+    ) -> crate::proto::wire::WireHeader {
+        let mut packet = [0u8; 12];
+        packet[0..2].copy_from_slice(&id.to_be_bytes());
+        packet[2..4].copy_from_slice(&flags.to_be_bytes());
+        packet[4..6].copy_from_slice(&question_count.to_be_bytes());
+        packet[10..12].copy_from_slice(&additional_count.to_be_bytes());
+        crate::proto::wire::decode_header(&packet).expect("test header should decode")
+    }
+
+    #[test]
+    fn inbound_dns_wire_header_classifier_rejects_before_full_parse() {
+        let response = decode_test_wire_header(1, 0x8000, 1, 0);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&response),
+            InboundDnsRequestDisposition::Drop
+        );
+
+        let status = decode_test_wire_header(2, 2 << 11, 1, 0);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&status),
+            InboundDnsRequestDisposition::Respond(Rcode::NotImp)
+        );
+
+        let multiple = decode_test_wire_header(3, 0, 2, 0);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&multiple),
+            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
+        );
+
+        let query = decode_test_wire_header(4, 0, 1, 0);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&query),
+            InboundDnsRequestDisposition::Accept
+        );
+
+        let potentially_signed_status = decode_test_wire_header(5, 2 << 11, 1, 1);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&potentially_signed_status),
+            InboundDnsRequestDisposition::Drop
+        );
+
+        let potentially_signed_multiple = decode_test_wire_header(6, 0, 2, 1);
+        assert_eq!(
+            classify_inbound_dns_wire_header(&potentially_signed_multiple),
             InboundDnsRequestDisposition::Drop
         );
     }
 
     #[test]
-    fn inbound_dns_request_classifier_returns_notimp_for_non_query_opcode() {
-        let mut request = make_request(7, "example.com.");
-        request.set_opcode(Opcode::Status);
-        assert_eq!(
-            classify_inbound_dns_request(&request),
-            InboundDnsRequestDisposition::Respond(Rcode::NotImp)
-        );
-    }
+    fn inbound_dns_wire_error_response_is_header_only() {
+        let request = decode_test_wire_header(0x1234, 0x0110, 2, 0);
+        let response = build_inbound_error_response_from_wire_header(&request, Rcode::FormErr);
 
-    #[test]
-    fn inbound_dns_request_classifier_returns_formerr_for_question_count() {
-        let empty = Message::new();
-        assert_eq!(
-            classify_inbound_dns_request(&empty),
-            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
-        );
-
-        let mut multiple = make_request(7, "example.com.");
-        multiple.add_question(Question::new(
-            Name::from_ascii("example.net.").expect("query name should be valid"),
-            RecordType::AAAA,
-            crate::proto::DNSClass::IN,
-        ));
-        assert_eq!(
-            classify_inbound_dns_request(&multiple),
-            InboundDnsRequestDisposition::Respond(Rcode::FormErr)
-        );
-    }
-
-    #[test]
-    fn inbound_dns_error_response_uses_server_finalize_policy() {
-        let mut request = make_request(0x1234, "example.com.");
-        let mut edns = Edns::new();
-        edns.flags_mut().dnssec_ok = true;
-        request.set_edns(edns);
-
-        let response = build_inbound_error_response(&request, Rcode::FormErr);
-        assert_eq!(response.id(), request.id());
+        assert_eq!(response.id(), 0x1234);
         assert_eq!(response.message_type(), MessageType::Response);
         assert_eq!(response.opcode(), Opcode::Query);
         assert_eq!(response.rcode(), Rcode::FormErr);
         assert!(response.recursion_available());
+        assert!(response.recursion_desired());
+        assert!(response.checking_disabled());
         assert!(response.questions().is_empty());
-        assert_eq!(response.recursion_desired(), request.recursion_desired());
-        assert_eq!(response.checking_disabled(), request.checking_disabled());
-        assert!(
-            response
-                .edns()
-                .as_ref()
-                .is_some_and(|edns| edns.flags().dnssec_ok)
-        );
+        assert!(response.edns().is_none());
     }
 
     fn make_request_handle(executor: Arc<dyn Executor>) -> RequestHandle {

@@ -27,20 +27,25 @@ use crate::infra::network::listen::{self, parse_listen_addr};
 use crate::infra::network::transport::udp::{
     UdpServerTransport, should_warn_udp_recv_error, udp_recv_error_backoff,
 };
+use crate::infra::network::udp_socket::UdpReplyTarget;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
     DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundDnsRequestDisposition, RequestHandle, Server,
-    ServerMetrics, build_inbound_error_response, classify_inbound_dns_request,
+    ServerMetrics, build_inbound_error_response_from_wire_header,
+    classify_inbound_dns_request_after_wire_header, classify_inbound_dns_wire_header,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
+use crate::proto::Message;
+use crate::proto::wire::decode_header;
 
 const UDP_RECV_BUFFER_SIZE: usize = 65_535;
 const MIN_UDP_SOCKET_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_UDP_SOCKET_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_UDP_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const UDP_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const LEGACY_UDP_PAYLOAD_SIZE: u16 = 512;
 
 /// UDP server configuration
 #[derive(Deserialize)]
@@ -253,7 +258,43 @@ async fn run_server(
                             continue;
                         }
 
-                        let msg = match UdpServerTransport::parse_datagram(&buf[..n]) {
+                        // Classify request properties that live entirely in the fixed DNS
+                        // header before parsing variable-length sections. This keeps oversized
+                        // response packets, unsupported opcodes, and invalid QDCOUNT values off
+                        // the full parser path.
+                        let wire_header = match decode_header(&buf[..n]) {
+                            Ok(header) => header,
+                            Err(_) => {
+                                if let Some(metrics) = handler.metrics.as_ref() {
+                                    metrics.on_invalid_datagram();
+                                }
+                                continue;
+                            }
+                        };
+
+                        match classify_inbound_dns_wire_header(&wire_header) {
+                            InboundDnsRequestDisposition::Accept => {}
+                            InboundDnsRequestDisposition::Drop => continue,
+                            InboundDnsRequestDisposition::Respond(rcode) => {
+                                let response =
+                                    build_inbound_error_response_from_wire_header(&wire_header, rcode);
+                                spawn_udp_protocol_error_response(
+                                    &tasks,
+                                    &request_cancel,
+                                    &transport,
+                                    handler.metrics.clone(),
+                                    response,
+                                    reply_target,
+                                    LEGACY_UDP_PAYLOAD_SIZE,
+                                );
+                                continue;
+                            }
+                        }
+
+                        let msg = match UdpServerTransport::parse_datagram_with_wire_header(
+                            &buf[..n],
+                            &wire_header,
+                        ) {
                             Ok(msg) => msg,
                             Err(_) => {
                                 if let Some(metrics) = handler.metrics.as_ref() {
@@ -263,27 +304,15 @@ async fn run_server(
                             }
                         };
 
-                        // Reject semantically invalid DNS messages before they can consume a
-                        // handler slot or upstream request-map entry. Local protocol errors are
-                        // sent inline and never enter the executor pipeline.
-                        match classify_inbound_dns_request(&msg) {
+                        // Fixed-header semantics are already validated. Full-message validation
+                        // only needs to reject detached SIG(0)/TSIG records, which cannot survive
+                        // upstream ID rewriting.
+                        match classify_inbound_dns_request_after_wire_header(&msg) {
                             InboundDnsRequestDisposition::Accept => {}
                             InboundDnsRequestDisposition::Drop => continue,
-                            InboundDnsRequestDisposition::Respond(rcode) => {
-                                let src_addr = reply_target.peer_addr();
-                                let max_payload = msg.max_payload();
-                                let response = build_inbound_error_response(&msg, rcode);
-                                if let Err(e) = transport
-                                    .write_message_to(&response, reply_target, max_payload)
-                                    .await
-                                {
-                                    warn!(
-                                        "Failed to send UDP protocol error to {}: {}",
-                                        src_addr, e
-                                    );
-                                }
-                                continue;
-                            }
+                            // The post-header classifier currently has no response-producing
+                            // branch; conservatively drop if that contract changes later.
+                            InboundDnsRequestDisposition::Respond(_) => continue,
                         }
 
                         let src_addr = reply_target.peer_addr();
@@ -356,6 +385,38 @@ async fn run_server(
 #[inline]
 fn udp_has_request_capacity(tasks: &TaskTracker, limit: usize) -> bool {
     tasks.len() < limit
+}
+
+fn spawn_udp_protocol_error_response(
+    tasks: &TaskTracker,
+    request_cancel: &CancellationToken,
+    transport: &Arc<UdpServerTransport>,
+    metrics: Option<Arc<ServerMetrics>>,
+    response: Message,
+    reply_target: UdpReplyTarget,
+    max_payload: u16,
+) {
+    let src_addr = reply_target.peer_addr();
+    let transport = transport.clone();
+    let task_cancel = request_cancel.clone();
+    tasks.spawn(async move {
+        tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => {}
+            result = transport.write_message_to(&response, reply_target, max_payload) => {
+                if let Err(error) = result {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.on_protocol_error_send_failed();
+                    }
+                    debug!(
+                        peer = %src_addr,
+                        error = %error,
+                        "Failed to send UDP protocol error response"
+                    );
+                }
+            }
+        }
+    });
 }
 
 async fn drain_udp_tasks(
@@ -549,6 +610,60 @@ recv_buffer_size: 262144
         drop(first);
         assert!(udp_has_request_capacity(&tasks, 2));
         drop(second);
+        assert_eq!(tasks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_udp_protocol_error_send_runs_in_tracked_task() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("server socket should bind");
+        let server_addr = server_socket.local_addr().expect("server address");
+        let transport = Arc::new(UdpServerTransport::new(server_socket).expect("server transport"));
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client socket should bind");
+
+        client
+            .send_to(&[0u8; 12], server_addr)
+            .await
+            .expect("probe datagram should send");
+        let mut raw = [0u8; 64];
+        let (_, reply_target) = transport
+            .read_datagram_from(&mut raw)
+            .await
+            .expect("probe datagram should arrive");
+
+        let mut response = Message::new();
+        response.set_id(0x1234);
+        response.set_message_type(crate::proto::MessageType::Response);
+        response.set_rcode(crate::proto::Rcode::FormErr);
+        response.set_recursion_available(true);
+
+        let tasks = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        spawn_udp_protocol_error_response(
+            &tasks,
+            &cancel,
+            &transport,
+            None,
+            response,
+            reply_target,
+            LEGACY_UDP_PAYLOAD_SIZE,
+        );
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("protocol error response should not stall")
+            .expect("protocol error response should arrive");
+        let decoded = Message::from_bytes(&buf[..n]).expect("response should decode");
+        assert_eq!(decoded.id(), 0x1234);
+        assert_eq!(decoded.rcode(), crate::proto::Rcode::FormErr);
+        assert!(n <= usize::from(LEGACY_UDP_PAYLOAD_SIZE));
+
+        tasks.close();
+        tasks.wait().await;
         assert_eq!(tasks.len(), 0);
     }
 
