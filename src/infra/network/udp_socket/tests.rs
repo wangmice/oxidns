@@ -45,6 +45,33 @@ fn reply_targets_preserve_peers_and_only_scope_link_local_replies() {
     assert_eq!(scoped_peer.outgoing_interface(), 7);
 }
 
+#[test]
+fn reply_targets_report_address_family_udp_payload_limits() {
+    let ipv4 = UdpReplyTarget::new(
+        "192.0.2.2:1234".parse().unwrap(),
+        "192.0.2.1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(ipv4.max_non_jumbo_udp_payload(), 65_507);
+
+    let ipv6 = UdpReplyTarget::new(
+        "[2001:db8::2]:1234".parse().unwrap(),
+        "2001:db8::1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(ipv6.max_non_jumbo_udp_payload(), 65_527);
+
+    let mapped = UdpReplyTarget::new(
+        "[::ffff:192.0.2.2]:1234".parse().unwrap(),
+        "::ffff:192.0.2.1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(mapped.max_non_jumbo_udp_payload(), 65_507);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn reply_addresses_survive_reordered_concurrent_sends() {

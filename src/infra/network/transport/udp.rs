@@ -17,6 +17,8 @@ use crate::infra::network::udp_socket::{UdpReplySocket, UdpReplyTarget};
 use crate::proto::Message;
 use crate::proto::wire::WireHeader;
 
+/// Receive-buffer capacity only. Safe UDP send payloads are smaller and depend
+/// on the reply IP address family.
 pub(crate) const UDP_MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
 const UDP_RECV_ERROR_BACKOFF_BASE_MS: u64 = 10;
 const UDP_RECV_ERROR_BACKOFF_MAX_MS: u64 = 250;
@@ -306,7 +308,7 @@ impl UdpServerTransport {
         to: UdpReplyTarget,
         max_payload: u16,
     ) -> Result<()> {
-        let max_payload = usize::from(max_payload);
+        let max_payload = usize::from(max_payload.min(to.max_non_jumbo_udp_payload()));
         let mut bytes = wire_buffer_pool().acquire();
         msg.append_to_with_limit(max_payload, &mut bytes)?;
         let n = self
@@ -411,6 +413,73 @@ mod tests {
 
         assert_eq!(decoded.id(), response.id());
         assert_eq!(decoded.answers().len(), response.answers().len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_server_transport_caps_ipv4_payload_and_sets_tc() {
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("receiver should bind");
+        let receiver_addr = receiver.local_addr().expect("receiver address");
+        let transport = UdpServerTransport::new(receiver).expect("server transport");
+
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client should bind");
+
+        let query = Message::new();
+        client
+            .send_to(
+                &query.to_bytes().expect("query should encode"),
+                receiver_addr,
+            )
+            .await
+            .expect("query should send");
+
+        let mut query_buf = [0u8; 512];
+        let (_, reply_target) = transport
+            .read_datagram_from(&mut query_buf)
+            .await
+            .expect("server should capture reply target");
+
+        let mut response = Message::new();
+        response.set_id(0xBEEF);
+        response.set_message_type(MessageType::Response);
+        let name = Name::from_ascii("oversized.example.com.").unwrap();
+        response.add_question(Question::new(name.clone(), RecordType::A, DNSClass::IN));
+        for index in 0..5_000u16 {
+            response.add_answer(Record::from_rdata(
+                name.clone(),
+                60,
+                RData::A(A(Ipv4Addr::new(198, 51, 100, (index % 250 + 1) as u8))),
+            ));
+        }
+        assert!(
+            response.to_bytes().expect("response should encode").len() > 65_507,
+            "test response must exceed the IPv4 UDP payload ceiling"
+        );
+
+        transport
+            .write_message_to(&response, reply_target, u16::MAX)
+            .await
+            .expect("oversized IPv4 response should be truncated before send");
+
+        let mut response_buf = vec![0u8; 65_535];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv_from(&mut response_buf),
+        )
+        .await
+        .expect("client receive should not time out")
+        .expect("client should receive truncated response");
+        assert!(len <= 65_507);
+
+        let decoded = Message::from_bytes(&response_buf[..len])
+            .expect("truncated response should remain a valid DNS message");
+        assert!(decoded.truncated());
+        assert_eq!(decoded.id(), response.id());
+        assert_eq!(decoded.questions(), response.questions());
     }
 
     #[test]
