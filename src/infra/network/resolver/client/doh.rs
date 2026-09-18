@@ -287,9 +287,7 @@ pub(super) fn append_response_chunk(response: &mut BytesMut, chunk: impl Buf) ->
 mod tests {
     use std::time::Duration;
 
-    use crate::app;
-
-use super::*;
+    use super::*;
 
     #[test]
     fn test_doh_request_uri_preserves_bracketed_ipv6_literals() {
