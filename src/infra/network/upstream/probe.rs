@@ -1388,6 +1388,7 @@ mod tests {
             bootstrap_version: None,
             socks5: None,
             idle_timeout: None,
+            keepalive_interval: None,
             max_conns: None,
             min_conns: None,
             insecure_skip_verify: None,

@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
 use h2::client::{ResponseFuture, SendRequest};
+use h2::{Ping, PingPong};
 use http::Version;
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, trace, warn};
 
 use super::UsingCountGuard;
@@ -17,7 +20,9 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
-use crate::infra::network::metrics::UpstreamTimeoutStage;
+use crate::infra::network::metrics::{
+    KeepaliveResult, NetworkProtocol, UpstreamTimeoutStage, upstream_keepalive,
+};
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::upstream::conn::doh::{
@@ -29,6 +34,7 @@ use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
+const H2_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[inline]
 fn h2_pool_stream_limit(peer_limit: usize) -> u16 {
@@ -49,6 +55,64 @@ fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
         H2RecvError::Connection(error)
     } else {
         H2RecvError::Stream(error)
+    }
+}
+
+async fn run_h2_keepalive(conn: Weak<H2Connection>, mut ping_pong: PingPong, interval: Duration) {
+    if interval.is_zero() {
+        return;
+    }
+    let interval_ms = interval.as_millis().min(u64::MAX as u128) as u64;
+
+    loop {
+        sleep(interval).await;
+
+        let Some(conn) = conn.upgrade() else {
+            return;
+        };
+        if conn.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if conn.using_count.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+
+        let idle_ms = AppClock::elapsed_millis().saturating_sub(conn.last_used());
+        if idle_ms < interval_ms {
+            continue;
+        }
+
+        match timeout(H2_KEEPALIVE_ACK_TIMEOUT, ping_pong.ping(Ping::opaque())).await {
+            Ok(Ok(_)) => {
+                upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Success);
+                trace!(
+                    conn_id = conn.id,
+                    upstream = %conn.upstream,
+                    idle_ms,
+                    "H2 keepalive ping acknowledged"
+                );
+            }
+            Ok(Err(error)) => {
+                upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Failed);
+                debug!(
+                    conn_id = conn.id,
+                    upstream = %conn.upstream,
+                    ?error,
+                    "H2 keepalive ping failed; disabling keepalive for this connection"
+                );
+                return;
+            }
+            Err(_) => {
+                upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
+                debug!(
+                    conn_id = conn.id,
+                    upstream = %conn.upstream,
+                    timeout_ms = H2_KEEPALIVE_ACK_TIMEOUT.as_millis(),
+                    "H2 keepalive ping timed out; disabling keepalive for this connection"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -215,6 +279,7 @@ pub struct H2ConnectionBuilder {
     request_uri: String,
     insecure_skip_verify: bool,
     socks5: Option<Socks5Opt>,
+    keepalive_interval: Option<Duration>,
 }
 
 impl H2ConnectionBuilder {
@@ -233,6 +298,7 @@ impl H2ConnectionBuilder {
             request_uri: build_doh_request_uri(connection_info),
             insecure_skip_verify: connection_info.insecure_skip_verify,
             socks5: connection_info.socks5.clone(),
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -275,7 +341,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
         let mut builder = h2::client::Builder::new();
         builder.data_frame_budget(H2_DATA_FRAME_BUDGET);
 
-        let (sender, connection) = match deadline.run(builder.handshake(tls_stream)).await {
+        let (sender, mut connection) = match deadline.run(builder.handshake(tls_stream)).await {
             DeadlineOutcome::Completed(Ok(value)) => value,
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("H2 handshake error: {}", e)));
@@ -284,6 +350,8 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                 return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ProtocolHandshake));
             }
         };
+
+        let ping_pong = connection.ping_pong();
 
         let h2_conn = Arc::new(H2Connection {
             id: conn_id,
@@ -296,6 +364,11 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
         });
+
+        if let (Some(ping_pong), Some(interval)) = (ping_pong, self.keepalive_interval) {
+            let keepalive_conn = Arc::downgrade(&h2_conn);
+            tokio::spawn(run_h2_keepalive(keepalive_conn, ping_pong, interval));
+        }
 
         let _conn = h2_conn.clone();
         tokio::spawn(async move {
@@ -529,6 +602,7 @@ mod tests {
         connection_info.insecure_skip_verify = true;
         connection_info.so_mark = Some(42);
         connection_info.bind_to_device = Some("utun9".to_string());
+        connection_info.keepalive_interval = Some(Duration::from_secs(5));
 
         let builder = H2ConnectionBuilder::new(&connection_info);
 
@@ -539,6 +613,7 @@ mod tests {
             "https://dns.example.com/dns-query?dns="
         );
         assert!(builder.insecure_skip_verify);
+        assert_eq!(builder.keepalive_interval, Some(Duration::from_secs(5)));
         assert_eq!(builder.socket_options.so_mark(), Some(42));
         assert_eq!(builder.socket_options.bind_to_device(), Some("utun9"));
     }

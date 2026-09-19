@@ -280,6 +280,7 @@ pub struct QuicConnectionBuilder {
     socks5: Option<Socks5Opt>,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl QuicConnectionBuilder {
@@ -298,6 +299,7 @@ impl QuicConnectionBuilder {
             socks5: connection_info.socks5.clone(),
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -332,7 +334,8 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
             quic_idle_timeout(self.timeout),
             vec![b"doq".to_vec()],
         )
-        .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake);
+        .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake)
+        .with_keep_alive_interval(self.keepalive_interval);
         let quic_conn = if let Some(socks5) = self.socks5.clone() {
             let (socket, peer_addr) = match deadline
                 .run(Socks5QuicSocket::connect(
@@ -426,6 +429,7 @@ mod tests {
         connection_info.insecure_skip_verify = true;
         connection_info.so_mark = Some(9);
         connection_info.bind_to_device = Some("wg0".to_string());
+        connection_info.keepalive_interval = Some(std::time::Duration::from_secs(4));
 
         let builder = QuicConnectionBuilder::new(&connection_info);
 
@@ -434,6 +438,10 @@ mod tests {
         assert_eq!(builder.target.host(), "dns.example.com");
         assert!(builder.insecure_skip_verify);
         assert_eq!(builder.timeout, std::time::Duration::from_secs(3));
+        assert_eq!(
+            builder.keepalive_interval,
+            Some(std::time::Duration::from_secs(4))
+        );
         assert_eq!(builder.socket_options.so_mark(), Some(9));
         assert_eq!(builder.socket_options.bind_to_device(), Some("wg0"));
     }

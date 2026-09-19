@@ -229,6 +229,15 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               advanced: true,
             },
             {
+              key: "keepalive_interval",
+              description:
+                "可选连接保活间隔。DoH2 使用 H2 PING，DoH3/DoQ 使用 QUIC keepalive，TCP/DoT 使用 TCP keepalive；默认关闭。",
+              label: "连接保活间隔",
+              type: "duration",
+              example: "5s",
+              advanced: true,
+            },
+            {
               key: "max_conns",
               description: "定义连接池连接上限，范围 1..4096。",
               label: "最大连接数",

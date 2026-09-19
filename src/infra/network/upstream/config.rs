@@ -169,6 +169,17 @@ pub struct UpstreamConfig {
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     pub idle_timeout: Option<Duration>,
 
+    /// Optional transport keepalive interval.
+    ///
+    /// Disabled by default to preserve existing upstream behavior. When set:
+    /// - DoH2 sends HTTP/2 PING frames while the connection is idle;
+    /// - DoH3 and DoQ enable QUIC transport keepalive;
+    /// - TCP and DoT enable TCP SO_KEEPALIVE with this idle probe time.
+    ///
+    /// A bare number is interpreted as seconds.
+    #[serde(default, deserialize_with = "deserialize_duration_option")]
+    pub keepalive_interval: Option<Duration>,
+
     /// Maximum number of connections in the pool
     ///
     /// Used as the pool size upper bound to limit per-upstream resource usage.
@@ -284,6 +295,9 @@ pub struct ConnectionInfo {
     /// Connection idle timeout in seconds
     pub idle_timeout: Duration,
 
+    /// Optional protocol/transport keepalive interval.
+    pub keepalive_interval: Option<Duration>,
+
     /// Maximum number of connections in the pool
     pub max_conns: Option<usize>,
 
@@ -339,6 +353,7 @@ impl ConnectionInfo {
             server_name: host,
             insecure_skip_verify: false,
             idle_timeout: Self::DEFAULT_CONN_IDLE_TIME,
+            keepalive_interval: None,
             raw_addr: addr.to_string(),
             enable_pipeline: None,
             enable_http3: false,
@@ -376,6 +391,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             bootstrap_version,
             socks5,
             idle_timeout,
+            keepalive_interval,
             max_conns,
             min_conns,
             insecure_skip_verify,
@@ -400,6 +416,43 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
         let port = config_port
             .or(port)
             .unwrap_or(connection_type.default_port());
+        let effective_idle_timeout = idle_timeout.unwrap_or(Self::DEFAULT_CONN_IDLE_TIME);
+        let effective_query_timeout = timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT);
+
+        if let Some(interval) = keepalive_interval {
+            if interval.is_zero() {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval must be greater than 0",
+                ));
+            }
+            if connection_type == ConnectionType::UDP {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval is not supported for UDP upstreams",
+                ));
+            }
+            if !effective_idle_timeout.is_zero() && interval >= effective_idle_timeout {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval must be less than idle_timeout",
+                ));
+            }
+
+            // DoQ and DoH3 also have QUIC's transport-level idle timeout.
+            // Keepalive must fire before that deadline or it cannot keep the
+            // connection alive. Keep this calculation in sync with
+            // `conn::quic_idle_timeout`.
+            if connection_type == ConnectionType::DoQ
+                || (connection_type == ConnectionType::DoH && enable_http3)
+            {
+                let quic_idle_timeout = effective_query_timeout
+                    .checked_mul(3)
+                    .unwrap_or(Duration::MAX);
+                if interval >= quic_idle_timeout {
+                    return Err(DnsError::plugin(
+                        "upstream keepalive_interval must be less than the QUIC idle timeout (3x timeout)",
+                    ));
+                }
+            }
+        }
 
         if let Some(max_conns) = max_conns {
             if max_conns == 0 {
@@ -500,10 +553,11 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             bootstrap_timeout,
             path,
             doh_query,
-            timeout: timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT),
+            timeout: effective_query_timeout,
             server_name: host,
             insecure_skip_verify: insecure_skip_verify.unwrap_or(false),
-            idle_timeout: idle_timeout.unwrap_or(Self::DEFAULT_CONN_IDLE_TIME),
+            idle_timeout: effective_idle_timeout,
+            keepalive_interval,
             raw_addr: addr,
             enable_pipeline,
             enable_http3,

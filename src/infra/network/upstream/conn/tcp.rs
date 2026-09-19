@@ -18,7 +18,7 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::dial::TlsDialOptions;
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::dial::connect_tls;
-use crate::infra::network::dial::{DialTarget, SocketOptions};
+use crate::infra::network::dial::{DialTarget, SocketOptions, configure_tcp_keepalive};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 #[cfg(feature = "upstream-dot")]
@@ -435,6 +435,7 @@ pub struct TcpConnectionBuilder {
     connection_type: ConnectionType,
     request_map_capacity: u16,
     socks5: Option<Socks5Opt>,
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl TcpConnectionBuilder {
@@ -459,6 +460,7 @@ impl TcpConnectionBuilder {
             connection_type: connection_info.connection_type,
             request_map_capacity,
             socks5: connection_info.socks5.clone(),
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -492,6 +494,8 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
                 return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
             }
         };
+
+        configure_tcp_keepalive(&stream, self.keepalive_interval)?;
 
         debug!(
             conn_id,
@@ -577,6 +581,7 @@ mod tests {
             .expect("connection info should parse");
         connection_info.timeout = Duration::from_secs(9);
         connection_info.insecure_skip_verify = true;
+        connection_info.keepalive_interval = Some(Duration::from_secs(5));
 
         let builder = TcpConnectionBuilder::new(&connection_info, DEFAULT_REQUEST_MAP_CAPACITY);
 
@@ -586,6 +591,7 @@ mod tests {
         assert_eq!(builder.request_map_capacity, DEFAULT_REQUEST_MAP_CAPACITY);
         assert_eq!(builder.target.host(), "dns.example.com");
         assert!(builder.insecure_skip_verify);
+        assert_eq!(builder.keepalive_interval, Some(Duration::from_secs(5)));
     }
 
     #[tokio::test]

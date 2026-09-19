@@ -21,6 +21,7 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
     "upstreams[].bootstrap_version",
     "upstreams[].socks5",
     "upstreams[].idle_timeout",
+    "upstreams[].keepalive_interval",
     "upstreams[].max_conns",
     "upstreams[].min_conns",
     "upstreams[].timeout",

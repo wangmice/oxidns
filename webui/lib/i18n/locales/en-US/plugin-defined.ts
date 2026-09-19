@@ -413,6 +413,12 @@ export const enUSPluginDefined = {
             "Define the connection pool idle connection retention time.",
           example: "30",
         },
+        "upstreams[].keepalive_interval": {
+          label: "Connection keepalive interval",
+          description:
+            "Optional keepalive interval; disabled by default. DoH2 uses H2 PING, DoH3/DoQ use QUIC keepalive, and TCP/DoT use TCP keepalive.",
+          example: "5s",
+        },
         "upstreams[].max_conns": {
           label: "Maximum number of connections",
           description:

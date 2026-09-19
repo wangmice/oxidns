@@ -17,11 +17,6 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
     feature = "_dns-client-doh3"
 ))]
 use std::sync::Arc;
-#[cfg(any(
-    feature = "_tls-client",
-    feature = "_dns-client-doq",
-    feature = "_dns-client-doh3"
-))]
 use std::time::Duration;
 
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
@@ -32,7 +27,7 @@ use quinn::{
 };
 #[cfg(feature = "_tls-client")]
 use rustls::pki_types::ServerName;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::net::TcpStream;
 #[cfg(any(
     feature = "_tls-client",
@@ -249,6 +244,7 @@ pub(crate) struct QuicDialOptions {
     handshake_timeout: Duration,
     query_timeout: Option<(QueryDeadline, UpstreamTimeoutStage)>,
     idle_timeout: Duration,
+    keep_alive_interval: Option<Duration>,
     alpn: Vec<Vec<u8>>,
 }
 
@@ -267,6 +263,7 @@ impl QuicDialOptions {
             handshake_timeout,
             query_timeout: None,
             idle_timeout,
+            keep_alive_interval: None,
             alpn,
         }
     }
@@ -279,6 +276,58 @@ impl QuicDialOptions {
         self.query_timeout = Some((deadline, stage));
         self
     }
+
+    pub(crate) fn with_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.keep_alive_interval = interval;
+        self
+    }
+}
+
+/// Enable TCP keepalive on an established stream.
+///
+/// The configured duration is used as the idle time before the first probe
+/// and, on targets supported by socket2, as the interval between later probes.
+/// Protocol-specific keepalive remains preferable when available (for example
+/// HTTP/2 PING), but DoT has no application-level keepalive frame.
+#[allow(dead_code)]
+pub(crate) fn configure_tcp_keepalive(
+    stream: &TcpStream,
+    interval: Option<Duration>,
+) -> Result<()> {
+    let Some(interval) = interval else {
+        return Ok(());
+    };
+    if interval.is_zero() {
+        return Err(DnsError::plugin(
+            "upstream keepalive_interval must be greater than 0",
+        ));
+    }
+
+    let keepalive = TcpKeepalive::new().with_time(interval);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        all(target_os = "wasi", not(target_env = "p1")),
+    ))]
+    let keepalive = keepalive.with_interval(interval);
+
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|error| DnsError::protocol(format!("failed to configure TCP keepalive: {error}")))
 }
 
 /// Establish a TLS client connection over an existing TCP stream.
@@ -403,6 +452,7 @@ async fn connect_quic_endpoint(
     let idle_ms = options.idle_timeout.as_millis().min(u32::MAX as u128) as u32;
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(VarInt::from_u32(idle_ms).into()));
+    transport.keep_alive_interval(options.keep_alive_interval);
 
     let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_config)?));
     client_config.transport_config(Arc::new(transport));

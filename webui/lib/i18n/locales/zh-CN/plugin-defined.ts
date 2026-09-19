@@ -373,6 +373,12 @@ export const zhCNPluginDefined = {
           description: "定义连接池空闲连接保留时间。",
           example: "30",
         },
+        "upstreams[].keepalive_interval": {
+          label: "连接保活间隔",
+          description:
+            "可选连接保活间隔；默认关闭。DoH2 使用 H2 PING，DoH3/DoQ 使用 QUIC keepalive，TCP/DoT 使用 TCP keepalive。",
+          example: "5s",
+        },
         "upstreams[].max_conns": {
           label: "最大连接数",
           description: "定义连接池连接上限，范围 1..4096。",

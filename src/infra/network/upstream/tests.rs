@@ -130,6 +130,7 @@ fn make_upstream_config(addr: &str) -> UpstreamConfig {
         bootstrap_version: None,
         socks5: None,
         idle_timeout: None,
+        keepalive_interval: None,
         max_conns: None,
         min_conns: None,
         insecure_skip_verify: None,
@@ -654,6 +655,93 @@ fn test_connection_info_rejects_invalid_bootstrap_version() {
 
     assert!(
         err.to_string().contains("bootstrap_version must be 4 or 6"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_is_preserved() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(5));
+
+    let info = clean_connection_info(cfg, "keepalive interval should be accepted");
+
+    assert_eq!(info.keepalive_interval, Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn test_keepalive_interval_rejects_zero() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.keepalive_interval = Some(Duration::ZERO);
+
+    let err = clean_connection_info_err(cfg, "zero keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be greater than 0"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_must_be_less_than_idle_timeout() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_secs(10));
+    cfg.keepalive_interval = Some(Duration::from_secs(10));
+
+    let err = clean_connection_info_err(cfg, "keepalive at idle timeout should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than idle_timeout"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_rejects_udp_upstream() {
+    let mut cfg = make_upstream_config("udp://8.8.8.8:53");
+    cfg.keepalive_interval = Some(Duration::from_secs(5));
+
+    let err = clean_connection_info_err(cfg, "UDP keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval is not supported for UDP upstreams"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doq_keepalive_must_precede_quic_idle_timeout() {
+    let mut cfg = make_upstream_config("doq://dns.example.com:853");
+    cfg.timeout = Some(Duration::from_secs(1));
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(3));
+
+    let err = clean_connection_info_err(cfg, "late DoQ keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than the QUIC idle timeout"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh3_keepalive_must_precede_quic_idle_timeout() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.enable_http3 = Some(true);
+    cfg.timeout = Some(Duration::from_secs(1));
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(3));
+
+    let err = clean_connection_info_err(cfg, "late DoH3 keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than the QUIC idle timeout"),
         "{err}"
     );
 }

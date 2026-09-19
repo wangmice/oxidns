@@ -75,6 +75,8 @@ export const zhCNDocs = {
       "- 类型：`string`；必填：否；默认值：无\n- 作用：为上游连接指定 SOCKS5 代理，支持 UDP、TCP、DoT、DoQ、DoH2 和 DoH3。\n- 支持格式：\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 需写成 `[addr]:port`\n  - 带认证的 IPv6 需写成 `username:password@[addr]:port`\n- 规则说明：\n  - 代理主机可以是 IP，也可以是主机名；主机名会使用系统解析。\n  - 认证部分只按第一个 `:` 分割用户名和密码，因此格式必须是 `username:password@...`。\n  - UDP、DoQ 和 DoH3 要求代理支持 SOCKS5 `UDP ASSOCIATE`。\n- 注意事项：格式错误、端口非法或代理主机解析失败时，该上游不会被正常创建。",
     "upstreams[].idle_timeout":
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：定义连接池空闲连接保留时间。",
+    "upstreams[].keepalive_interval":
+      "- 类型：`duration`；必填：否；默认值：关闭\n- 作用：为持久上游连接启用保活。DoH2 使用 HTTP/2 PING；DoH3/DoQ 使用 QUIC keepalive；TCP/DoT 使用 TCP keepalive。\n- 约束：必须大于 0，且小于 `idle_timeout`；UDP 上游不支持。DoH3/DoQ 还必须早于 QUIC idle timeout（当前为 `3 × timeout`）。\n- 注意：TCP/DoT 在平台支持时同时使用该值作为首次探测等待时间和后续探测间隔；DoT/TCP 经 SOCKS5 时，TCP keepalive 只作用于本机到代理这一段。",
     "upstreams[].max_conns":
       "- 类型：`integer`；必填：否；默认值：自动\n- 作用：定义连接池连接上限。\n- 取值范围：`1..4096`。",
     "upstreams[].min_conns":

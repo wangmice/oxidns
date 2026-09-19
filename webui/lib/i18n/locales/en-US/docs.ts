@@ -78,6 +78,8 @@ export const enUSDocs = {
       "- Type: `string`; Required: No; Default: None\n- Function: Specify a SOCKS5 proxy for UDP, TCP, DoT, DoQ, DoH2, or DoH3 upstream connections.\n- Supported formats:\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 needs to be written as `[addr]:port`\n  - IPv6 with authentication needs to be written as `username:password@[addr]:port`\n- Rule description:\n  - The proxy host can be an IP or a host name; the host name will be resolved using the system.\n  - The authentication part only separates the username and password by the first `:`, so the format must be `username:password@...`.\n  - UDP, DoQ, and DoH3 require SOCKS5 `UDP ASSOCIATE` support.\n- Note: When the format is incorrect, the port is illegal, or the proxy host resolution fails, the upstream will not be created normally.",
     "upstreams[].idle_timeout":
       "- Type: `integer`; required: no; default value: none\n- Unit: seconds\n- Function: Define the connection pool idle connection retention time.",
+    "upstreams[].keepalive_interval":
+      "- Type: `duration`; Required: No; Default: disabled\n- Function: Enable keepalive for persistent upstream connections. DoH2 uses HTTP/2 PING; DoH3/DoQ use QUIC keepalive; TCP/DoT use TCP keepalive.\n- Constraint: Must be greater than 0 and less than `idle_timeout`; UDP upstreams are not supported. DoH3/DoQ must also fire before the QUIC idle timeout (currently `3 × timeout`).\n- Note: For TCP/DoT over SOCKS5, TCP keepalive only covers the local-to-proxy TCP segment.",
     "upstreams[].max_conns":
       "- Type: `integer`; Required: No; Default: Automatic\n- Function: Define the upper limit of connection pool connections.\n- Range: `1..4096`.",
     "upstreams[].min_conns":

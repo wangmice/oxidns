@@ -183,6 +183,77 @@ if (!forwardDefinition || !fallbackDefinition || !httpRequestDefinition) {
   );
 }
 
+describe("forward upstream keepalive WebUI round-trip", () => {
+  const upstreamsField = forwardDefinition.configSchema.find(
+    (field) => field.key === "upstreams",
+  );
+
+  if (
+    !upstreamsField?.item ||
+    upstreamsField.item.type !== "object"
+  ) {
+    throw new Error("forward upstreams must use an object schema");
+  }
+
+  const keepaliveField = upstreamsField.item.fields.find(
+    (field) => field.key === "keepalive_interval",
+  );
+
+  it("exposes keepalive_interval as an advanced duration field", () => {
+    expect(keepaliveField).toMatchObject({
+      key: "keepalive_interval",
+      type: "duration",
+      advanced: true,
+      example: "5s",
+    });
+  });
+
+  it("loads and serializes keepalive_interval without dropping it", () => {
+    const config = {
+      upstreams: [
+        {
+          tag: "quad9_doh",
+          addr: "https://dns10.quad9.net/dns-query",
+          idle_timeout: 30,
+          keepalive_interval: "5s",
+          timeout: "5s",
+        },
+      ],
+    };
+
+    const formValues = createPluginConfigFormValues(
+      forwardDefinition.configSchema,
+      config,
+    );
+    expect(formValues).toMatchObject(config);
+    expect(
+      serializePluginConfigValues(forwardDefinition.configSchema, formValues),
+    ).toEqual(config);
+  });
+
+  it("localizes the keepalive field and attaches field documentation", () => {
+    for (const locale of ["zh-CN", "en-US"] as const) {
+      const localized = getLocalizedPluginKindDefinition("forward", locale);
+      const localizedUpstreams = localized?.configSchema.find(
+        (field) => field.key === "upstreams",
+      );
+      if (
+        !localizedUpstreams?.item ||
+        localizedUpstreams.item.type !== "object"
+      ) {
+        throw new Error("localized forward upstreams must use an object schema");
+      }
+      const field = localizedUpstreams.item.fields.find(
+        (candidate) => candidate.key === "keepalive_interval",
+      );
+
+      expect(field?.label).toBeTruthy();
+      expect(field?.description).toBeTruthy();
+      expect(field?.docs).toContain("keepalive");
+    }
+  });
+});
+
 describe("client_ip_from_ecs plugin definition", () => {
   it("is registered and localized for both WebUI locales", () => {
     const definition = executorPluginDefinitions.find(
