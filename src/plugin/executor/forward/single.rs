@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use super::metrics::ForwardMetrics;
 use super::{contextualize_upstream_error, is_timeout_error};
@@ -69,7 +69,7 @@ impl Executor for SingleDnsForwarder {
                 self.metrics.record_upstream_error(0, start_ms, timeout);
                 let upstream_error =
                     contextualize_upstream_error(self.upstream.connection_info(), e);
-                warn!(
+                debug!(
                     upstream = %self.upstream.connection_info().raw_addr,
                     upstream_tag = self.upstream.connection_info().tag.as_deref().unwrap_or(""),
                     source = %context.peer_addr(),

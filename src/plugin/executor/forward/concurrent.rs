@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::RngExt;
 use tokio::task::JoinSet;
-use tracing::{Level, debug, event_enabled, info, warn};
+use tracing::{Level, debug, event_enabled, info};
 
 use super::metrics::ForwardMetrics;
 use super::selection::{ResponseSelectionMode, SelectedResponse, select_response};
@@ -72,9 +72,10 @@ impl Executor for ConcurrentForwarder {
 
         let err = last_error.unwrap_or_else(|| "no upstream response".to_string());
         self.metrics.record_error(start_ms, timed_out);
-        warn!(
-            "forward plugin '{}' failed across all concurrent upstreams: {}",
-            self.tag, err
+        debug!(
+            forward_tag = %self.tag,
+            error = %err,
+            "forward plugin failed across all concurrent upstreams"
         );
         Err(DnsError::plugin(format!(
             "forward plugin '{}' failed across all concurrent upstreams: {}",
@@ -109,12 +110,23 @@ impl ConcurrentForwarder {
             let selected_idx = (start_idx + i) % total_upstreams;
             let upstream = self.upstreams[selected_idx].clone();
             let message = request.clone();
+            let query_id = message.id();
             let metrics = self.metrics.clone();
             join_set.spawn(async move {
                 let up_start = metrics.record_upstream_start(selected_idx);
-                let result: Result<Message> = match upstream.query(message).await {
+                match upstream.query(message).await {
                     Ok(response) => {
                         metrics.record_upstream_success(selected_idx, up_start);
+                        if event_enabled!(Level::DEBUG) {
+                            let info = upstream.connection_info();
+                            debug!(
+                                upstream_index = selected_idx,
+                                upstream = %info.raw_addr,
+                                upstream_tag = info.tag.as_deref().unwrap_or(""),
+                                query_id,
+                                "DNS upstream query succeeded"
+                            );
+                        }
                         Ok(response)
                     }
                     Err(err) => {
@@ -123,20 +135,20 @@ impl ConcurrentForwarder {
                             up_start,
                             is_timeout_error(&err),
                         );
-                        Err(contextualize_upstream_error(
-                            upstream.connection_info(),
-                            err,
-                        ))
+                        let info = upstream.connection_info();
+                        if event_enabled!(Level::DEBUG) {
+                            debug!(
+                                upstream_index = selected_idx,
+                                upstream = %info.raw_addr,
+                                upstream_tag = info.tag.as_deref().unwrap_or(""),
+                                query_id,
+                                error = %err,
+                                "DNS upstream query failed"
+                            );
+                        }
+                        Err(contextualize_upstream_error(info, err))
                     }
-                };
-                if event_enabled!(Level::DEBUG) {
-                    debug!(
-                        "DNS ConcurrentForwarder received message {}, remote_addr: {}",
-                        selected_idx,
-                        upstream.connection_info().raw_addr
-                    );
                 }
-                result
             });
         }
 

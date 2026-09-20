@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::debug;
 
 use crate::infra::error::Result;
 use crate::infra::network::metrics::UpstreamTimeoutStage;
@@ -68,7 +68,7 @@ pub trait Upstream: Send + Sync + Debug {
     ) -> Result<Message> {
         if deadline.remaining().is_none() {
             let info = self.connection_info();
-            warn!(
+            debug!(
                 upstream = %info.raw_addr,
                 upstream_tag = info.tag.as_deref().unwrap_or(""),
                 protocol = ?info.connection_type,
@@ -89,7 +89,7 @@ pub trait Upstream: Send + Sync + Debug {
             DeadlineOutcome::Completed(result) => result,
             DeadlineOutcome::Expired => {
                 let info = self.connection_info();
-                warn!(
+                debug!(
                     upstream = %info.raw_addr,
                     upstream_tag = info.tag.as_deref().unwrap_or(""),
                     protocol = ?info.connection_type,

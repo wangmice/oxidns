@@ -88,6 +88,9 @@ const EVICT_LOW_WATERMARK_PERCENT: usize = 85;
 const DEFAULT_LAZY_REFRESH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LAZY_REFRESH_CONCURRENCY: usize = 64;
 const DEFAULT_LAZY_REFRESH_FAILURE_COOLDOWN_SECS: u64 = 30;
+// Keep per-key refresh failures at DEBUG and emit at most one aggregate WARN
+// per window so one upstream outage cannot amplify into dozens of WARN lines.
+const LAZY_REFRESH_WARN_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_MISS_COALESCE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MISS_COALESCE_RETRY_GENERATIONS: usize = 1;
 static NEXT_MISS_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
@@ -595,6 +598,8 @@ struct CacheMetrics {
     lazy_refresh_failed_total: AtomicU64,
     lazy_refresh_skipped_busy_total: AtomicU64,
     lazy_refresh_skipped_cooldown_total: AtomicU64,
+    lazy_refresh_warn_last_ms: AtomicU64,
+    lazy_refresh_warn_pending: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -622,7 +627,54 @@ impl CacheMetrics {
             lazy_refresh_failed_total: AtomicU64::new(0),
             lazy_refresh_skipped_busy_total: AtomicU64::new(0),
             lazy_refresh_skipped_cooldown_total: AtomicU64::new(0),
+            lazy_refresh_warn_last_ms: AtomicU64::new(0),
+            lazy_refresh_warn_pending: AtomicU64::new(0),
         }
+    }
+
+    fn take_lazy_refresh_warning_batch(&self, now_ms: u64) -> Option<u64> {
+        self.lazy_refresh_warn_pending
+            .fetch_add(1, Ordering::Relaxed);
+
+        let last_ms = self.lazy_refresh_warn_last_ms.load(Ordering::Acquire);
+        if last_ms != 0 && now_ms.saturating_sub(last_ms) < LAZY_REFRESH_WARN_INTERVAL_MS {
+            return None;
+        }
+
+        let next_ms = now_ms.max(1);
+        if self
+            .lazy_refresh_warn_last_ms
+            .compare_exchange(last_ms, next_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+
+        Some(self.lazy_refresh_warn_pending.swap(0, Ordering::AcqRel))
+    }
+
+    fn record_lazy_refresh_warning(&self, domain: &str, failure_kind: &'static str, error: &str) {
+        debug!(
+            cache_tag = %self.tag,
+            domain,
+            failure_kind,
+            error = %error,
+            "lazy cache refresh failed"
+        );
+
+        let now_ms = AppClock::elapsed_millis();
+        let Some(failures) = self.take_lazy_refresh_warning_batch(now_ms) else {
+            return;
+        };
+
+        warn!(
+            cache_tag = %self.tag,
+            failures,
+            sample_domain = domain,
+            failure_kind,
+            sample_error = %error,
+            "lazy cache refresh failures observed"
+        );
     }
 
     fn record_skip(&self, reason: CacheSkipReason) {
@@ -1606,9 +1658,10 @@ impl Cache {
                             metrics
                                 .lazy_refresh_failed_total
                                 .fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                "lazy cache refresh response has incompatible ECS for {}",
-                                request_key.domain
+                            metrics.record_lazy_refresh_warning(
+                                request_key.domain.as_ref(),
+                                "incompatible_ecs",
+                                "refresh response ECS is incompatible with the request",
                             );
                             return;
                         };
@@ -1701,9 +1754,11 @@ impl Cache {
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "lazy cache refresh failed for {}: {}",
-                        request_key.domain, err
+                    let error = err.to_string();
+                    metrics.record_lazy_refresh_warning(
+                        request_key.domain.as_ref(),
+                        "upstream_error",
+                        &error,
                     );
                 }
                 Err(_) => {
@@ -1713,7 +1768,11 @@ impl Cache {
                     metrics
                         .lazy_refresh_failed_total
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!("lazy cache refresh timed out for {}", request_key.domain);
+                    metrics.record_lazy_refresh_warning(
+                        request_key.domain.as_ref(),
+                        "timeout",
+                        "refresh deadline expired",
+                    );
                 }
             }
         };
@@ -2485,6 +2544,18 @@ mod tests {
         ClientSubnet, DNSClass, Edns, EdnsCode, EdnsOption, Message, Name, Question, RData, Rcode,
         Record, RecordType,
     };
+
+    #[test]
+    fn lazy_refresh_warning_batch_is_windowed_and_accumulates_failures() {
+        let metrics = CacheMetrics::new("cache_test".to_string());
+
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(100), Some(1));
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(101), None);
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(5_099), None);
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(5_100), Some(3));
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(5_101), None);
+        assert_eq!(metrics.take_lazy_refresh_warning_batch(10_100), Some(2));
+    }
 
     async fn wait_until<F>(description: &str, condition: F)
     where
