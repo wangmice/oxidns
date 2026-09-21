@@ -4,11 +4,10 @@
 //! Protocol-specific upstream connection implementations.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex};
 #[cfg(any(feature = "upstream-doq", feature = "upstream-doh3"))]
 use std::time::Duration;
 
-use tokio::sync::Notify;
 #[cfg(feature = "_http-client")]
 pub(crate) mod doh;
 #[cfg(feature = "upstream-doh")]
@@ -33,11 +32,11 @@ pub(crate) use udp::{UdpConnection, UdpConnectionBuilder};
 /// Cold-path notification bridge from a connection driver to its owning pool.
 ///
 /// Registration happens once after a multiplexed connection is created. The
-/// mutex is touched only when the connection becomes unavailable, never on the
-/// query hot path.
+/// mutex is touched only during registration and when the connection becomes
+/// unavailable, never on the query hot path.
 #[derive(Default)]
 pub(crate) struct PoolUnavailableNotify {
-    notify: Mutex<Option<(Weak<Notify>, Weak<Notify>)>>,
+    notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for PoolUnavailableNotify {
@@ -47,28 +46,21 @@ impl std::fmt::Debug for PoolUnavailableNotify {
 }
 
 impl PoolUnavailableNotify {
-    pub(crate) fn register(&self, capacity_notify: Weak<Notify>, query_notify: Weak<Notify>) {
+    pub(crate) fn register(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         *self
             .notify
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((capacity_notify, query_notify));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notify);
     }
 
-    pub(crate) fn notify_waiters(&self) {
-        let notifiers = self
+    pub(crate) fn notify_pool(&self) {
+        let notify = self
             .notify
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let Some((capacity_notify, query_notify)) = notifiers else {
-            return;
-        };
-        if let Some(notify) = capacity_notify.upgrade() {
-            notify.notify_waiters();
-        }
-        if let Some(notify) = query_notify.upgrade() {
-            notify.notify_waiters();
+        if let Some(notify) = notify {
+            notify();
         }
     }
 }

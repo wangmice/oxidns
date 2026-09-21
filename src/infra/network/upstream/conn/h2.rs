@@ -166,15 +166,10 @@ impl Connection for H2Connection {
         !self.closed.load(Ordering::Acquire)
     }
 
-    fn register_unavailable_notify(
-        &self,
-        capacity_notify: Weak<Notify>,
-        query_notify: Weak<Notify>,
-    ) {
-        self.pool_unavailable_notify
-            .register(capacity_notify, query_notify);
+    fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.pool_unavailable_notify.register(notify);
         if self.closed.load(Ordering::Acquire) {
-            self.pool_unavailable_notify.notify_waiters();
+            self.pool_unavailable_notify.notify_pool();
         }
     }
 
@@ -196,7 +191,7 @@ impl H2Connection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return false;
         }
-        self.pool_unavailable_notify.notify_waiters();
+        self.pool_unavailable_notify.notify_pool();
         true
     }
 

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::sync::Notify;
@@ -97,9 +97,10 @@ pub struct PipelinePool<C: Connection> {
     next_expand_at_ms: AtomicU64,
     /// Consecutive background connection-creation failures.
     connect_failure_streak: AtomicU32,
-    /// Most recent background connection failure. Read only on foreground
-    /// pool-acquire timeout, so diagnostics do not add a lock to the hot path.
-    last_connect_failure: Mutex<Option<ConnectFailureObservation>>,
+    /// Most recent background connection failure. Writes are rare; foreground
+    /// pool-acquire timeouts take a lock-free snapshot so failure storms do not
+    /// serialize on a shared mutex.
+    last_connect_failure: ArcSwapOption<ConnectFailureObservation>,
 }
 
 #[async_trait]
@@ -309,7 +310,7 @@ impl<C: Connection> PipelinePool<C> {
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
-            last_connect_failure: Mutex::new(None),
+            last_connect_failure: ArcSwapOption::empty(),
         });
         start_maintenance(&pool);
         if min_size > 0 {
@@ -673,10 +674,9 @@ impl<C: Connection> PipelinePool<C> {
             }
 
             let state = pool.paced_expansion_state();
-            let build_limit = match state {
-                PacedExpansionState::ExpandSoft => 1,
-                PacedExpansionState::ExpandHard => MULTIPLEXED_MAX_CONCURRENT_BUILDS,
-                PacedExpansionState::Idle | PacedExpansionState::Saturated => continue,
+            let build_limit = match pool.paced_build_limit(state) {
+                Some(limit) => limit,
+                None => continue,
             };
 
             if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
@@ -819,6 +819,32 @@ impl<C: Connection> PipelinePool<C> {
         PacedExpansionState::Idle
     }
 
+    /// Return the total number of concurrent connection builds justified by
+    /// current pressure. Existing reservations consume this budget; the value
+    /// is a target, while `MULTIPLEXED_MAX_CONCURRENT_BUILDS` is only a ceiling.
+    fn paced_build_limit(&self, state: PacedExpansionState) -> Option<usize> {
+        match state {
+            PacedExpansionState::Idle | PacedExpansionState::Saturated => None,
+            PacedExpansionState::ExpandSoft => Some(1),
+            PacedExpansionState::ExpandHard => {
+                let pressure = self.pool_pressure();
+                let waiters = self.acquire_waiters.load(Ordering::Acquire);
+                let min_size_builds = self.min_size.saturating_sub(pressure.active_connections);
+                let waiter_deficit = waiters.saturating_sub(pressure.free_capacity);
+                let per_connection = usize::from(self.max_load.max(1));
+                let waiter_builds = waiter_deficit.div_ceil(per_connection);
+                let available_pool_slots =
+                    self.max_size.saturating_sub(pressure.active_connections);
+                let justified = min_size_builds
+                    .max(waiter_builds)
+                    .min(available_pool_slots)
+                    .min(MULTIPLEXED_MAX_CONCURRENT_BUILDS);
+
+                (justified > 0).then_some(justified)
+            }
+        }
+    }
+
     fn notify_expansion_capacity_change(&self) {
         self.expansion_quiescent_at_capacity
             .store(false, Ordering::Release);
@@ -861,28 +887,19 @@ impl<C: Connection> PipelinePool<C> {
     }
 
     fn record_connect_failure_message(&self, message: String) {
-        *self
-            .last_connect_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ConnectFailureObservation {
-            at_ms: AppClock::elapsed_millis(),
-            message,
-        });
+        self.last_connect_failure
+            .store(Some(Arc::new(ConnectFailureObservation {
+                at_ms: AppClock::elapsed_millis(),
+                message,
+            })));
     }
 
     fn clear_connect_failure(&self) {
-        self.last_connect_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        self.last_connect_failure.store(None);
     }
 
     fn paced_pool_acquire_timeout_error(&self, deadline: QueryDeadline) -> DnsError {
-        let failure = self
-            .last_connect_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let failure = self.last_connect_failure.load_full();
         if let Some(failure) = failure.filter(|failure| failure.at_ms >= deadline.started_at_ms) {
             let detail = format!(
                 "last upstream connection attempt failed: {}",
@@ -968,10 +985,7 @@ impl<C: Connection> PipelinePool<C> {
         {
             DeadlineOutcome::Completed(Ok(conn)) => {
                 if self.paced_expansion.is_some() {
-                    conn.register_unavailable_notify(
-                        Arc::downgrade(&self.expansion_capacity_notified),
-                        Arc::downgrade(&self.release_notified),
-                    );
+                    self.register_connection_unavailable_notify(&conn);
                 }
                 let slot = Arc::new(PipelineSlot::new(conn));
                 if self.insert_slot(slot.clone()) {
@@ -992,6 +1006,21 @@ impl<C: Connection> PipelinePool<C> {
                 Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
             }
         }
+    }
+
+    fn register_connection_unavailable_notify(&self, conn: &Arc<C>) {
+        let weak = self.self_weak.clone();
+        conn.register_unavailable_notify(Arc::new(move || {
+            let Some(pool) = weak.upgrade() else {
+                return;
+            };
+            // Connection loss creates potential whole-slot replacement
+            // capacity, not usable DNS stream capacity. Re-arm the controller
+            // directly and leave foreground waiters asleep until a real stream
+            // is released or a replacement connection is published.
+            pool.notify_expansion_capacity_change();
+            pool.request_paced_expansion();
+        }));
     }
 
     fn notify_inserted_query_capacity(&self, slot: &PipelineSlot<C>) {
@@ -1466,14 +1495,23 @@ impl<'a, C: Connection> PipelineLease<'a, C> {
 
     fn retire(&self) {
         self.slot.retire();
-        self.notify.notify_waiters();
-        self.notify_paced_capacity_change();
+        if self.expansion_capacity_notify.is_some() {
+            // Retiring a multiplexed slot removes capacity; it does not create
+            // stream capacity for blocked queries. Re-arm expansion directly
+            // and let a replacement insertion perform bounded query wakeups.
+            self.notify_paced_capacity_change();
+        } else {
+            self.notify.notify_waiters();
+        }
     }
 
     fn close(&self) {
         self.slot.close();
-        self.notify.notify_waiters();
-        self.notify_paced_capacity_change();
+        if self.expansion_capacity_notify.is_some() {
+            self.notify_paced_capacity_change();
+        } else {
+            self.notify.notify_waiters();
+        }
     }
 
     fn notify_paced_capacity_change(&self) {
@@ -1699,7 +1737,7 @@ mod tests {
 
         fn mark_unavailable(&self) {
             if self.available.swap(false, Ordering::AcqRel) {
-                self.pool_unavailable_notify.notify_waiters();
+                self.pool_unavailable_notify.notify_pool();
             }
         }
     }
@@ -1728,15 +1766,10 @@ mod tests {
             self.available.load(Ordering::Relaxed)
         }
 
-        fn register_unavailable_notify(
-            &self,
-            capacity_notify: Weak<Notify>,
-            query_notify: Weak<Notify>,
-        ) {
-            self.pool_unavailable_notify
-                .register(capacity_notify, query_notify);
+        fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+            self.pool_unavailable_notify.register(notify);
             if !self.available.load(Ordering::Acquire) {
-                self.pool_unavailable_notify.notify_waiters();
+                self.pool_unavailable_notify.notify_pool();
             }
         }
 
@@ -1919,7 +1952,7 @@ mod tests {
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
-            last_connect_failure: Mutex::new(None),
+            last_connect_failure: ArcSwapOption::empty(),
         }
     }
 
@@ -2405,6 +2438,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paced_min_size_counts_inflight_build_reservations() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            1,
+            4,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::from_millis(120), Duration::ZERO),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(stats.max_active.load(Ordering::Acquire), 1);
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if pool.slots.load().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("min-size prefill should complete with one connection");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_paced_hard_cap_quiesces_until_connection_becomes_replaceable() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
@@ -2461,6 +2523,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paced_slot_close_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.register_connection_unavailable_notify(&existing);
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(existing))]));
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        lease.close();
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        pool.acquire_waiters.store(0, Ordering::Release);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_replenishes_min_size_without_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            1,
+            2,
+            8,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.slots.load().len() == 1 && stats.calls.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial min-size prefill should complete");
+
+        let failed = pool.slots.load_full()[0].conn.clone();
+        failed.mark_unavailable();
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let slots = pool.slots.load();
+                if stats.calls.load(Ordering::Acquire) >= 2
+                    && slots.len() == 1
+                    && slots[0].connection().available()
+                    && !Arc::ptr_eq(&slots[0].conn, &failed)
+                {
+                    break;
+                }
+                drop(slots);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async loss should immediately replenish min_size without a foreground query");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 2);
+        assert_eq!(pool.acquire_waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.register_connection_unavailable_notify(&existing);
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        existing.mark_unavailable();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
     async fn test_async_unavailable_wakes_capacity_wait_without_fallback() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
@@ -2470,10 +2652,7 @@ mod tests {
             TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
         );
         let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
-        existing.register_unavailable_notify(
-            Arc::downgrade(&pool.expansion_capacity_notified),
-            Arc::downgrade(&pool.release_notified),
-        );
+        pool.register_connection_unavailable_notify(&existing);
         pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
             existing.clone(),
         ))]));
@@ -2505,8 +2684,9 @@ mod tests {
         .expect("second acquire should wait at the hard cap");
 
         // Simulate an H2/H3/DoQ driver observing remote connection loss while
-        // one stream lease is still held. The unavailable event wakes the
-        // paced controller, but max_size remains occupied until `held` drains.
+        // one stream lease is still held. The unavailable callback re-arms the
+        // paced controller directly, but max_size remains occupied until
+        // `held` drains.
         existing.mark_unavailable();
         tokio::time::timeout(Duration::from_millis(50), async {
             loop {

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use tokio::select;
@@ -84,7 +84,7 @@ impl QuicConnection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return false;
         }
-        self.pool_unavailable_notify.notify_waiters();
+        self.pool_unavailable_notify.notify_pool();
         true
     }
 
@@ -275,15 +275,10 @@ impl Connection for QuicConnection {
         !self.closed.load(Ordering::Acquire)
     }
 
-    fn register_unavailable_notify(
-        &self,
-        capacity_notify: Weak<Notify>,
-        query_notify: Weak<Notify>,
-    ) {
-        self.pool_unavailable_notify
-            .register(capacity_notify, query_notify);
+    fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.pool_unavailable_notify.register(notify);
         if self.closed.load(Ordering::Acquire) {
-            self.pool_unavailable_notify.notify_waiters();
+            self.pool_unavailable_notify.notify_pool();
         }
     }
 
