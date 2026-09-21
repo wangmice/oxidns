@@ -120,6 +120,6 @@ title: Prometheus 指标
 
 这些指标带有低基数插件级标签，例如 `plugin_tag`、`name`、`kind`、`reason`、`result`、`protocol`。`server_*` 额外带有 `protocol`（`udp`/`tcp`/`dot`/`quic`/`doh`）标签。`forward_upstream_*` 带有 `upstream` 标签，其取值为上游 tag（未配置时为解析后的地址）；由于上游集合在启动时固定且数量有限，属于低基数维度。
 
-`network_upstream_timeout_total` 是全局网络指标，不带 `outbound_profile`。其 `stage` 标签用于标识共享 query deadline 在网络栈中的耗尽阶段，当前取值为 `pool_acquire`、`connection_create`、`protocol_handshake` 和 `query_io`。该指标用于判断超时主要发生在连接池等待、连接创建、协议握手还是实际查询 I/O 阶段。
+`network_upstream_timeout_total` 是全局网络指标，不带 `outbound_profile`。其 `stage` 标签用于标识上游网络操作发生 deadline 超时的阶段，当前取值为 `pool_acquire`、`connection_create`、`protocol_handshake` 和 `query_io`。其中 `pool_acquire` 和 `query_io` 仅统计前台查询 deadline；`connection_create` 和 `protocol_handshake` 还包含后台连接池扩容的建连与握手超时。该指标用于判断超时主要发生在连接池等待、连接创建、协议握手还是实际查询 I/O 阶段。
 
 域名、客户端 IP 等高基数字段不会进入通用指标层；需要逐条查询明细时请使用 `query_recorder`。

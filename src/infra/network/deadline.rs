@@ -26,12 +26,19 @@ pub enum DeadlineOutcome<T> {
 pub struct QueryDeadline {
     pub started_at_ms: u64,
     pub expires_at_ms: u64,
-    track_upstream_timeout_metrics: bool,
+    timeout_metric_scope: TimeoutMetricScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutMetricScope {
+    Query,
+    Connection,
+    None,
 }
 
 impl QueryDeadline {
     pub fn new(timeout: Duration) -> Self {
-        Self::new_with_metric_tracking(timeout, true)
+        Self::new_with_metric_scope(timeout, TimeoutMetricScope::Query)
     }
 
     /// Deadline for background pool maintenance/prefill work.
@@ -39,24 +46,32 @@ impl QueryDeadline {
     /// Background connection upkeep shares the same timeout machinery but must
     /// not inflate query-facing upstream timeout metrics.
     pub(crate) fn background(timeout: Duration) -> Self {
-        Self::new_with_metric_tracking(timeout, false)
+        Self::new_with_metric_scope(timeout, TimeoutMetricScope::None)
     }
 
-    fn new_with_metric_tracking(timeout: Duration, track_upstream_timeout_metrics: bool) -> Self {
+    /// Deadline for detached background connection creation.
+    ///
+    /// These operations are not owned by one foreground query, but connection
+    /// establishment failures still need stage-level observability. Only
+    /// connection-create and protocol-handshake timeouts are recorded.
+    pub(crate) fn background_connection(timeout: Duration) -> Self {
+        Self::new_with_metric_scope(timeout, TimeoutMetricScope::Connection)
+    }
+
+    fn new_with_metric_scope(timeout: Duration, timeout_metric_scope: TimeoutMetricScope) -> Self {
         let started_at_ms = AppClock::elapsed_millis();
         let timeout_ms = duration_millis_u64(timeout);
         Self {
             started_at_ms,
             expires_at_ms: started_at_ms.saturating_add(timeout_ms),
-            track_upstream_timeout_metrics,
+            timeout_metric_scope,
         }
     }
 
     /// Return the earlier of this deadline and a new relative timeout while
-    /// preserving whether upstream timeout metrics are tracked.
+    /// preserving the upstream timeout metric scope.
     pub(crate) fn capped(self, timeout: Duration) -> Self {
-        let timeout_deadline =
-            Self::new_with_metric_tracking(timeout, self.track_upstream_timeout_metrics);
+        let timeout_deadline = Self::new_with_metric_scope(timeout, self.timeout_metric_scope);
         if timeout_deadline.expires_at_ms < self.expires_at_ms {
             timeout_deadline
         } else {
@@ -98,8 +113,19 @@ impl QueryDeadline {
         ))
     }
 
+    fn tracks_timeout_metric(&self, stage: UpstreamTimeoutStage) -> bool {
+        match self.timeout_metric_scope {
+            TimeoutMetricScope::Query => true,
+            TimeoutMetricScope::Connection => matches!(
+                stage,
+                UpstreamTimeoutStage::ConnectionCreate | UpstreamTimeoutStage::ProtocolHandshake
+            ),
+            TimeoutMetricScope::None => false,
+        }
+    }
+
     fn record_timeout_metric(&self, stage: UpstreamTimeoutStage) {
-        if self.track_upstream_timeout_metrics {
+        if self.tracks_timeout_metric(stage) {
             metrics::upstream_timeout(stage);
         }
     }
@@ -139,7 +165,10 @@ mod tests {
     #[test]
     fn timeout_error_with_detail_preserves_context() {
         AppClock::start();
-        let deadline = QueryDeadline::new(Duration::from_millis(25));
+        // This test only verifies error-detail formatting. Use a silent
+        // background deadline so parallel metrics tests are not affected by
+        // an unrelated global timeout-counter increment.
+        let deadline = QueryDeadline::background(Duration::from_millis(25));
         let error = deadline.timeout_error_for_with_detail(
             UpstreamTimeoutStage::PoolAcquire,
             "last upstream connection attempt failed: planned failure",
@@ -155,10 +184,31 @@ mod tests {
 
         let query = QueryDeadline::new(Duration::from_secs(5));
         let query_capped = query.capped(Duration::from_secs(1));
-        assert!(query_capped.track_upstream_timeout_metrics);
+        assert_eq!(query_capped.timeout_metric_scope, TimeoutMetricScope::Query);
+
+        let connection = QueryDeadline::background_connection(Duration::from_secs(5));
+        let connection_capped = connection.capped(Duration::from_secs(1));
+        assert_eq!(
+            connection_capped.timeout_metric_scope,
+            TimeoutMetricScope::Connection
+        );
 
         let background = QueryDeadline::background(Duration::from_secs(5));
         let background_capped = background.capped(Duration::from_secs(1));
-        assert!(!background_capped.track_upstream_timeout_metrics);
+        assert_eq!(
+            background_capped.timeout_metric_scope,
+            TimeoutMetricScope::None
+        );
+    }
+
+    #[test]
+    fn connection_background_tracks_only_connection_stages() {
+        AppClock::start();
+        let deadline = QueryDeadline::background_connection(Duration::from_secs(5));
+
+        assert!(deadline.tracks_timeout_metric(UpstreamTimeoutStage::ConnectionCreate));
+        assert!(deadline.tracks_timeout_metric(UpstreamTimeoutStage::ProtocolHandshake));
+        assert!(!deadline.tracks_timeout_metric(UpstreamTimeoutStage::PoolAcquire));
+        assert!(!deadline.tracks_timeout_metric(UpstreamTimeoutStage::QueryIo));
     }
 }

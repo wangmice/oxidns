@@ -1038,7 +1038,7 @@ export const enUSWebui = {
     outboundMetricsLocalProfile: "Local bootstrap",
     networkTimeoutMetricsTitle: "Upstream Timeout Stages",
     networkTimeoutMetricsDesc:
-      "Global counts of upstream query deadlines expiring at each network stage; these are not attributed to a single outbound profile.",
+      "Global counts of upstream operation deadlines expiring at each network stage; connection creation and protocol handshake also include background pool expansion, and these are not attributed to a single outbound profile.",
     networkTimeoutPoolAcquire: "Pool Acquire",
     networkTimeoutConnectionCreate: "Connection Create",
     networkTimeoutProtocolHandshake: "Protocol Handshake",
