@@ -123,7 +123,7 @@ describe("plugin metric formatting", () => {
 describe("Prometheus network metric parsing", () => {
   it("keeps global timeout-stage metrics separate from outbound profiles", () => {
     const parsed = parsePrometheusMetrics(`
-# HELP network_upstream_timeout_total Total upstream query deadline expirations by network stage.
+# HELP network_upstream_timeout_total Total upstream operation deadline expirations by network stage.
 # TYPE network_upstream_timeout_total counter
 network_upstream_timeout_total{stage="pool_acquire"} 3
 network_upstream_timeout_total{stage="query_io"} 7
