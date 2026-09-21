@@ -63,9 +63,29 @@ struct ConnectFailureObservation {
     message: String,
 }
 
-const SLOT_ACTIVE: u8 = 0;
-const SLOT_RETIRING: u8 = 1;
-const SLOT_CLOSED: u8 = 2;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Active = 0,
+    Retiring = 1,
+    Closed = 2,
+    /// Reserved packed bit pattern. Normal state transitions never write it,
+    /// but representing all two-bit values keeps decoding safe and preserves
+    /// the previous fail-closed handling if the packed word is ever corrupted.
+    Invalid = 3,
+}
+
+impl SlotState {
+    #[inline]
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Active,
+            1 => Self::Retiring,
+            2 => Self::Closed,
+            _ => Self::Invalid,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PipelinePool<C: Connection> {
@@ -184,14 +204,14 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
 
         for slot in slots.iter() {
             let (state, inflight) = slot.snapshot();
-            if state == SLOT_ACTIVE && slot.connection().available() {
+            if state == SlotState::Active && slot.connection().available() {
                 let idle = now.saturating_sub(slot.connection().last_used());
                 if inflight == 0 && idle >= self.max_idle.as_millis() as u64 {
                     idle_candidates.push(slot.clone());
                 } else {
                     keep.push(slot.clone());
                 }
-            } else if state == SLOT_RETIRING && inflight > 0 {
+            } else if state == SlotState::Retiring && inflight > 0 {
                 keep.push(slot.clone());
             } else if inflight > 0 {
                 slot.close();
@@ -1031,7 +1051,7 @@ impl<C: Connection> PipelinePool<C> {
         let mut pressure = PoolPressure::default();
         for slot in slots.iter() {
             let (state, inflight) = slot.snapshot();
-            if state != SLOT_ACTIVE || !slot.connection().available() {
+            if state != SlotState::Active || !slot.connection().available() {
                 continue;
             }
             let capacity_u16 = slot.effective_max_load(self.max_load);
@@ -1390,13 +1410,13 @@ const SLOT_INFLIGHT_MASK: u32 = u16::MAX as u32;
 const SLOT_STATE_SHIFT: u32 = 16;
 
 #[inline]
-const fn pack_slot_state(state: u8, inflight: u16) -> u32 {
+const fn pack_slot_state(state: SlotState, inflight: u16) -> u32 {
     ((state as u32) << SLOT_STATE_SHIFT) | inflight as u32
 }
 
 #[inline]
-const fn unpack_slot_state(word: u32) -> u8 {
-    ((word >> SLOT_STATE_SHIFT) & 0b11) as u8
+const fn unpack_slot_state(word: u32) -> SlotState {
+    SlotState::from_bits(((word >> SLOT_STATE_SHIFT) & 0b11) as u8)
 }
 
 #[inline]
@@ -1408,7 +1428,7 @@ impl<C: Connection> PipelineSlot<C> {
     fn new(conn: Arc<C>) -> Self {
         Self {
             conn,
-            state_and_inflight: AtomicU32::new(pack_slot_state(SLOT_ACTIVE, 0)),
+            state_and_inflight: AtomicU32::new(pack_slot_state(SlotState::Active, 0)),
         }
     }
 
@@ -1417,7 +1437,7 @@ impl<C: Connection> PipelineSlot<C> {
     }
 
     #[inline]
-    fn snapshot(&self) -> (u8, u16) {
+    fn snapshot(&self) -> (SlotState, u16) {
         let word = self.state_and_inflight.load(Ordering::Acquire);
         (unpack_slot_state(word), unpack_slot_inflight(word))
     }
@@ -1428,7 +1448,7 @@ impl<C: Connection> PipelineSlot<C> {
     }
 
     #[cfg(test)]
-    fn state(&self) -> u8 {
+    fn state(&self) -> SlotState {
         self.snapshot().0
     }
 
@@ -1445,7 +1465,7 @@ impl<C: Connection> PipelineSlot<C> {
         let effective_max_load = self.effective_max_load(max_load);
         let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
-            if unpack_slot_state(current) != SLOT_ACTIVE {
+            if unpack_slot_state(current) != SlotState::Active {
                 return false;
             }
 
@@ -1454,7 +1474,7 @@ impl<C: Connection> PipelineSlot<C> {
                 return false;
             }
 
-            let next = pack_slot_state(SLOT_ACTIVE, inflight + 1);
+            let next = pack_slot_state(SlotState::Active, inflight + 1);
             match self.state_and_inflight.compare_exchange_weak(
                 current,
                 next,
@@ -1481,7 +1501,7 @@ impl<C: Connection> PipelineSlot<C> {
         let effective_max_load = self.effective_max_load(max_load);
         let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
-            if unpack_slot_state(current) != SLOT_ACTIVE {
+            if unpack_slot_state(current) != SlotState::Active {
                 return None;
             }
 
@@ -1491,7 +1511,7 @@ impl<C: Connection> PipelineSlot<C> {
             }
 
             let next_inflight = inflight + 1;
-            let next = pack_slot_state(SLOT_ACTIVE, next_inflight);
+            let next = pack_slot_state(SlotState::Active, next_inflight);
             match self.state_and_inflight.compare_exchange_weak(
                 current,
                 next,
@@ -1549,7 +1569,7 @@ impl<C: Connection> PipelineSlot<C> {
                     // the slot state ACTIVE until its final lease drains. Treat
                     // that transition as whole-slot capacity becoming reusable.
                     let drained_unusable =
-                        inflight == 1 && (state != SLOT_ACTIVE || !self.conn.available());
+                        inflight == 1 && (state != SlotState::Active || !self.conn.available());
                     if drained_unusable {
                         self.close();
                     }
@@ -1564,9 +1584,9 @@ impl<C: Connection> PipelineSlot<C> {
         let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
             match unpack_slot_state(current) {
-                SLOT_ACTIVE => {
+                SlotState::Active => {
                     let inflight = unpack_slot_inflight(current);
-                    let next = pack_slot_state(SLOT_RETIRING, inflight);
+                    let next = pack_slot_state(SlotState::Retiring, inflight);
                     match self.state_and_inflight.compare_exchange_weak(
                         current,
                         next,
@@ -1582,14 +1602,13 @@ impl<C: Connection> PipelineSlot<C> {
                         Err(observed) => current = observed,
                     }
                 }
-                SLOT_RETIRING => {
+                SlotState::Retiring => {
                     if unpack_slot_inflight(current) == 0 {
                         self.close();
                     }
                     return;
                 }
-                SLOT_CLOSED => return,
-                _ => return,
+                SlotState::Closed | SlotState::Invalid => return,
             }
         }
     }
@@ -1597,10 +1616,10 @@ impl<C: Connection> PipelineSlot<C> {
     fn close(&self) {
         let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
-            if unpack_slot_state(current) == SLOT_CLOSED {
+            if unpack_slot_state(current) == SlotState::Closed {
                 return;
             }
-            let next = pack_slot_state(SLOT_CLOSED, unpack_slot_inflight(current));
+            let next = pack_slot_state(SlotState::Closed, unpack_slot_inflight(current));
             match self.state_and_inflight.compare_exchange_weak(
                 current,
                 next,
@@ -1622,8 +1641,8 @@ impl<C: Connection> PipelineSlot<C> {
         // healthy connection stays reusable. If maintenance wins, no later
         // borrower can enter a CLOSED slot.
         match self.state_and_inflight.compare_exchange(
-            pack_slot_state(SLOT_ACTIVE, 0),
-            pack_slot_state(SLOT_CLOSED, 0),
+            pack_slot_state(SlotState::Active, 0),
+            pack_slot_state(SlotState::Closed, 0),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -1632,19 +1651,20 @@ impl<C: Connection> PipelineSlot<C> {
                 true
             }
             Err(current) => {
-                unpack_slot_state(current) == SLOT_CLOSED && unpack_slot_inflight(current) == 0
+                unpack_slot_state(current) == SlotState::Closed
+                    && unpack_slot_inflight(current) == 0
             }
         }
     }
 
     fn needs_replacement(&self) -> bool {
         let state = unpack_slot_state(self.state_and_inflight.load(Ordering::Acquire));
-        state != SLOT_ACTIVE || !self.conn.available()
+        state != SlotState::Active || !self.conn.available()
     }
 
     fn is_drained_unusable(&self) -> bool {
         let (state, inflight) = self.snapshot();
-        inflight == 0 && (state != SLOT_ACTIVE || !self.conn.available())
+        inflight == 0 && (state != SlotState::Active || !self.conn.available())
     }
 }
 
@@ -2369,7 +2389,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(conn.close_calls(), 0);
-        assert_eq!(pool.slots.load()[0].state(), SLOT_RETIRING);
+        assert_eq!(pool.slots.load()[0].state(), SlotState::Retiring);
         drop(fast_lease);
         assert_eq!(conn.close_calls(), 1);
     }
@@ -2400,7 +2420,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(conn.close_calls(), 0);
-        assert_eq!(pool.slots.load()[0].state(), SLOT_ACTIVE);
+        assert_eq!(pool.slots.load()[0].state(), SlotState::Active);
 
         let lease = pool
             .acquire(QueryDeadline::new(Duration::from_secs(1)))
@@ -2499,7 +2519,7 @@ mod tests {
 
         pool.maintain().await;
 
-        assert_eq!(slot.state(), SLOT_CLOSED);
+        assert_eq!(slot.state(), SlotState::Closed);
         assert!(!slot.try_acquire(1));
         assert_eq!(conn.close_calls(), 1);
         assert!(pool.slots.load().is_empty());
@@ -2536,13 +2556,13 @@ mod tests {
         );
         assert_eq!(
             slot.state(),
-            SLOT_ACTIVE,
+            SlotState::Active,
             "a racing successful borrow must keep the connection reusable"
         );
         assert_eq!(conn.close_calls(), 0);
 
         slot.release_without_notify();
-        assert_eq!(slot.state(), SLOT_ACTIVE);
+        assert_eq!(slot.state(), SlotState::Active);
         assert_eq!(conn.close_calls(), 0);
         assert!(
             slot.try_acquire(4),
@@ -2558,7 +2578,7 @@ mod tests {
         let slot = PipelineSlot::new(conn.clone());
 
         assert!(slot.close_if_idle());
-        assert_eq!(slot.state(), SLOT_CLOSED);
+        assert_eq!(slot.state(), SlotState::Closed);
         assert!(!slot.try_acquire(4));
         assert_eq!(conn.close_calls(), 1);
     }
