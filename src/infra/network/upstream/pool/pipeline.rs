@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt::Debug;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use futures::FutureExt;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
 
@@ -76,6 +78,10 @@ pub struct PipelinePool<C: Connection> {
     expansion_worker_running: AtomicBool,
     /// Queries currently waiting because no slot had usable capacity.
     acquire_waiters: AtomicUsize,
+    /// Earliest monotonic time at which foreground load may schedule another
+    /// soft-pressure probe. This bounds level-triggered probes without keeping
+    /// a background polling worker alive.
+    next_soft_probe_at_ms: AtomicU64,
     /// Monotonic start time of the most recent connection build.
     last_expand_start_ms: AtomicU64,
     /// Earliest time another build may start after connection-creation failures.
@@ -284,6 +290,7 @@ impl<C: Connection> PipelinePool<C> {
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
             acquire_waiters: AtomicUsize::new(0),
+            next_soft_probe_at_ms: AtomicU64::new(0),
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
@@ -474,7 +481,30 @@ impl<C: Connection> PipelinePool<C> {
             return;
         }
         let soft_threshold = capacity.div_ceil(2);
-        if inflight == soft_threshold {
+        if inflight < soft_threshold {
+            return;
+        }
+
+        // Use a level-triggered soft probe so a dynamic reduction in peer
+        // stream capacity (for example an H2 SETTINGS update) cannot move the
+        // threshold below the current in-flight count without another exact
+        // edge crossing. The pool-wide gate limits the added hot-path work to
+        // one successful probe scheduling attempt per interval.
+        let now = AppClock::elapsed_millis();
+        let next_probe = self.next_soft_probe_at_ms.load(Ordering::Relaxed);
+        if now < next_probe {
+            return;
+        }
+        if self
+            .next_soft_probe_at_ms
+            .compare_exchange(
+                next_probe,
+                now.saturating_add(MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             self.request_paced_expansion();
         }
     }
@@ -495,8 +525,44 @@ impl<C: Connection> PipelinePool<C> {
 
         let weak = self.self_weak.clone();
         tokio::spawn(async move {
-            Self::run_paced_expansion_worker(weak).await;
+            Self::supervise_paced_expansion_worker(weak).await;
         });
+    }
+
+    async fn supervise_paced_expansion_worker(weak: Weak<Self>) {
+        let mut lifecycle = PacedExpansionWorkerLifecycle::new(weak.clone());
+        loop {
+            let outcome = AssertUnwindSafe(Self::run_paced_expansion_worker(weak.clone()))
+                .catch_unwind()
+                .await;
+            match outcome {
+                Ok(()) => {
+                    lifecycle.disarm();
+                    return;
+                }
+                Err(_) => {
+                    let Some(pool) = weak.upgrade() else {
+                        lifecycle.disarm();
+                        return;
+                    };
+
+                    // A panic must not leave `expansion_worker_running=true`
+                    // with no live worker. Keep ownership of the running flag
+                    // in this supervisor, re-arm demand, and reuse the same
+                    // bounded connection-failure backoff before retrying. This
+                    // also prevents a deterministic builder panic from turning
+                    // into a tight respawn loop.
+                    pool.expansion_requested.store(true, Ordering::Release);
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    warn!(
+                        delay_ms,
+                        "Multiplexed pipeline expansion worker panicked; retrying after backoff"
+                    );
+                    drop(pool);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
     }
 
     async fn run_paced_expansion_worker(weak: Weak<Self>) {
@@ -528,19 +594,6 @@ impl<C: Connection> PipelinePool<C> {
                     {
                         return;
                     }
-                    continue;
-                }
-                PacedExpansionState::Watch => {
-                    // A connection is already at or above its local 50% mark,
-                    // but aggregate pool occupancy is still below 50%. Keep a
-                    // low-frequency watch alive so load moving onto another,
-                    // less-busy connection cannot cross the aggregate threshold
-                    // without another local edge-trigger event.
-                    drop(pool);
-                    tokio::time::sleep(Duration::from_millis(
-                        MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS,
-                    ))
-                    .await;
                     continue;
                 }
                 PacedExpansionState::Expand => {}
@@ -642,11 +695,7 @@ impl<C: Connection> PipelinePool<C> {
             return PacedExpansionState::Expand;
         }
 
-        if pressure.has_half_loaded_connection {
-            PacedExpansionState::Watch
-        } else {
-            PacedExpansionState::Idle
-        }
+        PacedExpansionState::Idle
     }
 
     fn pool_pressure(&self) -> PoolPressure {
@@ -663,9 +712,6 @@ impl<C: Connection> PipelinePool<C> {
             pressure.total_inflight += usize::from(inflight.min(capacity_u16));
             pressure.total_capacity += capacity;
             pressure.free_capacity += capacity.saturating_sub(usize::from(inflight));
-            if capacity_u16 > 1 && inflight >= capacity_u16.div_ceil(2) {
-                pressure.has_half_loaded_connection = true;
-            }
         }
         pressure
     }
@@ -871,7 +917,6 @@ struct AcquiredLoad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacedExpansionState {
     Idle,
-    Watch,
     Expand,
 }
 
@@ -881,7 +926,6 @@ struct PoolPressure {
     total_inflight: usize,
     total_capacity: usize,
     free_capacity: usize,
-    has_half_loaded_connection: bool,
 }
 
 #[derive(Debug)]
@@ -1198,6 +1242,41 @@ impl<C: Connection> Drop for PipelineLease<'_, C> {
     }
 }
 
+struct PacedExpansionWorkerLifecycle<C: Connection> {
+    pool: Weak<PipelinePool<C>>,
+    armed: bool,
+}
+
+impl<C: Connection> PacedExpansionWorkerLifecycle<C> {
+    fn new(pool: Weak<PipelinePool<C>>) -> Self {
+        Self { pool, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<C: Connection> Drop for PacedExpansionWorkerLifecycle<C> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(pool) = self.pool.upgrade() else {
+            return;
+        };
+
+        // Task abortion/cancellation cannot be caught with `catch_unwind`.
+        // Publish the worker as absent and re-arm demand. Waking query waiters
+        // gives a live cold-pool request an immediate chance to restart the
+        // controller; min-conns pools are also recovered by maintenance.
+        pool.expansion_requested.store(true, Ordering::Release);
+        pool.expansion_worker_running
+            .store(false, Ordering::Release);
+        pool.release_notified.notify_waiters();
+    }
+}
+
 struct PoolAcquireWaiter<'a, C: Connection> {
     pool: &'a PipelinePool<C>,
     active: bool,
@@ -1243,8 +1322,17 @@ impl<C: Connection> Drop for SlotReservation<'_, C> {
     fn drop(&mut self) {
         if self.active {
             self.pool.reserved_slots.fetch_sub(1, Ordering::Release);
-            self.pool.release_notified.notify_waiters();
-            self.pool.expansion_capacity_notified.notify_waiters();
+            if self.pool.paced_expansion.is_some() {
+                // Releasing a failed/cancelled paced build frees only a pool
+                // reservation; it does not create DNS stream capacity. Wake
+                // the expansion controller, but leave query waiters asleep
+                // until a real slot is published or an active stream releases.
+                self.pool.expansion_capacity_notified.notify_waiters();
+            } else {
+                // Legacy pools let foreground acquirers compete for expansion
+                // reservations, so releasing one must wake those waiters.
+                self.pool.release_notified.notify_waiters();
+            }
         }
     }
 }
@@ -1385,6 +1473,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PanicOnceBuilder {
+        calls: Arc<AtomicUsize>,
+        connection: Arc<MockConnection>,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for PanicOnceBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+        ) -> Result<Arc<MockConnection>> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                panic!("planned multiplexed connection-builder panic");
+            }
+            Ok(self.connection.clone())
+        }
+    }
+
     #[derive(Debug, Default)]
     struct BuilderStats {
         calls: AtomicUsize,
@@ -1501,6 +1610,7 @@ mod tests {
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
             acquire_waiters: AtomicUsize::new(0),
+            next_soft_probe_at_ms: AtomicU64::new(0),
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
@@ -2090,7 +2200,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_soft_watch_catches_aggregate_threshold_without_new_local_edge() {
+    async fn test_level_triggered_soft_probe_handles_dynamic_capacity_reduction() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let mut leases = Vec::new();
+        for _ in 0..10 {
+            leases.push(
+                pool.acquire(QueryDeadline::new(Duration::from_secs(1)))
+                    .await
+                    .expect("initial acquire should succeed below the original soft threshold"),
+            );
+        }
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        // Simulate an H2 peer reducing SETTINGS_MAX_CONCURRENT_STREAMS from at
+        // least 32 to 16. The new soft threshold is 8, already below the
+        // current ten in-flight borrows, so no exact threshold edge remains.
+        existing.set_max_concurrent_queries(16);
+        leases.push(
+            pool.acquire(QueryDeadline::new(Duration::from_secs(1)))
+                .await
+                .expect("post-SETTINGS acquire should still use remaining capacity"),
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.slots.load().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("level-triggered probe should expand after dynamic capacity reduction");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn test_level_triggered_probe_preserves_aggregate_no_edge_expansion() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
@@ -2111,40 +2269,90 @@ mod tests {
         for _ in 0..20 {
             assert!(first.try_acquire(32));
         }
-        pool.slots
-            .store(Arc::new(vec![first.clone(), second.clone()]));
 
-        // 20/64 is below aggregate 50%, but conn1 is already locally above
-        // its 16/32 soft threshold. The worker must stay armed in Watch state.
-        pool.request_paced_expansion();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
-        assert_eq!(pool.paced_expansion_state(), PacedExpansionState::Watch);
-
-        // Raise only conn2 to 12/32. No connection crosses a local 16-stream
-        // edge here, yet aggregate load becomes exactly 32/64 = 50%.
-        for _ in 0..12 {
+        for _ in 0..11 {
             assert!(second.try_acquire(32));
         }
-        assert_eq!(pool.paced_expansion_state(), PacedExpansionState::Expand);
+        pool.slots
+            .store(Arc::new(vec![first.clone(), second.clone()]));
+        pool.index.store(0, Ordering::Relaxed);
 
-        tokio::time::timeout(Duration::from_millis(150), async {
+        // Aggregate starts at 31/64. The next round-robin acquire lands on
+        // conn1 and raises it from 20 to 21, so aggregate becomes 32/64 while
+        // neither connection crosses the exact local 16-stream edge.
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("level-triggered soft probe should not block foreground acquire");
+        assert!(Arc::ptr_eq(&lease.slot, &first));
+
+        tokio::time::timeout(Duration::from_millis(100), async {
             loop {
-                if stats.calls.load(Ordering::Acquire) == 1 {
+                if pool.slots.load().len() == 3 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("soft watch should detect aggregate threshold without a new local edge");
-        assert_eq!(pool.slots.load().len(), 3);
+        .expect("aggregate fifty-percent pressure should expand without an exact local edge");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+
+        drop(lease);
 
         for _ in 0..20 {
             first.release_without_notify();
         }
-        for _ in 0..12 {
+        for _ in 0..11 {
             second.release_without_notify();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_soft_probe_does_not_leave_background_polling_worker() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let first = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        let second = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        for _ in 0..20 {
+            assert!(first.try_acquire(32));
+        }
+        pool.slots.store(Arc::new(vec![first.clone(), second]));
+
+        // Local load is above 50%, but aggregate load is only 20/64. A soft
+        // probe should run once and then let the worker go idle instead of
+        // retaining the old 50ms Watch polling loop.
+        pool.maybe_request_soft_expansion(20, 32);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !pool.expansion_worker_running.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("soft probe worker should return to idle when aggregate load is low");
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        for _ in 0..20 {
+            first.release_without_notify();
         }
     }
 
@@ -2248,5 +2456,119 @@ mod tests {
             weak.upgrade().is_none(),
             "backoff worker must not self-retain the pool"
         );
+    }
+
+    #[tokio::test]
+    async fn test_paced_reservation_drop_does_not_wake_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+
+        let query_waiter = pool.release_notified.notified();
+        tokio::pin!(query_waiter);
+        query_waiter.as_mut().enable();
+        let expansion_waiter = pool.expansion_capacity_notified.notified();
+        tokio::pin!(expansion_waiter);
+        expansion_waiter.as_mut().enable();
+
+        let reservation = pool
+            .try_reserve_slot()
+            .expect("paced pool should reserve an expansion slot");
+        drop(reservation);
+
+        tokio::time::timeout(Duration::from_millis(50), expansion_waiter.as_mut())
+            .await
+            .expect("paced reservation release should wake the expansion controller");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), query_waiter.as_mut())
+                .await
+                .is_err(),
+            "paced reservation release must not wake DNS query waiters without new stream capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_reservation_drop_still_wakes_query_waiters() {
+        let pool = make_pool(0, 2, 32, 30, MockBuilder::new(vec![]), vec![]);
+        let query_waiter = pool.release_notified.notified();
+        tokio::pin!(query_waiter);
+        query_waiter.as_mut().enable();
+        let reservation = pool
+            .try_reserve_slot()
+            .expect("legacy pool should reserve an expansion slot");
+        drop(reservation);
+
+        tokio::time::timeout(Duration::from_millis(50), query_waiter.as_mut())
+            .await
+            .expect("legacy reservation release should preserve waiter wakeup semantics");
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_recovers_after_builder_panic() {
+        AppClock::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let connection = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        let pool = PipelinePool::new_multiplexed(
+            0,
+            1,
+            32,
+            Duration::from_secs(30),
+            Box::new(PanicOnceBuilder {
+                calls: calls.clone(),
+                connection: connection.clone(),
+            }),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.query(Message::new(), QueryDeadline::new(Duration::from_secs(2))),
+        )
+        .await
+        .expect("supervisor should recover before the query timeout")
+        .expect("second connection attempt should succeed");
+        assert_eq!(response.id(), 0);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(pool.slots.load().len(), 1);
+        assert_eq!(pool.connect_failure_streak.load(Ordering::Acquire), 0);
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while pool.expansion_worker_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered worker should eventually publish the idle state");
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_lifecycle_drop_rearms_cancelled_worker() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.expansion_worker_running.store(true, Ordering::Release);
+        pool.expansion_requested.store(false, Ordering::Release);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let lifecycle = PacedExpansionWorkerLifecycle::new(Arc::downgrade(&pool));
+        drop(lifecycle);
+
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(pool.expansion_requested.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_millis(50), notified.as_mut())
+            .await
+            .expect("abnormal worker drop should wake cold-pool query waiters");
     }
 }
