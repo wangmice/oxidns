@@ -295,7 +295,7 @@ pub(crate) fn create_multiplexed_pool<C: Connection>(
     let timeout = connection_info.timeout;
     let min_size = main_pool_min_conns(&connection_info);
     PooledUpstream::<C> {
-        pool: PipelinePool::new(
+        pool: PipelinePool::new_multiplexed(
             min_size,
             connection_info.max_conns_or_default(),
             MULTIPLEXED_MAX_CONNS_LOAD,

@@ -102,7 +102,7 @@ impl BootstrapPoolFactory<QuicConnection> for QuicBootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<QuicConnection>> {
         let info = connection_info_with_ip(connection_info, ip);
         let builder = QuicConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
             MULTIPLEXED_MAX_CONNS_LOAD,
@@ -127,7 +127,7 @@ impl BootstrapPoolFactory<H2Connection> for H2BootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<H2Connection>> {
         let info = connection_info_with_ip(connection_info, ip);
         let builder = H2ConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
             MULTIPLEXED_MAX_CONNS_LOAD,
@@ -152,7 +152,7 @@ impl BootstrapPoolFactory<H3Connection> for H3BootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<H3Connection>> {
         let info = connection_info_with_ip(connection_info, ip);
         let builder = H3ConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             main_pool_min_conns(&info),
             info.max_conns_or_default(),
             MULTIPLEXED_MAX_CONNS_LOAD,
