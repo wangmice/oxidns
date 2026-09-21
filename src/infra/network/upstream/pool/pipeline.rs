@@ -29,9 +29,33 @@ const MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS: u64 = 50;
 const MULTIPLEXED_MAX_CONCURRENT_BUILDS: usize = 2;
 const MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS: u64 = 100;
 const MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS: u64 = 2_000;
+const MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT: u64 = 20;
 
 #[derive(Debug, Clone, Copy)]
 struct PacedExpansionPolicy;
+
+#[inline]
+fn jittered_connect_backoff_ms(base_ms: u64, key: u64) -> u64 {
+    let jitter = base_ms.saturating_mul(MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT) / 100;
+    if jitter == 0 {
+        return base_ms.min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+    }
+
+    let low = base_ms.saturating_sub(jitter).max(1);
+    let high = base_ms
+        .saturating_add(jitter)
+        .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+    let span = high.saturating_sub(low).saturating_add(1);
+
+    // SplitMix64 finalizer: cheap deterministic diffusion for pointer/streak
+    // inputs. This is scheduling jitter, not cryptographic randomness.
+    let mut mixed = key.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+
+    low.saturating_add(mixed % span)
+}
 
 #[derive(Debug, Clone)]
 struct ConnectFailureObservation {
@@ -620,8 +644,8 @@ impl<C: Connection> PipelinePool<C> {
             // iteration or the exit handshake below.
             pool.expansion_requested.swap(false, Ordering::AcqRel);
 
-            let state = pool.paced_expansion_state();
-            match state {
+            let snapshot = pool.paced_expansion_snapshot();
+            match snapshot.state {
                 PacedExpansionState::Idle => {
                     // Publish the idle state before the final request check. A
                     // concurrent requester either observes `running=true` and
@@ -677,8 +701,7 @@ impl<C: Connection> PipelinePool<C> {
                 continue;
             }
 
-            let state = pool.paced_expansion_state();
-            let build_limit = match pool.paced_build_limit(state) {
+            let build_limit = match pool.paced_build_limit(&snapshot) {
                 Some(limit) => limit,
                 None => continue,
             };
@@ -733,10 +756,14 @@ impl<C: Connection> PipelinePool<C> {
                 unreachable!("pipeline reservation was checked above");
             };
 
-            if !matches!(
-                pool.paced_expansion_state(),
-                PacedExpansionState::ExpandSoft | PacedExpansionState::ExpandHard
-            ) {
+            // Revalidate both state and current demand after reserving. This
+            // closes the race where another detached build publishes capacity
+            // after the controller snapshot but before this reservation; a
+            // stale high build target must not cause an unnecessary handshake.
+            let current_snapshot = pool.paced_expansion_snapshot();
+            let current_limit = pool.paced_build_limit(&current_snapshot);
+            let reserved = pool.reserved_slots.load(Ordering::Acquire);
+            if !current_limit.is_some_and(|limit| reserved <= limit) {
                 drop(reservation);
                 continue;
             }
@@ -790,10 +817,23 @@ impl<C: Connection> PipelinePool<C> {
 
             match outcome {
                 Ok(DeadlineOutcome::Completed(Ok(conn))) => {
-                    let _ = pool.publish_paced_connection(reservation, conn);
-                    pool.connect_failure_streak.store(0, Ordering::Release);
-                    pool.next_expand_at_ms.store(0, Ordering::Release);
-                    pool.clear_connect_failure();
+                    match pool.publish_paced_connection(reservation, conn) {
+                        PacedPublishOutcome::Published | PacedPublishOutcome::Rejected => {
+                            pool.connect_failure_streak.store(0, Ordering::Release);
+                            pool.next_expand_at_ms.store(0, Ordering::Release);
+                            pool.clear_connect_failure();
+                        }
+                        PacedPublishOutcome::Unavailable => {
+                            let message =
+                                "new multiplexed connection became unavailable before publication";
+                            pool.record_connect_failure_message(message.to_string());
+                            let delay_ms = pool.record_connect_failure_backoff();
+                            debug!(
+                                delay_ms,
+                                "Multiplexed connection became unavailable before publication; backing off"
+                            );
+                        }
+                    }
                 }
                 Ok(DeadlineOutcome::Completed(Err(e))) => {
                     drop(reservation);
@@ -840,63 +880,88 @@ impl<C: Connection> PipelinePool<C> {
         &self,
         reservation: PacedSlotReservation<C>,
         conn: Arc<C>,
-    ) -> Option<Arc<PipelineSlot<C>>> {
+    ) -> PacedPublishOutcome {
         self.register_connection_unavailable_notify(&conn);
+        // A protocol driver can fail immediately after the builder returns. Do
+        // not publish a connection that is already known dead; registration
+        // above closes the failure-notification race for drivers that fail just
+        // before this check.
+        if !conn.available() {
+            conn.close();
+            return PacedPublishOutcome::Unavailable;
+        }
+
         let slot = Arc::new(PipelineSlot::new(conn));
-        if self.insert_slot(slot.clone()) {
-            reservation.commit();
-            debug!(
-                "Pipeline pool expanded: total={}/{}",
-                self.slots.load().len(),
-                self.max_size
-            );
-            self.notify_inserted_query_capacity(&slot);
-            Some(slot)
-        } else {
+        if !self.insert_slot(slot.clone()) {
             slot.close();
-            None
+            return PacedPublishOutcome::Rejected;
+        }
+
+        // Re-check after the ArcSwap insertion but before committing the build
+        // reservation or advertising stream capacity. If the connection died
+        // during insertion, remove it immediately and keep query waiters asleep.
+        if !slot.connection().available() {
+            slot.close();
+            let _ = self.usable_or_inflight_slot_count();
+            return PacedPublishOutcome::Unavailable;
+        }
+
+        reservation.commit();
+        debug!(
+            "Pipeline pool expanded: total={}/{}",
+            self.slots.load().len(),
+            self.max_size
+        );
+        self.notify_inserted_query_capacity(&slot);
+        PacedPublishOutcome::Published
+    }
+
+    fn paced_expansion_snapshot(&self) -> PacedExpansionSnapshot {
+        let pressure = self.pool_pressure();
+        let waiters = self.acquire_waiters.load(Ordering::Acquire);
+        let state = if pressure.active_connections < self.min_size {
+            if pressure.active_connections < self.max_size {
+                PacedExpansionState::ExpandHard
+            } else {
+                PacedExpansionState::Saturated
+            }
+        } else if pressure.active_connections >= self.max_size {
+            PacedExpansionState::Saturated
+        } else if waiters > pressure.free_capacity {
+            PacedExpansionState::ExpandHard
+        } else if pressure.total_capacity > 0
+            && pressure.total_inflight.saturating_mul(2) >= pressure.total_capacity
+        {
+            PacedExpansionState::ExpandSoft
+        } else {
+            PacedExpansionState::Idle
+        };
+
+        PacedExpansionSnapshot {
+            state,
+            pressure,
+            waiters,
         }
     }
 
     fn paced_expansion_state(&self) -> PacedExpansionState {
-        let pressure = self.pool_pressure();
-        if pressure.active_connections < self.min_size {
-            return if pressure.active_connections < self.max_size {
-                PacedExpansionState::ExpandHard
-            } else {
-                PacedExpansionState::Saturated
-            };
-        }
-        if pressure.active_connections >= self.max_size {
-            return PacedExpansionState::Saturated;
-        }
-
-        let waiters = self.acquire_waiters.load(Ordering::Acquire);
-        if waiters > pressure.free_capacity {
-            return PacedExpansionState::ExpandHard;
-        }
-
-        if pressure.total_capacity > 0
-            && pressure.total_inflight.saturating_mul(2) >= pressure.total_capacity
-        {
-            return PacedExpansionState::ExpandSoft;
-        }
-
-        PacedExpansionState::Idle
+        self.paced_expansion_snapshot().state
     }
 
     /// Return the total number of concurrent connection builds justified by
-    /// current pressure. Existing reservations consume this budget; the value
-    /// is a target, while `MULTIPLEXED_MAX_CONCURRENT_BUILDS` is only a ceiling.
-    fn paced_build_limit(&self, state: PacedExpansionState) -> Option<usize> {
-        match state {
+    /// one pressure snapshot. Reusing the controller's state snapshot avoids a
+    /// second full pool scan immediately before reservation; state is still
+    /// revalidated after reserving a slot to preserve race safety. Existing
+    /// reservations consume this budget; the value is a target, while
+    /// `MULTIPLEXED_MAX_CONCURRENT_BUILDS` is only a ceiling.
+    fn paced_build_limit(&self, snapshot: &PacedExpansionSnapshot) -> Option<usize> {
+        match snapshot.state {
             PacedExpansionState::Idle | PacedExpansionState::Saturated => None,
             PacedExpansionState::ExpandSoft => Some(1),
             PacedExpansionState::ExpandHard => {
-                let pressure = self.pool_pressure();
-                let waiters = self.acquire_waiters.load(Ordering::Acquire);
+                let pressure = &snapshot.pressure;
                 let min_size_builds = self.min_size.saturating_sub(pressure.active_connections);
-                let waiter_deficit = waiters.saturating_sub(pressure.free_capacity);
+                let waiter_deficit = snapshot.waiters.saturating_sub(pressure.free_capacity);
                 // Once the peer has published real multiplexing limits, size
                 // burst expansion from observed capacity instead of the
                 // configured ceiling. Using the smallest active connection
@@ -955,8 +1020,7 @@ impl<C: Connection> PipelinePool<C> {
             if pressure.active_connections == 0 {
                 pressure.min_connection_capacity = capacity;
             } else {
-                pressure.min_connection_capacity =
-                    pressure.min_connection_capacity.min(capacity);
+                pressure.min_connection_capacity = pressure.min_connection_capacity.min(capacity);
             }
             pressure.active_connections += 1;
             pressure.total_inflight += usize::from(inflight.min(capacity_u16));
@@ -1014,9 +1078,17 @@ impl<C: Connection> PipelinePool<C> {
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         let shift = failure.saturating_sub(1).min(31);
-        let delay_ms = MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS
+        let base_delay_ms = MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS
             .saturating_mul(1u64 << shift)
             .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+        // Mix the pool identity with the failure streak to decorrelate retry
+        // schedules across upstreams without putting an RNG on this failure
+        // path. The resulting delay stays within a bounded +/-20% window
+        // (clamped by the configured maximum), so retry storms are dispersed
+        // while preserving the existing exponential-backoff envelope.
+        let pool_salt = self as *const Self as usize as u64;
+        let jitter_key = pool_salt ^ u64::from(failure).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let delay_ms = jittered_connect_backoff_ms(base_delay_ms, jitter_key);
         self.next_expand_at_ms.store(
             AppClock::elapsed_millis().saturating_add(delay_ms),
             Ordering::Release,
@@ -1261,6 +1333,20 @@ enum PacedExpansionState {
     Saturated,
     ExpandSoft,
     ExpandHard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacedPublishOutcome {
+    Published,
+    Rejected,
+    Unavailable,
+}
+
+#[derive(Debug)]
+struct PacedExpansionSnapshot {
+    state: PacedExpansionState,
+    pressure: PoolPressure,
+    waiters: usize,
 }
 
 #[derive(Debug, Default)]
@@ -2606,7 +2692,7 @@ mod tests {
         pool.acquire_waiters.store(8, Ordering::Release);
 
         assert_eq!(
-            pool.paced_build_limit(PacedExpansionState::ExpandHard),
+            pool.paced_build_limit(&pool.paced_expansion_snapshot()),
             Some(2)
         );
 
@@ -2628,7 +2714,7 @@ mod tests {
         pool.acquire_waiters.store(8, Ordering::Release);
 
         assert_eq!(
-            pool.paced_build_limit(PacedExpansionState::ExpandHard),
+            pool.paced_build_limit(&pool.paced_expansion_snapshot()),
             Some(1)
         );
 
@@ -3356,15 +3442,58 @@ mod tests {
     }
 
     #[test]
-    fn test_paced_expansion_failure_backoff_caps_at_two_seconds() {
+    fn test_paced_publish_rejects_connection_already_unavailable() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let reservation = pool
+            .try_reserve_paced_slot()
+            .expect("test should reserve one paced slot");
+        let conn = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+
+        assert_eq!(
+            pool.publish_paced_connection(reservation, conn.clone()),
+            PacedPublishOutcome::Unavailable
+        );
+        assert!(pool.slots.load().is_empty());
+        assert_eq!(pool.reserved_slots.load(Ordering::Acquire), 0);
+        assert!(conn.close_calls() >= 1);
+    }
+
+    #[test]
+    fn test_paced_expansion_failure_backoff_is_jittered_and_bounded() {
         let pool = make_pool(0, 1, 32, 30, MockBuilder::new(vec![]), vec![]);
-        assert_eq!(pool.record_connect_failure_backoff(), 100);
-        assert_eq!(pool.record_connect_failure_backoff(), 200);
-        assert_eq!(pool.record_connect_failure_backoff(), 400);
-        assert_eq!(pool.record_connect_failure_backoff(), 800);
-        assert_eq!(pool.record_connect_failure_backoff(), 1_600);
-        assert_eq!(pool.record_connect_failure_backoff(), 2_000);
-        assert_eq!(pool.record_connect_failure_backoff(), 2_000);
+        let bases = [100_u64, 200, 400, 800, 1_600, 2_000, 2_000];
+
+        for base in bases {
+            let delay = pool.record_connect_failure_backoff();
+            let jitter = base * MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT / 100;
+            let low = base.saturating_sub(jitter).max(1);
+            let high = base
+                .saturating_add(jitter)
+                .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+            assert!(
+                (low..=high).contains(&delay),
+                "delay {delay} must stay inside jitter window {low}..={high}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connect_backoff_jitter_spreads_different_pool_keys() {
+        let base = 1_000;
+        let delays = (0_u64..16)
+            .map(|key| jittered_connect_backoff_ms(base, key))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            delays.len() > 1,
+            "different pool keys should disperse retries"
+        );
+        assert!(delays.iter().all(|delay| (800..=1_200).contains(delay)));
     }
 
     #[tokio::test]
