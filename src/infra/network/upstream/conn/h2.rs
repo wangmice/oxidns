@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -12,10 +12,10 @@ use h2::{Ping, PingPong};
 use http::Version;
 use tokio::select;
 use tokio::sync::Notify;
-use tokio::time::{sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, trace, warn};
 
-use super::{PoolUnavailableNotify, UsingCountGuard};
+use super::{PoolCapacityNotify, PoolUnavailableNotify, UsingCountGuard};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
@@ -35,10 +35,18 @@ use crate::proto::Message;
 
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
 const H2_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const H2_STREAM_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[inline]
 fn h2_pool_stream_limit(peer_limit: usize) -> u16 {
     peer_limit.clamp(1, u16::MAX as usize) as u16
+}
+
+#[inline]
+fn update_h2_pool_stream_limit(cached: &AtomicU16, peer_limit: usize) -> Option<(u16, u16)> {
+    let current = h2_pool_stream_limit(peer_limit);
+    let previous = cached.swap(current, Ordering::AcqRel);
+    (current > previous).then_some((previous, current))
 }
 
 enum H2RecvError {
@@ -128,6 +136,8 @@ pub struct H2Connection {
     request_uri: String,
     close_notify: Notify,
     pool_unavailable_notify: PoolUnavailableNotify,
+    pool_capacity_notify: PoolCapacityNotify,
+    cached_stream_limit: AtomicU16,
 }
 
 #[async_trait]
@@ -173,12 +183,19 @@ impl Connection for H2Connection {
         }
     }
 
+    fn register_capacity_increase_notify(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
+        self.pool_capacity_notify.register(notify);
+        // Close the handshake-to-publish race: SETTINGS may have changed after
+        // the cached value was initialized but before the pool callback existed.
+        self.refresh_pool_stream_limit();
+    }
+
     fn max_concurrent_queries(&self) -> u16 {
-        // Read h2's live peer SETTINGS value rather than caching a handshake
-        // snapshot. A floor of one keeps a query parked in `ready()` when the
-        // peer temporarily advertises zero streams so a later SETTINGS update
-        // can wake it without requiring a separate pool notification channel.
-        h2_pool_stream_limit(self.sender.current_max_send_streams())
+        // Pool lookup is a high-QPS hot path. Keep it lock-free instead of
+        // calling h2's `current_max_send_streams()`, which takes the protocol
+        // stream-state mutex internally. The connection driver refreshes this
+        // cache on a low-frequency cold path.
+        self.cached_stream_limit.load(Ordering::Acquire)
     }
 
     fn last_used(&self) -> u64 {
@@ -187,6 +204,15 @@ impl Connection for H2Connection {
 }
 
 impl H2Connection {
+    fn refresh_pool_stream_limit(&self) {
+        if let Some((previous, current)) = update_h2_pool_stream_limit(
+            &self.cached_stream_limit,
+            self.sender.current_max_send_streams(),
+        ) {
+            self.pool_capacity_notify.notify_pool(previous, current);
+        }
+    }
+
     fn mark_closed(&self) -> bool {
         if self.closed.swap(true, Ordering::AcqRel) {
             return false;
@@ -368,6 +394,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
         };
 
         let ping_pong = connection.ping_pong();
+        let initial_stream_limit = h2_pool_stream_limit(sender.current_max_send_streams());
 
         let h2_conn = Arc::new(H2Connection {
             id: conn_id,
@@ -380,6 +407,8 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
             pool_unavailable_notify: PoolUnavailableNotify::default(),
+            pool_capacity_notify: PoolCapacityNotify::default(),
+            cached_stream_limit: AtomicU16::new(initial_stream_limit),
         });
 
         if let (Some(ping_pong), Some(interval)) = (ping_pong, self.keepalive_interval) {
@@ -389,16 +418,31 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 
         let _conn = h2_conn.clone();
         tokio::spawn(async move {
-            select! {
-                res = connection => {
-                    _conn.close();
-                    match res {
-                        Ok(()) => debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed"),
-                        Err(e) => debug!(conn_id, upstream = %_conn.upstream, ?e, "H2 connection error"),
+            let mut stream_limit_refresh = interval(H2_STREAM_LIMIT_REFRESH_INTERVAL);
+            stream_limit_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // `interval()` fires immediately once. Consume that tick so the
+            // driver starts with the handshake snapshot and refreshes at the
+            // configured cadence afterwards.
+            stream_limit_refresh.tick().await;
+            tokio::pin!(connection);
+
+            loop {
+                select! {
+                    res = connection.as_mut() => {
+                        _conn.close();
+                        match res {
+                            Ok(()) => debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed"),
+                            Err(e) => debug!(conn_id, upstream = %_conn.upstream, ?e, "H2 connection error"),
+                        }
+                        break;
                     }
-                }
-                _ = _conn.close_notify.notified() => {
-                    debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed by notify");
+                    _ = _conn.close_notify.notified() => {
+                        debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed by notify");
+                        break;
+                    }
+                    _ = stream_limit_refresh.tick() => {
+                        _conn.refresh_pool_stream_limit();
+                    }
                 }
             }
         });
@@ -610,6 +654,17 @@ mod tests {
         assert_eq!(h2_pool_stream_limit(8), 8);
         assert_eq!(h2_pool_stream_limit(u16::MAX as usize), u16::MAX);
         assert_eq!(h2_pool_stream_limit(usize::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn test_h2_pool_stream_limit_cache_reports_only_increases() {
+        let cached = AtomicU16::new(8);
+
+        assert_eq!(update_h2_pool_stream_limit(&cached, 4), None);
+        assert_eq!(cached.load(Ordering::Acquire), 4);
+        assert_eq!(update_h2_pool_stream_limit(&cached, 4), None);
+        assert_eq!(update_h2_pool_stream_limit(&cached, 16), Some((4, 16)));
+        assert_eq!(cached.load(Ordering::Acquire), 16);
     }
 
     #[test]

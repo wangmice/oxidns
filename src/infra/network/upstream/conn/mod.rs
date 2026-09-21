@@ -65,6 +65,46 @@ impl PoolUnavailableNotify {
     }
 }
 
+type NotifyMutex = Mutex<Option<Arc<dyn Fn(u16, u16) + Send + Sync>>>;
+
+/// Cold-path notification bridge for increases in a connection's effective
+/// multiplexing capacity.
+///
+/// The callback receives the previous and current protocol-level stream limits.
+/// This stays separate from [`PoolUnavailableNotify`] because capacity growth
+/// creates usable query slots, while connection loss only creates replacement
+/// capacity for the pool controller.
+#[derive(Default)]
+pub(crate) struct PoolCapacityNotify {
+    notify: NotifyMutex,
+}
+
+impl std::fmt::Debug for PoolCapacityNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PoolCapacityNotify")
+    }
+}
+
+impl PoolCapacityNotify {
+    pub(crate) fn register(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
+        *self
+            .notify
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notify);
+    }
+
+    pub(crate) fn notify_pool(&self, previous: u16, current: u16) {
+        let notify = self
+            .notify
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(notify) = notify {
+            notify(previous, current);
+        }
+    }
+}
+
 /// RAII guard that decrements a connection's in-flight query counter on drop.
 ///
 /// Ensures `using_count` is always decremented even when the query future is

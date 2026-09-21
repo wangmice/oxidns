@@ -920,7 +920,7 @@ impl<C: Connection> PipelinePool<C> {
         reservation: PacedSlotReservation<C>,
         conn: Arc<C>,
     ) -> PacedPublishOutcome {
-        self.register_connection_unavailable_notify(&conn);
+        self.register_connection_pool_notifications(&conn);
         // A protocol driver can fail immediately after the builder returns. Do
         // not publish a connection that is already known dead; registration
         // above closes the failure-notification race for drivers that fail just
@@ -1181,7 +1181,7 @@ impl<C: Connection> PipelinePool<C> {
         {
             DeadlineOutcome::Completed(Ok(conn)) => {
                 if self.paced_expansion.is_some() {
-                    self.register_connection_unavailable_notify(&conn);
+                    self.register_connection_pool_notifications(&conn);
                 }
                 let slot = Arc::new(PipelineSlot::new(conn));
                 if self.insert_slot(slot.clone()) {
@@ -1204,7 +1204,7 @@ impl<C: Connection> PipelinePool<C> {
         }
     }
 
-    fn register_connection_unavailable_notify(&self, conn: &Arc<C>) {
+    fn register_connection_pool_notifications(&self, conn: &Arc<C>) {
         let weak = self.self_weak.clone();
         conn.register_unavailable_notify(Arc::new(move || {
             let Some(pool) = weak.upgrade() else {
@@ -1216,6 +1216,27 @@ impl<C: Connection> PipelinePool<C> {
             // is released or a replacement connection is published.
             pool.notify_expansion_capacity_change();
             pool.request_paced_expansion();
+        }));
+
+        let weak = self.self_weak.clone();
+        conn.register_capacity_increase_notify(Arc::new(move |previous, current| {
+            let Some(pool) = weak.upgrade() else {
+                return;
+            };
+            let previous = usize::from(previous.min(pool.max_load));
+            let current = usize::from(current.min(pool.max_load));
+            let added_capacity = current.saturating_sub(previous);
+            if added_capacity == 0 {
+                return;
+            }
+
+            // SETTINGS growth creates real stream capacity on an already
+            // published connection. Wake only the newly serviceable portion of
+            // the backlog instead of broadcasting every pool waiter.
+            let waiters = pool.acquire_waiters.load(Ordering::Acquire);
+            for _ in 0..waiters.min(added_capacity) {
+                pool.release_notified.notify_one();
+            }
         }));
     }
 
@@ -1908,7 +1929,7 @@ mod tests {
 
     use super::*;
     use crate::infra::error::{DnsError, Result};
-    use crate::infra::network::upstream::conn::PoolUnavailableNotify;
+    use crate::infra::network::upstream::conn::{PoolCapacityNotify, PoolUnavailableNotify};
 
     #[derive(Debug)]
     struct MockConnection {
@@ -1919,6 +1940,7 @@ mod tests {
         max_concurrent_queries: AtomicU16,
         query_delay: Duration,
         pool_unavailable_notify: PoolUnavailableNotify,
+        pool_capacity_notify: PoolCapacityNotify,
     }
 
     impl MockConnection {
@@ -1931,6 +1953,7 @@ mod tests {
                 max_concurrent_queries: AtomicU16::new(u16::MAX),
                 query_delay: Duration::ZERO,
                 pool_unavailable_notify: PoolUnavailableNotify::default(),
+                pool_capacity_notify: PoolCapacityNotify::default(),
             }
         }
 
@@ -1945,6 +1968,13 @@ mod tests {
 
         fn set_max_concurrent_queries(&self, max: u16) {
             self.max_concurrent_queries.store(max, Ordering::Release);
+        }
+
+        fn increase_max_concurrent_queries(&self, max: u16) {
+            let previous = self.max_concurrent_queries.swap(max, Ordering::AcqRel);
+            if max > previous {
+                self.pool_capacity_notify.notify_pool(previous, max);
+            }
         }
 
         fn mark_unavailable(&self) {
@@ -1983,6 +2013,10 @@ mod tests {
             if !self.available.load(Ordering::Acquire) {
                 self.pool_unavailable_notify.notify_pool();
             }
+        }
+
+        fn register_capacity_increase_notify(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
+            self.pool_capacity_notify.register(notify);
         }
 
         fn max_concurrent_queries(&self) -> u16 {
@@ -2920,7 +2954,7 @@ mod tests {
             TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
         );
         let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
-        pool.register_connection_unavailable_notify(&existing);
+        pool.register_connection_pool_notifications(&existing);
         pool.slots
             .store(Arc::new(vec![Arc::new(PipelineSlot::new(existing))]));
         let lease = pool
@@ -3004,7 +3038,7 @@ mod tests {
             TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
         );
         let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
-        pool.register_connection_unavailable_notify(&existing);
+        pool.register_connection_pool_notifications(&existing);
         pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
             existing.clone(),
         ))]));
@@ -3027,6 +3061,41 @@ mod tests {
             .filter_map(|waiter| waiter.now_or_never())
             .count();
         assert_eq!(ready, 0);
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_capacity_increase_wakes_only_added_stream_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            8,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        existing.set_max_concurrent_queries(2);
+        pool.register_connection_pool_notifications(&existing);
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        existing.increase_max_concurrent_queries(6);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 4);
         pool.acquire_waiters.store(0, Ordering::Release);
     }
 
@@ -3101,7 +3170,7 @@ mod tests {
             TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
         );
         let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
-        pool.register_connection_unavailable_notify(&existing);
+        pool.register_connection_pool_notifications(&existing);
         pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
             existing.clone(),
         ))]));

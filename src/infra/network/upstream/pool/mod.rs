@@ -99,6 +99,14 @@ pub trait Connection: Send + Sized + Debug + Sync + 'static {
     /// foreground query waiter. Other connection types may ignore it.
     fn register_unavailable_notify(&self, _notify: Arc<dyn Fn() + Send + Sync>) {}
 
+    /// Register a cold-path callback for increases in protocol-level query
+    /// capacity. The callback receives the previous and current peer limits.
+    ///
+    /// Dynamic-capacity transports override this so blocked pool waiters can be
+    /// woken when a peer raises its concurrent-stream limit. Static-capacity
+    /// connection types may ignore it.
+    fn register_capacity_increase_notify(&self, _notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {}
+
     /// Get the timestamp of the last successful activity (in milliseconds)
     ///
     /// Used for idle connection detection and cleanup
