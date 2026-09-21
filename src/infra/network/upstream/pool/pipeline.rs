@@ -897,7 +897,19 @@ impl<C: Connection> PipelinePool<C> {
                 let waiters = self.acquire_waiters.load(Ordering::Acquire);
                 let min_size_builds = self.min_size.saturating_sub(pressure.active_connections);
                 let waiter_deficit = waiters.saturating_sub(pressure.free_capacity);
-                let per_connection = usize::from(self.max_load.max(1));
+                // Once the peer has published real multiplexing limits, size
+                // burst expansion from observed capacity instead of the
+                // configured ceiling. Using the smallest active connection
+                // capacity is intentionally conservative: it prevents a low
+                // H2 SETTINGS_MAX_CONCURRENT_STREAMS value from serializing
+                // connection recovery behind one handshake at a time. Cold
+                // start still falls back to the configured max_load until an
+                // observation exists.
+                let per_connection = if pressure.active_connections == 0 {
+                    usize::from(self.max_load.max(1))
+                } else {
+                    pressure.min_connection_capacity.max(1)
+                };
                 let waiter_builds = waiter_deficit.div_ceil(per_connection);
                 let available_pool_slots =
                     self.max_size.saturating_sub(pressure.active_connections);
@@ -940,6 +952,12 @@ impl<C: Connection> PipelinePool<C> {
             }
             let capacity_u16 = slot.effective_max_load(self.max_load);
             let capacity = usize::from(capacity_u16);
+            if pressure.active_connections == 0 {
+                pressure.min_connection_capacity = capacity;
+            } else {
+                pressure.min_connection_capacity =
+                    pressure.min_connection_capacity.min(capacity);
+            }
             pressure.active_connections += 1;
             pressure.total_inflight += usize::from(inflight.min(capacity_u16));
             pressure.total_capacity += capacity;
@@ -1251,6 +1269,7 @@ struct PoolPressure {
     total_inflight: usize,
     total_capacity: usize,
     free_capacity: usize,
+    min_connection_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -2566,6 +2585,54 @@ mod tests {
 
         assert_eq!(stats.calls.load(Ordering::Acquire), 1);
         assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[test]
+    fn test_paced_build_limit_uses_observed_dynamic_stream_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            4,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let conn = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        conn.set_max_concurrent_queries(4);
+        let slot = Arc::new(PipelineSlot::new(conn));
+        for _ in 0..4 {
+            assert!(slot.try_acquire(32));
+        }
+        pool.slots.store(Arc::new(vec![slot.clone()]));
+        pool.acquire_waiters.store(8, Ordering::Release);
+
+        assert_eq!(
+            pool.paced_build_limit(PacedExpansionState::ExpandHard),
+            Some(2)
+        );
+
+        for _ in 0..4 {
+            slot.release_without_notify();
+        }
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn test_paced_build_limit_cold_start_uses_configured_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            4,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(8, Ordering::Release);
+
+        assert_eq!(
+            pool.paced_build_limit(PacedExpansionState::ExpandHard),
+            Some(1)
+        );
+
+        pool.acquire_waiters.store(0, Ordering::Release);
     }
 
     #[tokio::test]
