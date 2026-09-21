@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::infra::clock::AppClock;
-use crate::infra::error::Result;
+use crate::infra::error::{DnsError, Result};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
@@ -25,12 +25,18 @@ use crate::proto::Message;
 
 const POOL_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS: u64 = 50;
-const MULTIPLEXED_SLOT_CAPACITY_FALLBACK_MS: u64 = 250;
+const MULTIPLEXED_MAX_CONCURRENT_BUILDS: usize = 2;
 const MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS: u64 = 100;
 const MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PacedExpansionPolicy;
+
+#[derive(Debug, Clone)]
+struct ConnectFailureObservation {
+    at_ms: u64,
+    message: String,
+}
 
 const SLOT_ACTIVE: u8 = 0;
 const SLOT_RETIRING: u8 = 1;
@@ -61,7 +67,7 @@ pub struct PipelinePool<C: Connection> {
     /// Monotonic connection id source.
     next_id: AtomicU16,
     /// Notify query waiters when stream capacity changes.
-    release_notified: Notify,
+    release_notified: Arc<Notify>,
     /// Notify the paced expansion worker when a whole pool slot becomes
     /// reservable again. Kept separate from query wakeups to avoid a waiter
     /// stampede when a retiring slot finally drains.
@@ -78,16 +84,22 @@ pub struct PipelinePool<C: Connection> {
     expansion_worker_running: AtomicBool,
     /// Queries currently waiting because no slot had usable capacity.
     acquire_waiters: AtomicUsize,
-    /// Earliest monotonic time at which foreground load may schedule another
-    /// soft-pressure probe. This bounds level-triggered probes without keeping
-    /// a background polling worker alive.
-    next_soft_probe_at_ms: AtomicU64,
+    /// Suppress redundant controller wakeups while every pool slot is occupied
+    /// by a healthy active connection and `max_size` prevents further growth.
+    expansion_quiescent_at_capacity: AtomicBool,
+    /// Gate for level-triggered soft-pressure probes. The gate is re-armed by
+    /// a detached timer so high-QPS acquisitions do not read the monotonic
+    /// clock on every hit above the soft threshold.
+    soft_probe_ready: AtomicBool,
     /// Monotonic start time of the most recent connection build.
     last_expand_start_ms: AtomicU64,
     /// Earliest time another build may start after connection-creation failures.
     next_expand_at_ms: AtomicU64,
     /// Consecutive background connection-creation failures.
     connect_failure_streak: AtomicU32,
+    /// Most recent background connection failure. Read only on foreground
+    /// pool-acquire timeout, so diagnostics do not add a lock to the hot path.
+    last_connect_failure: Mutex<Option<ConnectFailureObservation>>,
 }
 
 #[async_trait]
@@ -124,6 +136,8 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
             drop(slots);
             if self.min_size > 0 {
                 if self.paced_expansion.is_some() {
+                    self.expansion_quiescent_at_capacity
+                        .store(false, Ordering::Release);
                     self.request_paced_expansion();
                 } else {
                     let _ = self
@@ -178,7 +192,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 slot.close();
             }
             self.release_notified.notify_waiters();
-            self.expansion_capacity_notified.notify_waiters();
+            self.notify_expansion_capacity_change();
             return;
         }
 
@@ -193,7 +207,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 new_len
             );
             self.release_notified.notify_waiters();
-            self.expansion_capacity_notified.notify_waiters();
+            self.notify_expansion_capacity_change();
         }
 
         if new_len < self.min_size {
@@ -282,7 +296,7 @@ impl<C: Connection> PipelinePool<C> {
             timeout_policy,
             connect_timeout,
             next_id: AtomicU16::new(1),
-            release_notified: Notify::new(),
+            release_notified: Arc::new(Notify::new()),
             expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
             paced_expansion,
@@ -290,10 +304,12 @@ impl<C: Connection> PipelinePool<C> {
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
             acquire_waiters: AtomicUsize::new(0),
-            next_soft_probe_at_ms: AtomicU64::new(0),
+            expansion_quiescent_at_capacity: AtomicBool::new(false),
+            soft_probe_ready: AtomicBool::new(true),
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
+            last_connect_failure: Mutex::new(None),
         });
         start_maintenance(&pool);
         if min_size > 0 {
@@ -413,22 +429,39 @@ impl<C: Connection> PipelinePool<C> {
         let slots = self.slots.load();
         let len = slots.len();
         if len == 0 {
+            self.expansion_quiescent_at_capacity
+                .store(false, Ordering::Release);
             return None;
         }
 
         let start_idx = self.index.fetch_add(1, Ordering::Relaxed) % len;
+        let mut saw_replacement_candidate = false;
         for offset in 0..len {
             let idx = (start_idx + offset) % len;
             let slot = &slots[idx];
             if let Some(load) = slot.try_acquire_observed(self.max_load) {
+                if saw_replacement_candidate {
+                    self.expansion_quiescent_at_capacity
+                        .store(false, Ordering::Release);
+                    self.request_paced_expansion();
+                }
                 return Some(AcquiredSlot {
                     slot: slot.clone(),
                     inflight: load.inflight,
                     capacity: load.capacity,
                 });
             }
+            saw_replacement_candidate |= slot.needs_replacement();
         }
 
+        if saw_replacement_candidate {
+            // An internally closed/retiring multiplexed connection can become
+            // replaceable without going through the pool controller. A failed
+            // foreground scan already touched every slot, so use that
+            // observation to lift hard-cap quiescence without another scan.
+            self.expansion_quiescent_at_capacity
+                .store(false, Ordering::Release);
+        }
         None
     }
 
@@ -437,8 +470,9 @@ impl<C: Connection> PipelinePool<C> {
             self.maybe_request_soft_expansion(acquired.inflight, acquired.capacity);
             return Ok(PipelineLease::new_paced(
                 acquired.slot,
-                &self.release_notified,
+                self.release_notified.as_ref(),
                 self.expansion_capacity_notified.as_ref(),
+                &self.expansion_quiescent_at_capacity,
             ));
         }
 
@@ -460,8 +494,9 @@ impl<C: Connection> PipelinePool<C> {
                 self.maybe_request_soft_expansion(acquired.inflight, acquired.capacity);
                 return Ok(PipelineLease::new_paced(
                     acquired.slot,
-                    &self.release_notified,
+                    self.release_notified.as_ref(),
                     self.expansion_capacity_notified.as_ref(),
+                    &self.expansion_quiescent_at_capacity,
                 ));
             }
 
@@ -469,7 +504,7 @@ impl<C: Connection> PipelinePool<C> {
             match deadline.run(notified.as_mut()).await {
                 DeadlineOutcome::Completed(()) => {}
                 DeadlineOutcome::Expired => {
-                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                    return Err(self.paced_pool_acquire_timeout_error(deadline));
                 }
             }
         }
@@ -481,36 +516,40 @@ impl<C: Connection> PipelinePool<C> {
             return;
         }
         let soft_threshold = capacity.div_ceil(2);
-        if inflight < soft_threshold {
+        if inflight < soft_threshold
+            || self.expansion_quiescent_at_capacity.load(Ordering::Relaxed)
+            || self.expansion_worker_running.load(Ordering::Relaxed)
+            || !self.soft_probe_ready.load(Ordering::Relaxed)
+        {
             return;
         }
 
-        // Use a level-triggered soft probe so a dynamic reduction in peer
-        // stream capacity (for example an H2 SETTINGS update) cannot move the
-        // threshold below the current in-flight count without another exact
-        // edge crossing. The pool-wide gate limits the added hot-path work to
-        // one successful probe scheduling attempt per interval.
-        let now = AppClock::elapsed_millis();
-        let next_probe = self.next_soft_probe_at_ms.load(Ordering::Relaxed);
-        if now < next_probe {
+        // Level-triggered probes preserve aggregate-pressure and dynamic peer
+        // capacity handling without paying an Instant read on every hot-path
+        // acquisition. Only one query per interval closes the gate; a detached
+        // weak timer re-arms it without retaining or polling the pool.
+        if self
+            .soft_probe_ready
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
-        if self
-            .next_soft_probe_at_ms
-            .compare_exchange(
-                next_probe,
-                now.saturating_add(MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            self.request_paced_expansion();
-        }
+
+        self.request_paced_expansion();
+        let weak = self.self_weak.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS)).await;
+            if let Some(pool) = weak.upgrade() {
+                pool.soft_probe_ready.store(true, Ordering::Release);
+            }
+        });
     }
 
     fn request_paced_expansion(&self) {
-        if self.paced_expansion.is_none() {
+        if self.paced_expansion.is_none()
+            || self.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+        {
             return;
         }
 
@@ -576,7 +615,8 @@ impl<C: Connection> PipelinePool<C> {
             // iteration or the exit handshake below.
             pool.expansion_requested.swap(false, Ordering::AcqRel);
 
-            match pool.paced_expansion_state() {
+            let state = pool.paced_expansion_state();
+            match state {
                 PacedExpansionState::Idle => {
                     // Publish the idle state before the final request check. A
                     // concurrent requester either observes `running=true` and
@@ -596,7 +636,33 @@ impl<C: Connection> PipelinePool<C> {
                     }
                     continue;
                 }
-                PacedExpansionState::Expand => {}
+                PacedExpansionState::Saturated => {
+                    // `max_size` is occupied entirely by healthy active
+                    // connections. Further hard-pressure requests cannot make
+                    // expansion possible, so suppress their controller wakeups
+                    // until a slot actually becomes replaceable. Revalidate
+                    // after publishing the flag to close a capacity-change race.
+                    pool.expansion_quiescent_at_capacity
+                        .store(true, Ordering::Release);
+                    if pool.paced_expansion_state() != PacedExpansionState::Saturated {
+                        pool.expansion_quiescent_at_capacity
+                            .store(false, Ordering::Release);
+                        continue;
+                    }
+
+                    // Requests that raced before quiescence was visible are
+                    // redundant at the hard cap. Capacity-changing paths clear
+                    // the quiescent flag; if that happens during this exit
+                    // handshake, explicitly restart the controller.
+                    pool.expansion_requested.store(false, Ordering::Release);
+                    pool.expansion_worker_running
+                        .store(false, Ordering::Release);
+                    if !pool.expansion_quiescent_at_capacity.load(Ordering::Acquire) {
+                        pool.request_paced_expansion();
+                    }
+                    return;
+                }
+                PacedExpansionState::ExpandSoft | PacedExpansionState::ExpandHard => {}
             }
 
             let delay = pool.paced_expansion_delay();
@@ -605,61 +671,101 @@ impl<C: Connection> PipelinePool<C> {
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            if pool.paced_expansion_state() != PacedExpansionState::Expand {
-                continue;
+
+            let state = pool.paced_expansion_state();
+            let build_limit = match state {
+                PacedExpansionState::ExpandSoft => 1,
+                PacedExpansionState::ExpandHard => MULTIPLEXED_MAX_CONCURRENT_BUILDS,
+                PacedExpansionState::Idle | PacedExpansionState::Saturated => continue,
+            };
+
+            if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
+                // The controller remains unique, but connection handshakes are
+                // detached and may overlap. Wait for one build reservation to
+                // finish instead of spinning while the bounded build window is
+                // full.
+                let capacity_changed = pool.expansion_capacity_notified.clone();
+                let notified = capacity_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
+                    drop(pool);
+                    notified.as_mut().await;
+                    continue;
+                }
             }
 
-            let mut reservation = pool.try_reserve_slot();
+            let mut reservation = pool.try_reserve_paced_slot();
             if reservation.is_none() {
-                // A retiring/in-flight slot can temporarily occupy
-                // max_size even though it cannot accept new queries.
-                // Register before the final re-check to close the
-                // notify-before-sleep race. The notifier is Arc-backed so
-                // the worker can release its strong pool reference while
-                // waiting. A low-frequency timer remains only as a safety
-                // net for unexpected missed-notification paths.
+                // A retiring/in-flight slot or an already-running connection
+                // build can temporarily occupy max_size even though no new
+                // build may start. Register before the final re-check to close
+                // the notify-before-sleep race.
                 let capacity_changed = pool.expansion_capacity_notified.clone();
                 let notified = capacity_changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
 
-                reservation = pool.try_reserve_slot();
+                reservation = pool.try_reserve_paced_slot();
                 if reservation.is_none() {
-                    // `SlotReservation` borrows `pool`. Consume the empty
-                    // option before dropping the Arc so the borrow cannot be
-                    // extended across the capacity wait.
+                    // A successful concurrent build may have filled max_size
+                    // between the pressure check and reservation attempt. Let
+                    // the top of the loop publish hard-cap quiescence instead
+                    // of waiting for an event that may never arrive.
+                    if matches!(
+                        pool.paced_expansion_state(),
+                        PacedExpansionState::Idle | PacedExpansionState::Saturated
+                    ) {
+                        continue;
+                    }
+
                     drop(reservation);
                     drop(pool);
-                    tokio::select! {
-                        _ = notified.as_mut() => {}
-                        _ = tokio::time::sleep(Duration::from_millis(
-                            MULTIPLEXED_SLOT_CAPACITY_FALLBACK_MS,
-                        )) => {}
-                    }
+                    notified.as_mut().await;
                     continue;
                 }
             }
             let Some(reservation) = reservation else {
                 unreachable!("pipeline reservation was checked above");
             };
-            if pool.paced_expansion_state() != PacedExpansionState::Expand {
+
+            if !matches!(
+                pool.paced_expansion_state(),
+                PacedExpansionState::ExpandSoft | PacedExpansionState::ExpandHard
+            ) {
                 drop(reservation);
                 continue;
             }
+
             pool.last_expand_start_ms
                 .store(AppClock::elapsed_millis(), Ordering::Release);
+            Self::spawn_paced_build(pool.clone(), reservation);
+        }
+    }
 
+    fn spawn_paced_build(pool: Arc<Self>, reservation: PacedSlotReservation<C>) {
+        tokio::spawn(async move {
             let deadline = QueryDeadline::background(pool.connect_timeout);
-            match pool.expand_one(reservation, deadline).await {
-                Ok(Some(_)) => {
+            let outcome = AssertUnwindSafe(pool.expand_one_paced(reservation, deadline))
+                .catch_unwind()
+                .await;
+
+            match outcome {
+                Ok(Ok(Some(_))) => {
                     pool.connect_failure_streak.store(0, Ordering::Release);
                     pool.next_expand_at_ms.store(0, Ordering::Release);
+                    pool.clear_connect_failure();
                 }
-                Ok(None) => {
-                    // Capacity changed while the connection was being built.
-                    // Re-evaluate instead of treating it as a transport failure.
+                Ok(Ok(None)) => {
+                    // The transport connected successfully even though a
+                    // concurrent capacity change made insertion unnecessary.
+                    // Clear failure diagnostics/backoff before re-evaluating.
+                    pool.connect_failure_streak.store(0, Ordering::Release);
+                    pool.next_expand_at_ms.store(0, Ordering::Release);
+                    pool.clear_connect_failure();
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    pool.record_connect_failure(&e);
                     let delay_ms = pool.record_connect_failure_backoff();
                     debug!(
                         delay_ms,
@@ -667,35 +773,56 @@ impl<C: Connection> PipelinePool<C> {
                         "Multiplexed pipeline expansion failed; backing off"
                     );
                 }
+                Err(_) => {
+                    pool.record_connect_failure_message(
+                        "multiplexed connection builder panicked".to_string(),
+                    );
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    warn!(
+                        delay_ms,
+                        "Multiplexed pipeline connection build panicked; backing off"
+                    );
+                }
             }
-        }
+
+            // `PacedSlotReservation` has released its build slot by here and
+            // already notified a controller waiting on the bounded build window.
+            // Re-evaluate level-triggered pressure after the outcome is recorded.
+            pool.request_paced_expansion();
+        });
     }
 
     fn paced_expansion_state(&self) -> PacedExpansionState {
         let pressure = self.pool_pressure();
         if pressure.active_connections < self.min_size {
             return if pressure.active_connections < self.max_size {
-                PacedExpansionState::Expand
+                PacedExpansionState::ExpandHard
             } else {
-                PacedExpansionState::Idle
+                PacedExpansionState::Saturated
             };
         }
         if pressure.active_connections >= self.max_size {
-            return PacedExpansionState::Idle;
+            return PacedExpansionState::Saturated;
         }
 
         let waiters = self.acquire_waiters.load(Ordering::Acquire);
         if waiters > pressure.free_capacity {
-            return PacedExpansionState::Expand;
+            return PacedExpansionState::ExpandHard;
         }
 
         if pressure.total_capacity > 0
             && pressure.total_inflight.saturating_mul(2) >= pressure.total_capacity
         {
-            return PacedExpansionState::Expand;
+            return PacedExpansionState::ExpandSoft;
         }
 
         PacedExpansionState::Idle
+    }
+
+    fn notify_expansion_capacity_change(&self) {
+        self.expansion_quiescent_at_capacity
+            .store(false, Ordering::Release);
+        self.expansion_capacity_notified.notify_waiters();
     }
 
     fn pool_pressure(&self) -> PoolPressure {
@@ -727,6 +854,44 @@ impl<C: Connection> PipelinePool<C> {
         let retry_at = self.next_expand_at_ms.load(Ordering::Acquire);
         let allowed_at = paced_at.max(retry_at);
         Duration::from_millis(allowed_at.saturating_sub(now))
+    }
+
+    fn record_connect_failure(&self, error: &DnsError) {
+        self.record_connect_failure_message(error.to_string());
+    }
+
+    fn record_connect_failure_message(&self, message: String) {
+        *self
+            .last_connect_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ConnectFailureObservation {
+            at_ms: AppClock::elapsed_millis(),
+            message,
+        });
+    }
+
+    fn clear_connect_failure(&self) {
+        self.last_connect_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+
+    fn paced_pool_acquire_timeout_error(&self, deadline: QueryDeadline) -> DnsError {
+        let failure = self
+            .last_connect_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(failure) = failure.filter(|failure| failure.at_ms >= deadline.started_at_ms) {
+            let detail = format!(
+                "last upstream connection attempt failed: {}",
+                failure.message
+            );
+            deadline.timeout_error_for_with_detail(UpstreamTimeoutStage::PoolAcquire, &detail)
+        } else {
+            deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire)
+        }
     }
 
     fn record_connect_failure_backoff(&self) -> u64 {
@@ -773,21 +938,49 @@ impl<C: Connection> PipelinePool<C> {
         reservation: SlotReservation<'_, C>,
         deadline: QueryDeadline,
     ) -> Result<Option<Arc<PipelineSlot<C>>>> {
+        let result = self.create_and_insert_slot(deadline).await;
+        if matches!(&result, Ok(Some(_))) {
+            reservation.commit();
+        }
+        result
+    }
+
+    async fn expand_one_paced(
+        &self,
+        reservation: PacedSlotReservation<C>,
+        deadline: QueryDeadline,
+    ) -> Result<Option<Arc<PipelineSlot<C>>>> {
+        let result = self.create_and_insert_slot(deadline).await;
+        if matches!(&result, Ok(Some(_))) {
+            reservation.commit();
+        }
+        result
+    }
+
+    async fn create_and_insert_slot(
+        &self,
+        deadline: QueryDeadline,
+    ) -> Result<Option<Arc<PipelineSlot<C>>>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         match deadline
             .run(self.connection_builder.create_connection(id, deadline))
             .await
         {
             DeadlineOutcome::Completed(Ok(conn)) => {
+                if self.paced_expansion.is_some() {
+                    conn.register_unavailable_notify(
+                        Arc::downgrade(&self.expansion_capacity_notified),
+                        Arc::downgrade(&self.release_notified),
+                    );
+                }
                 let slot = Arc::new(PipelineSlot::new(conn));
                 if self.insert_slot(slot.clone()) {
-                    reservation.commit();
                     debug!(
                         "Pipeline pool expanded: total={}/{}",
                         self.slots.load().len(),
                         self.max_size
                     );
-                    self.release_notified.notify_waiters();
+                    self.notify_inserted_query_capacity(&slot);
                     Ok(Some(slot))
                 } else {
                     slot.close();
@@ -798,6 +991,20 @@ impl<C: Connection> PipelinePool<C> {
             DeadlineOutcome::Expired => {
                 Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
             }
+        }
+    }
+
+    fn notify_inserted_query_capacity(&self, slot: &PipelineSlot<C>) {
+        if self.paced_expansion.is_none() {
+            self.release_notified.notify_waiters();
+            return;
+        }
+
+        let waiters = self.acquire_waiters.load(Ordering::Acquire);
+        let capacity = usize::from(slot.effective_max_load(self.max_load));
+        let wake_count = waiters.min(capacity.max(1));
+        for _ in 0..wake_count {
+            self.release_notified.notify_one();
         }
     }
 
@@ -847,6 +1054,27 @@ impl<C: Connection> PipelinePool<C> {
         }
     }
 
+    fn try_reserve_paced_slot(&self) -> Option<PacedSlotReservation<C>> {
+        loop {
+            let reserved = self.reserved_slots.load(Ordering::Acquire);
+            let active = self.usable_or_inflight_slot_count();
+            if active.saturating_add(reserved) >= self.max_size {
+                return None;
+            }
+            match self.reserved_slots.compare_exchange_weak(
+                reserved,
+                reserved + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(PacedSlotReservation::new(self.self_weak.clone()));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     fn usable_or_inflight_slot_count(&self) -> usize {
         let slots = self.slots.load();
         let mut active = 0usize;
@@ -876,7 +1104,7 @@ impl<C: Connection> PipelinePool<C> {
             &self.slots.compare_and_swap(&slots, Arc::new(pruned)),
         ) {
             self.release_notified.notify_waiters();
-            self.expansion_capacity_notified.notify_waiters();
+            self.notify_expansion_capacity_change();
             pruned_len
         } else {
             self.slots
@@ -917,7 +1145,9 @@ struct AcquiredLoad {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacedExpansionState {
     Idle,
-    Expand,
+    Saturated,
+    ExpandSoft,
+    ExpandHard,
 }
 
 #[derive(Debug, Default)]
@@ -1096,7 +1326,11 @@ impl<C: Connection> PipelineSlot<C> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    let drained_unusable = inflight == 1 && state != SLOT_ACTIVE;
+                    // An asynchronously failed multiplexed connection can keep
+                    // the slot state ACTIVE until its final lease drains. Treat
+                    // that transition as whole-slot capacity becoming reusable.
+                    let drained_unusable =
+                        inflight == 1 && (state != SLOT_ACTIVE || !self.conn.available());
                     if drained_unusable {
                         self.close();
                     }
@@ -1184,6 +1418,11 @@ impl<C: Connection> PipelineSlot<C> {
         }
     }
 
+    fn needs_replacement(&self) -> bool {
+        let state = unpack_slot_state(self.state_and_inflight.load(Ordering::Acquire));
+        state != SLOT_ACTIVE || !self.conn.available()
+    }
+
     fn is_drained_unusable(&self) -> bool {
         let (state, inflight) = self.snapshot();
         inflight == 0 && (state != SLOT_ACTIVE || !self.conn.available())
@@ -1194,6 +1433,7 @@ struct PipelineLease<'a, C: Connection> {
     slot: Arc<PipelineSlot<C>>,
     notify: &'a Notify,
     expansion_capacity_notify: Option<&'a Notify>,
+    expansion_quiescent_at_capacity: Option<&'a AtomicBool>,
 }
 
 impl<'a, C: Connection> PipelineLease<'a, C> {
@@ -1202,6 +1442,7 @@ impl<'a, C: Connection> PipelineLease<'a, C> {
             slot,
             notify,
             expansion_capacity_notify: None,
+            expansion_quiescent_at_capacity: None,
         }
     }
 
@@ -1209,11 +1450,13 @@ impl<'a, C: Connection> PipelineLease<'a, C> {
         slot: Arc<PipelineSlot<C>>,
         notify: &'a Notify,
         expansion_capacity_notify: &'a Notify,
+        expansion_quiescent_at_capacity: &'a AtomicBool,
     ) -> Self {
         Self {
             slot,
             notify,
             expansion_capacity_notify: Some(expansion_capacity_notify),
+            expansion_quiescent_at_capacity: Some(expansion_quiescent_at_capacity),
         }
     }
 
@@ -1224,20 +1467,29 @@ impl<'a, C: Connection> PipelineLease<'a, C> {
     fn retire(&self) {
         self.slot.retire();
         self.notify.notify_waiters();
+        self.notify_paced_capacity_change();
     }
 
     fn close(&self) {
         self.slot.close();
         self.notify.notify_waiters();
+        self.notify_paced_capacity_change();
+    }
+
+    fn notify_paced_capacity_change(&self) {
+        if let Some(quiescent) = self.expansion_quiescent_at_capacity {
+            quiescent.store(false, Ordering::Release);
+        }
+        if let Some(notify) = self.expansion_capacity_notify {
+            notify.notify_waiters();
+        }
     }
 }
 
 impl<C: Connection> Drop for PipelineLease<'_, C> {
     fn drop(&mut self) {
-        if self.slot.release(self.notify)
-            && let Some(notify) = self.expansion_capacity_notify
-        {
-            notify.notify_waiters();
+        if self.slot.release(self.notify) {
+            self.notify_paced_capacity_change();
         }
     }
 }
@@ -1327,12 +1579,43 @@ impl<C: Connection> Drop for SlotReservation<'_, C> {
                 // reservation; it does not create DNS stream capacity. Wake
                 // the expansion controller, but leave query waiters asleep
                 // until a real slot is published or an active stream releases.
-                self.pool.expansion_capacity_notified.notify_waiters();
+                self.pool.notify_expansion_capacity_change();
             } else {
                 // Legacy pools let foreground acquirers compete for expansion
                 // reservations, so releasing one must wake those waiters.
                 self.pool.release_notified.notify_waiters();
             }
+        }
+    }
+}
+
+struct PacedSlotReservation<C: Connection> {
+    pool: Weak<PipelinePool<C>>,
+    active: bool,
+}
+
+impl<C: Connection> PacedSlotReservation<C> {
+    fn new(pool: Weak<PipelinePool<C>>) -> Self {
+        Self { pool, active: true }
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+        if let Some(pool) = self.pool.upgrade() {
+            pool.reserved_slots.fetch_sub(1, Ordering::Release);
+            pool.notify_expansion_capacity_change();
+        }
+    }
+}
+
+impl<C: Connection> Drop for PacedSlotReservation<C> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(pool) = self.pool.upgrade() {
+            pool.reserved_slots.fetch_sub(1, Ordering::Release);
+            pool.notify_expansion_capacity_change();
         }
     }
 }
@@ -1375,6 +1658,7 @@ mod tests {
 
     use super::*;
     use crate::infra::error::{DnsError, Result};
+    use crate::infra::network::upstream::conn::PoolUnavailableNotify;
 
     #[derive(Debug)]
     struct MockConnection {
@@ -1384,6 +1668,7 @@ mod tests {
         close_calls: AtomicUsize,
         max_concurrent_queries: AtomicU16,
         query_delay: Duration,
+        pool_unavailable_notify: PoolUnavailableNotify,
     }
 
     impl MockConnection {
@@ -1395,6 +1680,7 @@ mod tests {
                 close_calls: AtomicUsize::new(0),
                 max_concurrent_queries: AtomicU16::new(u16::MAX),
                 query_delay: Duration::ZERO,
+                pool_unavailable_notify: PoolUnavailableNotify::default(),
             }
         }
 
@@ -1410,13 +1696,19 @@ mod tests {
         fn set_max_concurrent_queries(&self, max: u16) {
             self.max_concurrent_queries.store(max, Ordering::Release);
         }
+
+        fn mark_unavailable(&self) {
+            if self.available.swap(false, Ordering::AcqRel) {
+                self.pool_unavailable_notify.notify_waiters();
+            }
+        }
     }
 
     #[async_trait]
     impl Connection for MockConnection {
         fn close(&self) {
             self.close_calls.fetch_add(1, Ordering::Relaxed);
-            self.available.store(false, Ordering::Relaxed);
+            self.mark_unavailable();
         }
 
         async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
@@ -1434,6 +1726,18 @@ mod tests {
 
         fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed)
+        }
+
+        fn register_unavailable_notify(
+            &self,
+            capacity_notify: Weak<Notify>,
+            query_notify: Weak<Notify>,
+        ) {
+            self.pool_unavailable_notify
+                .register(capacity_notify, query_notify);
+            if !self.available.load(Ordering::Acquire) {
+                self.pool_unavailable_notify.notify_waiters();
+            }
         }
 
         fn max_concurrent_queries(&self) -> u16 {
@@ -1602,7 +1906,7 @@ mod tests {
             timeout_policy,
             connect_timeout: Duration::from_secs(5),
             next_id: AtomicU16::new(1),
-            release_notified: Notify::new(),
+            release_notified: Arc::new(Notify::new()),
             expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
             paced_expansion: None,
@@ -1610,10 +1914,12 @@ mod tests {
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
             acquire_waiters: AtomicUsize::new(0),
-            next_soft_probe_at_ms: AtomicU64::new(0),
+            expansion_quiescent_at_capacity: AtomicBool::new(false),
+            soft_probe_ready: AtomicBool::new(true),
             last_expand_start_ms: AtomicU64::new(u64::MAX),
             next_expand_at_ms: AtomicU64::new(0),
             connect_failure_streak: AtomicU32::new(0),
+            last_connect_failure: Mutex::new(None),
         }
     }
 
@@ -2063,7 +2369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_paced_cold_start_serializes_connection_builds() {
+    async fn test_paced_cold_start_bounds_parallel_connection_builds() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
@@ -2071,7 +2377,7 @@ mod tests {
             2,
             TrackingBuilder::new(
                 stats.clone(),
-                Duration::from_millis(20),
+                Duration::from_millis(120),
                 Duration::from_millis(200),
             ),
         );
@@ -2090,9 +2396,180 @@ mod tests {
                 .expect("query should complete");
         }
 
-        assert_eq!(stats.max_active.load(Ordering::Acquire), 1);
+        assert_eq!(
+            stats.max_active.load(Ordering::Acquire),
+            MULTIPLEXED_MAX_CONCURRENT_BUILDS
+        );
         assert!(stats.calls.load(Ordering::Acquire) >= 2);
         assert!(pool.slots.load().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_paced_hard_cap_quiesces_until_connection_becomes_replaceable() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            1,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+        pool.request_paced_expansion();
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                    && !pool.expansion_worker_running.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hard-cap controller should enter quiescence");
+
+        for _ in 0..1_000 {
+            pool.request_paced_expansion();
+        }
+        tokio::task::yield_now().await;
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(!pool.expansion_requested.load(Ordering::Acquire));
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        // Releasing ordinary stream capacity does not make another pool slot
+        // possible and should therefore keep hard-cap quiescence intact. Once
+        // the connection itself becomes unavailable, the next foreground scan
+        // observes that replacement is possible and re-arms the controller.
+        drop(lease);
+        assert!(pool.expansion_quiescent_at_capacity.load(Ordering::Acquire));
+        existing.close();
+
+        pool.query(Message::new(), QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("an unavailable hard-cap connection should be replaced");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_wakes_capacity_wait_without_fallback() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            1,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        existing.register_unavailable_notify(
+            Arc::downgrade(&pool.expansion_capacity_notified),
+            Arc::downgrade(&pool.release_notified),
+        );
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let held = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+
+        let waiter_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_pool
+                .acquire(QueryDeadline::new(Duration::from_millis(150)))
+                .await
+                .map(drop)
+        });
+
+        tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                if pool.acquire_waiters.load(Ordering::Acquire) == 1
+                    && pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second acquire should wait at the hard cap");
+
+        // Simulate an H2/H3/DoQ driver observing remote connection loss while
+        // one stream lease is still held. The unavailable event wakes the
+        // paced controller, but max_size remains occupied until `held` drains.
+        existing.mark_unavailable();
+        tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                if pool.expansion_worker_running.load(Ordering::Acquire)
+                    && !pool.expansion_requested.load(Ordering::Acquire)
+                    && !pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller should observe asynchronous unavailability");
+
+        // Give the worker time to reach its capacity wait. The old 250 ms
+        // fallback path would then miss the final ACTIVE/unavailable drain and
+        // let the 150 ms foreground deadline expire.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(held);
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("replacement should not depend on a periodic fallback")
+            .expect("waiter task should join")
+            .expect("waiter should acquire the replacement connection");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_inserted_multiplexed_capacity_wakes_only_matching_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        let slot = PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        )));
+        pool.notify_inserted_query_capacity(&slot);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 4);
     }
 
     #[tokio::test]
@@ -2336,6 +2813,10 @@ mod tests {
         // probe should run once and then let the worker go idle instead of
         // retaining the old 50ms Watch polling loop.
         pool.maybe_request_soft_expansion(20, 32);
+        assert!(!pool.soft_probe_ready.load(Ordering::Acquire));
+        for _ in 0..1_000 {
+            pool.maybe_request_soft_expansion(20, 32);
+        }
         tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 if !pool.expansion_worker_running.load(Ordering::Acquire) {
@@ -2349,6 +2830,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(pool.soft_probe_ready.load(Ordering::Acquire));
         assert_eq!(stats.calls.load(Ordering::Acquire), 0);
 
         for _ in 0..20 {
@@ -2378,8 +2860,9 @@ mod tests {
         // occupied but no connection can accept a new query.
         let retiring_lease = PipelineLease::new_paced(
             retiring,
-            &pool.release_notified,
+            pool.release_notified.as_ref(),
             pool.expansion_capacity_notified.as_ref(),
+            &pool.expansion_quiescent_at_capacity,
         );
 
         let waiting_pool = pool.clone();
@@ -2398,8 +2881,8 @@ mod tests {
             "replacement must wait while the retiring slot still occupies max_size"
         );
 
-        // The final release broadcasts the dedicated pool-capacity event. The
-        // replacement build should start well before the 250ms fallback timer.
+        // The final release broadcasts the dedicated pool-capacity event, so
+        // the replacement build can start immediately without polling.
         drop(retiring_lease);
         tokio::time::timeout(Duration::from_millis(150), async {
             loop {
@@ -2456,6 +2939,34 @@ mod tests {
             weak.upgrade().is_none(),
             "backoff worker must not self-retain the pool"
         );
+    }
+
+    #[tokio::test]
+    async fn test_paced_timeout_reports_recent_connection_failure() {
+        AppClock::start();
+        let pool = PipelinePool::new_multiplexed(
+            0,
+            1,
+            32,
+            Duration::from_secs(30),
+            Box::new(MockBuilder::new(vec![
+                Err(DnsError::runtime("planned connect failure")),
+                Err(DnsError::runtime("planned connect failure")),
+            ])),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        );
+
+        let error = pool
+            .query(
+                Message::new(),
+                QueryDeadline::new(Duration::from_millis(250)),
+            )
+            .await
+            .expect_err("query should expire while connection creation is backing off");
+        let error = error.to_string();
+        assert!(error.contains("DNS query timeout"));
+        assert!(error.contains("planned connect failure"));
     }
 
     #[tokio::test]

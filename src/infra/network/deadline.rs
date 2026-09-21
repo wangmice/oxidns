@@ -87,19 +87,41 @@ impl QueryDeadline {
         }
     }
 
+    fn timeout_duration(&self) -> Duration {
+        Duration::from_millis(self.expires_at_ms.saturating_sub(self.started_at_ms))
+    }
+
     pub fn timeout_error(&self) -> DnsError {
         DnsError::plugin(format!(
             "DNS query timeout after {:?}",
-            Duration::from_millis(self.expires_at_ms.saturating_sub(self.started_at_ms))
+            self.timeout_duration()
         ))
+    }
+
+    fn record_timeout_metric(&self, stage: UpstreamTimeoutStage) {
+        if self.track_upstream_timeout_metrics {
+            metrics::upstream_timeout(stage);
+        }
     }
 
     /// Record and construct a timeout error for the stage that exhausted this query deadline.
     pub(crate) fn timeout_error_for(&self, stage: UpstreamTimeoutStage) -> DnsError {
-        if self.track_upstream_timeout_metrics {
-            metrics::upstream_timeout(stage);
-        }
+        self.record_timeout_metric(stage);
         self.timeout_error()
+    }
+
+    /// Record a staged timeout while preserving a diagnostic detail gathered by
+    /// the caller during the same query lifetime.
+    pub(crate) fn timeout_error_for_with_detail(
+        &self,
+        stage: UpstreamTimeoutStage,
+        detail: &str,
+    ) -> DnsError {
+        self.record_timeout_metric(stage);
+        DnsError::plugin(format!(
+            "DNS query timeout after {:?}; {detail}",
+            self.timeout_duration()
+        ))
     }
 }
 
@@ -113,6 +135,19 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_error_with_detail_preserves_context() {
+        AppClock::start();
+        let deadline = QueryDeadline::new(Duration::from_millis(25));
+        let error = deadline.timeout_error_for_with_detail(
+            UpstreamTimeoutStage::PoolAcquire,
+            "last upstream connection attempt failed: planned failure",
+        );
+        let error = error.to_string();
+        assert!(error.contains("DNS query timeout"));
+        assert!(error.contains("planned failure"));
+    }
 
     #[test]
     fn capped_deadline_preserves_timeout_metric_scope() {

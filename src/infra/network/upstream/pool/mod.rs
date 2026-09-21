@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 use tokio::task::yield_now;
 
 use crate::infra::error::Result;
@@ -91,6 +92,18 @@ pub trait Connection: Send + Sized + Debug + Sync + 'static {
     ///
     /// Returns false if the connection is closed or experiencing errors
     fn available(&self) -> bool;
+
+    /// Register pool notifiers for connection-level unavailability.
+    ///
+    /// Multiplexed connections override this so an asynchronously closed
+    /// transport can wake pool expansion and foreground waiters immediately.
+    /// Other connection types may ignore it.
+    fn register_unavailable_notify(
+        &self,
+        _capacity_notify: Weak<Notify>,
+        _query_notify: Weak<Notify>,
+    ) {
+    }
 
     /// Get the timestamp of the last successful activity (in milliseconds)
     ///

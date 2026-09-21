@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, trace, warn};
 
-use super::UsingCountGuard;
+use super::{PoolUnavailableNotify, UsingCountGuard};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
@@ -127,12 +127,13 @@ pub struct H2Connection {
     last_used: AtomicU64,
     request_uri: String,
     close_notify: Notify,
+    pool_unavailable_notify: PoolUnavailableNotify,
 }
 
 #[async_trait]
 impl Connection for H2Connection {
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if !self.mark_closed() {
             return;
         }
         debug!(conn_id = self.id,
@@ -165,6 +166,18 @@ impl Connection for H2Connection {
         !self.closed.load(Ordering::Acquire)
     }
 
+    fn register_unavailable_notify(
+        &self,
+        capacity_notify: Weak<Notify>,
+        query_notify: Weak<Notify>,
+    ) {
+        self.pool_unavailable_notify
+            .register(capacity_notify, query_notify);
+        if self.closed.load(Ordering::Acquire) {
+            self.pool_unavailable_notify.notify_waiters();
+        }
+    }
+
     fn max_concurrent_queries(&self) -> u16 {
         // Read h2's live peer SETTINGS value rather than caching a handshake
         // snapshot. A floor of one keeps a query parked in `ready()` when the
@@ -179,6 +192,14 @@ impl Connection for H2Connection {
 }
 
 impl H2Connection {
+    fn mark_closed(&self) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.pool_unavailable_notify.notify_waiters();
+        true
+    }
+
     fn report_transport_error(&self, raw_id: u16, error: &DnsError) {
         if !self.transport_error_reported.swap(true, Ordering::AcqRel) {
             warn!(
@@ -363,6 +384,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
 
         if let (Some(ping_pong), Some(interval)) = (ping_pong, self.keepalive_interval) {

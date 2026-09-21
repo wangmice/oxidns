@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use tokio::select;
 use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
-use super::{UsingCountGuard, quic_idle_timeout};
+use super::{PoolUnavailableNotify, UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::deadline::DeadlineOutcome;
@@ -70,6 +70,7 @@ pub struct QuicConnection {
     closed: AtomicBool,
     last_used: AtomicU64,
     close_notify: Notify,
+    pool_unavailable_notify: PoolUnavailableNotify,
 }
 
 impl Debug for QuicConnection {
@@ -79,8 +80,16 @@ impl Debug for QuicConnection {
 }
 
 impl QuicConnection {
-    fn close_with_code(&self, code: u32, reason: &[u8]) -> bool {
+    fn mark_closed(&self) -> bool {
         if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.pool_unavailable_notify.notify_waiters();
+        true
+    }
+
+    fn close_with_code(&self, code: u32, reason: &[u8]) -> bool {
+        if !self.mark_closed() {
             return false;
         }
         self.transport.close_with_code(code, reason);
@@ -266,6 +275,18 @@ impl Connection for QuicConnection {
         !self.closed.load(Ordering::Acquire)
     }
 
+    fn register_unavailable_notify(
+        &self,
+        capacity_notify: Weak<Notify>,
+        query_notify: Weak<Notify>,
+    ) {
+        self.pool_unavailable_notify
+            .register(capacity_notify, query_notify);
+        if self.closed.load(Ordering::Acquire) {
+            self.pool_unavailable_notify.notify_waiters();
+        }
+    }
+
     fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
     }
@@ -383,6 +404,7 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             using_count: AtomicU32::new(0),
             close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
 
         // Spawn background task to monitor connection health

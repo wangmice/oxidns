@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
-use super::{UsingCountGuard, quic_idle_timeout};
+use super::{PoolUnavailableNotify, UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
@@ -78,6 +78,7 @@ pub struct H3Connection {
     last_used: AtomicU64,
     request_uri: String,
     close_notify: Notify,
+    pool_unavailable_notify: PoolUnavailableNotify,
 }
 impl Debug for H3Connection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -88,7 +89,7 @@ impl Debug for H3Connection {
 #[async_trait]
 impl Connection for H3Connection {
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if !self.mark_closed() {
             return;
         }
         debug!(conn_id = self.id,
@@ -118,12 +119,32 @@ impl Connection for H3Connection {
         !self.closed.load(Ordering::Acquire)
     }
 
+    fn register_unavailable_notify(
+        &self,
+        capacity_notify: Weak<Notify>,
+        query_notify: Weak<Notify>,
+    ) {
+        self.pool_unavailable_notify
+            .register(capacity_notify, query_notify);
+        if self.closed.load(Ordering::Acquire) {
+            self.pool_unavailable_notify.notify_waiters();
+        }
+    }
+
     fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
     }
 }
 
 impl H3Connection {
+    fn mark_closed(&self) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.pool_unavailable_notify.notify_waiters();
+        true
+    }
+
     async fn query_inner(&self, request: Message) -> Result<Message> {
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
@@ -293,6 +314,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
 
         let _conn = h3_conn.clone();
@@ -300,7 +322,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         let _driver_handle = tokio::spawn(async move {
             select! {
                 _ = poll_fn(|cx| driver.poll_close(cx)) => {
-                    _conn.closed.store(true, Ordering::Release);
+                    _conn.mark_closed();
                     debug!(conn_id, upstream = %_conn.upstream, "H3 connection poll closed");
                 }
                 _ = _conn.close_notify.notified() => {
