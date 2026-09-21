@@ -197,8 +197,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
             for slot in close_after_swap {
                 slot.close();
             }
-            self.release_notified.notify_waiters();
-            self.notify_expansion_capacity_change();
+            self.notify_removed_pool_slot();
             return;
         }
 
@@ -212,8 +211,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 close_after_swap.len(),
                 new_len
             );
-            self.release_notified.notify_waiters();
-            self.notify_expansion_capacity_change();
+            self.notify_removed_pool_slot();
         }
 
         if new_len < self.min_size {
@@ -919,6 +917,19 @@ impl<C: Connection> PipelinePool<C> {
         self.expansion_capacity_notified.notify_waiters();
     }
 
+    /// Removing a whole pool slot creates room for a replacement connection,
+    /// but does not itself create usable DNS stream capacity. Multiplexed
+    /// query waiters stay asleep until a replacement is inserted; legacy
+    /// pools keep their historical wake-all behavior because foreground
+    /// acquirers may compete directly for expansion reservations.
+    fn notify_removed_pool_slot(&self) {
+        if self.paced_expansion.is_some() {
+            self.notify_expansion_capacity_change();
+        } else {
+            self.release_notified.notify_waiters();
+        }
+    }
+
     fn pool_pressure(&self) -> PoolPressure {
         let slots = self.slots.load();
         let mut pressure = PoolPressure::default();
@@ -1188,8 +1199,7 @@ impl<C: Connection> PipelinePool<C> {
             &slots,
             &self.slots.compare_and_swap(&slots, Arc::new(pruned)),
         ) {
-            self.release_notified.notify_waiters();
-            self.notify_expansion_capacity_change();
+            self.notify_removed_pool_slot();
             pruned_len
         } else {
             self.slots
@@ -2774,6 +2784,67 @@ mod tests {
             .count();
         assert_eq!(ready, 0);
         pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn test_paced_pruning_dead_slot_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let dead = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(dead))]));
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        assert_eq!(pool.usable_or_inflight_slot_count(), 0);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+    }
+
+    #[tokio::test]
+    async fn test_paced_maintenance_removal_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let dead = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(dead))]));
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        pool.maintain().await;
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        assert!(pool.slots.load().is_empty());
     }
 
     #[tokio::test]
