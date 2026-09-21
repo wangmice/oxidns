@@ -184,10 +184,9 @@ impl Connection for H2Connection {
     }
 
     fn register_capacity_increase_notify(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
+        // Cache refreshes are owned by the connection driver so updates stay
+        // single-writer and cannot be reordered by registration racing a tick.
         self.pool_capacity_notify.register(notify);
-        // Close the handshake-to-publish race: SETTINGS may have changed after
-        // the cached value was initialized but before the pool callback existed.
-        self.refresh_pool_stream_limit();
     }
 
     fn max_concurrent_queries(&self) -> u16 {
@@ -425,6 +424,12 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             // configured cadence afterwards.
             stream_limit_refresh.tick().await;
             tokio::pin!(connection);
+            // Keep one Notified future alive across timer ticks. Recreating it
+            // inside `select!` would make the close branch cancellation-unsafe:
+            // a timer tick winning the race could drop an already-notified
+            // future and lose the single `notify_one()` permit from `close()`.
+            let close_notified = _conn.close_notify.notified();
+            tokio::pin!(close_notified);
 
             loop {
                 select! {
@@ -436,7 +441,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
                         }
                         break;
                     }
-                    _ = _conn.close_notify.notified() => {
+                    _ = close_notified.as_mut() => {
                         debug!(conn_id, upstream = %_conn.upstream, "H2 connection closed by notify");
                         break;
                     }

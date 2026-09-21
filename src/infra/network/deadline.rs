@@ -187,7 +187,6 @@ mod tests {
         assert!(error.contains("planned failure"));
     }
 
-
     #[test]
     fn background_connection_timeout_uses_connection_operation_wording() {
         AppClock::start();
