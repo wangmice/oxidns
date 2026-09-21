@@ -106,9 +106,17 @@ impl QueryDeadline {
         Duration::from_millis(self.expires_at_ms.saturating_sub(self.started_at_ms))
     }
 
+    fn timeout_label(&self) -> &'static str {
+        match self.timeout_metric_scope {
+            TimeoutMetricScope::Connection => "upstream connection operation",
+            TimeoutMetricScope::Query | TimeoutMetricScope::None => "DNS query",
+        }
+    }
+
     pub fn timeout_error(&self) -> DnsError {
         DnsError::plugin(format!(
-            "DNS query timeout after {:?}",
+            "{} timeout after {:?}",
+            self.timeout_label(),
             self.timeout_duration()
         ))
     }
@@ -145,7 +153,8 @@ impl QueryDeadline {
     ) -> DnsError {
         self.record_timeout_metric(stage);
         DnsError::plugin(format!(
-            "DNS query timeout after {:?}; {detail}",
+            "{} timeout after {:?}; {detail}",
+            self.timeout_label(),
             self.timeout_duration()
         ))
     }
@@ -175,6 +184,34 @@ mod tests {
         );
         let error = error.to_string();
         assert!(error.contains("DNS query timeout"));
+        assert!(error.contains("planned failure"));
+    }
+
+
+    #[test]
+    fn background_connection_timeout_uses_connection_operation_wording() {
+        AppClock::start();
+        let deadline = QueryDeadline::background_connection(Duration::from_millis(25));
+
+        let error = deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate);
+        assert!(
+            error
+                .to_string()
+                .contains("upstream connection operation timeout")
+        );
+    }
+
+    #[test]
+    fn background_connection_timeout_with_detail_uses_connection_operation_wording() {
+        AppClock::start();
+        let deadline = QueryDeadline::background_connection(Duration::from_millis(25));
+
+        let error = deadline.timeout_error_for_with_detail(
+            UpstreamTimeoutStage::ProtocolHandshake,
+            "planned failure",
+        );
+        let error = error.to_string();
+        assert!(error.contains("upstream connection operation timeout"));
         assert!(error.contains("planned failure"));
     }
 
