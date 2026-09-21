@@ -2673,8 +2673,8 @@ mod tests {
         assert_eq!(pool.slots.load().len(), 1);
     }
 
-    #[test]
-    fn test_paced_build_limit_uses_observed_dynamic_stream_capacity() {
+    #[tokio::test]
+    async fn test_paced_build_limit_uses_observed_dynamic_stream_capacity() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
@@ -2702,8 +2702,8 @@ mod tests {
         pool.acquire_waiters.store(0, Ordering::Release);
     }
 
-    #[test]
-    fn test_paced_build_limit_cold_start_uses_configured_capacity() {
+    #[tokio::test]
+    async fn test_paced_build_limit_cold_start_uses_configured_capacity() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
@@ -2939,8 +2939,8 @@ mod tests {
         pool.acquire_waiters.store(0, Ordering::Release);
     }
 
-    #[test]
-    fn test_paced_pruning_dead_slot_does_not_broadcast_query_waiters() {
+    #[tokio::test]
+    async fn test_paced_pruning_dead_slot_does_not_broadcast_query_waiters() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
@@ -3441,8 +3441,8 @@ mod tests {
         assert_eq!(stats.calls.load(Ordering::Acquire), 1);
     }
 
-    #[test]
-    fn test_paced_publish_rejects_connection_already_unavailable() {
+    #[tokio::test]
+    async fn test_paced_publish_rejects_connection_already_unavailable() {
         let stats = Arc::new(BuilderStats::default());
         let pool = make_paced_pool(
             0,
