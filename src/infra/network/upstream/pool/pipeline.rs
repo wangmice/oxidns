@@ -11,6 +11,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::infra::clock::AppClock;
@@ -59,7 +60,7 @@ pub struct PipelinePool<C: Connection> {
     /// Maximum allowed idle time before a connection is dropped.
     max_idle: Duration,
     /// Factory to create new connections.
-    connection_builder: Box<dyn ConnectionBuilder<C>>,
+    connection_builder: Arc<dyn ConnectionBuilder<C>>,
     /// Per-query timeout policy for acquired slots.
     timeout_policy: QueryTimeoutPolicy,
     /// Timeout used only by background prefill/maintenance expansion.
@@ -76,6 +77,10 @@ pub struct PipelinePool<C: Connection> {
     maintenance_task_handle: Mutex<Option<task_center::ManagedTaskHandle>>,
     /// Multiplexed pools use a background paced expansion controller.
     paced_expansion: Option<PacedExpansionPolicy>,
+    /// Cancels detached multiplexed connection builds when this pool is dropped.
+    /// Build tasks intentionally do not retain `Arc<PipelinePool<_>>`, so a
+    /// reload or pool swap can end the old generation immediately.
+    paced_build_shutdown: CancellationToken,
     /// Weak self-reference used to spawn expansion workers without retaining the pool forever.
     self_weak: Weak<PipelinePool<C>>,
     /// A pressure change arrived while the expansion worker was running or exiting.
@@ -293,7 +298,7 @@ impl<C: Connection> PipelinePool<C> {
             min_size,
             max_load: max_load.max(1),
             max_idle: idle_time,
-            connection_builder,
+            connection_builder: Arc::from(connection_builder),
             timeout_policy,
             connect_timeout,
             next_id: AtomicU16::new(1),
@@ -301,6 +306,7 @@ impl<C: Connection> PipelinePool<C> {
             expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
             paced_expansion,
+            paced_build_shutdown: CancellationToken::new(),
             self_weak: weak.clone(),
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
@@ -744,27 +750,55 @@ impl<C: Connection> PipelinePool<C> {
     }
 
     fn spawn_paced_build(pool: Arc<Self>, reservation: PacedSlotReservation<C>) {
+        // Extract everything the network handshake needs before spawning it.
+        // In particular, the detached task must not retain `Arc<PipelinePool>`:
+        // otherwise an old pool generation survives reload/pool swap until the
+        // connection timeout and may continue satisfying its old `min_size`.
+        let weak = pool.self_weak.clone();
+        let builder = pool.connection_builder.clone();
+        let shutdown = pool.paced_build_shutdown.clone();
+        let connect_timeout = pool.connect_timeout;
+        let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
+        drop(pool);
+
         tokio::spawn(async move {
-            let deadline = QueryDeadline::background(pool.connect_timeout);
-            let outcome = AssertUnwindSafe(pool.expand_one_paced(reservation, deadline))
-                .catch_unwind()
-                .await;
+            let deadline = QueryDeadline::background(connect_timeout);
+            let build = AssertUnwindSafe(deadline.run(builder.create_connection(id, deadline)))
+                .catch_unwind();
+            tokio::pin!(build);
+
+            let outcome = tokio::select! {
+                biased;
+                outcome = build.as_mut() => outcome,
+                _ = shutdown.cancelled() => {
+                    // Dropping the builder future cancels the in-flight
+                    // handshake. The reservation only holds a weak pool
+                    // reference, so this cannot keep an obsolete pool alive.
+                    drop(reservation);
+                    return;
+                }
+            };
+
+            let Some(pool) = weak.upgrade() else {
+                // The pool disappeared after the build completed but before
+                // publication. Never leak a successfully created connection
+                // from an obsolete generation.
+                if let Ok(DeadlineOutcome::Completed(Ok(conn))) = outcome {
+                    conn.close();
+                }
+                drop(reservation);
+                return;
+            };
 
             match outcome {
-                Ok(Ok(Some(_))) => {
+                Ok(DeadlineOutcome::Completed(Ok(conn))) => {
+                    let _ = pool.publish_paced_connection(reservation, conn);
                     pool.connect_failure_streak.store(0, Ordering::Release);
                     pool.next_expand_at_ms.store(0, Ordering::Release);
                     pool.clear_connect_failure();
                 }
-                Ok(Ok(None)) => {
-                    // The transport connected successfully even though a
-                    // concurrent capacity change made insertion unnecessary.
-                    // Clear failure diagnostics/backoff before re-evaluating.
-                    pool.connect_failure_streak.store(0, Ordering::Release);
-                    pool.next_expand_at_ms.store(0, Ordering::Release);
-                    pool.clear_connect_failure();
-                }
-                Ok(Err(e)) => {
+                Ok(DeadlineOutcome::Completed(Err(e))) => {
+                    drop(reservation);
                     pool.record_connect_failure(&e);
                     let delay_ms = pool.record_connect_failure_backoff();
                     debug!(
@@ -773,7 +807,19 @@ impl<C: Connection> PipelinePool<C> {
                         "Multiplexed pipeline expansion failed; backing off"
                     );
                 }
+                Ok(DeadlineOutcome::Expired) => {
+                    drop(reservation);
+                    let e = deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate);
+                    pool.record_connect_failure(&e);
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    debug!(
+                        delay_ms,
+                        error = ?e,
+                        "Multiplexed pipeline expansion timed out; backing off"
+                    );
+                }
                 Err(_) => {
+                    drop(reservation);
                     pool.record_connect_failure_message(
                         "multiplexed connection builder panicked".to_string(),
                     );
@@ -785,11 +831,33 @@ impl<C: Connection> PipelinePool<C> {
                 }
             }
 
-            // `PacedSlotReservation` has released its build slot by here and
-            // already notified a controller waiting on the bounded build window.
+            // The reservation has released its build slot by here and already
+            // notified a controller waiting on the bounded build window.
             // Re-evaluate level-triggered pressure after the outcome is recorded.
             pool.request_paced_expansion();
         });
+    }
+
+    fn publish_paced_connection(
+        &self,
+        reservation: PacedSlotReservation<C>,
+        conn: Arc<C>,
+    ) -> Option<Arc<PipelineSlot<C>>> {
+        self.register_connection_unavailable_notify(&conn);
+        let slot = Arc::new(PipelineSlot::new(conn));
+        if self.insert_slot(slot.clone()) {
+            reservation.commit();
+            debug!(
+                "Pipeline pool expanded: total={}/{}",
+                self.slots.load().len(),
+                self.max_size
+            );
+            self.notify_inserted_query_capacity(&slot);
+            Some(slot)
+        } else {
+            slot.close();
+            None
+        }
     }
 
     fn paced_expansion_state(&self) -> PacedExpansionState {
@@ -953,18 +1021,6 @@ impl<C: Connection> PipelinePool<C> {
     async fn expand_one(
         &self,
         reservation: SlotReservation<'_, C>,
-        deadline: QueryDeadline,
-    ) -> Result<Option<Arc<PipelineSlot<C>>>> {
-        let result = self.create_and_insert_slot(deadline).await;
-        if matches!(&result, Ok(Some(_))) {
-            reservation.commit();
-        }
-        result
-    }
-
-    async fn expand_one_paced(
-        &self,
-        reservation: PacedSlotReservation<C>,
         deadline: QueryDeadline,
     ) -> Result<Option<Arc<PipelineSlot<C>>>> {
         let result = self.create_and_insert_slot(deadline).await;
@@ -1670,6 +1726,8 @@ impl<C: Connection> ManagedMaintenanceTask for PipelinePool<C> {
 
 impl<C: Connection> Drop for PipelinePool<C> {
     fn drop(&mut self) {
+        self.paced_build_shutdown.cancel();
+
         let task_handle = self
             .maintenance_task_handle
             .lock()
@@ -1845,6 +1903,39 @@ mod tests {
         query_delay: Duration,
     }
 
+    #[derive(Debug, Default)]
+    struct LifecycleBuilderStats {
+        calls: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    struct LifecycleBuildGuard(Arc<LifecycleBuilderStats>);
+
+    impl Drop for LifecycleBuildGuard {
+        fn drop(&mut self) {
+            self.0.cancelled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct LifecycleBlockingBuilder {
+        stats: Arc<LifecycleBuilderStats>,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for LifecycleBlockingBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+        ) -> Result<Arc<MockConnection>> {
+            self.stats.calls.fetch_add(1, Ordering::AcqRel);
+            let _guard = LifecycleBuildGuard(self.stats.clone());
+            std::future::pending::<()>().await;
+            unreachable!("lifecycle test builder must be cancelled")
+        }
+    }
+
     impl TrackingBuilder {
         fn new(stats: Arc<BuilderStats>, build_delay: Duration, query_delay: Duration) -> Self {
             Self {
@@ -1935,7 +2026,7 @@ mod tests {
             min_size,
             max_load: max_load.max(1),
             max_idle: Duration::from_secs(idle_secs),
-            connection_builder: Box::new(builder),
+            connection_builder: Arc::new(builder),
             timeout_policy,
             connect_timeout: Duration::from_secs(5),
             next_id: AtomicU16::new(1),
@@ -1943,6 +2034,7 @@ mod tests {
             expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
             paced_expansion: None,
+            paced_build_shutdown: CancellationToken::new(),
             self_weak: Weak::new(),
             expansion_requested: AtomicBool::new(false),
             expansion_worker_running: AtomicBool::new(false),
@@ -2464,6 +2556,48 @@ mod tests {
 
         assert_eq!(stats.calls.load(Ordering::Acquire), 1);
         assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paced_build_does_not_retain_pool_after_drop() {
+        AppClock::start();
+        let stats = Arc::new(LifecycleBuilderStats::default());
+        let pool = PipelinePool::new_multiplexed(
+            1,
+            1,
+            32,
+            Duration::from_secs(30),
+            Box::new(LifecycleBlockingBuilder {
+                stats: stats.clone(),
+            }),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(30),
+        );
+        let weak = Arc::downgrade(&pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while stats.calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paced connection build should start");
+
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if weak.upgrade().is_none() && stats.cancelled.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the pool should cancel the detached build without retaining the pool");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(stats.cancelled.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
