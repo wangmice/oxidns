@@ -302,7 +302,7 @@ impl MetricSource for NetworkMetrics {
             let labels = [MetricLabel::new("stage", stage.as_str())];
             sink.emit(MetricSample::counter(
                 "network_upstream_timeout_total",
-                "Total upstream query deadline expirations by network stage.",
+                "Total upstream operation deadline expirations by network stage.",
                 &labels,
                 self.upstream_timeout_total[stage.as_index()].load(Ordering::Relaxed),
             ));

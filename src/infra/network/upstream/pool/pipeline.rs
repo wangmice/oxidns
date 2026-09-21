@@ -592,17 +592,21 @@ impl<C: Connection> PipelinePool<C> {
         }
 
         let weak = self.self_weak.clone();
+        let shutdown = self.paced_build_shutdown.clone();
         tokio::spawn(async move {
-            Self::supervise_paced_expansion_worker(weak).await;
+            Self::supervise_paced_expansion_worker(weak, shutdown).await;
         });
     }
 
-    async fn supervise_paced_expansion_worker(weak: Weak<Self>) {
+    async fn supervise_paced_expansion_worker(weak: Weak<Self>, shutdown: CancellationToken) {
         let mut lifecycle = PacedExpansionWorkerLifecycle::new(weak.clone());
         loop {
-            let outcome = AssertUnwindSafe(Self::run_paced_expansion_worker(weak.clone()))
-                .catch_unwind()
-                .await;
+            let outcome = AssertUnwindSafe(Self::run_paced_expansion_worker(
+                weak.clone(),
+                shutdown.clone(),
+            ))
+            .catch_unwind()
+            .await;
             match outcome {
                 Ok(()) => {
                     lifecycle.disarm();
@@ -627,13 +631,19 @@ impl<C: Connection> PipelinePool<C> {
                         "Multiplexed pipeline expansion worker panicked; retrying after backoff"
                     );
                     drop(pool);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            lifecycle.disarm();
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    }
                 }
             }
         }
     }
 
-    async fn run_paced_expansion_worker(weak: Weak<Self>) {
+    async fn run_paced_expansion_worker(weak: Weak<Self>, shutdown: CancellationToken) {
         loop {
             let Some(pool) = weak.upgrade() else {
                 return;
@@ -697,7 +707,10 @@ impl<C: Connection> PipelinePool<C> {
             let delay = pool.paced_expansion_delay();
             if !delay.is_zero() {
                 drop(pool);
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
                 continue;
             }
 
@@ -717,7 +730,10 @@ impl<C: Connection> PipelinePool<C> {
                 notified.as_mut().enable();
                 if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
                     drop(pool);
-                    notified.as_mut().await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notified.as_mut() => {}
+                    }
                     continue;
                 }
             }
@@ -748,7 +764,10 @@ impl<C: Connection> PipelinePool<C> {
 
                     drop(reservation);
                     drop(pool);
-                    notified.as_mut().await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notified.as_mut() => {}
+                    }
                     continue;
                 }
             }
@@ -787,7 +806,7 @@ impl<C: Connection> PipelinePool<C> {
         drop(pool);
 
         tokio::spawn(async move {
-            let deadline = QueryDeadline::background(connect_timeout);
+            let deadline = QueryDeadline::background_connection(connect_timeout);
             let build = AssertUnwindSafe(deadline.run(builder.create_connection(id, deadline)))
                 .catch_unwind();
             tokio::pin!(build);
@@ -2719,6 +2738,42 @@ mod tests {
         );
 
         pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_paced_controller_wait_is_cancelled_when_pool_drops() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(1, Ordering::Release);
+        // Pretend the only build window is already reserved so the controller
+        // must wait on expansion-capacity notification instead of starting a
+        // connection build.
+        pool.reserved_slots.store(1, Ordering::Release);
+        pool.request_paced_expansion();
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while Arc::strong_count(&pool.expansion_capacity_notified) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paced controller should start waiting for build capacity");
+
+        let capacity_notify = Arc::downgrade(&pool.expansion_capacity_notified);
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while capacity_notify.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the pool should cancel a controller waiting on capacity");
     }
 
     #[tokio::test]
