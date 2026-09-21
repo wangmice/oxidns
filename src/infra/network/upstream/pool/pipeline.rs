@@ -2003,6 +2003,22 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct AlwaysFailBuilder {
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for AlwaysFailBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+        ) -> Result<Arc<MockConnection>> {
+            Err(DnsError::runtime(self.message))
+        }
+    }
+
+    #[derive(Debug)]
     struct PanicOnceBuilder {
         calls: Arc<AtomicUsize>,
         connection: Arc<MockConnection>,
@@ -3585,22 +3601,34 @@ mod tests {
             1,
             32,
             Duration::from_secs(30),
-            Box::new(MockBuilder::new(vec![
-                Err(DnsError::runtime("planned connect failure")),
-                Err(DnsError::runtime("planned connect failure")),
-            ])),
+            Box::new(AlwaysFailBuilder {
+                message: "planned connect failure",
+            }),
             QueryTimeoutPolicy::Reuse,
             Duration::from_secs(1),
         );
 
-        let error = pool
-            .query(
-                Message::new(),
-                QueryDeadline::new(Duration::from_millis(250)),
-            )
+        let deadline = QueryDeadline::new(Duration::from_secs(1));
+        let waiting_pool = pool.clone();
+        let query = tokio::spawn(async move { waiting_pool.query(Message::new(), deadline).await });
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if pool.last_connect_failure.load_full().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection failure should be recorded before the query deadline expires");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), query)
             .await
-            .expect_err("query should expire while connection creation is backing off");
-        let error = error.to_string();
+            .expect("query task should finish after its deadline")
+            .expect("query task should join")
+            .expect_err("query should expire while connection creation is backing off")
+            .to_string();
         assert!(error.contains("DNS query timeout"));
         assert!(error.contains("planned connect failure"));
     }
