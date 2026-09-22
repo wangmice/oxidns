@@ -9,6 +9,7 @@ use crate::proto::{Message, MessageType};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DnsResponseIdPolicy {
     MatchRequest,
+    #[cfg(any(test, feature = "_dns-client-doh", feature = "_dns-client-doq"))]
     Exact(u16),
 }
 
@@ -20,6 +21,7 @@ pub(crate) fn validate_dns_response(
 ) -> Result<()> {
     let expected_id = match id_policy {
         DnsResponseIdPolicy::MatchRequest => request.id(),
+        #[cfg(any(test, feature = "_dns-client-doh", feature = "_dns-client-doq"))]
         DnsResponseIdPolicy::Exact(id) => id,
     };
 

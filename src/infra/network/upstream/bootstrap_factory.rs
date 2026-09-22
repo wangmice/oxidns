@@ -5,9 +5,10 @@ use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+#[cfg(any(feature = "upstream-doh", feature = "upstream-doq"))]
+use crate::infra::network::upstream::builder::MULTIPLEXED_MAX_CONNS_LOAD;
 use crate::infra::network::upstream::builder::{
-    MULTIPLEXED_MAX_CONNS_LOAD, main_pool_min_conns, pipeline_request_map_capacity,
-    reuse_request_map_capacity,
+    main_pool_min_conns, pipeline_request_map_capacity, reuse_request_map_capacity,
 };
 use crate::infra::network::upstream::config::ConnectionInfo;
 #[cfg(feature = "upstream-doh")]

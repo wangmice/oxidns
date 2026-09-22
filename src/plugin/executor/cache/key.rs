@@ -100,6 +100,7 @@ fn canonical_domain_from_text(raw: &str) -> Option<String> {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 #[inline]
 pub(super) fn normalize_domain_key(raw: &str) -> String {
     canonical_domain_from_text(raw).unwrap_or_else(|| raw.trim().to_ascii_lowercase())

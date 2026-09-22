@@ -300,6 +300,7 @@ impl<C: Connection> PipelinePool<C> {
     /// Build a pool for multiplexed transports (H2/H3/DoQ). Connection
     /// creation is detached from query lifetimes and paced by one background
     /// worker so bursts cannot create a handshake storm.
+    #[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
     pub fn new_multiplexed(
         min_size: usize,
         max_size: usize,
