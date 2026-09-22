@@ -91,26 +91,18 @@ impl ProviderFileReloadService {
         let targets = Arc::new(targets);
         let callback_targets = targets.clone();
         let callback_base = base.clone();
-        let mut watcher =
-            match recommended_watcher(move |result: notify::Result<Event>| match result {
-                Ok(event) => signal_event(&callback_base, &callback_targets, event),
-                Err(error) => {
-                    error!(
-                        %error,
-                        "provider file watcher backend error; scheduling full resync"
-                    );
-                    signal_all(&callback_targets);
-                }
-            }) {
-                Ok(watcher) => watcher,
-                Err(error) => {
-                    warn!(
-                        %error,
-                        "provider file watcher is unavailable; automatic rule reload disabled"
-                    );
-                    return Ok(None);
-                }
-            };
+        let mut watcher = match recommended_watcher(move |result: notify::Result<Event>| {
+            handle_watcher_result(&callback_base, &callback_targets, result);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "provider file watcher is unavailable; automatic rule reload disabled"
+                );
+                return Ok(None);
+            }
+        };
 
         let mut active_directories = 0usize;
         for directory in &watched_dirs {
@@ -168,6 +160,29 @@ impl ProviderFileReloadService {
             {
                 warn!(%error, "provider file reload worker failed during shutdown");
             }
+        }
+    }
+}
+
+fn handle_watcher_result(
+    base: &Path,
+    targets: &HashMap<PathBuf, Vec<DirtySender>>,
+    result: notify::Result<Event>,
+) {
+    match result {
+        Ok(event) if event.need_rescan() => {
+            warn!(
+                "provider file watcher reported missed filesystem events; scheduling full resync"
+            );
+            signal_all(targets);
+        }
+        Ok(event) => signal_event(base, targets, event),
+        Err(error) => {
+            error!(
+                %error,
+                "provider file watcher backend error; scheduling full resync"
+            );
+            signal_all(targets);
         }
     }
 }
@@ -241,7 +256,11 @@ async fn run_provider_worker(
             }
         }
 
-        match control.reload_after_current().await {
+        let reload_result = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = control.reload_after_current() => result,
+        };
+        match reload_result {
             Ok(()) => info!(
                 provider = %tag,
                 "provider automatically reloaded after rule file change"
@@ -635,5 +654,68 @@ mod tests {
         fs::write(&path, "after-shutdown\n").expect("post-shutdown update");
         tokio::time::sleep(TEST_DEBOUNCE * 3).await;
         assert_eq!(provider.reloads.load(Ordering::Relaxed), reloads);
+    }
+
+    #[test]
+    fn rescan_event_marks_all_targets_dirty() {
+        use notify::event::Flag;
+
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let targets = HashMap::from([
+            (PathBuf::from("first.rules"), vec![first_tx]),
+            (PathBuf::from("second.rules"), vec![second_tx]),
+        ]);
+        let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+
+        handle_watcher_result(Path::new("."), &targets, Ok(event));
+
+        assert!(first_rx.try_recv().is_ok());
+        assert!(second_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_auto_reload_waiting_behind_manual_reload() {
+        let provider = Arc::new(BlockingProvider::new("blocking"));
+        let control = reload_entry(provider.clone(), Vec::new()).1;
+        let manual_control = control.clone();
+        let manual = tokio::spawn(async move { manual_control.reload().await });
+        provider.started.notified().await;
+
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_provider_worker(
+            provider.tag().to_string(),
+            control,
+            rx,
+            cancel.child_token(),
+            Duration::from_millis(10),
+        ));
+
+        tx.send(()).await.expect("dirty signal");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(11)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(provider.reloads.load(Ordering::Relaxed), 1);
+
+        cancel.cancel();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            worker.is_finished(),
+            "cancelled worker should not wait for manual reload ownership"
+        );
+        worker.await.expect("worker should stop cleanly");
+        assert_eq!(provider.reloads.load(Ordering::Relaxed), 1);
+
+        provider.release.notify_one();
+        manual
+            .await
+            .expect("manual reload task should finish")
+            .expect("manual reload should succeed");
+        assert_eq!(provider.reloads.load(Ordering::Relaxed), 1);
     }
 }
