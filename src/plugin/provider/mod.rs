@@ -18,6 +18,7 @@
 
 use std::any::Any;
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 
@@ -30,6 +31,7 @@ pub mod adguard_rule;
 pub mod domain_set;
 #[cfg(feature = "plugin-dynamic-domain")]
 pub mod dynamic_domain_set;
+mod file_reload;
 #[cfg(feature = "provider-protobuf")]
 pub mod geoip;
 #[cfg(feature = "provider-protobuf")]
@@ -42,6 +44,7 @@ mod control;
 #[cfg(feature = "api")]
 pub(crate) use control::ProviderReloadError;
 pub(crate) use control::ProviderRuntimeControl;
+pub(crate) use file_reload::ProviderFileReloadService;
 
 #[async_trait]
 #[allow(dead_code)]
@@ -69,6 +72,16 @@ pub trait Provider: Plugin {
 
     /// Reload the provider's internal data using the same startup config.
     async fn reload(&self) -> DnsResult<()>;
+
+    /// Local files whose external changes should trigger a provider reload.
+    ///
+    /// Paths are resolved using the same process working-directory semantics as
+    /// the provider's normal file I/O. Machine-managed files should not be
+    /// returned here to avoid feeding the provider's own writes back into its
+    /// reload path.
+    fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 
     #[inline]
     fn supports_ip_matching(&self) -> bool {

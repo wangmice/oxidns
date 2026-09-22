@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::infra::error::DnsError;
 use crate::plugin::provider::Provider;
@@ -54,6 +54,20 @@ impl ProviderRuntimeControl {
                 .map_err(|_| ProviderReloadError::Busy {
                     tag: self.provider.tag().to_string(),
                 })?;
+        self.run_reload(guard).await
+    }
+
+    /// Wait for an in-flight reload, then rebuild once from the newest source.
+    ///
+    /// Filesystem-triggered reloads use this path so a change that arrives
+    /// while a manual or previous automatic reload is running is never lost.
+    pub(crate) async fn reload_after_current(&self) -> Result<(), ProviderReloadError> {
+        self.ensure_accepting_reloads()?;
+        let guard = self.reload_lock.clone().lock_owned().await;
+        self.run_reload(guard).await
+    }
+
+    async fn run_reload(&self, guard: OwnedMutexGuard<()>) -> Result<(), ProviderReloadError> {
         self.ensure_accepting_reloads()?;
         let provider = self.provider.clone();
         let tag = provider.tag().to_string();
@@ -202,6 +216,32 @@ mod tests {
             completed,
             "detached reload should eventually release ownership"
         );
+        assert_eq!(provider.reloads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn waiting_reload_runs_after_in_flight_reload() {
+        let provider = Arc::new(BlockingProvider {
+            reloads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let control = Arc::new(ProviderRuntimeControl::new(provider.clone()));
+        let first_control = control.clone();
+        let first = tokio::spawn(async move { first_control.reload().await });
+
+        provider.started.notified().await;
+        let waiting_control = control.clone();
+        let waiting = tokio::spawn(async move { waiting_control.reload_after_current().await });
+        tokio::task::yield_now().await;
+        assert_eq!(provider.reloads.load(Ordering::Relaxed), 1);
+
+        provider.release.notify_one();
+        first.await.expect("first reload should finish").unwrap();
+        waiting
+            .await
+            .expect("waiting reload task should finish")
+            .unwrap();
         assert_eq!(provider.reloads.load(Ordering::Relaxed), 2);
     }
 
