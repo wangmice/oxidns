@@ -48,7 +48,7 @@ const topLevelOrder = [...OXIDNS_CONFIG_TOP_LEVEL_KEYS];
 
 const orderByPath = new Map<string, readonly string[]>([
   ["", topLevelOrder],
-  ["runtime", ["worker_threads"]],
+  ["runtime", ["worker_threads", "provider_file_auto_reload"]],
   ["api", ["http"]],
   ["api.http", ["listen", "ssl", "auth", "cors", "webui"]],
   ["api.http.ssl", ["cert", "key", "client_ca", "require_client_cert"]],
@@ -119,6 +119,9 @@ export function getOxiDnsConfigValueSuggestions(
     return [{ label: "basic", type: "enum" }];
   }
   if (valueKey === "require_client_cert") {
+    return booleanSuggestions();
+  }
+  if (valueKey === "provider_file_auto_reload" && joined === "runtime") {
     return booleanSuggestions();
   }
   if (valueKey === "resolver" && joined.includes("network.outbound.profiles")) {

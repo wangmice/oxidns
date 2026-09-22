@@ -432,6 +432,7 @@ export default function SettingsPage() {
 
   const [backendUrl, setBackendUrl] = useState(serverConfig.url);
   const [workerThreads, setWorkerThreads] = useState("");
+  const [providerFileAutoReload, setProviderFileAutoReload] = useState(false);
   const [apiListen, setApiListen] = useState("");
   const [apiSslEnabled, setApiSslEnabled] = useState(false);
   const [apiSslCert, setApiSslCert] = useState("");
@@ -479,6 +480,7 @@ export default function SettingsPage() {
       const outbound = asRecord(network.outbound);
 
       setWorkerThreads(String(runtime.worker_threads ?? ""));
+      setProviderFileAutoReload(runtime.provider_file_auto_reload === true);
       setApiListen(String(httpObj.listen ?? ""));
       setApiSslEnabled(Boolean(ssl.cert || ssl.key));
       setApiSslCert(String(ssl.cert ?? ""));
@@ -653,6 +655,11 @@ export default function SettingsPage() {
       nextRuntime.worker_threads = Number(workerThreads);
     } else {
       delete nextRuntime.worker_threads;
+    }
+    if (providerFileAutoReload) {
+      nextRuntime.provider_file_auto_reload = true;
+    } else {
+      delete nextRuntime.provider_file_auto_reload;
     }
 
     const nextApi: Record<string, unknown> = {
@@ -1213,6 +1220,21 @@ export default function SettingsPage() {
                       className="font-mono max-w-xs"
                     />
                   </Field>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
+                    <div>
+                      <p className="text-sm font-medium">
+                        {t(WEBUI.settings.providerFileAutoReload)}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {t(WEBUI.settings.providerFileAutoReloadDesc)}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={providerFileAutoReload}
+                      onCheckedChange={setProviderFileAutoReload}
+                      aria-label={t(WEBUI.settings.providerFileAutoReload)}
+                    />
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     <Button
                       onClick={handleSaveTopLevelConfig}

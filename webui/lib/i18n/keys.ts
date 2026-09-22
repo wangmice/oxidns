@@ -925,6 +925,8 @@ export const WEBUI = {
     workerThreads: "webui.settings.workerThreads",
     workerThreadsDesc: "webui.settings.workerThreadsDesc",
     workerThreadsPlaceholder: "webui.settings.workerThreadsPlaceholder",
+    providerFileAutoReload: "webui.settings.providerFileAutoReload",
+    providerFileAutoReloadDesc: "webui.settings.providerFileAutoReloadDesc",
     outboundCard: "webui.settings.outboundCard",
     outboundCardDesc: "webui.settings.outboundCardDesc",
     defaultOutboundProfile: "webui.settings.defaultOutboundProfile",

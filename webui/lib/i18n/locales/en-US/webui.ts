@@ -986,11 +986,14 @@ export const enUSWebui = {
     initOrderLabel: "Init Order",
     configOkBadge: "Config validation passed",
     runtimeCard: "Runtime",
-    runtimeCardDesc: "Tokio runtime parameters (runtime)",
+    runtimeCardDesc: "OxiDNS runtime parameters (runtime)",
     workerThreads: "Worker Threads",
     workerThreadsDesc:
       "Number of Tokio multi-thread runtime workers. Leave empty for automatic (system parallelism). Cannot be 0.",
     workerThreadsPlaceholder: "Leave empty for system default",
+    providerFileAutoReload: "Provider File Auto Reload",
+    providerFileAutoReloadDesc:
+      "Watch rule files owned by file-backed providers and reload them after external changes. Disabled by default; this is a runtime setting and requires an OxiDNS restart after saving.",
     outboundCard: "Outbound Network",
     outboundCardDesc:
       "Configure network.outbound profiles shared by HTTP clients, upgrades, downloads, and upstreams.",
