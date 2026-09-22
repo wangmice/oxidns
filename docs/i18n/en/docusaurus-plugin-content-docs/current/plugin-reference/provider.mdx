@@ -9,6 +9,27 @@ Providers with domain or IP match capability can be referenced directly by match
 
 Every live provider also registers `POST /api/plugins/<provider_tag>/reload`, and the `reload_provider` executor can refresh that provider's snapshot in place with the same startup configuration without rebuilding unrelated plugins. The WebUI exposes the same capability as **Reload data** on provider cards and detail views, with distinct pending, success, failure, and busy feedback.
 
+## Automatic External File Reload
+
+File-backed providers automatically watch their configured rule files after the runtime is initialized:
+
+- `domain_set.files`
+- `ip_set.files`
+- `adguard_rule.files`
+- `geosite.file`
+- `geoip.file`
+
+The watcher monitors each rule file's parent directory non-recursively. File events use an approximately `500ms` trailing debounce, so bursts for the same provider are coalesced. After watches become active, OxiDNS also schedules one catch-up reload to close the startup window between the provider's initial load and watcher registration.
+
+Automatic and manual `reload_provider` operations share the same serialized reload control. A new snapshot is published only after the source has been read, parsed, and rebuilt successfully; a temporarily missing file, invalid data, or rebuild failure leaves the previous snapshot active. A file change that arrives while a reload is running is retained as one follow-up reload, without adding polling work to the DNS query path.
+
+Deleting and recreating the **rule file itself** is supported as long as its parent directory remains present and watched. Keep these limits in mind:
+
+- If the rule file itself is a symbolic link, changing only its target is not guaranteed to produce an event that every platform can route back to the configured path. OxiDNS logs a startup warning for this case. Replacing/retargeting the link entry or explicitly reloading the provider is more reliable.
+- If the **watched parent directory itself** is removed and recreated, the current runtime does not guarantee automatic re-registration of the native watch. Perform an application reload or restart.
+- `dynamic_domain_set.path` is intentionally excluded because that file is managed and written by the provider itself; watching it would create a self-triggered feedback loop.
+- Direct matcher `"&file"` rules are read when the matcher is built and are not part of provider auto-reload. For automatic file reload, put the file under `domain_set.files`, `ip_set.files`, or another file-backed provider and reference it through `"$tag"`.
+
 At runtime, OxiDNS only initializes providers that are actually consumed. If a provider is not referenced directly or indirectly by any `server`, `executor`, or `matcher`, it is skipped during startup, does not appear in the runtime registry, and emits a warning log so the unused configuration is visible.
 
 ---

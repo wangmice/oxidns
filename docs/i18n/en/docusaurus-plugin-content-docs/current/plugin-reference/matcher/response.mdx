@@ -72,6 +72,9 @@ Matches CNAME targets in the response.
     and bare domains without a prefix as `domain:` rules
   - provider references with domain match capability, such as `domain_set` or `geosite`
   - file references
+- File-reference behavior:
+  - `&/path/to/file` is read when the matcher is built and is not registered with the provider file watcher.
+  - For runtime automatic file reload, use a file-backed provider such as `domain_set.files` and reference it from the matcher with `"$tag"`.
 - Runtime impact:
   - Returns `true` when any CNAME target in the response matches.
 

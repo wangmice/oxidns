@@ -65,6 +65,7 @@ import Admonition from "@theme/Admonition";
   - 空行与注释行会被忽略。
 - 运行影响：
   - 文件内容会在初始化或 `reload_provider` 时重新读取，并编译进当前 provider 的本地 matcher。
+  - 外部修改这些文件时会自动触发 provider reload；连续文件事件会经过约 `500ms` trailing debounce 合并。
 
 #### `sets`
 
@@ -179,7 +180,7 @@ plugins:
 
 - 仅提供 IP 命中能力，可被 `client_ip`、`resp_ip`、`ptr_ip` 直接引用。
 - 也可被 `ip_set.sets` 组合，并在上层 provider 运行时继续参与匹配。
-- 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容。
+- 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容；外部修改 `file` 时也会自动触发 provider reload。
 - 如需在运行前把部分 selector 预导出成文本规则文件，可使用 `oxidns export-dat --kind geoip`。
 
 <Admonition type="note" title="Selector 注意事项">

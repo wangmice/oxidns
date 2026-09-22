@@ -65,6 +65,7 @@ Provides IP and CIDR rule sets that can be referenced by matchers such as `clien
   - Empty lines and comment lines are ignored.
 - Runtime impact:
   - File contents are re-read during initialization or `reload_provider` and compiled into the current provider's local matcher.
+  - External changes to these files automatically trigger a provider reload; bursts are coalesced with an approximately `500ms` trailing debounce.
 
 #### `sets`
 
@@ -174,7 +175,7 @@ Combine GeoIP data with local CIDRs for reuse by several matchers:
 
 - Exposes IP-only membership checks.
 - Can be referenced directly by `client_ip`, `resp_ip`, and `ptr_ip`, or composed by `ip_set`.
-- Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`.
+- Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`; external changes to `file` also trigger an automatic provider reload.
 - To pre-export selected rules into text files before runtime, use `oxidns export-dat --kind geoip`.
 
 <Admonition type="note" title="Selector Notes">
