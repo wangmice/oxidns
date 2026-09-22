@@ -11,7 +11,14 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
 
 ## 外部规则文件自动重载
 
-文件型 provider 会在 runtime 初始化完成后自动监听其规则文件：
+自动文件重载默认关闭。需要显式启用：
+
+```yaml
+runtime:
+  provider_file_auto_reload: true
+```
+
+启用后，文件型 provider 会在 runtime 初始化完成后自动监听其规则文件：
 
 - `domain_set.files`
 - `ip_set.files`

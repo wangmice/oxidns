@@ -193,6 +193,16 @@ impl PluginRegistry {
         configs: Vec<PluginConfig>,
         matcher_runtime_controls_enabled: bool,
     ) -> Result<()> {
+        self.init_plugins_with_runtime_options(configs, matcher_runtime_controls_enabled, false)
+            .await
+    }
+
+    pub(crate) async fn init_plugins_with_runtime_options(
+        self: Arc<Self>,
+        configs: Vec<PluginConfig>,
+        matcher_runtime_controls_enabled: bool,
+        provider_file_auto_reload_enabled: bool,
+    ) -> Result<()> {
         use crate::plugin::dependency;
 
         let mut seen_tags = HashMap::new();
@@ -345,24 +355,29 @@ impl PluginRegistry {
             lock_mutex(&self.init_order).push(plugin_config.tag.clone());
         }
 
-        let file_reload_entries = self
-            .plugins
-            .iter()
-            .filter_map(|entry| {
-                if entry.plugin_type != PluginType::Provider {
-                    return None;
-                }
-                let paths = entry.provider().reload_watch_paths();
-                if paths.is_empty() {
-                    return None;
-                }
-                let Some(PluginRuntimeControl::Provider(control)) = entry.runtime_control() else {
-                    return None;
-                };
-                Some((entry.tag.clone(), control, paths))
-            })
-            .collect::<Vec<_>>();
-        *lock_mutex(&self.file_reload) = ProviderFileReloadService::start(file_reload_entries)?;
+        if provider_file_auto_reload_enabled {
+            let file_reload_entries = self
+                .plugins
+                .iter()
+                .filter_map(|entry| {
+                    if entry.plugin_type != PluginType::Provider {
+                        return None;
+                    }
+                    let paths = entry.provider().reload_watch_paths();
+                    if paths.is_empty() {
+                        return None;
+                    }
+                    let Some(PluginRuntimeControl::Provider(control)) = entry.runtime_control()
+                    else {
+                        return None;
+                    };
+                    Some((entry.tag.clone(), control, paths))
+                })
+                .collect::<Vec<_>>();
+            *lock_mutex(&self.file_reload) = ProviderFileReloadService::start(file_reload_entries)?;
+        } else {
+            debug!("provider file auto-reload disabled by runtime configuration");
+        }
 
         info!("All plugins initialized successfully");
         Ok(())

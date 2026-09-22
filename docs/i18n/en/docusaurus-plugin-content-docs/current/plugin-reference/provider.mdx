@@ -11,7 +11,14 @@ Every live provider also registers `POST /api/plugins/<provider_tag>/reload`, an
 
 ## Automatic External File Reload
 
-File-backed providers automatically watch their configured rule files after the runtime is initialized:
+Automatic file reload is disabled by default. Enable it explicitly:
+
+```yaml
+runtime:
+  provider_file_auto_reload: true
+```
+
+When enabled, file-backed providers automatically watch their configured rule files after the runtime is initialized:
 
 - `domain_set.files`
 - `ip_set.files`

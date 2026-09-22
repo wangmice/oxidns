@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap as StdHashMap;
+use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -122,6 +123,56 @@ struct CaptureProvider {
 }
 
 #[derive(Debug)]
+struct WatchedProvider {
+    tag: String,
+    path: PathBuf,
+}
+
+#[async_trait]
+impl Plugin for WatchedProvider {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+#[async_trait]
+impl Provider for WatchedProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn reload(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        vec![self.path.clone()]
+    }
+
+    fn supports_domain_matching(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct WatchedProviderFactory {
+    path: PathBuf,
+}
+
+impl PluginFactory for WatchedProviderFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> Result<UninitializedPlugin> {
+        Ok(UninitializedPlugin::Provider(Box::new(WatchedProvider {
+            tag: plugin_config.tag.clone(),
+            path: self.path.clone(),
+        })))
+    }
+}
+
+#[derive(Debug)]
 struct DrainingProvider {
     tag: String,
     started: Arc<Notify>,
@@ -155,6 +206,51 @@ impl Provider for DrainingProvider {
 
     fn supports_domain_matching(&self) -> bool {
         true
+    }
+}
+
+#[tokio::test]
+async fn provider_file_auto_reload_runtime_switch_controls_watcher_creation() {
+    for enabled in [false, true] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("rules.txt");
+        std::fs::write(&path, "example.com\n").expect("rules");
+
+        let mut registry = PluginRegistry::new();
+        registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+        registry.register_factory(
+            "watched_provider",
+            DependencyKind::Provider,
+            Box::new(WatchedProviderFactory { path }),
+        );
+        let registry = Arc::new(registry);
+        registry
+            .clone()
+            .init_plugins_with_runtime_options(
+                vec![
+                    PluginConfig {
+                        tag: "watched".to_string(),
+                        plugin_type: "watched_provider".to_string(),
+                        args: None,
+                    },
+                    PluginConfig {
+                        tag: "match_qname".to_string(),
+                        plugin_type: "qname".to_string(),
+                        args: Some(serde_yaml_ng::from_str("- '$watched'").unwrap()),
+                    },
+                ],
+                false,
+                enabled,
+            )
+            .await
+            .expect("plugin init should succeed");
+
+        assert_eq!(
+            lock_mutex(&registry.file_reload).is_some(),
+            enabled,
+            "watcher state should follow runtime.provider_file_auto_reload"
+        );
+        registry.destroy().await;
     }
 }
 

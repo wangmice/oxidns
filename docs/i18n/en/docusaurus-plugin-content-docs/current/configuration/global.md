@@ -145,6 +145,7 @@ Field notes:
 ```yaml
 runtime:
   worker_threads: 4
+  provider_file_auto_reload: true
 ```
 
 Field notes:
@@ -153,6 +154,11 @@ Field notes:
   - Meaning: Number of Tokio multi-thread runtime workers.
   - Default: Uses system available parallelism when omitted.
   - Constraint: Must not be `0`.
+- `provider_file_auto_reload`
+  - Meaning: Automatically watch external files owned by file-backed providers and reload the affected provider after changes.
+  - Default: `false`.
+  - When enabled, covers `domain_set.files`, `ip_set.files`, `adguard_rule.files`, `geosite.file`, and `geoip.file`.
+  - This switch only controls the automatic file watcher; manual `reload_provider`, management API, and WebUI provider reloads remain available.
 
 ### `log`
 
