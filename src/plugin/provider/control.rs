@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 
 use crate::infra::error::DnsError;
 use crate::plugin::provider::Provider;
@@ -59,12 +60,21 @@ impl ProviderRuntimeControl {
 
     /// Wait for an in-flight reload, then rebuild once from the newest source.
     ///
-    /// Filesystem-triggered reloads use this path so a change that arrives
-    /// while a manual or previous automatic reload is running is never lost.
-    pub(crate) async fn reload_after_current(&self) -> Result<(), ProviderReloadError> {
+    /// Cancellation is honored only while waiting for reload ownership. Once
+    /// the mutex guard has been acquired, the rebuild runs to completion so
+    /// runtime teardown cannot detach an already-started automatic reload.
+    pub(crate) async fn reload_after_current(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ProviderReloadError> {
         self.ensure_accepting_reloads()?;
-        let guard = self.reload_lock.clone().lock_owned().await;
-        self.run_reload(guard).await
+        let guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(false),
+            guard = self.reload_lock.clone().lock_owned() => guard,
+        };
+        self.run_reload(guard).await?;
+        Ok(true)
     }
 
     async fn run_reload(&self, guard: OwnedMutexGuard<()>) -> Result<(), ProviderReloadError> {
@@ -232,7 +242,11 @@ mod tests {
 
         provider.started.notified().await;
         let waiting_control = control.clone();
-        let waiting = tokio::spawn(async move { waiting_control.reload_after_current().await });
+        let waiting_cancel = CancellationToken::new();
+        let waiting =
+            tokio::spawn(
+                async move { waiting_control.reload_after_current(&waiting_cancel).await },
+            );
         tokio::task::yield_now().await;
         assert_eq!(provider.reloads.load(Ordering::Relaxed), 1);
 

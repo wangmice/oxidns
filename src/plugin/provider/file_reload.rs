@@ -56,6 +56,7 @@ impl ProviderFileReloadService {
 
         let mut targets: HashMap<PathBuf, Vec<DirtySender>> = HashMap::new();
         let mut worker_specs = Vec::new();
+        let mut configured_files = HashSet::new();
         let mut watched_dirs = HashSet::new();
         let mut symlink_paths = HashSet::new();
 
@@ -66,6 +67,7 @@ impl ProviderFileReloadService {
                 if !provider_paths.insert(path.clone()) {
                     continue;
                 }
+                configured_files.insert(path.clone());
                 if let Ok(metadata) = std::fs::symlink_metadata(&path)
                     && metadata.file_type().is_symlink()
                 {
@@ -87,11 +89,14 @@ impl ProviderFileReloadService {
             let provider_paths = provider_paths.into_iter().collect::<Vec<_>>();
             for path in &provider_paths {
                 targets.entry(path.clone()).or_default().push(tx.clone());
+                if let Some(alias) = canonical_parent_alias(path) {
+                    targets.entry(alias).or_default().push(tx.clone());
+                }
             }
-            worker_specs.push((tag, control, rx, provider_paths));
+            worker_specs.push((tag, control, tx, rx, provider_paths));
         }
 
-        if targets.is_empty() {
+        if configured_files.is_empty() {
             return Ok(None);
         }
 
@@ -152,8 +157,8 @@ impl ProviderFileReloadService {
             );
         }
 
-        let active_files = targets
-            .keys()
+        let active_files = configured_files
+            .iter()
             .filter(|path| {
                 path.parent()
                     .is_some_and(|parent| active_directories.contains(parent))
@@ -163,10 +168,15 @@ impl ProviderFileReloadService {
         let cancel = CancellationToken::new();
         let workers = worker_specs
             .into_iter()
-            .filter_map(|(tag, control, rx, paths)| {
+            .filter_map(|(tag, control, tx, rx, paths)| {
                 if !has_watched_path(&paths, &active_directories) {
                     return None;
                 }
+                // Close the init-to-watch race: after directory watches are
+                // active, force one coalesced rebuild from the newest source.
+                // Any filesystem event that raced with this signal shares the
+                // same capacity-one dirty slot and is covered by that rebuild.
+                signal(&tx);
                 Some(tokio::spawn(run_provider_worker(
                     tag,
                     control,
@@ -178,7 +188,7 @@ impl ProviderFileReloadService {
             .collect::<Vec<_>>();
 
         info!(
-            configured_files = targets.len(),
+            configured_files = configured_files.len(),
             watched_files = active_files,
             configured_directories = watched_dirs.len(),
             directories = active_directories.len(),
@@ -302,12 +312,10 @@ async fn run_provider_worker(
             }
         }
 
-        let reload_result = tokio::select! {
-            _ = cancel.cancelled() => return,
-            result = control.reload_after_current() => result,
-        };
+        let reload_result = control.reload_after_current(&cancel).await;
         match reload_result {
-            Ok(()) => info!(
+            Ok(false) => return,
+            Ok(true) => info!(
                 provider = %tag,
                 "provider automatically reloaded after rule file change"
             ),
@@ -325,6 +333,19 @@ fn has_watched_path(paths: &[PathBuf], active_directories: &HashSet<PathBuf>) ->
         path.parent()
             .is_some_and(|parent| active_directories.contains(parent))
     })
+}
+
+/// Return a routing alias for backends that report a canonicalized parent
+/// directory even when the configured path used a symlinked parent.
+///
+/// Only the parent is canonicalized. The final component is appended unchanged
+/// so a configured rule file that is itself a symlink is not followed.
+fn canonical_parent_alias(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let file_name = path.file_name()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    let alias = lexical_normalize(canonical_parent.join(file_name));
+    (alias != path).then_some(alias)
 }
 
 fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
@@ -519,6 +540,44 @@ mod tests {
             ],
             &watched
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_parent_alias_resolves_parent_without_following_final_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("tempdir");
+        let real_parent = directory.path().join("real");
+        let linked_parent = directory.path().join("linked");
+        fs::create_dir(&real_parent).expect("real parent");
+        symlink(&real_parent, &linked_parent).expect("parent symlink");
+
+        let configured = linked_parent.join("rules.txt");
+        let alias = canonical_parent_alias(&configured).expect("canonical parent alias");
+        assert_eq!(
+            alias,
+            std::fs::canonicalize(&real_parent)
+                .expect("canonical real parent")
+                .join("rules.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_start_performs_catch_up_reload() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("rules.txt");
+        fs::write(&path, "new\n").expect("rules");
+        let provider = Arc::new(ReloadingFileProvider::new("catch-up", path.clone(), "old"));
+        let service = ProviderFileReloadService::start_with_debounce(
+            vec![reload_entry(provider.clone(), vec![path])],
+            TEST_DEBOUNCE,
+        )
+        .expect("watcher should start")
+        .expect("watcher should be active");
+
+        wait_until(|| provider.snapshot() == "new", "startup catch-up reload").await;
+        service.shutdown().await;
     }
 
     #[tokio::test]
