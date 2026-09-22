@@ -57,6 +57,7 @@ impl ProviderFileReloadService {
         let mut targets: HashMap<PathBuf, Vec<DirtySender>> = HashMap::new();
         let mut worker_specs = Vec::new();
         let mut watched_dirs = HashSet::new();
+        let mut symlink_paths = HashSet::new();
 
         for (tag, control, paths) in entries {
             let mut provider_paths = HashSet::new();
@@ -64,6 +65,11 @@ impl ProviderFileReloadService {
                 let path = absolute_lexical(&base, &path);
                 if !provider_paths.insert(path.clone()) {
                     continue;
+                }
+                if let Ok(metadata) = std::fs::symlink_metadata(&path)
+                    && metadata.file_type().is_symlink()
+                {
+                    symlink_paths.insert(path.clone());
                 }
                 let parent = path.parent().ok_or_else(|| {
                     DnsError::plugin(format!(
@@ -78,14 +84,22 @@ impl ProviderFileReloadService {
             }
 
             let (tx, rx) = mpsc::channel(1);
-            for path in provider_paths {
-                targets.entry(path).or_default().push(tx.clone());
+            let provider_paths = provider_paths.into_iter().collect::<Vec<_>>();
+            for path in &provider_paths {
+                targets.entry(path.clone()).or_default().push(tx.clone());
             }
-            worker_specs.push((tag, control, rx));
+            worker_specs.push((tag, control, rx, provider_paths));
         }
 
         if targets.is_empty() {
             return Ok(None);
+        }
+
+        for path in symlink_paths {
+            warn!(
+                path = %path.display(),
+                "provider rule source is a symbolic link; target-only changes may not trigger automatic reload, so replace or retarget the link entry itself or reload the provider explicitly"
+            );
         }
 
         let targets = Arc::new(targets);
@@ -104,40 +118,72 @@ impl ProviderFileReloadService {
             }
         };
 
-        let mut active_directories = 0usize;
+        let mut active_directories = HashSet::new();
+        let mut failed_directories = Vec::new();
         for directory in &watched_dirs {
             match watcher.watch(directory, RecursiveMode::NonRecursive) {
-                Ok(()) => active_directories += 1,
-                Err(error) => warn!(
-                    directory = %directory.display(),
-                    %error,
-                    "failed to watch provider rule directory; automatic reload is unavailable for files in this directory"
-                ),
+                Ok(()) => {
+                    active_directories.insert(directory.clone());
+                }
+                Err(error) => {
+                    failed_directories.push(directory.clone());
+                    warn!(
+                        directory = %directory.display(),
+                        %error,
+                        "failed to watch provider rule directory; automatic reload is unavailable for files in this directory"
+                    );
+                }
             }
         }
-        if active_directories == 0 {
+        if active_directories.is_empty() {
             warn!("no provider rule directories could be watched; automatic rule reload disabled");
             return Ok(None);
         }
+        if !failed_directories.is_empty() {
+            warn!(
+                configured_directories = watched_dirs.len(),
+                watched_directories = active_directories.len(),
+                failed_directories = failed_directories.len(),
+                "provider file auto-reload started in degraded mode"
+            );
+            debug!(
+                directories = ?failed_directories,
+                "provider file auto-reload directories unavailable"
+            );
+        }
+
+        let active_files = targets
+            .keys()
+            .filter(|path| {
+                path.parent()
+                    .is_some_and(|parent| active_directories.contains(parent))
+            })
+            .count();
 
         let cancel = CancellationToken::new();
         let workers = worker_specs
             .into_iter()
-            .map(|(tag, control, rx)| {
-                tokio::spawn(run_provider_worker(
+            .filter_map(|(tag, control, rx, paths)| {
+                if !has_watched_path(&paths, &active_directories) {
+                    return None;
+                }
+                Some(tokio::spawn(run_provider_worker(
                     tag,
                     control,
                     rx,
                     cancel.child_token(),
                     debounce,
-                ))
+                )))
             })
             .collect::<Vec<_>>();
 
         info!(
-            files = targets.len(),
-            directories = active_directories,
+            configured_files = targets.len(),
+            watched_files = active_files,
+            configured_directories = watched_dirs.len(),
+            directories = active_directories.len(),
             providers = workers.len(),
+            degraded = !failed_directories.is_empty(),
             debounce_ms = debounce.as_millis(),
             "provider file auto-reload started"
         );
@@ -272,6 +318,13 @@ async fn run_provider_worker(
             ),
         }
     }
+}
+
+fn has_watched_path(paths: &[PathBuf], active_directories: &HashSet<PathBuf>) -> bool {
+    paths.iter().any(|path| {
+        path.parent()
+            .is_some_and(|parent| active_directories.contains(parent))
+    })
 }
 
 fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
@@ -446,6 +499,26 @@ mod tests {
             absolute_lexical(base, Path::new("rules/../rules/cn.txt")),
             PathBuf::from("base/rules/cn.txt")
         );
+    }
+
+    #[test]
+    fn provider_worker_requires_at_least_one_watched_directory() {
+        let watched = HashSet::from([PathBuf::from("rules")]);
+        assert!(has_watched_path(
+            &[PathBuf::from("rules/domain.txt")],
+            &watched
+        ));
+        assert!(!has_watched_path(
+            &[PathBuf::from("unavailable/domain.txt")],
+            &watched
+        ));
+        assert!(has_watched_path(
+            &[
+                PathBuf::from("unavailable/domain.txt"),
+                PathBuf::from("rules/domain.txt")
+            ],
+            &watched
+        ));
     }
 
     #[tokio::test]
