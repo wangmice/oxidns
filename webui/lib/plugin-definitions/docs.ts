@@ -89,6 +89,8 @@ export const pluginFieldDocs = {
       "- 类型：`boolean`；必填：否；默认值：协议默认行为\n- 作用：控制 TCP 或 DoT 流水线。\n- 说明：也可直接通过 `tcp+pipeline://` 或 `tls+pipeline://` 在 `addr` 中启用。",
     "upstreams[].enable_http3":
       "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH 是否使用 HTTP/3。\n- 说明：也可直接通过 `h3://` 在 `addr` 中启用。",
+    "upstreams[].use_post":
+      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH/DoH3 请求是否使用 HTTP POST。\n- 说明：\n  - `false` 使用 RFC 8484 GET，请求 DNS wire message 通过 `dns=` 查询参数传输。\n  - `true` 使用 POST，请求体为原始 `application/dns-message` wire message。\n  - DoH URL 中原有固定 query 参数会在 GET/POST 下保留。\n  - UDP、TCP、DoT、DoQ 等非 DoH upstream 忽略此项。",
     "upstreams[].so_mark":
       "- 类型：`integer`；必填：否；默认值：无\n- 作用：设置 Linux `SO_MARK`。",
     "upstreams[].bind_to_device":

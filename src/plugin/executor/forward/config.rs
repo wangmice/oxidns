@@ -147,6 +147,7 @@ pub(super) fn make_default_upstream_config(addr: String) -> UpstreamConfig {
         timeout: None,
         enable_pipeline: None,
         enable_http3: None,
+        use_post: false,
         so_mark: None,
         bind_to_device: None,
     }

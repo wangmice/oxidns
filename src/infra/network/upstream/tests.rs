@@ -137,6 +137,7 @@ fn make_upstream_config(addr: &str) -> UpstreamConfig {
         timeout: None,
         enable_pipeline: None,
         enable_http3: None,
+        use_post: false,
         so_mark: None,
         bind_to_device: None,
     }
@@ -272,6 +273,34 @@ fn test_helper_scheme_h3_forces_http3() {
     let info = clean_connection_info(cfg, "helper scheme should be accepted");
     assert_eq!(info.connection_type, ConnectionType::DoH);
     assert!(info.enable_http3);
+}
+
+#[test]
+fn test_use_post_is_enabled_only_for_doh() {
+    let mut doh = make_upstream_config("https://dns.example.test/dns-query");
+    doh.use_post = true;
+    let doh = clean_connection_info(doh, "DoH use_post should parse");
+    assert!(doh.use_post);
+
+    let mut doh3 = make_upstream_config("h3://dns.example.test/dns-query");
+    doh3.use_post = true;
+    let doh3 = clean_connection_info(doh3, "DoH3 use_post should parse");
+    assert!(doh3.use_post);
+    assert!(doh3.enable_http3);
+
+    let mut udp = make_upstream_config("udp://1.1.1.1:53");
+    udp.use_post = true;
+    let udp = clean_connection_info(udp, "UDP should ignore use_post");
+    assert!(!udp.use_post);
+}
+
+#[test]
+fn test_use_post_defaults_to_false() {
+    let doh = clean_connection_info(
+        make_upstream_config("https://dns.example.test/dns-query"),
+        "DoH default should parse",
+    );
+    assert!(!doh.use_post);
 }
 
 #[test]

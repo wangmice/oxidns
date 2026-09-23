@@ -183,6 +183,69 @@ if (!forwardDefinition || !fallbackDefinition || !httpRequestDefinition) {
   );
 }
 
+describe("forward upstream HTTP method WebUI round-trip", () => {
+  const upstreamsField = forwardDefinition.configSchema.find(
+    (field) => field.key === "upstreams",
+  );
+
+  if (!upstreamsField?.item || upstreamsField.item.type !== "object") {
+    throw new Error("forward upstreams must use an object schema");
+  }
+
+  const usePostField = upstreamsField.item.fields.find(
+    (field) => field.key === "use_post",
+  );
+
+  it("exposes use_post as an advanced switch defaulting to GET", () => {
+    expect(usePostField).toMatchObject({
+      key: "use_post",
+      type: "switch",
+      default: false,
+      advanced: true,
+    });
+  });
+
+  it("loads and serializes use_post without dropping it", () => {
+    const config = {
+      upstreams: [
+        {
+          tag: "quad9_doh",
+          addr: "https://dns10.quad9.net/dns-query",
+          use_post: true,
+        },
+      ],
+    };
+
+    const formValues = createPluginConfigFormValues(
+      forwardDefinition.configSchema,
+      config,
+    );
+    expect(formValues).toMatchObject(config);
+    expect(
+      serializePluginConfigValues(forwardDefinition.configSchema, formValues),
+    ).toEqual(config);
+  });
+
+  it("localizes use_post and attaches field documentation", () => {
+    for (const locale of ["zh-CN", "en-US"] as const) {
+      const localized = getLocalizedPluginKindDefinition("forward", locale);
+      const localizedUpstreams = localized?.configSchema.find(
+        (field) => field.key === "upstreams",
+      );
+      if (!localizedUpstreams?.item || localizedUpstreams.item.type !== "object") {
+        throw new Error("localized forward upstreams must use an object schema");
+      }
+      const field = localizedUpstreams.item.fields.find(
+        (candidate) => candidate.key === "use_post",
+      );
+
+      expect(field?.label).toBeTruthy();
+      expect(field?.description).toBeTruthy();
+      expect(field?.docs).toContain("POST");
+    }
+  });
+});
+
 describe("forward upstream keepalive WebUI round-trip", () => {
   const upstreamsField = forwardDefinition.configSchema.find(
     (field) => field.key === "upstreams",

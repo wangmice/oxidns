@@ -216,6 +216,16 @@ Sends DNS queries to upstreams.
 - Type: `boolean`; Required: no; Default: `false`
 - Purpose: Use HTTP/3 for DoH.
 
+#### `upstreams[].use_post`
+
+- Type: `boolean`; Required: no; Default: `false`
+- Purpose: Select HTTP POST for DoH/DoH3 requests.
+- Behavior:
+  - `false`: uses RFC 8484 GET and carries the DNS wire message in the URL `dns=` parameter.
+  - `true`: uses POST with the raw `application/dns-message` wire message in the request body.
+  - Fixed query parameters configured in the DoH URL are preserved for both GET and POST.
+  - Non-DoH upstreams such as UDP, TCP, DoT, and DoQ ignore this field.
+
 #### `upstreams[].so_mark`
 
 - Type: `integer`; Required: no

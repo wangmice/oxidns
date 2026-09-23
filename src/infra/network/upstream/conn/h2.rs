@@ -26,8 +26,9 @@ use crate::infra::network::metrics::{
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::upstream::conn::doh::{
-    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
-    get_cap_buf_with_context_len, validate_doh_content_type,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request,
+    build_dns_post_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -134,6 +135,7 @@ pub struct H2Connection {
     transport_error_reported: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
+    use_post: bool,
     close_notify: Notify,
     pool_unavailable_notify: PoolUnavailableNotify,
     pool_capacity_notify: PoolCapacityNotify,
@@ -245,11 +247,21 @@ impl H2Connection {
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
 
-        let http_request = build_dns_get_request(
-            self.request_uri.as_str(),
-            body_bytes.as_slice(),
-            Version::HTTP_2,
-        )?;
+        let (http_request, post_body) = if self.use_post {
+            (
+                build_dns_post_request(self.request_uri.as_str(), Version::HTTP_2)?,
+                Some(Bytes::copy_from_slice(body_bytes.as_slice())),
+            )
+        } else {
+            (
+                build_dns_get_request(
+                    self.request_uri.as_str(),
+                    body_bytes.as_slice(),
+                    Version::HTTP_2,
+                )?,
+                None,
+            )
+        };
         drop(body_bytes);
 
         // `ready()` is the authoritative protocol-level backpressure point.
@@ -269,11 +281,8 @@ impl H2Connection {
             },
         };
 
-        // DoH GET carries the DNS payload in the URI, so the request body is
-        // empty. Mark the stream as finished when sending headers,
-        // otherwise some servers will wait for an end-of-stream signal
-        // and never produce a response.
-        let (response_future, _send_stream) = match sender.send_request(http_request, true) {
+        let end_stream = post_body.is_none();
+        let (response_future, mut send_stream) = match sender.send_request(http_request, end_stream) {
             Ok(value) => value,
             Err(error) => match classify_h2_error("H2 send_request error", error) {
                 H2RecvError::Connection(error) => {
@@ -285,6 +294,20 @@ impl H2Connection {
                 H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
             },
         };
+
+        if let Some(post_body) = post_body
+            && let Err(error) = send_stream.send_data(post_body, true)
+        {
+            match classify_h2_error("H2 send_data error", error) {
+                H2RecvError::Connection(error) => {
+                    self.close();
+                    self.report_transport_error(raw_id, &error);
+                    return Err(error);
+                }
+                H2RecvError::Stream(error) => return Err(error),
+                H2RecvError::HttpStatus(_) | H2RecvError::InvalidResponse(_) => unreachable!(),
+            }
+        }
 
         match recv(response_future).await {
             Ok(bytes) => {
@@ -318,6 +341,7 @@ pub struct H2ConnectionBuilder {
     upstream: String,
     socket_options: SocketOptions,
     request_uri: String,
+    use_post: bool,
     insecure_skip_verify: bool,
     socks5: Option<Socks5Opt>,
     keepalive_interval: Option<Duration>,
@@ -336,7 +360,8 @@ impl H2ConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
-            request_uri: build_doh_request_uri(connection_info),
+            request_uri: build_doh_request_uri(connection_info, connection_info.use_post),
+            use_post: connection_info.use_post,
             insecure_skip_verify: connection_info.insecure_skip_verify,
             socks5: connection_info.socks5.clone(),
             keepalive_interval: connection_info.keepalive_interval,
@@ -404,6 +429,7 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
+            use_post: self.use_post,
             close_notify: Notify::new(),
             pool_unavailable_notify: PoolUnavailableNotify::default(),
             pool_capacity_notify: PoolCapacityNotify::default(),
@@ -693,6 +719,22 @@ mod tests {
         assert_eq!(builder.keepalive_interval, Some(Duration::from_secs(5)));
         assert_eq!(builder.socket_options.so_mark(), Some(42));
         assert_eq!(builder.socket_options.bind_to_device(), Some("utun9"));
+    }
+
+    #[test]
+    fn test_builder_new_uses_post_uri_without_dns_parameter() {
+        let mut connection_info =
+            ConnectionInfo::with_addr("https://dns.example.com/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
+        connection_info.use_post = true;
+
+        let builder = H2ConnectionBuilder::new(&connection_info);
+
+        assert!(builder.use_post);
+        assert_eq!(
+            builder.request_uri,
+            "https://dns.example.com/dns-query?token=abc&profile=fast"
+        );
     }
 
     #[test]
