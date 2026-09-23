@@ -473,6 +473,7 @@ export const enUSPluginDefined = {
           forward_success_total: "Successful forwards",
           forward_error_total: "Forward failures",
           forward_timeout_total: "Forward timeouts",
+          forward_incomplete_alias_selected_total: "Incomplete CNAME fallback selections",
           forward_latency_count: "Latency samples",
           forward_latency_sum_ms: "Total latency (ms)",
           forward_upstream_query_total: "Upstream queries",
@@ -491,6 +492,8 @@ export const enUSPluginDefined = {
             "The total number of queries for which the upstream returned an error or could not get a response.",
           forward_timeout_total:
             "The total number of queries that did not receive a response from the upstream due to timeout.",
+          forward_incomplete_alias_selected_total:
+            "Selection-aware concurrent forward queries that chose an incomplete CNAME alias response as the best available result; excludes single-upstream and fastest modes.",
           forward_latency_count:
             "The number of completed queries included in latency statistics.",
           forward_latency_sum_ms:

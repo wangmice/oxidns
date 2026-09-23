@@ -7,6 +7,7 @@ import {
 } from "./dashboard-traffic";
 import {
   formatMetricValue,
+  groupMetricRows,
   parsePrometheusMetrics,
   selectCardMetrics,
   type PluginMetricsMap,
@@ -36,6 +37,29 @@ describe("plugin metric formatting", () => {
     );
 
     expect(unlabeled).toEqual([]);
+  });
+
+  it("localizes the forward incomplete CNAME selection metric", () => {
+    const series = [
+      {
+        name: "forward_incomplete_alias_selected_total",
+        labels: { plugin_tag: "forward_main" },
+        value: 3,
+        kind: "counter" as const,
+        help: "backend fallback help",
+      },
+    ];
+
+    expect(groupMetricRows(series, "zh-CN")[0]).toMatchObject({
+      label: "不完整 CNAME 兜底选择",
+      help:
+        "启用响应选择的并发转发在没有更完整结果时，将不完整 CNAME 别名响应作为最佳可用结果的查询总数；单上游和 fastest 模式不计入。",
+    });
+    expect(groupMetricRows(series, "en-US")[0]).toMatchObject({
+      label: "Incomplete CNAME fallback selections",
+      help:
+        "Selection-aware concurrent forward queries that chose an incomplete CNAME alias response as the best available result; excludes single-upstream and fastest modes.",
+    });
   });
 
   it("formats timestamp gauges as local date-times", () => {
