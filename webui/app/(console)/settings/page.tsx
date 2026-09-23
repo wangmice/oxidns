@@ -11,6 +11,7 @@ import {
   type UpgradeBundle,
 } from "@/lib/update-store";
 import { stringifyOxiDnsConfig, type OxiDnsConfig } from "@/lib/oxidns-config";
+import { applyProviderFileAutoReloadSetting } from "@/lib/runtime-settings";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -433,6 +434,8 @@ export default function SettingsPage() {
   const [backendUrl, setBackendUrl] = useState(serverConfig.url);
   const [workerThreads, setWorkerThreads] = useState("");
   const [providerFileAutoReload, setProviderFileAutoReload] = useState(false);
+  const [providerFileAutoReloadTouched, setProviderFileAutoReloadTouched] =
+    useState(false);
   const [apiListen, setApiListen] = useState("");
   const [apiSslEnabled, setApiSslEnabled] = useState(false);
   const [apiSslCert, setApiSslCert] = useState("");
@@ -481,6 +484,7 @@ export default function SettingsPage() {
 
       setWorkerThreads(String(runtime.worker_threads ?? ""));
       setProviderFileAutoReload(runtime.provider_file_auto_reload === true);
+      setProviderFileAutoReloadTouched(false);
       setApiListen(String(httpObj.listen ?? ""));
       setApiSslEnabled(Boolean(ssl.cert || ssl.key));
       setApiSslCert(String(ssl.cert ?? ""));
@@ -648,20 +652,16 @@ export default function SettingsPage() {
       configModel,
       outboundRenameMap,
     );
-    const nextRuntime: Record<string, unknown> = {
-      ...asRecord(baseConfigModel.runtime),
-    };
+    const nextRuntime = applyProviderFileAutoReloadSetting(
+      asRecord(baseConfigModel.runtime),
+      providerFileAutoReload,
+      providerFileAutoReloadTouched,
+    );
     if (workerThreads.trim()) {
       nextRuntime.worker_threads = Number(workerThreads);
     } else {
       delete nextRuntime.worker_threads;
     }
-    if (providerFileAutoReload) {
-      nextRuntime.provider_file_auto_reload = true;
-    } else {
-      delete nextRuntime.provider_file_auto_reload;
-    }
-
     const nextApi: Record<string, unknown> = {
       ...asRecord(baseConfigModel.api),
     };
@@ -1231,7 +1231,10 @@ export default function SettingsPage() {
                     </div>
                     <Switch
                       checked={providerFileAutoReload}
-                      onCheckedChange={setProviderFileAutoReload}
+                      onCheckedChange={(checked) => {
+                        setProviderFileAutoReload(checked);
+                        setProviderFileAutoReloadTouched(true);
+                      }}
                       aria-label={t(WEBUI.settings.providerFileAutoReload)}
                     />
                   </div>
