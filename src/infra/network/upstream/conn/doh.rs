@@ -239,6 +239,25 @@ pub fn build_dns_get_request(uri: &str, buf: &[u8], version: Version) -> Result<
         .map_err(|e| DnsError::protocol(format!("invalid DoH request URI: {e}")))
 }
 
+/// Build a DoH POST request whose DNS wire message is sent as the HTTP body.
+///
+/// The returned request contains only headers and URI. H2/H3 callers stream
+/// the raw DNS message separately so transport-specific flow control remains
+/// owned by the protocol implementation.
+#[cfg(feature = "_http-client")]
+#[allow(dead_code)]
+#[inline]
+pub fn build_dns_post_request(uri: &str, version: Version) -> Result<Request<()>> {
+    http::Request::builder()
+        .version(version)
+        .header(header::CONTENT_TYPE, DNS_HEADER_VALUE)
+        .header(header::ACCEPT, DNS_HEADER_VALUE)
+        .method(Method::POST)
+        .uri(uri)
+        .body(())
+        .map_err(|e| DnsError::protocol(format!("invalid DoH request URI: {e}")))
+}
+
 /// Extract and pre-allocate response buffer from HTTP response
 ///
 /// Reads the Content-Length header to optimize buffer allocation.
@@ -277,29 +296,26 @@ pub const MAX_DOH_DNS_BODY_SIZE: usize = u16::MAX as usize;
 /// Error bodies are diagnostics only; keep them bounded independently.
 pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 
-/// Build DoH request URI template from connection info
+/// Build the DoH request URI from connection info.
 ///
-/// Constructs the full HTTPS URI for DoH requests, handling non-standard ports.
-/// Configured fixed query parameters are preserved and the returned URI ends
-/// with `dns=` ready for the base64url-encoded DNS message to be appended.
+/// Configured fixed query parameters are preserved for both HTTP methods.
+/// GET returns a URI template ending in `dns=`, ready for the per-query
+/// base64url payload. POST returns only the configured endpoint and fixed
+/// query parameters because the DNS wire message is carried in the body.
 ///
 /// # Arguments
 /// * `connection_info` - Connection configuration with server name, port,
 ///   path, and optional fixed DoH query parameters
-///
-/// # Returns
-/// String containing "https://server:port/path?dns=" (port omitted if 443)
+/// * `use_post` - Whether the request body carries the DNS message
 ///
 /// # Examples
-/// - Standard port: `https://dns.example.com/dns-query?dns=`
-/// - Custom port: `https://dns.example.com:8443/dns-query?dns=`
-/// - Fixed query: `https://dns.example.com/dns-query?token=abc&dns=`
-///
-/// The returned value is an immutable URI template. Per-query capacity for the
-/// Base64 payload is reserved by `build_dns_get_request`.
+/// - GET: `https://dns.example.com/dns-query?dns=`
+/// - GET with fixed query: `https://dns.example.com/dns-query?token=abc&dns=`
+/// - POST: `https://dns.example.com/dns-query`
+/// - POST with fixed query: `https://dns.example.com/dns-query?token=abc`
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
-pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
+pub fn build_doh_request_uri(connection_info: &ConnectionInfo, use_post: bool) -> String {
     let host = doh_uri_host(&connection_info.server_name);
     let mut uri = if connection_info.port != ConnectionType::DoH.default_port() {
         // Include port in URI for non-standard ports. IPv6 literals must be
@@ -315,12 +331,15 @@ pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
 
     match connection_info.doh_query.as_deref() {
         Some(query) if !query.is_empty() => {
-            uri.reserve(query.len() + "?&dns=".len());
+            uri.reserve(query.len() + if use_post { 1 } else { "?&dns=".len() });
             uri.push('?');
             uri.push_str(query);
-            uri.push_str("&dns=");
+            if !use_post {
+                uri.push_str("&dns=");
+            }
         }
-        _ => uri.push_str("?dns="),
+        _ if !use_post => uri.push_str("?dns="),
+        _ => {}
     }
 
     uri
@@ -356,6 +375,24 @@ mod tests {
             "https://dns.example.test/dns-query?dns=AAECAw"
         );
         assert_eq!(request.headers()[header::CONTENT_TYPE], DNS_HEADER_VALUE);
+    }
+
+    #[test]
+    fn test_build_dns_post_request_sets_uri_method_and_headers() {
+        let request = build_dns_post_request(
+            "https://dns.example.test/dns-query?token=abc",
+            Version::HTTP_2,
+        )
+        .expect("valid DoH POST request should build");
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.version(), Version::HTTP_2);
+        assert_eq!(
+            request.uri().to_string(),
+            "https://dns.example.test/dns-query?token=abc"
+        );
+        assert_eq!(request.headers()[header::CONTENT_TYPE], DNS_HEADER_VALUE);
+        assert_eq!(request.headers()[header::ACCEPT], DNS_HEADER_VALUE);
     }
 
     #[test]

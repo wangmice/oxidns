@@ -30,8 +30,9 @@ use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
-    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_doh_request_uri,
-    get_cap_buf_with_context_len, validate_doh_content_type,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request,
+    build_dns_post_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -77,6 +78,7 @@ pub struct H3Connection {
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
+    use_post: bool,
     close_notify: Notify,
     pool_unavailable_notify: PoolUnavailableNotify,
 }
@@ -144,17 +146,32 @@ impl H3Connection {
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
 
-        let http_request = build_dns_get_request(
-            self.request_uri.as_str(),
-            body_bytes.as_slice(),
-            Version::HTTP_3,
-        )?;
+        let (http_request, post_body) = if self.use_post {
+            (
+                build_dns_post_request(self.request_uri.as_str(), Version::HTTP_3)?,
+                Some(Bytes::copy_from_slice(body_bytes.as_slice())),
+            )
+        } else {
+            (
+                build_dns_get_request(
+                    self.request_uri.as_str(),
+                    body_bytes.as_slice(),
+                    Version::HTTP_3,
+                )?,
+                None,
+            )
+        };
         drop(body_bytes);
 
-        self.do_request(http_request, &request).await
+        self.do_request(http_request, post_body, &request).await
     }
 
-    async fn do_request(&self, http_request: Request<()>, request: &Message) -> Result<Message> {
+    async fn do_request(
+        &self,
+        http_request: Request<()>,
+        post_body: Option<Bytes>,
+        request: &Message,
+    ) -> Result<Message> {
         let raw_id = request.id();
         let mut request_stream = match self.sender.clone().send_request(http_request).await {
             Ok(stream) => stream,
@@ -167,6 +184,19 @@ impl H3Connection {
                 H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
             },
         };
+
+        if let Some(post_body) = post_body
+            && let Err(error) = request_stream.send_data(post_body).await
+        {
+            match classify_h3_stream_error("H3 send_data error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            }
+        }
 
         if let Err(error) = request_stream.finish().await {
             match classify_h3_stream_error("H3 finish stream error", error) {
@@ -211,6 +241,7 @@ pub struct H3ConnectionBuilder {
     socket_options: SocketOptions,
     socks5: Option<Socks5Opt>,
     request_uri: String,
+    use_post: bool,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
     keepalive_interval: Option<std::time::Duration>,
@@ -230,7 +261,8 @@ impl H3ConnectionBuilder {
                 connection_info.bind_to_device.clone(),
             ),
             socks5: connection_info.socks5.clone(),
-            request_uri: build_doh_request_uri(connection_info),
+            request_uri: build_doh_request_uri(connection_info, connection_info.use_post),
+            use_post: connection_info.use_post,
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
             keepalive_interval: connection_info.keepalive_interval,
@@ -308,6 +340,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
+            use_post: self.use_post,
             close_notify: Notify::new(),
             pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
@@ -466,6 +499,22 @@ mod tests {
         );
         assert_eq!(builder.socket_options.so_mark(), Some(7));
         assert_eq!(builder.socket_options.bind_to_device(), Some("utun1"));
+    }
+
+    #[test]
+    fn test_builder_new_uses_post_uri_without_dns_parameter() {
+        let mut connection_info =
+            ConnectionInfo::with_addr("h3://dns.example.com/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
+        connection_info.use_post = true;
+
+        let builder = H3ConnectionBuilder::new(&connection_info);
+
+        assert!(builder.use_post);
+        assert_eq!(
+            builder.request_uri,
+            "https://dns.example.com/dns-query?token=abc&profile=fast"
+        );
     }
 
     #[test]

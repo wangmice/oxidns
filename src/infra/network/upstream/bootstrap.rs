@@ -445,6 +445,7 @@ mod tests {
             timeout: None,
             enable_pipeline: None,
             enable_http3: None,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
         };

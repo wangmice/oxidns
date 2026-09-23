@@ -227,6 +227,14 @@ pub struct UpstreamConfig {
     /// Requires the upstream server to support HTTP/3.
     pub enable_http3: Option<bool>,
 
+    /// Use HTTP POST for DNS-over-HTTPS requests.
+    ///
+    /// Defaults to `false`, which uses RFC 8484 GET requests. When enabled,
+    /// DoH over HTTP/2 and HTTP/3 send the DNS wire message as the request
+    /// body. This option is ignored for non-DoH upstream protocols.
+    #[serde(default)]
+    pub use_post: bool,
+
     /// Linux SO_MARK socket option for policy routing
     ///
     /// Sets the mark on outgoing packets, which can be used with
@@ -313,6 +321,9 @@ pub struct ConnectionInfo {
     /// Use HTTP/3 (true) instead of HTTP/2 (false) for DoH
     pub enable_http3: bool,
 
+    /// Use HTTP POST instead of GET for DoH requests.
+    pub use_post: bool,
+
     /// Linux SO_MARK for packet marking (policy routing)
     pub so_mark: Option<u32>,
 
@@ -357,6 +368,7 @@ impl ConnectionInfo {
             raw_addr: addr.to_string(),
             enable_pipeline: None,
             enable_http3: false,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
             max_conns: None,
@@ -398,6 +410,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             timeout,
             enable_pipeline,
             enable_http3,
+            use_post,
             so_mark,
             bind_to_device,
         } = upstream_config;
@@ -413,6 +426,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
         } else {
             enable_http3.unwrap_or(false)
         };
+        let use_post = connection_type == ConnectionType::DoH && use_post;
         let port = config_port
             .or(port)
             .unwrap_or(connection_type.default_port());
@@ -561,6 +575,7 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             raw_addr: addr,
             enable_pipeline,
             enable_http3,
+            use_post,
             so_mark,
             bind_to_device,
             max_conns,

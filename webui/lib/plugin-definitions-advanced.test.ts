@@ -27,6 +27,7 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
     "upstreams[].timeout",
     "upstreams[].enable_pipeline",
     "upstreams[].enable_http3",
+    "upstreams[].use_post",
     "upstreams[].so_mark",
     "upstreams[].bind_to_device",
   ],

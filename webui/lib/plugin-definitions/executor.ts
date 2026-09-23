@@ -286,6 +286,15 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               advanced: true,
             },
             {
+              key: "use_post",
+              description:
+                "DoH/DoH3 使用 HTTP POST 发送 DNS wire message；默认使用 GET。UDP、TCP、DoT、DoQ 等非 DoH 上游忽略此项。",
+              label: "DoH 使用 POST",
+              type: "switch",
+              default: false,
+              advanced: true,
+            },
+            {
               key: "so_mark",
               description: "设置 Linux SO_MARK。",
               label: "SO_MARK",

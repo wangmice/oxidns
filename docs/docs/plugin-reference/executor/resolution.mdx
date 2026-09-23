@@ -257,6 +257,16 @@ import Admonition from "@theme/Admonition";
 - 示例：`enable_http3: true`
 - 说明：也可直接通过 `h3://` 在 `addr` 中启用。
 
+#### `upstreams[].use_post`
+
+- 类型：`boolean`；必填：否；默认值：`false`
+- 作用：控制 DoH/DoH3 是否使用 HTTP POST。
+- 行为：
+  - `false`：使用 RFC 8484 GET，DNS wire message 通过 URL 的 `dns=` 参数传输。
+  - `true`：使用 POST，请求体直接携带 `application/dns-message` wire message。
+  - 配置在 DoH URL 中的固定 query 参数在 GET 和 POST 下都会保留。
+  - UDP、TCP、DoT、DoQ 等非 DoH upstream 会忽略该字段。
+
 #### `upstreams[].so_mark`
 
 - 类型：`integer`；必填：否；默认值：无
