@@ -4,6 +4,7 @@
 //! Protocol-specific upstream connection implementations.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 use std::sync::{Arc, Mutex};
 #[cfg(any(feature = "upstream-doq", feature = "upstream-doh3"))]
 use std::time::Duration;
@@ -34,17 +35,20 @@ pub(crate) use udp::{UdpConnection, UdpConnectionBuilder};
 /// Registration happens once after a multiplexed connection is created. The
 /// mutex is touched only during registration and when the connection becomes
 /// unavailable, never on the query hot path.
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 #[derive(Default)]
 pub(crate) struct PoolUnavailableNotify {
     notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 impl std::fmt::Debug for PoolUnavailableNotify {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PoolUnavailableNotify")
     }
 }
 
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 impl PoolUnavailableNotify {
     pub(crate) fn register(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         *self
@@ -65,6 +69,7 @@ impl PoolUnavailableNotify {
     }
 }
 
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 type NotifyMutex = Mutex<Option<Arc<dyn Fn(u16, u16) + Send + Sync>>>;
 
 /// Cold-path notification bridge for increases in a connection's effective
@@ -74,17 +79,20 @@ type NotifyMutex = Mutex<Option<Arc<dyn Fn(u16, u16) + Send + Sync>>>;
 /// This stays separate from [`PoolUnavailableNotify`] because capacity growth
 /// creates usable query slots, while connection loss only creates replacement
 /// capacity for the pool controller.
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 #[derive(Default)]
 pub(crate) struct PoolCapacityNotify {
     notify: NotifyMutex,
 }
 
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 impl std::fmt::Debug for PoolCapacityNotify {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PoolCapacityNotify")
     }
 }
 
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 impl PoolCapacityNotify {
     pub(crate) fn register(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
         *self

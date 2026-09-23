@@ -432,6 +432,7 @@ pub(crate) fn upstream_timeout(stage: UpstreamTimeoutStage) {
     network_metrics().upstream_timeout_total[stage.as_index()].fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(any(feature = "upstream-doh", test))]
 #[inline]
 pub(crate) fn upstream_keepalive(protocol: NetworkProtocol, result: KeepaliveResult) {
     ensure_registered();

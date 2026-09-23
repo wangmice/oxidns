@@ -145,6 +145,7 @@ include:
 ```yaml
 runtime:
   worker_threads: 4
+  provider_file_auto_reload: true
 ```
 
 字段说明：
@@ -153,6 +154,11 @@ runtime:
   - 含义：Tokio 多线程运行时的 worker 数。
   - 默认：未配置时自动取系统可用并行度。
   - 限制：不能为 `0`。
+- `provider_file_auto_reload`
+  - 含义：是否自动监听文件型 provider 的外部规则文件，并在文件变化后 reload 对应 provider。
+  - 默认：`false`。
+  - 设为 `true` 后支持 `domain_set.files`、`ip_set.files`、`adguard_rule.files`、`geosite.file` 和 `geoip.file`。
+  - 该开关只控制自动文件 watcher；手动 `reload_provider`、管理 API 和 WebUI 的 provider reload 不受影响。
 
 ### `log`
 

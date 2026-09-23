@@ -632,6 +632,7 @@ impl DnsCacheStore {
     }
 
     /// Remove one live entry by key (management API path).
+    #[cfg(any(feature = "api", test))]
     #[inline]
     pub(super) fn remove(&self, key: &CacheKey) -> bool {
         let removed = self.cache_map.remove(key);

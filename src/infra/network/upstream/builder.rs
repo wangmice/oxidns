@@ -247,6 +247,7 @@ pub(crate) const fn pipeline_request_map_capacity() -> u16 {
 /// transport connection (H2/H3/DoQ). Keep this below the generic DNS
 /// pipelining limit so one connection cannot become an oversized failure
 /// domain under bursty refresh traffic.
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
 pub(crate) const MULTIPLEXED_MAX_CONNS_LOAD: u16 = 32;
 
 #[inline]
@@ -288,6 +289,7 @@ pub(crate) fn create_pipeline_pool<C: Connection>(
 /// stream (H2/H3/DoQ). A timeout is stream-local, so the underlying
 /// connection remains reusable unless the connection implementation marks
 /// itself unavailable because of a connection-level failure.
+#[cfg(any(feature = "upstream-doh", feature = "upstream-doq"))]
 pub(crate) fn create_multiplexed_pool<C: Connection>(
     connection_info: ConnectionInfo,
     builder: Box<dyn ConnectionBuilder<C>>,

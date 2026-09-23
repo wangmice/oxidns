@@ -22,7 +22,7 @@ use crate::config::types::PluginConfig;
 use crate::core::rule_matcher::{IpPrefixMatcher, IpRuleFamily};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result as DnsResult};
-use crate::infra::io::{LineClassifier, TextLine, TextLocation, TextSource};
+use crate::infra::io::{LineClassifier, TextLine, TextLocation, TextSource, TextSourceSession};
 use crate::infra::task::spawn_isolated_build;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::provider::Provider;
@@ -61,10 +61,15 @@ pub struct IpSet {
 impl IpSet {
     fn build_local_snapshot(tag: &str, args: &IpSetArgs) -> DnsResult<IpSetSnapshot> {
         let start_ms = AppClock::elapsed_millis();
-        let (local_rules, v4_capacity, v6_capacity) = count_ip_rules(args)?;
+        let classifier = LineClassifier::new(&["#"]);
+        let source = TextSource::new("args.ips", &args.ips, &args.files);
+        let mut session = source
+            .open_replay()
+            .map_err(|error| DnsError::plugin(format!("failed to open IP rules: {error}")))?;
+        let (local_rules, v4_capacity, v6_capacity) = count_ip_rules(&mut session, &classifier)?;
         let mut matcher = IpPrefixMatcher::default();
         matcher.reserve_rules(v4_capacity, v6_capacity);
-        scan_ip_rules(args, |raw, source| {
+        scan_ip_rules(&mut session, &classifier, |raw, source| {
             add_ip_rule_from_source(&mut matcher, raw, source)
         })?;
         matcher.finalize_compact();
@@ -160,6 +165,15 @@ impl Provider for IpSet {
         Ok(())
     }
 
+    fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        self.args
+            .files
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
     fn supports_ip_matching(&self) -> bool {
         true
     }
@@ -214,12 +228,16 @@ impl PluginFactory for IpSetFactory {
     }
 }
 
-fn scan_ip_rules<F>(args: &IpSetArgs, mut on_rule: F) -> DnsResult<()>
+fn scan_ip_rules<F>(
+    session: &mut TextSourceSession<'_>,
+    classifier: &LineClassifier<'_>,
+    mut on_rule: F,
+) -> DnsResult<()>
 where
     F: FnMut(&str, TextLocation<'_>) -> DnsResult<()>,
 {
-    TextSource::new("args.ips", &args.ips, &args.files)
-        .scan(&LineClassifier::new(&["#"]), |line: TextLine<'_>| {
+    session
+        .scan(classifier, |line: TextLine<'_>| {
             if line.annotations().blank || line.annotations().leading_comment.is_some() {
                 return Ok(());
             }
@@ -232,11 +250,14 @@ where
         .map_err(|error| DnsError::plugin(format!("failed to load IP rules: {error}")))
 }
 
-fn count_ip_rules(args: &IpSetArgs) -> DnsResult<(usize, usize, usize)> {
+fn count_ip_rules(
+    session: &mut TextSourceSession<'_>,
+    classifier: &LineClassifier<'_>,
+) -> DnsResult<(usize, usize, usize)> {
     let mut total = 0usize;
     let mut v4 = 0usize;
     let mut v6 = 0usize;
-    scan_ip_rules(args, |raw, source| {
+    scan_ip_rules(session, classifier, |raw, source| {
         total += 1;
         match IpPrefixMatcher::classify_rule(raw).map_err(|error| {
             DnsError::plugin(format!("invalid ip/cidr '{raw}' in {source}: {error}"))

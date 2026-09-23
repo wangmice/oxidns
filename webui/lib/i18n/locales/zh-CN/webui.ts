@@ -944,11 +944,14 @@ export const zhCNWebui = {
     initOrderLabel: "初始化顺序",
     configOkBadge: "配置校验通过",
     runtimeCard: "运行时",
-    runtimeCardDesc: "Tokio 运行时参数（runtime）",
+    runtimeCardDesc: "OxiDNS 运行时参数（runtime）",
     workerThreads: "Worker 线程数",
     workerThreadsDesc:
       "Tokio 多线程运行时的 worker 数，留空自动取系统可用并行度，不能为 0",
     workerThreadsPlaceholder: "留空使用系统默认",
+    providerFileAutoReload: "Provider 文件自动重载",
+    providerFileAutoReloadDesc:
+      "监听文件型 provider 的规则文件并在外部修改后自动重载。默认关闭；此项属于 runtime 设置，保存后需要重启 OxiDNS 才会生效。",
     outboundCard: "出站网络",
     outboundCardDesc:
       "配置 network.outbound profiles，供 HTTP 客户端、升级、下载和上游复用",

@@ -3,6 +3,11 @@
 # See full documentation at:
 # https://oxidns.org
 
+runtime:
+  # Opt in to automatic reloads for file-backed provider rule sources.
+  # Default: false.
+  provider_file_auto_reload: false
+
 log:
   level: info
 

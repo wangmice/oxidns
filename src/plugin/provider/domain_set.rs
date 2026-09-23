@@ -66,8 +66,13 @@ impl DomainSet {
         let start_ms = AppClock::elapsed_millis();
         let mut matcher = DomainRuleMatcher::default();
         let mut local_rules = 0usize;
-        TextSource::new("args.exps", &args.exps, &args.files)
-            .scan(&LineClassifier::new(&["#"]), |line| {
+        let classifier = LineClassifier::new(&["#"]);
+        let source = TextSource::new("args.exps", &args.exps, &args.files);
+        let mut session = source
+            .open_replay()
+            .map_err(|error| DnsError::plugin(format!("failed to open domain rules: {error}")))?;
+        session
+            .scan(&classifier, |line| {
                 if line.annotations().blank || line.annotations().leading_comment.is_some() {
                     return Ok(());
                 }
@@ -75,6 +80,11 @@ impl DomainSet {
                 add_domain_rule_from_source(&mut matcher, line.trimmed(), line.location())
             })
             .map_err(|error| DnsError::plugin(format!("failed to load domain rules: {error}")))?;
+        // A second replay validates that no source changed while the candidate
+        // matcher was being built. Only fully stable input may be published.
+        session
+            .scan(&classifier, |_| Ok::<(), DnsError>(()))
+            .map_err(|error| DnsError::plugin(format!("failed to verify domain rules: {error}")))?;
         matcher.finalize().map_err(DnsError::plugin)?;
 
         let has_domain_rules = matcher.has_rules();
@@ -171,6 +181,15 @@ impl Provider for DomainSet {
         .await?;
         self.snapshot.store(Arc::new(snapshot));
         Ok(())
+    }
+
+    fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        self.args
+            .files
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 
     fn supports_domain_matching(&self) -> bool {

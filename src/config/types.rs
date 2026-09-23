@@ -753,6 +753,11 @@ pub struct RuntimeConfig {
     ///
     /// When omitted, OxiDNS uses the system's available CPU parallelism.
     pub worker_threads: Option<usize>,
+
+    /// Automatically watch file-backed provider sources and reload the
+    /// affected provider after external file changes.
+    #[serde(default)]
+    pub provider_file_auto_reload: bool,
 }
 
 impl RuntimeConfig {
@@ -1000,6 +1005,7 @@ mod tests {
             include: Vec::new(),
             runtime: RuntimeConfig {
                 worker_threads: Some(0),
+                provider_file_auto_reload: false,
             },
             api: ApiConfig::default(),
             log: LogConfig::default(),
@@ -1023,6 +1029,24 @@ mod tests {
             RuntimeConfig::default().effective_worker_threads(),
             expected
         );
+    }
+
+    #[test]
+    fn test_provider_file_auto_reload_defaults_to_disabled() {
+        let runtime: RuntimeConfig =
+            serde_yaml_ng::from_str("{}").expect("runtime config should parse");
+        assert!(!runtime.provider_file_auto_reload);
+    }
+
+    #[test]
+    fn test_provider_file_auto_reload_can_be_enabled() {
+        let runtime: RuntimeConfig = serde_yaml_ng::from_str(
+            r#"
+provider_file_auto_reload: true
+"#,
+        )
+        .expect("runtime config should parse");
+        assert!(runtime.provider_file_auto_reload);
     }
 
     #[test]

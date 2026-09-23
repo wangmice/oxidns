@@ -13,6 +13,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 use std::task::{Context, Poll};
 
 use fast_socks5::client::{Config, Socks5Stream};
@@ -41,6 +42,7 @@ pub(crate) struct Socks5UdpAssociation {
     socket: UdpSocket,
     control_closed: CancellationToken,
     control_shutdown: CancellationToken,
+    #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
     control_recv_waker: Arc<AtomicWaker>,
 }
 
@@ -94,10 +96,12 @@ impl Socks5UdpAssociation {
             socket: udp_socket,
             control_closed,
             control_shutdown,
+            #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
             control_recv_waker,
         })
     }
 
+    #[cfg(any(test, feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
     #[inline]
     pub(crate) fn get_ref(&self) -> &UdpSocket {
         &self.socket
@@ -117,15 +121,18 @@ impl Socks5UdpAssociation {
         self.control_closed.is_cancelled()
     }
 
+    #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
     #[inline]
     pub(crate) fn check_control_open(&self) -> io::Result<()> {
         self.ensure_control_open()
     }
 
+    #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
     pub(crate) fn poll_control_closed_recv(&self, cx: &mut Context<'_>) -> Poll<()> {
         poll_control_closed(&self.control_closed, &self.control_recv_waker, cx)
     }
 
+    #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
     #[inline]
     pub(crate) fn control_closed_token(&self) -> CancellationToken {
         self.control_closed.clone()
@@ -219,6 +226,7 @@ async fn monitor_control_channel(
     }
 }
 
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 fn poll_control_closed(
     control_closed: &CancellationToken,
     waker: &AtomicWaker,

@@ -1610,6 +1610,7 @@ where
     /// Only the key and scalar expiry are copied while the shard read guard is
     /// held. Management/observability callers can then perform filtering or
     /// ordering after releasing the cache shard without retaining value Arcs.
+    #[cfg(feature = "api")]
     pub(crate) fn visit_key_expiry_cloned_by_shard(
         &self,
         mut visitor: impl FnMut(Vec<(K, u64)>) -> bool,
@@ -1994,6 +1995,7 @@ where
         self.state.load().entry_count.load(Ordering::Relaxed)
     }
 
+    #[cfg(feature = "api")]
     #[inline]
     pub(crate) fn state_id(&self) -> u64 {
         self.state.load().state_id

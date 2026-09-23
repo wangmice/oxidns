@@ -176,6 +176,10 @@ impl Provider for GeoIpProvider {
         Ok(())
     }
 
+    fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![std::path::PathBuf::from(&self.args.file)]
+    }
+
     fn supports_ip_matching(&self) -> bool {
         true
     }

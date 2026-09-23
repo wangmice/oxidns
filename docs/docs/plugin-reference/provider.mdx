@@ -9,6 +9,34 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
 
 运行中的 provider 都会注册一个管理接口 `POST /api/plugins/<provider_tag>/reload`，并可通过 `reload_provider` executor 使用启动时同一份配置刷新自身快照，而不会重建其它插件。WebUI 会在 provider 卡片和详情页提供同一能力的“重新加载数据”入口，并区分执行中、成功、失败和 busy 状态。
 
+## 外部规则文件自动重载
+
+自动文件重载默认关闭。需要显式启用：
+
+```yaml
+runtime:
+  provider_file_auto_reload: true
+```
+
+启用后，文件型 provider 会在 runtime 初始化完成后自动监听其规则文件：
+
+- `domain_set.files`
+- `ip_set.files`
+- `adguard_rule.files`
+- `geosite.file`
+- `geoip.file`
+
+监听器以规则文件的父目录为单位进行非递归监听。文件事件采用约 `500ms` trailing debounce，同一 provider 的连续事件会合并；监听建立后还会执行一次 catch-up reload，用于覆盖 provider 初始加载与 watcher 注册之间的启动窗口。
+
+自动 reload 与手动 `reload_provider` 共用同一个串行化 reload 控制。新的 snapshot 只有在完整读取、解析和构建成功后才会发布；如果文件暂时缺失、格式无效或构建失败，当前 snapshot 会继续使用。reload 进行期间再次发生文件变化时，会保留一个后续 reload，不需要查询路径参与轮询。
+
+删除并重新创建**规则文件本身**可以恢复自动 reload，只要其父目录仍然存在并保持被监听。以下情况需要注意：
+
+- 规则文件本身是符号链接时，仅修改链接目标并不保证所有平台都能产生可路由到该配置路径的事件；启动时会输出 warning。替换/重定向链接目录项或显式执行 provider reload 更可靠。
+- 如果被监听的**父目录本身**被删除并重新创建，当前 runtime 不保证自动重新注册 native watch；请执行应用级 reload 或重启。
+- `dynamic_domain_set.path` 是 provider 自己管理和写入的文件，故意不加入自动 watcher，避免自身写入形成反馈循环。
+- matcher 中的直接 `"&file"` 规则在 matcher 构建时读取，不属于 provider 自动 reload；需要自动文件重载时，应把规则文件放入 `domain_set.files` / `ip_set.files` 等 provider 后再通过 `"$tag"` 引用。
+
 运行时只会初始化真正被消费到的 provider。如果某个 provider 没有被任何 `server`、`executor`、`matcher` 直接或间接引用，它会在启动阶段被跳过，不会出现在 runtime registry 中，并会输出一条 warning 日志提示该 provider 未被使用。
 
 ---
