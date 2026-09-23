@@ -30,9 +30,8 @@ use crate::infra::network::proxy::Socks5Opt;
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
-    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request,
-    build_dns_post_request, build_doh_request_uri, get_cap_buf_with_context_len,
-    validate_doh_content_type,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_dns_post_request,
+    build_doh_request_uri, get_cap_buf_with_context_len, validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -261,7 +260,7 @@ impl H3ConnectionBuilder {
                 connection_info.bind_to_device.clone(),
             ),
             socks5: connection_info.socks5.clone(),
-            request_uri: build_doh_request_uri(connection_info, connection_info.use_post),
+            request_uri: build_doh_request_uri(connection_info),
             use_post: connection_info.use_post,
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,

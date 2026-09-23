@@ -56,6 +56,7 @@ fn run_upstream(options: ProbeUpstreamOptions) -> Result<()> {
             timeout: Some(options.timeout),
             enable_pipeline: None,
             enable_http3: None,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
         },
@@ -529,6 +530,7 @@ plugins:
             timeout: Some(Duration::from_secs(1)),
             enable_pipeline: None,
             enable_http3: None,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
         })

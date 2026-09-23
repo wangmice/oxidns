@@ -306,8 +306,6 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 /// # Arguments
 /// * `connection_info` - Connection configuration with server name, port,
 ///   path, and optional fixed DoH query parameters
-/// * `use_post` - Whether the request body carries the DNS message
-///
 /// # Examples
 /// - GET: `https://dns.example.com/dns-query?dns=`
 /// - GET with fixed query: `https://dns.example.com/dns-query?token=abc&dns=`
@@ -315,7 +313,8 @@ pub const MAX_DOH_ERROR_BODY_SIZE: usize = 8 * 1024;
 /// - POST with fixed query: `https://dns.example.com/dns-query?token=abc`
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
-pub fn build_doh_request_uri(connection_info: &ConnectionInfo, use_post: bool) -> String {
+pub fn build_doh_request_uri(connection_info: &ConnectionInfo) -> String {
+    let use_post = connection_info.use_post;
     let host = doh_uri_host(&connection_info.server_name);
     let mut uri = if connection_info.port != ConnectionType::DoH.default_port() {
         // Include port in URI for non-standard ports. IPv6 literals must be
