@@ -284,10 +284,7 @@ impl UdpServerTransport {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, UdpReplyTarget)> {
-        self.socket
-            .recv_from(buf)
-            .await
-            .map_err(|e| DnsError::protocol(format!("Failed to recv_from UDP: {e}")))
+        Ok(self.socket.recv_from(buf).await?)
     }
 
     /// Decode a datagram while reusing a fixed header already parsed from the
