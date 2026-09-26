@@ -9,6 +9,7 @@ use rand::RngExt;
 use tokio::task::JoinSet;
 use tracing::{Level, debug, event_enabled, info};
 
+use super::config::ForwardErrorPolicy;
 use super::metrics::ForwardMetrics;
 use super::selection::{ResponseSelectionMode, SelectedResponse, select_response};
 use super::{contextualize_upstream_error, is_timeout_error};
@@ -33,6 +34,9 @@ pub(super) struct ConcurrentForwarder {
 
     /// Whether to stop the executor chain after a successful upstream response.
     pub(super) short_circuit: bool,
+
+    /// Behavior after all usable upstream attempts fail.
+    pub(super) on_error: ForwardErrorPolicy,
 
     pub(super) response_selection: ResponseSelectionMode,
 
@@ -78,6 +82,9 @@ impl Executor for ConcurrentForwarder {
             error = %err,
             "forward plugin failed across all concurrent upstreams"
         );
+        if self.on_error == ForwardErrorPolicy::Continue {
+            return Ok(ExecStep::Next);
+        }
         Err(DnsError::plugin(format!(
             "forward plugin '{}' failed across all concurrent upstreams: {}",
             self.tag, err
@@ -112,7 +119,7 @@ impl ConcurrentForwarder {
 
         for _ in 0..self.active_concurrent.min(total_upstreams) {
             let upstreams = upstreams.clone();
-            let request  = request.clone();
+            let request = request.clone();
             let next_candidate = next_candidate.clone();
             let metrics = self.metrics.clone();
             join_set.spawn(async move {

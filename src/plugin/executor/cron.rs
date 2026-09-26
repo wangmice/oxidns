@@ -1223,7 +1223,7 @@ jobs:
         let started = Arc::new(Notify::new());
         let started_task = started.clone();
         let task_log = log.clone();
-        let handle = task_center::spawn_fixed(
+        let handle = task_center::spawn_fixed_isolated(
             "cron-destroy-order",
             Duration::from_secs(60),
             TaskOptions::default(),

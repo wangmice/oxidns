@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use super::concurrent::ConcurrentForwarder;
 use super::config::{
-    MAX_CONCURRENT_QUERIES, parse_forward_config, parse_quick_setup_param,
+    ForwardErrorPolicy, MAX_CONCURRENT_QUERIES, parse_forward_config, parse_quick_setup_param,
     resolve_active_concurrent, validate_upstream_addr,
 };
 use super::factory::ForwardFactory;
@@ -236,6 +236,7 @@ async fn concurrent_returns_error_when_all_upstreams_fail() {
             Arc::new(MockUpstream::fail("u2 fail", Duration::ZERO)),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::default(),
         metrics: metrics.clone(),
     };
@@ -250,6 +251,33 @@ async fn concurrent_returns_error_when_all_upstreams_fail() {
     assert!(err.to_string().contains("upstream '1.1.1.1' query failed"));
     assert!(context.response().is_none());
     assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.latency_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn concurrent_on_error_continue_returns_next_without_response() {
+    let metrics = test_metrics();
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: Arc::new(vec![
+            Arc::new(MockUpstream::fail("u1 fail", Duration::ZERO)),
+            Arc::new(MockUpstream::fail("u2 fail", Duration::ZERO)),
+        ]),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Continue,
+        response_selection: ResponseSelectionMode::default(),
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+
+    assert!(matches!(step, ExecStep::Next));
+    assert!(context.response().is_none());
+    assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.success_total.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.latency_count.load(Ordering::Relaxed), 1);
 }
@@ -310,6 +338,33 @@ upstreams:
     .expect("forward config should parse");
 
     assert!(cfg.short_circuit);
+}
+
+#[test]
+fn parse_forward_config_defaults_on_error_to_fail() {
+    let cfg = parse_forward_config(&make_plugin_config(
+        r#"
+upstreams:
+  - addr: "udp://1.1.1.1:53"
+"#,
+    ))
+    .expect("forward config should parse");
+
+    assert_eq!(cfg.on_error, ForwardErrorPolicy::Fail);
+}
+
+#[test]
+fn parse_forward_config_accepts_on_error_continue() {
+    let cfg = parse_forward_config(&make_plugin_config(
+        r#"
+on_error: continue
+upstreams:
+  - addr: "udp://1.1.1.1:53"
+"#,
+    ))
+    .expect("forward config should parse");
+
+    assert_eq!(cfg.on_error, ForwardErrorPolicy::Continue);
 }
 
 #[test]
@@ -391,6 +446,7 @@ async fn concurrent_success_sets_response() {
         active_concurrent: 1,
         upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
     };
@@ -411,6 +467,7 @@ async fn concurrent_skips_temporarily_unavailable_upstream() {
             Arc::new(MockUpstream::ok()),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: test_metrics(),
     };
@@ -433,6 +490,7 @@ async fn concurrent_replaces_attempt_that_enters_cooldown() {
             Arc::new(CoolingFailureUpstream::new(calls.clone())),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: test_metrics(),
     };
@@ -451,6 +509,7 @@ async fn single_success_stops_when_short_circuit_enabled() {
         tag: "forward-test".to_string(),
         upstream: Box::new(MockUpstream::ok()),
         short_circuit: true,
+        on_error: ForwardErrorPolicy::Fail,
         metrics: metrics.clone(),
     };
 
@@ -473,6 +532,7 @@ async fn single_metrics_record_error_and_timeout() {
             Duration::ZERO,
         )),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         metrics: metrics.clone(),
     };
 
@@ -488,12 +548,35 @@ async fn single_metrics_record_error_and_timeout() {
 }
 
 #[tokio::test]
+async fn single_on_error_continue_returns_next_without_response() {
+    let metrics = test_metrics();
+    let forwarder = SingleDnsForwarder {
+        tag: "forward-test".to_string(),
+        upstream: Box::new(MockUpstream::fail("upstream failed", Duration::ZERO)),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Continue,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+
+    assert!(matches!(step, ExecStep::Next));
+    assert!(context.response().is_none());
+    assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.success_total.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.latency_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn single_does_not_classify_for_incomplete_alias_metric() {
     let metrics = test_metrics();
     let forwarder = SingleDnsForwarder {
         tag: "forward-test".to_string(),
         upstream: Box::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         metrics: metrics.clone(),
     };
 
@@ -520,6 +603,7 @@ async fn concurrent_selection_records_selected_incomplete_alias() {
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: metrics.clone(),
     };
@@ -547,6 +631,7 @@ async fn fastest_does_not_classify_for_incomplete_alias_metric() {
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: metrics.clone(),
     };
@@ -570,6 +655,7 @@ async fn concurrent_success_stops_when_short_circuit_enabled() {
         active_concurrent: 1,
         upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: true,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
     };
@@ -593,6 +679,7 @@ async fn concurrent_prefers_noerror_over_early_servfail() {
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
     };
@@ -619,6 +706,7 @@ async fn concurrent_returns_last_non_preferred_rcode_when_no_preferred_response(
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
     };
@@ -642,6 +730,7 @@ async fn fastest_selection_returns_early_nxdomain() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: test_metrics(),
     };
@@ -665,6 +754,7 @@ async fn balanced_selection_waits_briefly_for_positive_after_negative() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
     };
@@ -687,6 +777,7 @@ async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
     };
@@ -712,6 +803,7 @@ async fn balanced_selection_keeps_cname_only_above_negative_fallback() {
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
     };
@@ -735,6 +827,7 @@ async fn prefer_positive_waits_for_late_positive() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
     };
@@ -757,6 +850,7 @@ async fn prefer_positive_waits_for_complete_answer_after_cname_only() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
     };
@@ -782,6 +876,7 @@ async fn prefer_positive_keeps_cname_only_above_negative_fallback() {
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
     };
@@ -809,6 +904,7 @@ async fn consensus_selection_returns_after_two_negative_votes() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
             "forward-test".to_string(),
@@ -842,6 +938,7 @@ async fn consensus_selection_returns_negative_over_incomplete_alias() {
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
             "forward-test".to_string(),
@@ -871,6 +968,7 @@ async fn consensus_selection_waits_when_negative_votes_disagree() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
             "forward-test".to_string(),
@@ -900,6 +998,7 @@ async fn consensus_selection_does_not_count_cname_only_as_negative_vote() {
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
             "forward-test".to_string(),
@@ -928,6 +1027,7 @@ async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
             )),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: test_metrics(),
     };
@@ -953,6 +1053,7 @@ async fn consensus_selection_counts_cname_with_soa_as_nodata() {
             ))),
         ]),
         short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: test_metrics(),
     };

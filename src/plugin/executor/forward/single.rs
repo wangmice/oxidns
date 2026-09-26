@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, info};
 
+use super::config::ForwardErrorPolicy;
 use super::metrics::ForwardMetrics;
 use super::{contextualize_upstream_error, is_timeout_error};
 use crate::core::context::DnsContext;
@@ -30,6 +31,9 @@ pub(super) struct SingleDnsForwarder {
 
     /// Whether to stop the executor chain after a successful upstream response.
     pub(super) short_circuit: bool,
+
+    /// Behavior after the upstream attempt fails.
+    pub(super) on_error: ForwardErrorPolicy,
 
     pub(super) metrics: Arc<ForwardMetrics>,
 }
@@ -80,6 +84,9 @@ impl Executor for SingleDnsForwarder {
                     error = %upstream_error,
                     "DNS query failed"
                 );
+                if self.on_error == ForwardErrorPolicy::Continue {
+                    return Ok(ExecStep::Next);
+                }
                 return Err(DnsError::plugin(format!(
                     "forward plugin '{}' query failed: {}",
                     self.tag, upstream_error
