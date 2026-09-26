@@ -76,7 +76,7 @@ impl PluginFactory for ForwardFactory {
                 ConcurrentForwarder {
                     tag: plugin_config.tag.clone(),
                     active_concurrent,
-                    upstreams,
+                    upstreams: Arc::new(upstreams),
                     short_circuit,
                     response_selection,
                     metrics: Arc::new(ForwardMetrics::new(plugin_config.tag.clone(), names)),
@@ -128,7 +128,7 @@ impl PluginFactory for ForwardFactory {
                         Some(MAX_CONCURRENT_QUERIES),
                         upstreams.len(),
                     ),
-                    upstreams,
+                    upstreams: Arc::new(upstreams),
                     short_circuit,
                     response_selection: ResponseSelectionMode::default(),
                     metrics: Arc::new(ForwardMetrics::new(tag.to_string(), names)),

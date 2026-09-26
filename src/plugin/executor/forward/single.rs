@@ -66,7 +66,9 @@ impl Executor for SingleDnsForwarder {
             Err(e) => {
                 let timeout = is_timeout_error(&e);
                 self.metrics.record_error(start_ms, timeout);
-                self.metrics.record_upstream_error(0, start_ms, timeout);
+                if !e.is_rate_limit_cooldown() {
+                    self.metrics.record_upstream_error(0, start_ms, timeout);
+                }
                 let upstream_error =
                     contextualize_upstream_error(self.upstream.connection_info(), e);
                 debug!(

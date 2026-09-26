@@ -21,6 +21,8 @@ use crate::infra::network::upstream::pool::pipeline::PipelinePool;
 use crate::infra::network::upstream::pool::reuse::ReusePool;
 use crate::infra::network::upstream::pool::{Connection, ConnectionBuilder, QueryTimeoutPolicy};
 use crate::infra::network::upstream::pooled::{PooledUpstream, UdpTruncatedUpstream};
+#[cfg(feature = "upstream-doh")]
+use crate::infra::network::upstream::rate_limit::DohRateLimitedUpstream;
 use crate::infra::network::upstream::traits::Upstream;
 
 /// Builder for creating upstream instances
@@ -32,6 +34,7 @@ impl UpstreamBuilder {
             "Creating upstream: type={:?}, remote={:?}, port={}",
             connection_info.connection_type, connection_info.remote_ip, connection_info.port
         );
+        let rate_limit_doh = connection_info.connection_type == ConnectionType::DoH;
 
         if connection_info.bootstrap.is_none() {
             let upstream: Box<dyn Upstream> = match connection_info.connection_type {
@@ -158,7 +161,7 @@ impl UpstreamBuilder {
                     ));
                 }
             };
-            Ok(upstream)
+            Ok(wrap_doh_rate_limit(upstream, rate_limit_doh))
         } else {
             // Domain-based upstream: use bootstrap or system DNS for resolution
             let upstream: Box<dyn Upstream> = match &connection_info.connection_type {
@@ -226,7 +229,7 @@ impl UpstreamBuilder {
                     ));
                 }
             };
-            Ok(upstream)
+            Ok(wrap_doh_rate_limit(upstream, rate_limit_doh))
         }
     }
 
@@ -236,6 +239,18 @@ impl UpstreamBuilder {
         debug!("create upstream, connection info: {:?}", connection_info);
         Self::with_connection_info(connection_info)
     }
+}
+
+fn wrap_doh_rate_limit(upstream: Box<dyn Upstream>, enabled: bool) -> Box<dyn Upstream> {
+    #[cfg(feature = "upstream-doh")]
+    if enabled {
+        return Box::new(DohRateLimitedUpstream::new(upstream));
+    }
+
+    #[cfg(not(feature = "upstream-doh"))]
+    let _ = enabled;
+
+    upstream
 }
 
 #[inline]

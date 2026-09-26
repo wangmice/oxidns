@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +41,7 @@ struct MockUpstream {
     answer: MockAnswer,
     fail_message: Option<String>,
     delay: Duration,
+    temporary_unavailable_ms: Option<u64>,
 }
 
 impl MockUpstream {
@@ -74,6 +75,7 @@ impl MockUpstream {
             answer: MockAnswer::None,
             fail_message: None,
             delay,
+            temporary_unavailable_ms: None,
         }
     }
 
@@ -85,7 +87,14 @@ impl MockUpstream {
             answer: MockAnswer::None,
             fail_message: Some(msg.to_string()),
             delay,
+            temporary_unavailable_ms: None,
         }
+    }
+
+    fn cooling() -> Self {
+        let mut upstream = Self::ok();
+        upstream.temporary_unavailable_ms = Some(60_000);
+        upstream
     }
 }
 
@@ -147,6 +156,47 @@ impl Upstream for MockUpstream {
     fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
     }
+
+    fn temporary_unavailable_for_ms(&self) -> Option<u64> {
+        self.temporary_unavailable_ms
+    }
+}
+
+#[derive(Debug)]
+struct CoolingFailureUpstream {
+    connection_info: ConnectionInfo,
+    calls: Arc<AtomicUsize>,
+    unavailable: AtomicBool,
+}
+
+impl CoolingFailureUpstream {
+    fn new(calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            connection_info: ConnectionInfo::with_addr("1.1.1.1")
+                .expect("mock upstream addr must be valid"),
+            calls,
+            unavailable: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl Upstream for CoolingFailureUpstream {
+    async fn inner_query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.unavailable.store(true, Ordering::Release);
+            return Err(DnsError::doh_rate_limited(None, "mock 429"));
+        }
+        Ok(request.response(Rcode::NoError))
+    }
+
+    fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
+    }
+
+    fn temporary_unavailable_for_ms(&self) -> Option<u64> {
+        self.unavailable.load(Ordering::Acquire).then_some(60_000)
+    }
 }
 
 fn make_context() -> DnsContext {
@@ -181,10 +231,10 @@ async fn concurrent_returns_error_when_all_upstreams_fail() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::fail("u1 fail", Duration::ZERO)),
             Arc::new(MockUpstream::fail("u2 fail", Duration::ZERO)),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::default(),
         metrics: metrics.clone(),
@@ -339,7 +389,7 @@ async fn concurrent_success_sets_response() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
-        upstreams: vec![Arc::new(MockUpstream::ok())],
+        upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
@@ -349,6 +399,49 @@ async fn concurrent_success_sets_response() {
     let step = forwarder.execute(&mut context).await.unwrap();
     assert!(matches!(step, ExecStep::Next));
     assert!(context.response().is_some());
+}
+
+#[tokio::test]
+async fn concurrent_skips_temporarily_unavailable_upstream() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        upstreams: Arc::new(vec![
+            Arc::new(MockUpstream::cooling()),
+            Arc::new(MockUpstream::ok()),
+        ]),
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics: test_metrics(),
+    };
+
+    for _ in 0..16 {
+        let mut context = make_context();
+        forwarder.execute(&mut context).await.unwrap();
+        assert!(context.response().is_some());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_replaces_attempt_that_enters_cooldown() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        upstreams: Arc::new(vec![
+            Arc::new(CoolingFailureUpstream::new(calls.clone())),
+            Arc::new(CoolingFailureUpstream::new(calls.clone())),
+        ]),
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    forwarder.execute(&mut context).await.unwrap();
+
+    assert!(context.response().is_some());
+    assert_eq!(calls.load(Ordering::Acquire), 2);
 }
 
 #[tokio::test]
@@ -422,10 +515,10 @@ async fn concurrent_selection_records_selected_incomplete_alias() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: metrics.clone(),
@@ -449,10 +542,10 @@ async fn fastest_does_not_classify_for_incomplete_alias_metric() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: metrics.clone(),
@@ -475,7 +568,7 @@ async fn concurrent_success_stops_when_short_circuit_enabled() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
-        upstreams: vec![Arc::new(MockUpstream::ok())],
+        upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: true,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
@@ -492,13 +585,13 @@ async fn concurrent_prefers_noerror_over_early_servfail() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::ServFail, Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NoError,
                 Duration::from_millis(20),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
@@ -518,13 +611,13 @@ async fn concurrent_returns_last_non_preferred_rcode_when_no_preferred_response(
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::ServFail, Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::Refused,
                 Duration::from_millis(20),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::default(),
         metrics: test_metrics(),
@@ -544,10 +637,10 @@ async fn fastest_selection_returns_early_nxdomain() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Fastest,
         metrics: test_metrics(),
@@ -567,10 +660,10 @@ async fn balanced_selection_waits_briefly_for_positive_after_negative() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
@@ -589,10 +682,10 @@ async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
@@ -611,13 +704,13 @@ async fn balanced_selection_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
                 Duration::from_millis(20),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Balanced,
         metrics: test_metrics(),
@@ -637,10 +730,10 @@ async fn prefer_positive_waits_for_late_positive() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
@@ -659,10 +752,10 @@ async fn prefer_positive_waits_for_complete_answer_after_cname_only() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
@@ -681,13 +774,13 @@ async fn prefer_positive_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
                 Duration::from_millis(20),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::PreferPositive,
         metrics: test_metrics(),
@@ -707,14 +800,14 @@ async fn consensus_selection_returns_after_two_negative_votes() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
                 Duration::from_millis(20),
             )),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
@@ -737,7 +830,7 @@ async fn consensus_selection_returns_negative_over_incomplete_alias() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
@@ -747,7 +840,7 @@ async fn consensus_selection_returns_negative_over_incomplete_alias() {
                 Rcode::NXDomain,
                 Duration::from_millis(40),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
@@ -769,14 +862,14 @@ async fn consensus_selection_waits_when_negative_votes_disagree() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NoError,
                 Duration::from_millis(20),
             )),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
@@ -798,14 +891,14 @@ async fn consensus_selection_does_not_count_cname_only_as_negative_vote() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
                 Duration::from_millis(20),
             )),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: Arc::new(ForwardMetrics::new(
@@ -827,13 +920,13 @@ async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
                 Rcode::NXDomain,
                 Duration::from_millis(20),
             )),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: test_metrics(),
@@ -853,12 +946,12 @@ async fn consensus_selection_counts_cname_with_soa_as_nodata() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
-        upstreams: vec![
+        upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_nodata(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_nodata(Duration::from_millis(
                 20,
             ))),
-        ],
+        ]),
         short_circuit: false,
         response_selection: ResponseSelectionMode::Consensus,
         metrics: test_metrics(),

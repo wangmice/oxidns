@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(feature = "_http-client")]
+use std::time::Duration;
+
+#[cfg(feature = "_http-client")]
 use base64::Engine;
 #[cfg(feature = "_http-client")]
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 #[cfg(feature = "_http-client")]
 use bytes::BytesMut;
 #[cfg(feature = "_http-client")]
-use http::header::CONTENT_LENGTH;
+use http::header::{CONTENT_LENGTH, RETRY_AFTER};
 #[cfg(feature = "_http-client")]
 use http::{HeaderMap, HeaderValue, Method, Request, Response, Version, header};
 
@@ -21,6 +24,18 @@ use crate::infra::network::upstream::{ConnectionInfo, ConnectionType};
 #[cfg(feature = "_http-client")]
 #[allow(dead_code)]
 const DNS_HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/dns-message");
+
+/// Parse the numeric delta-seconds form of `Retry-After`.
+///
+/// HTTP-date values fall back to the local exponential backoff so the DoH
+/// error path does not need wall-clock date parsing or another dependency.
+#[cfg(feature = "_http-client")]
+#[inline]
+pub(crate) fn parse_doh_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let seconds = raw.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
 
 /// Validate the media type of a successful DNS-over-HTTPS response.
 ///
@@ -577,5 +592,28 @@ mod tests {
         let result = build_dns_get_request("https://[?dns=", &[0, 1, 2, 3], Version::HTTP_2);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_doh_retry_after_accepts_delta_seconds() {
+        let response = Response::builder()
+            .header(RETRY_AFTER, "17")
+            .body(())
+            .expect("response should build");
+
+        assert_eq!(
+            parse_doh_retry_after(response.headers()),
+            Some(Duration::from_secs(17))
+        );
+    }
+
+    #[test]
+    fn test_parse_doh_retry_after_ignores_http_date() {
+        let response = Response::builder()
+            .header(RETRY_AFTER, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(())
+            .expect("response should build");
+
+        assert_eq!(parse_doh_retry_after(response.headers()), None);
     }
 }

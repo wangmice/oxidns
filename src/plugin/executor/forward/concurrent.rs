@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use rand::RngExt;
@@ -28,7 +29,7 @@ pub(super) struct ConcurrentForwarder {
     /// Fixed active upstream fanout, computed at creation time.
     pub(super) active_concurrent: usize,
 
-    pub(super) upstreams: Vec<Arc<dyn Upstream>>,
+    pub(super) upstreams: Arc<Vec<Arc<dyn Upstream>>>,
 
     /// Whether to stop the executor chain after a successful upstream response.
     pub(super) short_circuit: bool,
@@ -104,49 +105,86 @@ impl ConcurrentForwarder {
         }
 
         let mut join_set = JoinSet::new();
+        let upstreams = self.upstreams.clone();
+        let request = Arc::new(request);
+        let next_candidate = Arc::new(AtomicUsize::new(0));
         let start_idx = rand::rng().random_range(0..total_upstreams);
 
-        for i in 0..self.active_concurrent {
-            let selected_idx = (start_idx + i) % total_upstreams;
-            let upstream = self.upstreams[selected_idx].clone();
-            let message = request.clone();
-            let query_id = message.id();
+        for _ in 0..self.active_concurrent.min(total_upstreams) {
+            let upstreams = upstreams.clone();
+            let request  = request.clone();
+            let next_candidate = next_candidate.clone();
             let metrics = self.metrics.clone();
             join_set.spawn(async move {
-                let up_start = metrics.record_upstream_start(selected_idx);
-                match upstream.query(message).await {
-                    Ok(response) => {
-                        metrics.record_upstream_success(selected_idx, up_start);
-                        if event_enabled!(Level::DEBUG) {
-                            let info = upstream.connection_info();
-                            debug!(
-                                upstream_index = selected_idx,
-                                upstream = %info.raw_addr,
-                                upstream_tag = info.tag.as_deref().unwrap_or(""),
-                                query_id,
-                                "DNS upstream query succeeded"
-                            );
-                        }
-                        Ok(response)
+                let mut last_cooldown_ms = None;
+                let mut last_retry_error = None;
+                loop {
+                    let offset = next_candidate.fetch_add(1, Ordering::Relaxed);
+                    if offset >= upstreams.len() {
+                        return Err(last_retry_error.unwrap_or_else(|| {
+                            DnsError::rate_limit_cooldown(last_cooldown_ms.unwrap_or(1))
+                        }));
                     }
-                    Err(err) => {
-                        metrics.record_upstream_error(
-                            selected_idx,
-                            up_start,
-                            is_timeout_error(&err),
+
+                    let selected_idx = (start_idx + offset) % upstreams.len();
+                    let upstream = upstreams[selected_idx].clone();
+                    if let Some(remaining_ms) = upstream.temporary_unavailable_for_ms() {
+                        last_cooldown_ms = Some(
+                            last_cooldown_ms.map_or(remaining_ms, |old: u64| old.min(remaining_ms)),
                         );
-                        let info = upstream.connection_info();
-                        if event_enabled!(Level::DEBUG) {
-                            debug!(
-                                upstream_index = selected_idx,
-                                upstream = %info.raw_addr,
-                                upstream_tag = info.tag.as_deref().unwrap_or(""),
-                                query_id,
-                                error = %err,
-                                "DNS upstream query failed"
-                            );
+                        continue;
+                    }
+
+                    let query_id = request.id();
+                    let up_start = metrics.record_upstream_start(selected_idx);
+                    match upstream.query(request.as_ref().clone()).await {
+                        Ok(response) => {
+                            metrics.record_upstream_success(selected_idx, up_start);
+                            if event_enabled!(Level::DEBUG) {
+                                let info = upstream.connection_info();
+                                debug!(
+                                    upstream_index = selected_idx,
+                                    upstream = %info.raw_addr,
+                                    upstream_tag = info.tag.as_deref().unwrap_or(""),
+                                    query_id,
+                                    "DNS upstream query succeeded"
+                                );
+                            }
+                            return Ok(response);
                         }
-                        Err(contextualize_upstream_error(info, err))
+                        Err(DnsError::RateLimitCooldown { retry_after_ms }) => {
+                            last_cooldown_ms = Some(
+                                last_cooldown_ms
+                                    .map_or(retry_after_ms, |old: u64| old.min(retry_after_ms)),
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            metrics.record_upstream_error(
+                                selected_idx,
+                                up_start,
+                                is_timeout_error(&err),
+                            );
+                            let info = upstream.connection_info();
+                            if event_enabled!(Level::DEBUG) {
+                                debug!(
+                                    upstream_index = selected_idx,
+                                    upstream = %info.raw_addr,
+                                    upstream_tag = info.tag.as_deref().unwrap_or(""),
+                                    query_id,
+                                    error = %err,
+                                    "DNS upstream query failed"
+                                );
+                            }
+                            let retry_elsewhere = matches!(&err, DnsError::DohRateLimited { .. })
+                                || upstream.temporary_unavailable_for_ms().is_some();
+                            let err = contextualize_upstream_error(info, err);
+                            if retry_elsewhere {
+                                last_retry_error = Some(err);
+                                continue;
+                            }
+                            return Err(err);
+                        }
                     }
                 }
             });
@@ -158,7 +196,7 @@ impl ConcurrentForwarder {
         };
         select_response(
             &mut join_set,
-            self.active_concurrent,
+            self.active_concurrent.min(total_upstreams),
             question,
             self.response_selection,
         )
