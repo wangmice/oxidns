@@ -791,6 +791,44 @@ plugins:
             .handle(test_request(
                 Method::POST,
                 "/config/validate",
+                Bytes::from_static(
+                    br#"
+plugins:
+  - tag: forward_continue
+    type: forward
+    args:
+      on_error: continue
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+                ),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = validate
+            .handle(test_request(
+                Method::POST,
+                "/config/validate",
+                Bytes::from_static(
+                    br#"
+plugins:
+  - tag: forward_invalid_policy
+    type: forward
+    args:
+      on_error: ignore
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+                ),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = validate
+            .handle(test_request(
+                Method::POST,
+                "/config/validate",
                 Bytes::from_static(b"plugins: ["),
             ))
             .await;

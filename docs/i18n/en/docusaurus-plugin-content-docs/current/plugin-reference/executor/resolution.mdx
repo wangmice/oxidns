@@ -22,6 +22,8 @@ Sends DNS queries to upstreams.
     concurrent: 3
     # Concurrent upstream response selection: fastest / balanced / prefer_positive / consensus
     response_selection: balanced
+    # Control flow after all upstreams fail: fail / continue
+    on_error: fail
     upstreams:
       # Simplest UDP upstream
       - tag: "cf_udp"
@@ -85,6 +87,28 @@ Sends DNS queries to upstreams.
   - `prefer_positive`: a complete positive wins immediately. Otherwise, OxiDNS waits for every started upstream and then uses the common fallback order. Consequently, an incomplete alias outranks a single negative when no complete positive exists.
   - `consensus`: one complete positive still wins immediately. `NXDOMAIN` and NODATA are counted separately; two negatives of the same kind can confirm and return a negative early, without requiring identical SOA data or identical wire messages. Fan-out below two falls back to `prefer_positive`. If every upstream finishes without negative consensus, the common fallback order still returns the best available response and may therefore return a single negative. This is a negative-confidence policy, not strict majority voting across all responses.
 
+#### `on_error`
+
+- Type: `string`; Required: no; Default: `fail`
+- Values: `fail`, `continue`
+- Purpose: Controls what `forward` does when every usable upstream fails to produce a DNS response.
+- Behavior:
+  - `fail`: preserves the default behavior. `forward` returns an error, stops the current sequence, and the error continues to bubble through parent sequences unless another executor explicitly catches it.
+  - `continue`: still records `forward_error_total`, timeout metrics, and per-upstream errors, but converts the terminal forwarding failure into `ExecStep::Next` so the current sequence can continue.
+  - `continue` does not create a new DNS response and does not count the failed forwarding attempt as a success. Any response that already existed in the context before `forward` is left unchanged.
+- Typical use: let a primary forwarding path fall through to later matchers and an explicit `fallback` executor after all upstreams time out, fail to connect, or remain in 429 cooldown.
+- `on_error` applies only when no upstream DNS Message is available. DNS Messages such as `SERVFAIL`, `REFUSED`, `NXDOMAIN`, or an incomplete alias are still handled by `response_selection`.
+
+#### DoH / DoH3 HTTP 429 backoff
+
+- A DoH/DoH3 upstream that returns HTTP `429 Too Many Requests` enters an upstream-local cooldown without closing a healthy H2/H3 transport.
+- Local exponential backoff starts at `1s`, then grows through `2s`, `4s`, `8s`, `16s`, and `32s` up to `60s`.
+- Numeric `Retry-After` values are honored and capped at `300s`.
+- While an upstream is cooling, multi-upstream forwarding skips it and fills the lane from other available candidates. A single-upstream forwarder fails fast with the local cooldown error.
+- When cooldown expires, only one half-open probe is admitted. Probe success resets the backoff; another 429 advances the backoff; an ordinary probe failure re-arms the current backoff level.
+- A half-open probe cancelled only because another racing upstream won is not treated as another rate-limit failure; it is rescheduled after a short suppression interval of about `500ms`.
+- Concurrent 429 responses from the same wave are coalesced, and a stale 429 from an older request cannot re-close an upstream after a successful probe.
+
 #### CNAME response handling
 
 - For A/AAAA and other non-CNAME queries, a positive response requires the requested type at the original QNAME or the terminal name of its CNAME chain.
@@ -100,6 +124,7 @@ Sends DNS queries to upstreams.
 - Runtime impact:
   - One upstream means normal forwarding.
   - More than one enables racing behavior.
+  - A DoH/DoH3 upstream in 429 cooldown does not consume an effective query lane; the dispatcher continues with another available upstream.
 
 #### `short_circuit`
 

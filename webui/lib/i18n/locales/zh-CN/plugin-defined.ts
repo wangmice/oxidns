@@ -317,6 +317,14 @@ export const zhCNPluginDefined = {
             consensus: "负向共识",
           },
         },
+        on_error: {
+          label: "失败处理",
+          description: "定义所有可尝试上游都未产生 DNS 响应时的控制流。",
+          options: {
+            fail: "失败并返回错误",
+            continue: "记录失败并继续",
+          },
+        },
         upstreams: {
           label: "上游列表",
           description: "定义一个或多个上游目标。",

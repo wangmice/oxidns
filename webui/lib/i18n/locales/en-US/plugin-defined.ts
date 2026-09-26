@@ -354,6 +354,15 @@ export const enUSPluginDefined = {
             consensus: "Negative consensus",
           },
         },
+        on_error: {
+          label: "Failure handling",
+          description:
+            "Controls what happens when every usable upstream fails to produce a DNS response.",
+          options: {
+            fail: "Fail and return an error",
+            continue: "Record failure and continue",
+          },
+        },
         upstreams: {
           label: "upstream list",
           description: "Define one or more upstream targets.",

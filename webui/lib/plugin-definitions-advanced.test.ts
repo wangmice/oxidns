@@ -14,6 +14,7 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   "executor/forward": [
     "concurrent",
     "response_selection",
+    "on_error",
     "upstreams[].outbound",
     "upstreams[].dial_addr",
     "upstreams[].port",
@@ -211,5 +212,23 @@ describe("plugin advanced field classification", () => {
     );
 
     expect(hiddenRequiredFields).toEqual([]);
+  });
+
+  it("exposes the forward error policy as fail or continue", () => {
+    const forward = pluginKindDefinitions.find(
+      (definition) =>
+        definition.type === "executor" && definition.kind === "forward",
+    );
+    const field = forward?.configSchema.find(
+      (candidate) => candidate.key === "on_error",
+    );
+
+    expect(field?.type).toBe("select");
+    expect(field?.default).toBe("fail");
+    expect(field?.advanced).toBe(true);
+    expect(field?.options).toEqual([
+      { label: "失败并返回错误", value: "fail" },
+      { label: "记录失败并继续", value: "continue" },
+    ]);
   });
 });
