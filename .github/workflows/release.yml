@@ -443,75 +443,75 @@ jobs:
           generate_release_notes: true
           draft: false
 
-      - name: Notify Telegram
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_ANNOUNCEMENTS_THREAD_ID: ${{ secrets.TELEGRAM_ANNOUNCEMENTS_THREAD_ID }}
-          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          : "${TELEGRAM_BOT_TOKEN:?missing TELEGRAM_BOT_TOKEN}"
-          : "${TELEGRAM_CHAT_ID:?missing TELEGRAM_CHAT_ID}"
-          : "${TELEGRAM_ANNOUNCEMENTS_THREAD_ID:?missing TELEGRAM_ANNOUNCEMENTS_THREAD_ID}"
+      # - name: Notify Telegram
+      #   env:
+      #     TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      #     TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      #     TELEGRAM_ANNOUNCEMENTS_THREAD_ID: ${{ secrets.TELEGRAM_ANNOUNCEMENTS_THREAD_ID }}
+      #     RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+      #   run: |
+      #     set -euo pipefail
+      #     : "${TELEGRAM_BOT_TOKEN:?missing TELEGRAM_BOT_TOKEN}"
+      #     : "${TELEGRAM_CHAT_ID:?missing TELEGRAM_CHAT_ID}"
+      #     : "${TELEGRAM_ANNOUNCEMENTS_THREAD_ID:?missing TELEGRAM_ANNOUNCEMENTS_THREAD_ID}"
 
-          RELEASE_NOTES_PATH=".github/release-notes.md"
-          MESSAGE=$(python3 .github/scripts/telegram_release_message.py \
-            "$RELEASE_NOTES_PATH" "$RELEASE_URL")
+      #     RELEASE_NOTES_PATH=".github/release-notes.md"
+      #     MESSAGE=$(python3 .github/scripts/telegram_release_message.py \
+      #       "$RELEASE_NOTES_PATH" "$RELEASE_URL")
 
-          SEND_RESPONSE=$(curl -sS --fail-with-body \
-            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "message_thread_id=${TELEGRAM_ANNOUNCEMENTS_THREAD_ID}" \
-            --data-urlencode "text=${MESSAGE}" \
-            --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "disable_web_page_preview=false")
-          MESSAGE_ID=$(jq -er '.result.message_id' <<<"$SEND_RESPONSE")
+      #     SEND_RESPONSE=$(curl -sS --fail-with-body \
+      #       -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      #       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      #       --data-urlencode "message_thread_id=${TELEGRAM_ANNOUNCEMENTS_THREAD_ID}" \
+      #       --data-urlencode "text=${MESSAGE}" \
+      #       --data-urlencode "parse_mode=HTML" \
+      #       --data-urlencode "disable_web_page_preview=false")
+      #     MESSAGE_ID=$(jq -er '.result.message_id' <<<"$SEND_RESPONSE")
 
-          PIN_RESPONSE=$(curl -sS --fail-with-body \
-            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/pinChatMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "message_id=${MESSAGE_ID}" \
-            --data-urlencode "disable_notification=true")
-          jq -e '.ok == true and .result == true' >/dev/null <<<"$PIN_RESPONSE"
+      #     PIN_RESPONSE=$(curl -sS --fail-with-body \
+      #       -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/pinChatMessage" \
+      #       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      #       --data-urlencode "message_id=${MESSAGE_ID}" \
+      #       --data-urlencode "disable_notification=true")
+      #     jq -e '.ok == true and .result == true' >/dev/null <<<"$PIN_RESPONSE"
 
-  publish-support-crates:
-    name: Publish support crates to crates.io
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    needs: publish
-    steps:
-      - uses: actions/checkout@v7
+  # publish-support-crates:
+  #   name: Publish support crates to crates.io
+  #   if: startsWith(github.ref, 'refs/tags/')
+  #   runs-on: ubuntu-latest
+  #   needs: publish
+  #   steps:
+  #     - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+  #     - uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish oxidns-proto
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: cargo publish --locked --manifest-path crates/proto/Cargo.toml
+  #     - name: Publish oxidns-proto
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+  #       run: cargo publish --locked --manifest-path crates/proto/Cargo.toml
 
-      - name: Publish oxidns-ripset
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: cargo publish --locked --manifest-path crates/ripset/Cargo.toml
+  #     - name: Publish oxidns-ripset
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+  #       run: cargo publish --locked --manifest-path crates/ripset/Cargo.toml
 
-  publish-crate:
-    name: Publish to crates.io
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    needs: publish-support-crates
-    steps:
-      - uses: actions/checkout@v7
+  # publish-crate:
+  #   name: Publish to crates.io
+  #   if: startsWith(github.ref, 'refs/tags/')
+  #   runs-on: ubuntu-latest
+  #   needs: publish-support-crates
+  #   steps:
+  #     - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+  #     - uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify package
-        run: cargo publish --locked --dry-run
+  #     - name: Verify package
+  #       run: cargo publish --locked --dry-run
 
-      - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: cargo publish --locked
+  #     - name: Publish
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+  #       run: cargo publish --locked
 
   docker:
     name: Publish Docker Images
