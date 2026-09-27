@@ -295,7 +295,12 @@ impl DohRateLimitState {
             }
 
             if is_cooling(word) && next_generation(permit.generation) == current_generation {
-                return self.record_same_wave_rate_limit(current_generation, now, retry_after_ms);
+                return self.record_same_wave_rate_limit(
+                    permit.generation,
+                    current_generation,
+                    now,
+                    retry_after_ms,
+                );
             }
 
             return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
@@ -304,6 +309,7 @@ impl DohRateLimitState {
 
     fn record_same_wave_rate_limit(
         &self,
+        previous_generation: u64,
         generation: u64,
         now: u64,
         retry_after_ms: u64,
@@ -323,7 +329,8 @@ impl DohRateLimitState {
             0
         };
         let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
-        let Some(cooldown_until) = self.extend_cooldown_for_generation(generation, requested_until)
+        let Some(cooldown_until) =
+            self.advance_cooldown_generation(previous_generation, generation, requested_until)
         else {
             self.finish_probe_invalidation(invalidation);
             return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
@@ -667,9 +674,13 @@ impl DohRateLimitState {
         cooldown_matches_generation(cooldown, generation).then_some(cooldown_until_ms(cooldown))
     }
 
-    /// Move deadline ownership forward while preserving the longest already
-    /// published deadline. This is the only normal path that may retag a
-    /// cooldown word across generations.
+    /// Publish or extend the deadline for the current cooling generation.
+    ///
+    /// The caller must name both the immediately previous generation and the
+    /// current generation. This lets a same-wave request help finish the
+    /// publication window after another request has already advanced
+    /// `state_word`, while preventing an old writer from retagging a deadline
+    /// after the state has moved on again.
     fn advance_cooldown_generation(
         &self,
         previous_generation: u64,
@@ -677,6 +688,11 @@ impl DohRateLimitState {
         requested_until_ms: u64,
     ) -> Option<u64> {
         loop {
+            let state = self.state_word.load(Ordering::Acquire);
+            if !is_cooling(state) || state_generation(state) != generation {
+                return None;
+            }
+
             let current = self.cooldown_word.load(Ordering::Acquire);
             if cooldown_matches_generation(current, generation) {
                 let current_until = cooldown_until_ms(current);
@@ -1010,6 +1026,61 @@ mod tests {
         assert!(is_cooling(word));
         assert_eq!(state_generation(word), 1);
         assert_eq!(state_backoff_streak(word), 1);
+    }
+
+    #[test]
+    fn same_wave_retry_after_can_help_publish_first_cooldown() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        let second = state.acquire().expect("second query should be admitted");
+
+        // Deterministically model the first request being paused immediately
+        // after it wins the state transition but before it publishes the
+        // matching cooldown owner/deadline.
+        let expected_word = state.state_word.load(Ordering::Acquire);
+        let previous_generation = state_generation(expected_word);
+        let generation = next_generation(previous_generation);
+        let next_word = pack_state(generation, true, 1);
+        state
+            .state_word
+            .compare_exchange(
+                expected_word,
+                next_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("first request should win the initial cooldown transition");
+
+        let pending_cooldown = state.cooldown_word.load(Ordering::Acquire);
+        assert!(cooldown_matches_generation(
+            pending_cooldown,
+            previous_generation
+        ));
+
+        let before = AppClock::elapsed_millis();
+        let observation = state.record_rate_limit(&second, Some(Duration::from_secs(300)));
+        assert!(!observation.entered_new_cooldown);
+
+        let helped_until = current_cooldown_until(&state);
+        assert!(helped_until >= before.saturating_add(300_000));
+
+        // The original winner now resumes with only its local 100 ms backoff.
+        // Its publication must observe the already-assisted 300 second
+        // deadline rather than replacing it.
+        let winner_until = state
+            .advance_cooldown_generation(
+                previous_generation,
+                generation,
+                before.saturating_add(100),
+            )
+            .expect("original winner should observe completed publication");
+        assert_eq!(winner_until, helped_until);
+
+        let word = state.state_word.load(Ordering::Acquire);
+        assert_eq!(state_generation(word), generation);
+        assert_eq!(state_backoff_streak(word), 1);
+
+        drop(first);
     }
 
     #[test]
