@@ -67,7 +67,8 @@ import Admonition from "@theme/Admonition";
 - 作用：定义多上游模式下的并发查询扇出数。
 - 运行影响：
   - 值越大，多上游竞争越积极，但同时会增加上游请求量。
-  - 该值只决定本次实际启动的上游数量，不会在收到 CNAME-only 响应后自动顺序尝试尚未启动的上游；`concurrent: 1` 保持单次上游选择语义。
+  - 该值决定同时在途的上游查询数量，不会在收到 CNAME-only 响应后为了 response selection 自动顺序尝试尚未启动的上游。
+  - `concurrent: 1` 通常只查询一个随机上游；例外是 DoH/DoH3 429 cooldown/recovery，当前候选因限流不可用时，同一 lane 可以顺序切换到尚未尝试的候选，但同时在途查询仍最多为一个。
   - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。
 
 #### `response_selection`
@@ -75,7 +76,7 @@ import Admonition from "@theme/Admonition";
 - 类型：`string`；必填：否；默认值：`balanced`
 - 取值：`fastest`、`balanced`、`prefer_positive`、`consensus`
 - 作用：定义多上游并发返回不一致时的结果选择策略。
-- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，每次也只随机启动其中一个上游，不会为了 selection 再查询其他上游。
+- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，response selection 本身不会扩大查询数量，只有 429 cooldown/recovery 才可能在同一单 lane 内顺序换用其它候选。
 - 除 `fastest` 外，响应会按原始 Question 分类为：
   - **完整正响应（complete positive）**：请求类型位于原始 QNAME 或其 CNAME 链终点。
   - **不完整别名（incomplete alias）**：存在 CNAME 链，但没有最终请求类型，也没有 SOA 否定证明。

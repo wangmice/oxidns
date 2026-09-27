@@ -66,7 +66,8 @@ Sends DNS queries to upstreams.
 - Type: `integer`; Required: no; Default: `1`
 - Runtime range is clamped to `1..=32` and never exceeds the upstream count.
 - Purpose: Number of concurrent upstream fan-out requests.
-- This is the number of upstreams actually started for one request. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response, so `concurrent: 1` retains single-attempt selection semantics.
+- This controls how many upstream queries may be in flight at once. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response for response selection.
+- `concurrent: 1` normally queries one randomly selected upstream. The exception is DoH/DoH3 429 cooldown/recovery: if the current candidate is rate-limited or locally unavailable, the same lane may move sequentially to an untried candidate while keeping at most one query in flight.
 - Recommendation: use `2..=8` for routine racing; higher values are intended for short-term observation or explicit multi-protocol racing.
 
 #### `response_selection`
@@ -74,7 +75,7 @@ Sends DNS queries to upstreams.
 - Type: `string`; Required: no; Default: `balanced`
 - Values: `fastest`, `balanced`, `prefer_positive`, `consensus`
 - Purpose: Selects the winning response when concurrent upstreams return different results.
-- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, each request still starts only one randomly selected upstream; selection does not query additional upstreams.
+- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, response selection itself does not increase query fan-out; only 429 cooldown/recovery may move the single lane sequentially to another candidate.
 - Except in `fastest` mode, every response is classified against the original Question as:
   - **Complete positive**: the requested type exists at the original QNAME or its CNAME-chain terminal.
   - **Incomplete alias**: a CNAME chain exists, but neither the final requested type nor an SOA denial is present.

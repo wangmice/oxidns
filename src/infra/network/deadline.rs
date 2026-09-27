@@ -79,6 +79,20 @@ impl QueryDeadline {
         }
     }
 
+    /// Rebase the total timeout on this deadline's original start time.
+    ///
+    /// Unlike [`Self::capped`], this does not read the clock again. It is used
+    /// when a retry path discovers a larger lane-wide budget after the first
+    /// attempt has already started, while keeping that budget anchored to the
+    /// original attempt rather than granting a fresh timeout.
+    pub(crate) fn with_total_timeout(self, timeout: Duration) -> Self {
+        let timeout_ms = duration_millis_u64(timeout);
+        Self {
+            expires_at_ms: self.started_at_ms.saturating_add(timeout_ms),
+            ..self
+        }
+    }
+
     pub fn remaining(&self) -> Option<Duration> {
         let now = AppClock::elapsed_millis();
         if now >= self.expires_at_ms {
@@ -234,6 +248,19 @@ mod tests {
         assert_eq!(
             background_capped.timeout_metric_scope,
             TimeoutMetricScope::None
+        );
+    }
+
+    #[test]
+    fn total_timeout_remains_anchored_to_original_start() {
+        AppClock::start();
+        let original = QueryDeadline::new(Duration::from_secs(1));
+        let extended = original.with_total_timeout(Duration::from_secs(5));
+
+        assert_eq!(extended.started_at_ms, original.started_at_ms);
+        assert_eq!(
+            extended.expires_at_ms,
+            original.started_at_ms.saturating_add(5_000)
         );
     }
 

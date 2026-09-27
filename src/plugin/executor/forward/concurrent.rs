@@ -299,7 +299,7 @@ impl ConcurrentForwarder {
     }
 }
 
-async fn query_retry_lane<F>(
+pub(super) async fn query_retry_lane<F>(
     upstreams: &[Arc<dyn Upstream>],
     request: &Message,
     mut next_candidate: F,
@@ -315,6 +315,9 @@ where
     // lane. Later 429 replacements share that absolute deadline instead of
     // receiving a fresh full timeout.
     let mut lane_deadline: Option<(QueryDeadline, Duration)> = None;
+    // Compute the order-independent retry budget only after a replacement is
+    // actually needed, keeping the healthy path free of an O(n) timeout scan.
+    let mut retry_budget = None;
     let query_id = request.id();
 
     loop {
@@ -407,6 +410,20 @@ where
                     || upstream.temporary_unavailable_for_ms().is_some();
                 let err = contextualize_upstream_error(info, err);
                 if retry_elsewhere {
+                    let total_budget = *retry_budget.get_or_insert_with(|| {
+                        upstreams
+                            .iter()
+                            .map(|candidate| candidate.timeout())
+                            .max()
+                            .unwrap_or(upstream_timeout)
+                    });
+                    if let Some((deadline, current_budget)) = lane_deadline
+                        && total_budget > current_budget
+                    {
+                        lane_deadline =
+                            Some((deadline.with_total_timeout(total_budget), total_budget));
+                    }
+
                     // A candidate-specific timeout may be shorter than the
                     // lane budget. Continue only while the original lane
                     // deadline still has time remaining.

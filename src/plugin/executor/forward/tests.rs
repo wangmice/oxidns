@@ -684,6 +684,59 @@ async fn concurrent_retry_reuses_first_attempt_deadline_budget() {
 }
 
 #[tokio::test]
+async fn concurrent_retry_budget_is_independent_of_short_first_timeout() {
+    let metrics = test_metrics();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_deadline = Arc::new(AtomicU64::new(0));
+    let second_deadline = Arc::new(AtomicU64::new(0));
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        has_doh_upstream: true,
+        upstreams: Arc::new(vec![
+            Arc::new(DeadlineSequenceUpstream::new(
+                Duration::from_secs(1),
+                calls.clone(),
+                first_deadline.clone(),
+                second_deadline.clone(),
+            )),
+            Arc::new(DeadlineSequenceUpstream::new(
+                Duration::from_secs(10),
+                calls.clone(),
+                first_deadline.clone(),
+                second_deadline.clone(),
+            )),
+        ]),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics,
+    };
+
+    let request = make_context().request;
+    let mut next_candidate = 0_usize;
+    super::concurrent::query_retry_lane(
+        forwarder.upstreams.as_slice(),
+        &request,
+        || {
+            let current = next_candidate;
+            next_candidate += 1;
+            current
+        },
+        0,
+        forwarder.metrics.as_ref(),
+    )
+    .await
+    .expect("longer-timeout fallback should receive the shared retry budget");
+
+    let first = first_deadline.load(Ordering::Acquire);
+    let second = second_deadline.load(Ordering::Acquire);
+    assert_ne!(first, 0);
+    assert_eq!(second.saturating_sub(first), 9_000);
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
 async fn single_success_stops_when_short_circuit_enabled() {
     let metrics = test_metrics();
     let forwarder = SingleDnsForwarder {
