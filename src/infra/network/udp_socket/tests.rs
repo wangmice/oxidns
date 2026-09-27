@@ -206,7 +206,7 @@ async fn closed_client_ports_do_not_interrupt_windows_listeners() {
         ("[::]:0", "[::1]:0", "::1"),
         ("[::]:0", "127.0.0.1:0", "127.0.0.1"),
     ] {
-        let raw = listen::build_udp_socket(listen.parse().unwrap(), |_| {}).unwrap();
+        let raw = listen::build_udp_socket(listen.parse().unwrap(), |_| Ok(())).unwrap();
         let destination = SocketAddr::new(
             destination.parse().unwrap(),
             raw.local_addr().unwrap().port(),
