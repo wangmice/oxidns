@@ -142,7 +142,7 @@ enum ProbePhase {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ProbeInvalidation {
     SuccessCommitting,
-    ActiveInvalidated,
+    ActiveInvalidated { guard_epoch: u64 },
     NoActiveProbe,
 }
 
@@ -175,7 +175,7 @@ impl DohRateLimitState {
         }
         let now = AppClock::elapsed_millis();
         let until = cooldown_until_ms(cooldown);
-        (until > now).then_some(until - now)
+        until.checked_sub(now).filter(|remaining| *remaining != 0)
     }
 
     fn acquire(&self) -> Result<RateLimitPermit<'_>> {
@@ -209,7 +209,7 @@ impl DohRateLimitState {
                 || !cooldown_matches_generation(latest_cooldown, generation)
                 || cooldown_until_ms(latest_cooldown) > now
             {
-                self.release_probe_slot();
+                self.release_probe_slot(probe_epoch);
                 continue;
             }
 
@@ -230,7 +230,7 @@ impl DohRateLimitState {
             || !cooldown_matches_generation(cooldown, permit.generation)
             || cooldown_until_ms(cooldown) > now
         {
-            self.release_probe_slot();
+            self.release_probe_slot(permit.probe_epoch);
             let retry_after_ms = if cooldown_matches_generation(cooldown, permit.generation) {
                 cooldown_until_ms(cooldown).saturating_sub(now).max(1)
             } else {
@@ -325,12 +325,15 @@ impl DohRateLimitState {
         let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
         let Some(cooldown_until) = self.extend_cooldown_for_generation(generation, requested_until)
         else {
+            self.finish_probe_invalidation(invalidation);
             return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
         };
+        self.finish_probe_invalidation(invalidation);
 
         if invalidation == ProbeInvalidation::NoActiveProbe {
             // Catch a probe reservation that raced with the deadline update.
-            let _ = self.invalidate_active_probe();
+            let raced = self.invalidate_active_probe();
+            self.finish_probe_invalidation(raced);
         }
 
         RateLimitObservation {
@@ -492,7 +495,11 @@ impl DohRateLimitState {
 
     fn rearm_cancelled_probe(&self, permit: &RateLimitPermit<'_>) {
         let word = self.state_word.load(Ordering::Acquire);
-        if !is_cooling(word) || permit.generation != state_generation(word) {
+        if !is_cooling(word)
+            || permit.generation != state_generation(word)
+            || self.probe_word.load(Ordering::Acquire)
+                != pack_probe(permit.probe_epoch, ProbePhase::Active)
+        {
             return;
         }
 
@@ -529,12 +536,20 @@ impl DohRateLimitState {
         }
     }
 
-    fn release_probe_slot(&self) {
+    /// Release only the probe slot owned by `epoch`.
+    ///
+    /// A stale permit may run `Drop` after another request has already
+    /// reserved a newer epoch. Matching the epoch makes release idempotent and
+    /// prevents the stale owner from clearing the newer request's slot.
+    fn release_probe_slot(&self, epoch: u64) {
         loop {
             let current = self.probe_word.load(Ordering::Acquire);
+            if probe_epoch(current) != epoch {
+                return;
+            }
             match probe_phase(current) {
                 ProbePhase::Active | ProbePhase::Committing => {
-                    let idle = pack_probe(probe_epoch(current), ProbePhase::Idle);
+                    let idle = pack_probe(epoch, ProbePhase::Idle);
                     if self
                         .probe_word
                         .compare_exchange_weak(current, idle, Ordering::AcqRel, Ordering::Acquire)
@@ -548,14 +563,20 @@ impl DohRateLimitState {
         }
     }
 
+    fn finish_probe_invalidation(&self, invalidation: ProbeInvalidation) {
+        if let ProbeInvalidation::ActiveInvalidated { guard_epoch } = invalidation {
+            self.release_probe_slot(guard_epoch);
+        }
+    }
+
     fn invalidate_active_probe(&self) -> ProbeInvalidation {
         loop {
             let current = self.probe_word.load(Ordering::Acquire);
             match probe_phase(current) {
                 ProbePhase::Committing => return ProbeInvalidation::SuccessCommitting,
                 ProbePhase::Active => {
-                    let invalidated =
-                        pack_probe(next_probe_epoch(probe_epoch(current)), ProbePhase::Active);
+                    let guard_epoch = next_probe_epoch(probe_epoch(current));
+                    let invalidated = pack_probe(guard_epoch, ProbePhase::Active);
                     if self
                         .probe_word
                         .compare_exchange_weak(
@@ -566,7 +587,7 @@ impl DohRateLimitState {
                         )
                         .is_ok()
                     {
-                        return ProbeInvalidation::ActiveInvalidated;
+                        return ProbeInvalidation::ActiveInvalidated { guard_epoch };
                     }
                 }
                 ProbePhase::Idle => return ProbeInvalidation::NoActiveProbe,
@@ -853,7 +874,7 @@ impl Drop for RateLimitPermit<'_> {
         if self.in_flight && !self.completed {
             self.state.rearm_cancelled_probe(self);
         }
-        self.state.release_probe_slot();
+        self.state.release_probe_slot(self.probe_epoch);
     }
 }
 
@@ -989,6 +1010,71 @@ mod tests {
         assert!(is_cooling(word));
         assert_eq!(state_generation(word), 1);
         assert_eq!(state_backoff_streak(word), 1);
+    }
+
+    #[test]
+    fn stale_probe_release_cannot_clear_newer_owner() {
+        let state = state();
+
+        let stale_epoch = state.reserve_probe().expect("first probe should reserve");
+        state.release_probe_slot(stale_epoch);
+
+        let newer_epoch = state.reserve_probe().expect("second probe should reserve");
+        assert_ne!(newer_epoch, stale_epoch);
+        assert_eq!(
+            state.probe_word.load(Ordering::Acquire),
+            pack_probe(newer_epoch, ProbePhase::Active)
+        );
+
+        // Simulate the first permit's delayed Drop. It must not release the
+        // slot currently owned by the newer epoch.
+        state.release_probe_slot(stale_epoch);
+        assert_eq!(
+            state.probe_word.load(Ordering::Acquire),
+            pack_probe(newer_epoch, ProbePhase::Active)
+        );
+
+        state.release_probe_slot(newer_epoch);
+        assert_eq!(
+            probe_phase(state.probe_word.load(Ordering::Acquire)),
+            ProbePhase::Idle
+        );
+    }
+
+    #[test]
+    fn invalidation_guard_is_released_by_invalidator_not_stale_permit() {
+        let state = state();
+        let owner_epoch = state.reserve_probe().expect("probe should reserve");
+
+        let invalidation = state.invalidate_active_probe();
+        let ProbeInvalidation::ActiveInvalidated { guard_epoch } = invalidation else {
+            panic!("active probe should be invalidated");
+        };
+        assert_ne!(guard_epoch, owner_epoch);
+
+        // The stale owner cannot clear the invalidation guard.
+        state.release_probe_slot(owner_epoch);
+        assert_eq!(
+            state.probe_word.load(Ordering::Acquire),
+            pack_probe(guard_epoch, ProbePhase::Active)
+        );
+
+        state.finish_probe_invalidation(invalidation);
+        assert_eq!(
+            probe_phase(state.probe_word.load(Ordering::Acquire)),
+            ProbePhase::Idle
+        );
+    }
+
+    #[test]
+    fn expired_cooldown_status_does_not_underflow() {
+        let state = state();
+        let permit = state.acquire().expect("query should be admitted");
+        state.record_rate_limit(&permit, None);
+        expire_current_cooldown(&state);
+        std::thread::sleep(Duration::from_millis(2));
+
+        assert_eq!(state.temporary_unavailable_for_ms(), None);
     }
 
     #[test]
