@@ -1704,7 +1704,7 @@ where
     /// `Exact` mode may scan the complete cache because callers require a hard
     /// capacity guarantee before publishing a prepared generation. `Periodic`
     /// mode is request-time maintenance and is deliberately bounded: one pass
-    /// samples at most [`PERIODIC_MAINTENANCE_SAMPLE_SIZE`] entries and uses
+    /// samples at most `PERIODIC_MAINTENANCE_SAMPLE_SIZE` entries and uses
     /// that same sample for expired-first cleanup and sampled LRU eviction.
     ///
     /// Returns `(expired_removed, evicted, after_len)`.
