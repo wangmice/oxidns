@@ -149,6 +149,7 @@ enum ProbeInvalidation {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CooldownAdvanceError {
     StateChanged,
+    ProbeSuccessCommitting,
     OwnerMismatch,
 }
 
@@ -353,7 +354,8 @@ impl DohRateLimitState {
                     generation = state_generation(latest);
                     continue;
                 }
-                Err(CooldownAdvanceError::OwnerMismatch) => {
+                Err(CooldownAdvanceError::ProbeSuccessCommitting)
+                | Err(CooldownAdvanceError::OwnerMismatch) => {
                     self.finish_probe_invalidation(invalidation);
                     return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
                 }
@@ -404,16 +406,14 @@ impl DohRateLimitState {
         let published_until =
             match self.advance_cooldown_generation(generation, next_generation, cooldown_until) {
                 Ok(published_until) => published_until,
-                Err(_) => {
-                    // Do not leave state and deadline ownership permanently split if
-                    // publication cannot complete.
-                    let _ = self.state_word.compare_exchange(
-                        next_word,
+                Err(error) => {
+                    return self.handle_cooldown_publish_error(
+                        error,
                         expected_word,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
+                        next_word,
+                        retry_after_ms,
+                        streak_before,
                     );
-                    return None;
                 }
             };
 
@@ -423,6 +423,40 @@ impl DohRateLimitState {
             retry_after_ms,
             backoff_streak,
         })
+    }
+
+    fn handle_cooldown_publish_error(
+        &self,
+        error: CooldownAdvanceError,
+        expected_word: u64,
+        next_word: u64,
+        retry_after_ms: u64,
+        streak_before: u32,
+    ) -> Option<RateLimitObservation> {
+        match error {
+            CooldownAdvanceError::StateChanged | CooldownAdvanceError::ProbeSuccessCommitting => {
+                // Ownership already moved away from this publisher. In
+                // particular, a successful half-open probe publishes the next
+                // cooldown owner before it publishes the next healthy state.
+                // Rolling `next_word` back here would undo that legitimate
+                // transition and can make the outer record loop spin
+                // synchronously until the probe resumes.
+                None
+            }
+            CooldownAdvanceError::OwnerMismatch => {
+                // This is an actual invariant failure, not a legitimate owner
+                // handoff. Restore the state if it still belongs to us, but
+                // stop processing this 429 instead of returning the generic
+                // retry signal and replaying the same transition indefinitely.
+                let _ = self.state_word.compare_exchange(
+                    next_word,
+                    expected_word,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                Some(RateLimitObservation::ignored(retry_after_ms, streak_before))
+            }
+        }
     }
 
     fn reset_after_probe_success(&self, permit: &RateLimitPermit<'_>) -> bool {
@@ -709,6 +743,18 @@ impl DohRateLimitState {
                 let latest_state = self.state_word.load(Ordering::Acquire);
                 if !is_cooling(latest_state) || state_generation(latest_state) != generation {
                     return Err(CooldownAdvanceError::StateChanged);
+                }
+                let probe = self.probe_word.load(Ordering::Acquire);
+                if cooldown_matches_generation(current, next_generation(generation))
+                    && cooldown_until_ms(current) == 0
+                    && probe_phase(probe) == ProbePhase::Committing
+                {
+                    // Probe success is a two-step publication:
+                    // cooldown owner N -> N+1, then state N(cooling) ->
+                    // N+1(healthy). The old cooldown publisher must not treat
+                    // that legitimate transient as corruption and roll state
+                    // back to generation N-1.
+                    return Err(CooldownAdvanceError::ProbeSuccessCommitting);
                 }
                 return Err(CooldownAdvanceError::OwnerMismatch);
             }
@@ -1385,6 +1431,130 @@ mod tests {
             current_cooldown_until(&state) >= before.saturating_add(300_000),
             "429 observed before the generation change must be rebound to the current cooldown"
         );
+    }
+
+    #[test]
+    fn old_publisher_does_not_rollback_probe_success_commit() {
+        let state = state();
+        let old = state.acquire().expect("old query should be admitted");
+        let expected_word = state.state_word.load(Ordering::Acquire);
+        let previous_generation = state_generation(expected_word);
+        let generation = next_generation(previous_generation);
+        let cooling_word = pack_state(generation, true, 1);
+
+        // A wins the first 429 state transition and pauses before publishing
+        // its deadline.
+        state
+            .state_word
+            .compare_exchange(
+                expected_word,
+                cooling_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("old publisher should enter the cooling generation");
+
+        // B assists publication so that the cooldown can expire and admit a
+        // half-open probe while A remains paused.
+        let now = AppClock::elapsed_millis();
+        state
+            .advance_cooldown_generation(previous_generation, generation, now.saturating_add(100))
+            .expect("helper should publish the cooling deadline");
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        assert!(state.try_claim_probe_success(&probe));
+
+        // Pause probe success after it advances deadline ownership but before
+        // it advances state to the next healthy generation.
+        let cooldown = state.cooldown_word.load(Ordering::Acquire);
+        let healthy_generation = next_generation(generation);
+        assert!(state.clear_cooldown_generation(cooldown, generation, healthy_generation));
+        assert_eq!(
+            state.state_word.load(Ordering::Acquire),
+            cooling_word,
+            "probe success has not published healthy state yet"
+        );
+        assert!(cooldown_matches_generation(
+            state.cooldown_word.load(Ordering::Acquire),
+            healthy_generation
+        ));
+        assert_eq!(
+            probe_phase(state.probe_word.load(Ordering::Acquire)),
+            ProbePhase::Committing
+        );
+
+        let publish_error = state
+            .advance_cooldown_generation(previous_generation, generation, now.saturating_add(100))
+            .expect_err("old publisher must recognize the probe-success handoff");
+        assert_eq!(publish_error, CooldownAdvanceError::ProbeSuccessCommitting);
+
+        let result =
+            state.handle_cooldown_publish_error(publish_error, expected_word, cooling_word, 0, 0);
+        assert!(
+            result.is_none(),
+            "legitimate ownership handoff should return the outer retry signal"
+        );
+        assert_eq!(
+            state.state_word.load(Ordering::Acquire),
+            cooling_word,
+            "old publisher must not roll state back while probe success is committing"
+        );
+
+        // This is the outer retry that previously spun synchronously. It must
+        // return immediately even though the probe is still paused in its
+        // committing phase.
+        let stale = state.record_rate_limit(&old, None);
+        assert!(!stale.entered_new_cooldown);
+        assert_eq!(
+            state.state_word.load(Ordering::Acquire),
+            cooling_word,
+            "outer retry must not replay and roll back the old transition"
+        );
+
+        // Finish the probe transition and prove the old publisher no longer
+        // owns anything that can restore generation 0.
+        let healthy_word = pack_state(healthy_generation, false, 0);
+        state
+            .state_word
+            .compare_exchange(
+                cooling_word,
+                healthy_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("probe should publish healthy state");
+        probe.complete();
+        drop(probe);
+        drop(old);
+        assert_eq!(state.state_word.load(Ordering::Acquire), healthy_word);
+    }
+
+    #[test]
+    fn owner_mismatch_rolls_back_once_and_stops_retry_signal() {
+        let state = state();
+        let permit = state.acquire().expect("query should be admitted");
+        let unrelated_generation = 2;
+        state
+            .cooldown_word
+            .store(pack_cooldown(unrelated_generation, 0), Ordering::Release);
+
+        let expected_word = state.state_word.load(Ordering::Acquire);
+        let observation = state
+            .try_enter_cooldown(
+                expected_word,
+                state_generation(expected_word),
+                AppClock::elapsed_millis(),
+                0,
+            )
+            .expect("true owner mismatch must stop the outer retry loop");
+
+        assert!(!observation.entered_new_cooldown);
+        assert_eq!(state.state_word.load(Ordering::Acquire), expected_word);
+        drop(permit);
     }
 
     #[test]
