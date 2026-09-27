@@ -51,6 +51,16 @@ pub trait Upstream: Send + Sync + Debug {
         self.connection_info().connection_type
     }
 
+    /// Remaining local cooldown before this upstream should be attempted.
+    ///
+    /// `None` means the upstream is eligible for a query. Implementations may
+    /// return a small positive duration while a half-open probe is already in
+    /// flight. Healthy implementations should keep this method on a lock-free
+    /// fast path.
+    fn temporary_unavailable_for_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether `inner_query` owns deadline enforcement and timeout cleanup.
     ///
     /// Pool-backed implementations must return `true` so the pool can observe

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, info};
 
+use super::config::ForwardErrorPolicy;
 use super::metrics::ForwardMetrics;
 use super::{contextualize_upstream_error, is_timeout_error};
 use crate::core::context::DnsContext;
@@ -30,6 +31,9 @@ pub(super) struct SingleDnsForwarder {
 
     /// Whether to stop the executor chain after a successful upstream response.
     pub(super) short_circuit: bool,
+
+    /// Behavior after the upstream attempt fails.
+    pub(super) on_error: ForwardErrorPolicy,
 
     pub(super) metrics: Arc<ForwardMetrics>,
 }
@@ -56,17 +60,21 @@ impl Executor for SingleDnsForwarder {
     #[hotpath::measure]
     async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
         let start_ms = self.metrics.record_query_start();
-        self.metrics.record_upstream_start(0);
+        let up_start = self.metrics.record_upstream_start(0);
         match self.upstream.query(context.request.clone()).await {
             Ok(res) => {
                 context.set_response(res);
                 self.metrics.record_success(start_ms);
-                self.metrics.record_upstream_success(0, start_ms);
+                self.metrics.record_upstream_success(0, up_start);
             }
             Err(e) => {
                 let timeout = is_timeout_error(&e);
                 self.metrics.record_error(start_ms, timeout);
-                self.metrics.record_upstream_error(0, start_ms, timeout);
+                if e.is_rate_limit_cooldown() {
+                    self.metrics.cancel_upstream_start(0);
+                } else {
+                    self.metrics.record_upstream_error(0, up_start, timeout);
+                }
                 let upstream_error =
                     contextualize_upstream_error(self.upstream.connection_info(), e);
                 debug!(
@@ -78,6 +86,9 @@ impl Executor for SingleDnsForwarder {
                     error = %upstream_error,
                     "DNS query failed"
                 );
+                if self.on_error == ForwardErrorPolicy::Continue {
+                    return Ok(ExecStep::Next);
+                }
                 return Err(DnsError::plugin(format!(
                     "forward plugin '{}' query failed: {}",
                     self.tag, upstream_error

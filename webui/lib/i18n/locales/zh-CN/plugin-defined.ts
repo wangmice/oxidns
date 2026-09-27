@@ -317,6 +317,14 @@ export const zhCNPluginDefined = {
             consensus: "负向共识",
           },
         },
+        on_error: {
+          label: "失败处理",
+          description: "定义所有可尝试上游都未产生 DNS 响应时的控制流。",
+          options: {
+            fail: "失败并返回错误",
+            continue: "记录失败并继续",
+          },
+        },
         upstreams: {
           label: "上游列表",
           description: "定义一个或多个上游目标。",
@@ -405,6 +413,11 @@ export const zhCNPluginDefined = {
         "upstreams[].enable_http3": {
           label: "启用 HTTP/3",
           description: "控制 DoH 是否使用 HTTP/3。",
+        },
+        "upstreams[].use_post": {
+          label: "DoH 使用 POST",
+          description:
+            "控制 DoH/DoH3 请求是否使用 HTTP POST；UDP、TCP、DoT、DoQ 等非 DoH 上游忽略此项。",
         },
         "upstreams[].so_mark": {
           label: "SO_MARK",

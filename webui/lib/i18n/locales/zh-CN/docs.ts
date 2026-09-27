@@ -53,6 +53,8 @@ export const zhCNDocs = {
       "- 类型：`integer`；必填：否；默认值：`1`\n- 取值范围：实际运行时会限制在 `1..=32`，且不会超过 upstream 数量。\n- 建议范围：`2..=8`；更高值适合高级观测或特殊部署。\n- 作用：定义多上游模式下的并发查询扇出数。\n- 运行影响：\n  - 值越大，多上游竞争越积极，但同时会增加上游请求量。",
     response_selection:
       "- 类型：`string`；必填：否；默认值：`balanced`\n- 可选值：`fastest`、`balanced`、`prefer_positive`、`consensus`\n- 作用：定义并发上游返回多个响应时的选择策略。\n- 运行影响：\n  - `fastest`：第一个成功返回的 DNS 响应胜出。\n  - `balanced`：正向响应立即胜出；负向响应会短暂等待可能的正向响应。\n  - `prefer_positive`：正向响应优先；负向响应需要等待本轮并发完成。\n  - `consensus`：正向响应优先；负向响应需要兼容结果确认。",
+    on_error:
+      "- 类型：`string`；必填：否；默认值：`fail`\n- 可选值：`fail`、`continue`\n- 作用：定义所有可尝试 upstream 都未产生 DNS 响应时的控制流。\n- `fail`：返回错误并终止当前 sequence。\n- `continue`：记录失败 metrics，返回 `Next` 继续当前 sequence，并且不生成新的 response。",
     upstreams:
       "- 类型：`array`；必填：是；默认值：无\n- 作用：定义一个或多个上游目标。\n- 运行影响：\n  - 数组长度为 `1` 时使用单上游模式。\n  - 数组长度大于 `1` 时使用竞争式查询模式。",
     short_circuit:
@@ -89,6 +91,8 @@ export const zhCNDocs = {
       "- 类型：`boolean`；必填：否；默认值：协议默认行为\n- 作用：控制 TCP 或 DoT 流水线。\n- 说明：也可直接通过 `tcp+pipeline://` 或 `tls+pipeline://` 在 `addr` 中启用。",
     "upstreams[].enable_http3":
       "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH 是否使用 HTTP/3。\n- 说明：也可直接通过 `h3://` 在 `addr` 中启用。",
+    "upstreams[].use_post":
+      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH/DoH3 请求是否使用 HTTP POST。\n- `false`：使用 RFC 8484 GET，通过 `dns=` 查询参数传输 DNS wire message。\n- `true`：使用 POST，请求体为原始 `application/dns-message` wire message。\n- DoH URL 中已有的固定 query 参数会继续保留；非 DoH upstream 忽略此项。",
     "upstreams[].so_mark":
       "- 类型：`integer`；必填：否；默认值：无\n- 作用：设置 Linux `SO_MARK`。",
     "upstreams[].bind_to_device":

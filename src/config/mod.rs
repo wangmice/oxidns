@@ -57,6 +57,18 @@ pub fn validate_file(path: &Path) -> Result<ConfigValidationSummary> {
     })
 }
 
+/// Strictly validate an on-disk configuration, including plugin-specific
+/// argument schemas, without constructing runtime plugin resources.
+pub fn validate_file_strict(path: &Path) -> Result<ConfigValidationSummary> {
+    let config = init(path)?;
+    crate::plugin::validate_plugin_configs(&config)?;
+    let dependency_graph = crate::plugin::analyze_configuration(&config)?;
+    Ok(ConfigValidationSummary {
+        plugin_count: config.plugins.len(),
+        dependency_graph,
+    })
+}
+
 /// Validate configuration from YAML text.
 pub fn validate_text(text: &str) -> Result<ConfigValidationSummary> {
     let config = parse_config_text(text)?;
@@ -66,6 +78,24 @@ pub fn validate_text(text: &str) -> Result<ConfigValidationSummary> {
         ));
     }
     config.validate()?;
+    let dependency_graph = crate::plugin::analyze_configuration(&config)?;
+    Ok(ConfigValidationSummary {
+        plugin_count: config.plugins.len(),
+        dependency_graph,
+    })
+}
+
+/// Strictly validate YAML text, including plugin-specific argument schemas,
+/// without constructing runtime plugin resources.
+pub fn validate_text_strict(text: &str) -> Result<ConfigValidationSummary> {
+    let config = parse_config_text(text)?;
+    if !config.include.is_empty() {
+        return Err(DnsError::config(
+            "include is only supported when validating configuration from a file",
+        ));
+    }
+    config.validate()?;
+    crate::plugin::validate_plugin_configs(&config)?;
     let dependency_graph = crate::plugin::analyze_configuration(&config)?;
     Ok(ConfigValidationSummary {
         plugin_count: config.plugins.len(),
@@ -218,6 +248,46 @@ plugins:
         .expect_err("unknown plugin should fail");
 
         assert!(err.to_string().contains("Unknown plugin type"));
+    }
+
+    #[test]
+    fn validate_text_strict_rejects_invalid_forward_args() {
+        let err = validate_text_strict(
+            r#"
+plugins:
+  - tag: forward_invalid_policy
+    type: forward
+    args:
+      on_error: ignore
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+        )
+        .expect_err("invalid forward arguments should fail config validation");
+
+        let message = err.to_string();
+        assert!(message.contains("failed to parse forward plugin config"));
+        assert!(message.contains("ignore"));
+        assert!(message.contains("fail"));
+        assert!(message.contains("continue"));
+    }
+
+    #[test]
+    fn validate_text_keeps_dependency_analysis_permissive_for_plugin_args() {
+        let summary = validate_text(
+            r#"
+plugins:
+  - tag: forward_placeholder
+    type: forward
+"#,
+        )
+        .expect("dependency analysis should allow incomplete plugin args");
+
+        assert_eq!(summary.plugin_count, 1);
+        assert_eq!(
+            summary.dependency_graph.init_order,
+            vec!["forward_placeholder".to_string()]
+        );
     }
 
     #[test]

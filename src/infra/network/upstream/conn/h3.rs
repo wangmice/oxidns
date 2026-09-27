@@ -31,7 +31,8 @@ use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_d
 use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_dns_post_request,
-    build_doh_request_uri, get_cap_buf_with_context_len, validate_doh_content_type,
+    build_doh_request_uri, get_cap_buf_with_context_len, parse_doh_retry_after,
+    validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -396,6 +397,15 @@ async fn recv(
         .map_err(|e| classify_h3_stream_error("H3 response error", e))?;
 
     let status_code = response.status();
+    if status_code == http::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = parse_doh_retry_after(response.headers());
+        request_stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        return Err(H3RecvError::HttpStatus(DnsError::doh_rate_limited(
+            retry_after,
+            "response body skipped after rate-limit headers",
+        )));
+    }
+
     if status_code.is_success() {
         validate_doh_content_type(response.headers()).map_err(H3RecvError::InvalidResponse)?;
     }
@@ -429,7 +439,6 @@ async fn recv(
     if !status_code.is_success() {
         let error_string = String::from_utf8_lossy(response_bytes.as_ref());
         let suffix = if truncated { " (truncated)" } else { "" };
-
         Err(H3RecvError::HttpStatus(DnsError::protocol(format!(
             "http unsuccessful code: {}, message: {}{}",
             status_code, error_string, suffix

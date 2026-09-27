@@ -22,6 +22,8 @@ import Admonition from "@theme/Admonition";
     concurrent: 3
     # 并发上游结果选择模式：fastest / balanced / prefer_positive / consensus
     response_selection: balanced
+    # 全部上游失败后的控制流：fail / continue
+    on_error: fail
     upstreams:
       # 最简单的 UDP 上游
       - tag: "cf_udp"
@@ -65,7 +67,8 @@ import Admonition from "@theme/Admonition";
 - 作用：定义多上游模式下的并发查询扇出数。
 - 运行影响：
   - 值越大，多上游竞争越积极，但同时会增加上游请求量。
-  - 该值只决定本次实际启动的上游数量，不会在收到 CNAME-only 响应后自动顺序尝试尚未启动的上游；`concurrent: 1` 保持单次上游选择语义。
+  - 该值决定同时在途的上游查询数量，不会在收到 CNAME-only 响应后为了 response selection 自动顺序尝试尚未启动的上游。
+  - `concurrent: 1` 通常只查询一个随机上游；例外是 DoH/DoH3 429 cooldown/recovery，当前候选因限流不可用时，同一 lane 可以顺序切换到尚未尝试的候选，但同时在途查询仍最多为一个。
   - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。
 
 #### `response_selection`
@@ -73,7 +76,7 @@ import Admonition from "@theme/Admonition";
 - 类型：`string`；必填：否；默认值：`balanced`
 - 取值：`fastest`、`balanced`、`prefer_positive`、`consensus`
 - 作用：定义多上游并发返回不一致时的结果选择策略。
-- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，每次也只随机启动其中一个上游，不会为了 selection 再查询其他上游。
+- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，response selection 本身不会扩大查询数量，只有 429 cooldown/recovery 才可能在同一单 lane 内顺序换用其它候选。
 - 除 `fastest` 外，响应会按原始 Question 分类为：
   - **完整正响应（complete positive）**：请求类型位于原始 QNAME 或其 CNAME 链终点。
   - **不完整别名（incomplete alias）**：存在 CNAME 链，但没有最终请求类型，也没有 SOA 否定证明。
@@ -85,6 +88,28 @@ import Admonition from "@theme/Admonition";
   - `balanced`：默认模式。完整正响应立即胜出。第一个确定负响应会启动固定 100ms 的 grace window，窗口内仍等待完整正响应；窗口到期或全部上游完成后按上述统一排名选择。不完整别名和其他响应本身不会启动 grace window。
   - `prefer_positive`：完整正响应立即胜出；否则等待所有已启动上游完成，再按统一排名选择。因此在没有完整正响应时，不完整别名会优先于单个负响应。
   - `consensus`：完整正响应仍由一票立即胜出。`NXDOMAIN` 与 NODATA 分开计票，两个同类负响应可提前确认并返回对应负响应；不要求两个负响应的 SOA 或完整报文完全相同。若并发数小于 2，则退化为 `prefer_positive`。如果所有上游结束仍没有负共识，则按统一排名返回最佳可用响应，此时仍可能返回单个负响应；因此该模式是“负向谨慎”，不是严格的全响应多数决。
+
+#### `on_error`
+
+- 类型：`string`；必填：否；默认值：`fail`
+- 取值：`fail`、`continue`
+- 作用：定义所有可尝试 upstream 都未产生 DNS 响应时，`forward` 如何处理最终错误。
+- 行为：
+  - `fail`：保持默认行为，返回错误并终止当前 sequence；未被专门捕获的错误会继续向上级 sequence 传播。
+  - `continue`：仍按失败记录 `forward_error_total`、timeout 和各 upstream error 指标，但不把该失败作为 executor error 向上返回，而是返回 `ExecStep::Next` 继续当前 sequence。
+  - `continue` 不会生成新的 DNS response，也不会把失败计为 success；调用前已经存在于上下文中的 response 不会被主动清除。
+- 典型用途：让主转发链在全部 upstream timeout、连接失败、429 cooldown 等情况下继续执行后续 matcher，并落入显式的 `fallback` executor。
+- `on_error` 只处理“没有任何 upstream DNS Message 可选”的最终失败；如果 upstream 返回了 `SERVFAIL`、`REFUSED`、`NXDOMAIN` 或 incomplete alias，这些仍是 DNS Message，会按 `response_selection` 规则处理。
+
+#### DoH / DoH3 HTTP 429 退避
+
+- DoH/DoH3 upstream 返回 HTTP `429 Too Many Requests` 时，会进入该 upstream 独立的 cooldown，不关闭健康的 H2/H3 transport。
+- 本地指数退避从 `1s` 开始，连续 429 依次增长为 `2s`、`4s`、`8s`、`16s`、`32s`，最高 `60s`。
+- 数字形式的 `Retry-After` 会参与 cooldown，服务器请求的等待时间最高按 `300s` 处理。
+- cooldown 期间，多 upstream forward 会跳过该 upstream，并用其它可用候选补足当前并发 lane；只有一个 upstream 时会快速返回本地 cooldown 错误。
+- cooldown 到期后只允许一个 half-open probe。probe 成功会重置 backoff；再次收到 429 会进入下一档 backoff；probe 的普通失败会重新进入当前档 cooldown。
+- 如果 half-open probe 只是因为 `fastest` 等竞速结果被取消，不会视为新的限流失败，只会短暂抑制约 `500ms` 后允许再次 probe。
+- 同一波并发 429 会合并处理，旧请求迟到的 429 不会在成功 probe 后重新关闭已恢复的 upstream。
 
 #### CNAME 响应处理
 
@@ -101,6 +126,7 @@ import Admonition from "@theme/Admonition";
 - 运行影响：
   - 数组长度为 `1` 时使用单上游模式。
   - 数组长度大于 `1` 时使用竞争式查询模式。
+  - 处于 429 cooldown 的 DoH/DoH3 upstream 不会占用一个有效并发查询 lane；调度器会继续领取其它可用 upstream。
 
 #### `short_circuit`
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
 use h2::client::{ResponseFuture, SendRequest};
-use h2::{Ping, PingPong};
+use h2::{Ping, PingPong, SendStream};
 use http::Version;
 use tokio::select;
 use tokio::sync::Notify;
@@ -27,7 +27,8 @@ use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::upstream::conn::doh::{
     MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_dns_post_request,
-    build_doh_request_uri, get_cap_buf_with_context_len, validate_doh_content_type,
+    build_doh_request_uri, get_cap_buf_with_context_len, parse_doh_retry_after,
+    validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
@@ -309,7 +310,7 @@ impl H2Connection {
             }
         }
 
-        match recv(response_future).await {
+        match recv(response_future, &mut send_stream).await {
             Ok(bytes) => {
                 let mut resp = Message::from_bytes(&bytes)?;
                 validate_dns_response(&request, &resp, DnsResponseIdPolicy::Exact(0))?;
@@ -482,12 +483,24 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
     }
 }
 
-async fn recv(response_future: ResponseFuture) -> std::result::Result<Bytes, H2RecvError> {
+async fn recv(
+    response_future: ResponseFuture,
+    send_stream: &mut SendStream<Bytes>,
+) -> std::result::Result<Bytes, H2RecvError> {
     let response = response_future
         .await
         .map_err(|e| classify_h2_error("H2 response error", e))?;
 
     let status_code = response.status();
+    if status_code == http::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = parse_doh_retry_after(response.headers());
+        send_stream.send_reset(h2::Reason::CANCEL);
+        return Err(H2RecvError::HttpStatus(DnsError::doh_rate_limited(
+            retry_after,
+            "response body skipped after rate-limit headers",
+        )));
+    }
+
     if status_code.is_success() {
         validate_doh_content_type(response.headers()).map_err(H2RecvError::InvalidResponse)?;
     }
@@ -606,14 +619,16 @@ mod tests {
             .uri("https://dns.example.test/dns-query")
             .body(())
             .expect("request should build");
-        let (response_future, _send_stream) = sender
+        let (response_future, mut send_stream) = sender
             .send_request(request, true)
             .expect("request should send");
 
-        let response_bytes =
-            tokio::time::timeout(std::time::Duration::from_secs(2), recv(response_future))
-                .await
-                .expect("response should not stall on the 16-byte H2 receive window");
+        let response_bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recv(response_future, &mut send_stream),
+        )
+        .await
+        .expect("response should not stall on the 16-byte H2 receive window");
         let response_bytes = match response_bytes {
             Ok(bytes) => bytes,
             Err(_) => panic!("response body should be received successfully"),
@@ -663,14 +678,82 @@ mod tests {
             .uri("https://dns.example.test/dns-query")
             .body(())
             .expect("request should build");
-        let (response_future, _send_stream) = sender
+        let (response_future, mut send_stream) = sender
             .send_request(request, true)
             .expect("request should send");
 
-        match recv(response_future).await {
+        match recv(response_future, &mut send_stream).await {
             Err(H2RecvError::Stream(_)) => {}
             Err(_) => panic!("RST_STREAM must remain stream-local"),
             Ok(_) => panic!("RST_STREAM must fail the request"),
+        }
+
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn recv_returns_429_without_waiting_for_response_body() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let Some(Ok((_request, mut respond))) = connection.accept().await else {
+                panic!("server should receive one request");
+            };
+
+            let response = http::Response::builder()
+                .status(http::StatusCode::TOO_MANY_REQUESTS)
+                .header(http::header::RETRY_AFTER, "7")
+                .body(())
+                .expect("response should build");
+            let _open_body = respond
+                .send_response(response, false)
+                .expect("429 headers should send");
+
+            while let Some(result) = connection.accept().await {
+                if let Err(error) = result {
+                    panic!("server connection failed: {error}");
+                }
+            }
+        });
+
+        let (mut sender, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        sender = sender
+            .ready()
+            .await
+            .expect("client sender should become ready");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://dns.example.test/dns-query")
+            .body(())
+            .expect("request should build");
+        let (response_future, mut send_stream) = sender
+            .send_request(request, true)
+            .expect("request should send");
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(250),
+            recv(response_future, &mut send_stream),
+        )
+        .await
+        .expect("429 headers should be returned without waiting for body EOF")
+        .expect_err("429 must be returned as an HTTP status error");
+
+        match error {
+            H2RecvError::HttpStatus(DnsError::DohRateLimited { retry_after, .. }) => {
+                assert_eq!(retry_after, Some(Duration::from_secs(7)));
+            }
+            _ => panic!("expected structured 429 response"),
         }
 
         drop(sender);

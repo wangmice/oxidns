@@ -15,6 +15,8 @@ mod conn;
 mod pool;
 mod pooled;
 pub mod probe;
+#[cfg(feature = "upstream-doh")]
+mod rate_limit;
 mod traits;
 
 pub use builder::UpstreamBuilder;

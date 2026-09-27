@@ -82,6 +82,10 @@ Request body requirements:
 * Non-empty UTF-8 YAML text; or
 * JSON: `{"format":"yaml","content":"...yaml..."}`
 
+`forward` accepts `on_error: fail | continue` through the same full-YAML configuration path as its other arguments. `POST /api/config/validate` validates the field, and `PUT /api/config` performs the same validation before saving by default. The API preserves the field verbatim in the YAML content.
+
+For example, `on_error: continue` lets a primary `forward` whose upstreams all fail return control to the sequence so later matchers or an explicit `fallback` executor can take over, while the forwarding failure is still recorded in metrics.
+
 Good fit:
 
 * Validate a config in the control plane before writing it to disk.

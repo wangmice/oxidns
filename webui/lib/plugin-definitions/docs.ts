@@ -50,9 +50,11 @@ export const pluginFieldDocs = {
   },
   forward: {
     concurrent:
-      "- 类型：`integer`；必填：否；默认值：`1`\n- 取值范围：实际运行时会限制在 `1..=32`，且不会超过上游数量。\n- 作用：定义多上游模式下的并发查询扇出数。\n- 运行影响：\n  - 值越大，多上游竞争越积极，但同时会增加上游请求量。\n  - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。",
+      "- 类型：`integer`；必填：否；默认值：`1`\n- 取值范围：实际运行时会限制在 `1..=32`，且不会超过上游数量。\n- 作用：定义多上游模式下同时在途的查询数量。\n- 运行影响：\n  - 值越大，多上游竞争越积极，但同时会增加上游请求量。\n  - `concurrent: 1` 通常只查询一个随机上游；DoH/DoH3 429 cooldown/recovery 时，同一 lane 可顺序切换到尚未尝试的候选，但仍最多只有一个查询在途。\n  - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。",
     response_selection:
       "- 类型：`string`；必填：否；默认值：`balanced`\n- 可选值：`fastest`、`balanced`、`prefer_positive`、`consensus`\n- 作用：定义多上游并发返回不一致时的结果选择策略。\n- 模式说明：\n  - `fastest`：第一个成功返回的 DNS 响应胜出，传输错误不会胜出。\n  - `balanced`：默认模式，正向答案立即胜出，负向答案会短暂等待。\n  - `prefer_positive`：正向答案立即胜出，负向答案等待已发起的并发上游全部结束。\n  - `consensus`：正向答案立即胜出，负向答案需要两个上游确认。",
+    on_error:
+      "- 类型：`string`；必填：否；默认值：`fail`\n- 可选值：`fail`、`continue`\n- 作用：定义所有可尝试 upstream 都未产生 DNS 响应时的控制流。\n- `fail`：返回错误并终止当前 sequence，错误继续向上级调用链传播。\n- `continue`：保留失败 metrics，但返回 `Next` 继续当前 sequence，不生成新的 response。\n- 典型用途：让主 forward 失败后继续执行后续 matcher，并落入显式 `fallback` executor。",
     upstreams:
       "- 类型：`array`；必填：是；默认值：无\n- 作用：定义一个或多个上游目标。\n- 运行影响：\n  - 数组长度为 `1` 时使用单上游模式。\n  - 数组长度大于 `1` 时使用竞争式查询模式。",
     short_circuit:

@@ -56,6 +56,8 @@ export const enUSDocs = {
       "- Type: `integer`; required: no; default value: `1`\n- Value range: clamped to `1..=32` during actual operation, and never above the upstream count.\n- Recommended range: `2..=8`; higher values are intended for advanced observation or special deployments.\n- Function: Define the number of concurrent query fanouts in multi-upstream mode.\n- Operational impact:\n  - The larger the value, the more active the multi-upstream competition will be, but at the same time it will increase the amount of upstream requests.",
     response_selection:
       "- Type: `string`; Required: No; Default: `balanced`\n- Supported values: `fastest`, `balanced`, `prefer_positive`, `consensus`\n- Function: Defines how to choose among multiple responses returned by concurrent upstreams.\n- Operational impact:\n  - `fastest`: The first successful DNS response wins.\n  - `balanced`: Positive responses win immediately; negative responses wait briefly for a possible positive response.\n  - `prefer_positive`: Positive responses are preferred; negative responses wait until the current fanout completes.\n  - `consensus`: Positive responses are preferred; negative responses require compatible confirmation.",
+    on_error:
+      "- Type: `string`; Required: No; Default: `fail`\n- Values: `fail`, `continue`\n- Function: Defines control flow when all usable upstream attempts fail to produce a DNS response.\n- `fail`: return the forward error and stop the current sequence.\n- `continue`: record failure metrics, return `Next`, and continue the current sequence without producing a new response.",
     upstreams:
       "- Type: `array`; Required: Yes; Default: None\n- Function: Define one or more upstream targets.\n- Operational impact:\n  - Use single upstream mode when array length is `1`.\n  - Use competitive query mode when the array length is greater than `1`.",
     short_circuit:
@@ -92,6 +94,8 @@ export const enUSDocs = {
       "- Type: `boolean`; required: no; default value: protocol default behavior\n- Function: Control TCP or DoT pipeline.\n- Note: It can also be enabled directly in `addr` through `tcp+pipeline://` or `tls+pipeline://`.",
     "upstreams[].enable_http3":
       "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether DoH uses HTTP/3.\n- Note: It can also be enabled directly in `addr` through `h3://`.",
+    "upstreams[].use_post":
+      "- Type: `boolean`; Required: No; Default: `false`\n- Function: Controls whether DoH/DoH3 requests use HTTP POST.\n- `false`: use RFC 8484 GET and carry the DNS wire message in the `dns=` query parameter.\n- `true`: use POST with the raw `application/dns-message` wire message as the request body.\n- Existing fixed query parameters in the DoH URL are preserved; non-DoH upstreams ignore this setting.",
     "upstreams[].so_mark":
       "- Type: `integer`; required: no; default value: none\n- Function: Set Linux `SO_MARK`.",
     "upstreams[].bind_to_device":

@@ -354,6 +354,15 @@ export const enUSPluginDefined = {
             consensus: "Negative consensus",
           },
         },
+        on_error: {
+          label: "Failure handling",
+          description:
+            "Controls what happens when every usable upstream fails to produce a DNS response.",
+          options: {
+            fail: "Fail and return an error",
+            continue: "Record failure and continue",
+          },
+        },
         upstreams: {
           label: "upstream list",
           description: "Define one or more upstream targets.",
@@ -447,6 +456,11 @@ export const enUSPluginDefined = {
         "upstreams[].enable_http3": {
           label: "Enable HTTP/3",
           description: "Controls whether DoH uses HTTP/3.",
+        },
+        "upstreams[].use_post": {
+          label: "Use POST for DoH",
+          description:
+            "Controls whether DoH/DoH3 requests use HTTP POST; UDP, TCP, DoT, DoQ, and other non-DoH upstreams ignore this field.",
         },
         "upstreams[].so_mark": {
           label: "SO_MARK",

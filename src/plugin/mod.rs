@@ -165,6 +165,28 @@ pub fn analyze_configuration(config: &Config) -> Result<DependencyGraphReport> {
     Ok(report)
 }
 
+/// Validate plugin-specific configuration without constructing runtime
+/// resources.
+///
+/// This is intentionally separate from dependency analysis: callers that only
+/// need a dependency graph may use incomplete placeholder plugin arguments.
+/// Strict configuration entry points such as the management API opt into this
+/// additional validation step explicitly.
+pub(crate) fn validate_plugin_configs(config: &Config) -> Result<()> {
+    let factories = inventory::iter::<FactoryRegistration>
+        .into_iter()
+        .map(|registration| (registration.plugin_type, (registration.constructor)()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for plugin in &config.plugins {
+        let factory = factories.get(plugin.plugin_type.as_str()).ok_or_else(|| {
+            DnsError::plugin(format!("Unknown plugin type: {}", plugin.plugin_type))
+        })?;
+        factory.validate_plugin_config(plugin)?;
+    }
+    Ok(())
+}
+
 pub struct FactoryRegistration {
     pub plugin_type: &'static str,
     pub module_path: &'static str,
@@ -364,6 +386,15 @@ pub trait PluginFactory: Debug + Send + Sync + 'static {
         _plugin_config: &PluginConfig,
     ) -> Vec<dependency::DependencySpec> {
         vec![]
+    }
+
+    /// Validate plugin-specific configuration without creating runtime
+    /// resources.
+    ///
+    /// This hook is used by config/API validation. Implementations must avoid
+    /// network I/O, task spawning, pool construction, and other side effects.
+    fn validate_plugin_config(&self, _plugin_config: &PluginConfig) -> Result<()> {
+        Ok(())
     }
 
     /// Optional dependency extraction for runtime-only quick setup forms.

@@ -12,7 +12,7 @@ mod metrics;
 mod selection;
 mod single;
 
-pub use config::ForwardConfig;
+pub use config::{ForwardConfig, ForwardErrorPolicy};
 pub use factory::ForwardFactory;
 pub use selection::ResponseSelectionMode;
 

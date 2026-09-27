@@ -464,7 +464,7 @@ enum ConfigSaveError {
 }
 
 fn validate_config_file(path: &Path) -> std::result::Result<ConfigCheckResponse, String> {
-    let summary = config::validate_file(path).map_err(|err| err.to_string())?;
+    let summary = config::validate_file_strict(path).map_err(|err| err.to_string())?;
     Ok(ConfigCheckResponse {
         ok: true,
         source: "file",
@@ -476,7 +476,7 @@ fn validate_config_file(path: &Path) -> std::result::Result<ConfigCheckResponse,
 }
 
 fn validate_config_text(text: &str) -> std::result::Result<ConfigCheckResponse, String> {
-    let summary = config::validate_text(text).map_err(|err| err.to_string())?;
+    let summary = config::validate_text_strict(text).map_err(|err| err.to_string())?;
     Ok(ConfigCheckResponse {
         ok: true,
         source: "body",
@@ -521,7 +521,7 @@ fn save_config_file(
     }
 
     let summary = if request.validate.unwrap_or(true) {
-        config::validate_text(&request.content)
+        config::validate_text_strict(&request.content)
             .map_err(|err| ConfigSaveError::Validation(err.to_string()))?
     } else {
         let parsed: crate::config::types::Config = serde_yaml_ng::from_str(&request.content)
@@ -786,6 +786,44 @@ plugins:
             ))
             .await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = validate
+            .handle(test_request(
+                Method::POST,
+                "/config/validate",
+                Bytes::from_static(
+                    br#"
+plugins:
+  - tag: forward_continue
+    type: forward
+    args:
+      on_error: continue
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+                ),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = validate
+            .handle(test_request(
+                Method::POST,
+                "/config/validate",
+                Bytes::from_static(
+                    br#"
+plugins:
+  - tag: forward_invalid_policy
+    type: forward
+    args:
+      on_error: ignore
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+                ),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = validate
             .handle(test_request(

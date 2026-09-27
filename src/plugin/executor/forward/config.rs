@@ -10,6 +10,17 @@ use crate::infra::network::upstream::{ConnectionInfo, UpstreamConfig};
 
 pub(super) const MAX_CONCURRENT_QUERIES: usize = 32;
 
+/// How a forwarder behaves after all usable upstream attempts fail.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardErrorPolicy {
+    /// Return the forward error to the caller and stop the current sequence.
+    #[default]
+    Fail,
+    /// Record the failure, produce no new response, and continue the sequence.
+    Continue,
+}
+
 /// Forward plugin configuration
 #[derive(Deserialize)]
 #[allow(unused)]
@@ -31,6 +42,10 @@ pub struct ForwardConfig {
     /// Whether to stop the executor chain after a successful upstream response.
     #[serde(default)]
     pub short_circuit: bool,
+
+    /// Behavior after all usable upstream attempts fail.
+    #[serde(default)]
+    pub on_error: ForwardErrorPolicy,
 }
 
 pub(super) fn parse_forward_config(plugin_config: &PluginConfig) -> Result<ForwardConfig> {

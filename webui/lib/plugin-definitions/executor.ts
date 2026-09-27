@@ -143,6 +143,19 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ],
       },
       {
+        key: "on_error",
+        description:
+          "定义所有可尝试上游都未产生 DNS 响应时的控制流；fail 返回错误，continue 记录失败后继续当前 sequence。",
+        label: "失败处理",
+        type: "select",
+        default: "fail",
+        advanced: true,
+        options: [
+          { label: "失败并返回错误", value: "fail" },
+          { label: "记录失败并继续", value: "continue" },
+        ],
+      },
+      {
         key: "upstreams",
         description: "定义一个或多个上游目标。",
         label: "上游列表",
