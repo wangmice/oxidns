@@ -146,6 +146,12 @@ enum ProbeInvalidation {
     NoActiveProbe,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CooldownAdvanceError {
+    StateChanged,
+    OwnerMismatch,
+}
+
 impl DohRateLimitState {
     fn new(initial_backoff: Duration, max_backoff: Duration) -> Self {
         let initial_backoff_ms = duration_millis_u64(initial_backoff).max(1);
@@ -271,12 +277,7 @@ impl DohRateLimitState {
                 // a same-wave 429 may already have invalidated this permit's
                 // probe epoch while leaving the cooldown generation intact.
                 if !self.try_claim_probe_rate_limit(permit) {
-                    return self.record_invalidated_probe_rate_limit(
-                        current_generation,
-                        backoff_streak,
-                        now,
-                        retry_after_ms,
-                    );
+                    return self.record_cooling_rate_limit(current_generation, now, retry_after_ms);
                 }
 
                 if let Some(observation) =
@@ -307,81 +308,70 @@ impl DohRateLimitState {
 
     fn record_cooling_rate_limit(
         &self,
-        generation: u64,
+        mut generation: u64,
         now: u64,
         retry_after_ms: u64,
     ) -> RateLimitObservation {
-        let word = self.state_word.load(Ordering::Acquire);
-        if !is_cooling(word) || state_generation(word) != generation {
-            return RateLimitObservation::ignored(retry_after_ms, state_backoff_streak(word));
-        }
-        let backoff_streak = state_backoff_streak(word);
+        loop {
+            let word = self.state_word.load(Ordering::Acquire);
+            if !is_cooling(word) {
+                return RateLimitObservation::ignored(retry_after_ms, state_backoff_streak(word));
+            }
 
-        let invalidation = self.invalidate_active_probe();
+            let current_generation = state_generation(word);
+            if current_generation != generation {
+                generation = current_generation;
+                continue;
+            }
+            let backoff_streak = state_backoff_streak(word);
 
-        let current_until = self.cooldown_until_for_generation(generation).unwrap_or(0);
-        let local_rearm_ms = if current_until <= now {
-            self.backoff_for_streak(backoff_streak.saturating_sub(1))
-        } else {
-            0
-        };
-        let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
-        let previous_generation = previous_generation(generation);
-        let Some(cooldown_until) =
-            self.advance_cooldown_generation(previous_generation, generation, requested_until)
-        else {
+            let invalidation = self.invalidate_active_probe();
+
+            let current_until = self.cooldown_until_for_generation(generation).unwrap_or(0);
+            let local_rearm_ms = if current_until <= now {
+                self.backoff_for_streak(backoff_streak.saturating_sub(1))
+            } else {
+                0
+            };
+            let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
+            let previous_generation = previous_generation(generation);
+            let cooldown_until = match self.advance_cooldown_generation(
+                previous_generation,
+                generation,
+                requested_until,
+            ) {
+                Ok(cooldown_until) => cooldown_until,
+                Err(CooldownAdvanceError::StateChanged) => {
+                    self.finish_probe_invalidation(invalidation);
+                    let latest = self.state_word.load(Ordering::Acquire);
+                    if !is_cooling(latest) {
+                        return RateLimitObservation::ignored(
+                            retry_after_ms,
+                            state_backoff_streak(latest),
+                        );
+                    }
+                    generation = state_generation(latest);
+                    continue;
+                }
+                Err(CooldownAdvanceError::OwnerMismatch) => {
+                    self.finish_probe_invalidation(invalidation);
+                    return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
+                }
+            };
             self.finish_probe_invalidation(invalidation);
-            return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
-        };
-        self.finish_probe_invalidation(invalidation);
 
-        if invalidation == ProbeInvalidation::NoActiveProbe {
-            // Catch a probe reservation that raced with the deadline update.
-            let raced = self.invalidate_active_probe();
-            self.finish_probe_invalidation(raced);
-        }
+            if invalidation == ProbeInvalidation::NoActiveProbe {
+                // Catch a probe reservation that raced with the deadline update.
+                let raced = self.invalidate_active_probe();
+                self.finish_probe_invalidation(raced);
+            }
 
-        RateLimitObservation {
-            entered_new_cooldown: false,
-            cooldown_ms: cooldown_until.saturating_sub(now),
-            retry_after_ms,
-            backoff_streak,
-        }
-    }
-
-    fn record_invalidated_probe_rate_limit(
-        &self,
-        generation: u64,
-        backoff_streak: u32,
-        now: u64,
-        retry_after_ms: u64,
-    ) -> RateLimitObservation {
-        let word = self.state_word.load(Ordering::Acquire);
-        if !is_cooling(word) || state_generation(word) != generation {
-            return RateLimitObservation::ignored(retry_after_ms, state_backoff_streak(word));
-        }
-
-        // The probe is stale, so it must not advance either generation or
-        // streak. Its 429 is still a useful server signal, however: it may
-        // extend the current cooldown, but it can never shorten a deadline
-        // that was already published by the request which invalidated it.
-        let current_until = self.cooldown_until_for_generation(generation).unwrap_or(0);
-        let local_rearm_ms = if current_until <= now {
-            self.backoff_for_streak(backoff_streak.saturating_sub(1))
-        } else {
-            0
-        };
-        let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
-        let Some(cooldown_until) = self.extend_cooldown_for_generation(generation, requested_until)
-        else {
-            return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
-        };
-
-        RateLimitObservation {
-            entered_new_cooldown: false,
-            cooldown_ms: cooldown_until.saturating_sub(now),
-            retry_after_ms,
-            backoff_streak,
+            return RateLimitObservation {
+                entered_new_cooldown: false,
+                cooldown_ms: cooldown_until.saturating_sub(now),
+                retry_after_ms,
+                backoff_streak,
+            };
         }
     }
 
@@ -411,19 +401,21 @@ impl DohRateLimitState {
             .ok()?;
 
         let cooldown_until = now.saturating_add(cooldown_ms);
-        let Some(published_until) =
-            self.advance_cooldown_generation(generation, next_generation, cooldown_until)
-        else {
-            // Do not leave state and deadline ownership permanently split if
-            // publication cannot complete.
-            let _ = self.state_word.compare_exchange(
-                next_word,
-                expected_word,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            return None;
-        };
+        let published_until =
+            match self.advance_cooldown_generation(generation, next_generation, cooldown_until) {
+                Ok(published_until) => published_until,
+                Err(_) => {
+                    // Do not leave state and deadline ownership permanently split if
+                    // publication cannot complete.
+                    let _ = self.state_word.compare_exchange(
+                        next_word,
+                        expected_word,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return None;
+                }
+            };
 
         Some(RateLimitObservation {
             entered_new_cooldown: true,
@@ -684,18 +676,18 @@ impl DohRateLimitState {
         previous_generation: u64,
         generation: u64,
         requested_until_ms: u64,
-    ) -> Option<u64> {
+    ) -> std::result::Result<u64, CooldownAdvanceError> {
         loop {
             let state = self.state_word.load(Ordering::Acquire);
             if !is_cooling(state) || state_generation(state) != generation {
-                return None;
+                return Err(CooldownAdvanceError::StateChanged);
             }
 
             let current = self.cooldown_word.load(Ordering::Acquire);
             if cooldown_matches_generation(current, generation) {
                 let current_until = cooldown_until_ms(current);
                 if requested_until_ms <= current_until {
-                    return Some(current_until);
+                    return Ok(current_until);
                 }
                 let next = pack_cooldown(generation, requested_until_ms);
                 match self.cooldown_word.compare_exchange_weak(
@@ -704,13 +696,21 @@ impl DohRateLimitState {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => return Some(cooldown_until_ms(next)),
+                    Ok(_) => return Ok(cooldown_until_ms(next)),
                     Err(_) => continue,
                 }
             }
 
             if !cooldown_matches_generation(current, previous_generation) {
-                return None;
+                // The state may have advanced after the check at the top of
+                // this loop. In that case a newer cooldown owner is not an
+                // invariant violation; tell the caller to rebind the same 429
+                // observation to the latest cooling generation.
+                let latest_state = self.state_word.load(Ordering::Acquire);
+                if !is_cooling(latest_state) || state_generation(latest_state) != generation {
+                    return Err(CooldownAdvanceError::StateChanged);
+                }
+                return Err(CooldownAdvanceError::OwnerMismatch);
             }
 
             let next = pack_cooldown(
@@ -723,7 +723,7 @@ impl DohRateLimitState {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(cooldown_until_ms(next)),
+                Ok(_) => return Ok(cooldown_until_ms(next)),
                 Err(_) => continue,
             }
         }
@@ -1335,6 +1335,55 @@ mod tests {
         assert!(
             current_cooldown_until(&state) >= before.saturating_add(300_000),
             "stale but newly received 429 must preserve its Retry-After"
+        );
+    }
+
+    #[test]
+    fn cooling_429_rebinds_after_generation_changes_before_publish() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        state.record_rate_limit(&first, None);
+
+        // Keep the generation observed by a stale 429 handler, then advance
+        // the limiter through a real probe 429 before that handler publishes
+        // its Retry-After.
+        let stale_generation = state_generation(state.state_word.load(Ordering::Acquire));
+        assert_eq!(stale_generation, 1);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        let probe_observation = state.record_rate_limit(&probe, None);
+        probe.complete();
+        drop(probe);
+        assert!(probe_observation.entered_new_cooldown);
+
+        let before = AppClock::elapsed_millis();
+        assert_eq!(
+            state.advance_cooldown_generation(
+                previous_generation(stale_generation),
+                stale_generation,
+                before.saturating_add(300_000),
+            ),
+            Err(CooldownAdvanceError::StateChanged),
+            "a stale publication attempt must be classified as retryable state movement",
+        );
+
+        let observation = state.record_cooling_rate_limit(
+            stale_generation,
+            before,
+            duration_millis_u64(Duration::from_secs(300)),
+        );
+
+        let word = state.state_word.load(Ordering::Acquire);
+        assert_eq!(state_generation(word), 2);
+        assert_eq!(state_backoff_streak(word), 2);
+        assert!(!observation.entered_new_cooldown);
+        assert!(
+            current_cooldown_until(&state) >= before.saturating_add(300_000),
+            "429 observed before the generation change must be rebound to the current cooldown"
         );
     }
 
