@@ -414,6 +414,11 @@ export const zhCNPluginDefined = {
           label: "启用 HTTP/3",
           description: "控制 DoH 是否使用 HTTP/3。",
         },
+        "upstreams[].use_post": {
+          label: "DoH 使用 POST",
+          description:
+            "控制 DoH/DoH3 请求是否使用 HTTP POST；UDP、TCP、DoT、DoQ 等非 DoH 上游忽略此项。",
+        },
         "upstreams[].so_mark": {
           label: "SO_MARK",
           description: "设置 Linux SO_MARK。",

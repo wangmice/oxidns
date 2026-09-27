@@ -457,6 +457,11 @@ export const enUSPluginDefined = {
           label: "Enable HTTP/3",
           description: "Controls whether DoH uses HTTP/3.",
         },
+        "upstreams[].use_post": {
+          label: "Use POST for DoH",
+          description:
+            "Controls whether DoH/DoH3 requests use HTTP POST; UDP, TCP, DoT, DoQ, and other non-DoH upstreams ignore this field.",
+        },
         "upstreams[].so_mark": {
           label: "SO_MARK",
           description: "Set Linux SO_MARK.",
