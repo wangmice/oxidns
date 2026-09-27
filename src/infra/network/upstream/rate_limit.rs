@@ -16,6 +16,7 @@ use crate::proto::Message;
 
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const DEFAULT_BACKOFF_RESET_WINDOW: Duration = Duration::from_secs(60);
 const MAX_SERVER_RETRY_AFTER: Duration = Duration::from_secs(300);
 const CANCELLED_PROBE_RETRY: Duration = Duration::from_millis(500);
 const COOLING_BIT: u64 = 1;
@@ -47,7 +48,11 @@ impl DohRateLimitedUpstream {
     pub(crate) fn new(inner: Box<dyn Upstream>) -> Self {
         Self {
             inner,
-            state: DohRateLimitState::new(DEFAULT_INITIAL_BACKOFF, DEFAULT_MAX_BACKOFF),
+            state: DohRateLimitState::new(
+                DEFAULT_INITIAL_BACKOFF,
+                DEFAULT_MAX_BACKOFF,
+                DEFAULT_BACKOFF_RESET_WINDOW,
+            ),
         }
     }
 }
@@ -63,7 +68,7 @@ impl Upstream for DohRateLimitedUpstream {
 
         match &result {
             Ok(_) if permit.is_probe() => {
-                if self.state.reset_after_probe_success(&permit) {
+                if self.state.recover_after_probe_success(&permit) {
                     let info = self.inner.connection_info();
                     debug!(
                         upstream = %info.raw_addr,
@@ -127,8 +132,10 @@ struct DohRateLimitState {
     state_word: AtomicU64,
     cooldown_word: AtomicU64,
     probe_word: AtomicU64,
+    backoff_reset_deadline_ms: AtomicU64,
     initial_backoff_ms: u64,
     max_backoff_ms: u64,
+    backoff_reset_window_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -154,15 +161,22 @@ enum CooldownAdvanceError {
 }
 
 impl DohRateLimitState {
-    fn new(initial_backoff: Duration, max_backoff: Duration) -> Self {
+    fn new(
+        initial_backoff: Duration,
+        max_backoff: Duration,
+        backoff_reset_window: Duration,
+    ) -> Self {
         let initial_backoff_ms = duration_millis_u64(initial_backoff).max(1);
         let max_backoff_ms = duration_millis_u64(max_backoff).max(initial_backoff_ms);
+        let backoff_reset_window_ms = duration_millis_u64(backoff_reset_window).max(1);
         Self {
             state_word: AtomicU64::new(pack_state(0, false, 0)),
             cooldown_word: AtomicU64::new(pack_cooldown(0, 0)),
             probe_word: AtomicU64::new(pack_probe(0, ProbePhase::Idle)),
+            backoff_reset_deadline_ms: AtomicU64::new(0),
             initial_backoff_ms,
             max_backoff_ms,
+            backoff_reset_window_ms,
         }
     }
 
@@ -384,7 +398,17 @@ impl DohRateLimitState {
         now: u64,
         retry_after_ms: u64,
     ) -> Option<RateLimitObservation> {
-        let streak_before = state_backoff_streak(expected_word);
+        let carried_streak = state_backoff_streak(expected_word);
+        let streak_before = if !is_cooling(expected_word) && carried_streak != 0 {
+            let reset_deadline = self.backoff_reset_deadline_ms.load(Ordering::Acquire);
+            if now >= reset_deadline {
+                0
+            } else {
+                carried_streak
+            }
+        } else {
+            carried_streak
+        };
         let backoff_streak = streak_before
             .saturating_add(1)
             .min(BACKOFF_STREAK_VALUE_MASK as u32);
@@ -459,7 +483,7 @@ impl DohRateLimitState {
         }
     }
 
-    fn reset_after_probe_success(&self, permit: &RateLimitPermit<'_>) -> bool {
+    fn recover_after_probe_success(&self, permit: &RateLimitPermit<'_>) -> bool {
         if !self.try_claim_probe_success(permit) {
             return false;
         }
@@ -484,13 +508,34 @@ impl DohRateLimitState {
             return false;
         }
 
-        let next_word = pack_state(next_generation, false, 0);
+        // A successful half-open probe proves that one request is accepted,
+        // not that the upstream is ready for the previous full request rate.
+        // Preserve the backoff streak while returning to healthy state and
+        // forget it only after a full quiet window without another 429.
+        //
+        // Publish the reset deadline before the healthy state. The probe is
+        // still `Committing`, so no same-generation 429 can take ownership
+        // during this handoff, and any newly admitted healthy request is
+        // guaranteed to observe the matching deadline.
+        let previous_reset_deadline = self.backoff_reset_deadline_ms.load(Ordering::Acquire);
+        let reset_deadline = now.saturating_add(self.backoff_reset_window_ms);
+        self.backoff_reset_deadline_ms
+            .store(reset_deadline, Ordering::Release);
+
+        let backoff_streak = state_backoff_streak(word);
+        let next_word = pack_state(next_generation, false, backoff_streak);
         match self
             .state_word
             .compare_exchange(word, next_word, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => true,
             Err(_) => {
+                let _ = self.backoff_reset_deadline_ms.compare_exchange(
+                    reset_deadline,
+                    previous_reset_deadline,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 // `Committing` prevents a same-wave 429 from taking ownership
                 // during the success transition, so restoring the old owner is
                 // safe if the state CAS unexpectedly loses.
@@ -1012,7 +1057,11 @@ mod tests {
 
     fn state() -> DohRateLimitState {
         AppClock::start();
-        DohRateLimitState::new(Duration::from_millis(100), Duration::from_millis(600))
+        DohRateLimitState::new(
+            Duration::from_millis(100),
+            Duration::from_millis(600),
+            Duration::from_millis(600),
+        )
     }
 
     #[test]
@@ -1237,7 +1286,7 @@ mod tests {
         let before = AppClock::elapsed_millis();
         state.record_rate_limit(&late, Some(Duration::from_secs(5)));
         assert!(current_cooldown_until(&state) >= before.saturating_add(5_000));
-        assert!(!state.reset_after_probe_success(&probe));
+        assert!(!state.recover_after_probe_success(&probe));
         assert!(is_cooling(state.state_word.load(Ordering::Acquire)));
 
         probe.complete();
@@ -1318,7 +1367,7 @@ mod tests {
         state
             .begin_probe_io(&mut probe)
             .expect("probe should enter in-flight state");
-        assert!(state.reset_after_probe_success(&probe));
+        assert!(state.recover_after_probe_success(&probe));
         probe.complete();
         drop(probe);
 
@@ -1326,7 +1375,77 @@ mod tests {
         assert!(!stale.entered_new_cooldown);
         let word = state.state_word.load(Ordering::Acquire);
         assert!(!is_cooling(word));
-        assert_eq!(state_backoff_streak(word), 0);
+        assert_eq!(state_backoff_streak(word), 1);
+    }
+
+    #[test]
+    fn probe_success_preserves_streak_for_rapid_relimit() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        assert!(state.recover_after_probe_success(&probe));
+        probe.complete();
+        drop(probe);
+
+        let healthy = state.state_word.load(Ordering::Acquire);
+        assert!(!is_cooling(healthy));
+        assert_eq!(state_backoff_streak(healthy), 1);
+
+        let next = state
+            .acquire()
+            .expect("recovered upstream should admit normal traffic");
+        let observation = state.record_rate_limit(&next, None);
+
+        assert!(observation.entered_new_cooldown);
+        assert_eq!(observation.backoff_streak, 2);
+        assert_eq!(observation.cooldown_ms, 200);
+        let cooling = state.state_word.load(Ordering::Acquire);
+        assert!(is_cooling(cooling));
+        assert_eq!(state_backoff_streak(cooling), 2);
+    }
+
+    #[test]
+    fn stable_healthy_window_resets_preserved_streak() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        assert!(state.recover_after_probe_success(&probe));
+        probe.complete();
+        drop(probe);
+
+        let healthy = state.state_word.load(Ordering::Acquire);
+        assert_eq!(state_backoff_streak(healthy), 1);
+
+        // Avoid a real-time sleep while deterministically modeling a full
+        // healthy reset window having elapsed.
+        let now = AppClock::elapsed_millis();
+        state
+            .backoff_reset_deadline_ms
+            .store(now.saturating_sub(1), Ordering::Release);
+
+        let next = state
+            .acquire()
+            .expect("stable upstream should admit normal traffic");
+        let observation = state.record_rate_limit(&next, None);
+
+        assert!(observation.entered_new_cooldown);
+        assert_eq!(observation.backoff_streak, 1);
+        assert_eq!(observation.cooldown_ms, 100);
+        let cooling = state.state_word.load(Ordering::Acquire);
+        assert!(is_cooling(cooling));
+        assert_eq!(state_backoff_streak(cooling), 1);
     }
 
     #[test]
@@ -1517,7 +1636,7 @@ mod tests {
 
         // Finish the probe transition and prove the old publisher no longer
         // owns anything that can restore generation 0.
-        let healthy_word = pack_state(healthy_generation, false, 0);
+        let healthy_word = pack_state(healthy_generation, false, 1);
         state
             .state_word
             .compare_exchange(
@@ -1612,7 +1731,7 @@ mod tests {
         state
             .begin_probe_io(&mut probe)
             .expect("probe should enter in-flight state");
-        assert!(state.reset_after_probe_success(&probe));
+        assert!(state.recover_after_probe_success(&probe));
         probe.complete();
         drop(probe);
 
