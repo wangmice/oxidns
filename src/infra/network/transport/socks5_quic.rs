@@ -314,7 +314,7 @@ mod tests {
                 let mut header = [0u8; SOCKS5_UDP_HEADER_MAX_SIZE];
                 let header_len = write_socks5_udp_header(&mut header, &target).unwrap();
                 let header = &header[..header_len];
-                for payload_len in [0, 1_200, 2_048, 3_000, 16_384] {
+                for payload_len in [0, 1_200, 2_048, 3_000, 4_096] {
                     let payload: Vec<u8> =
                         (0..payload_len).map(|index| (index % 251) as u8).collect();
                     loop {

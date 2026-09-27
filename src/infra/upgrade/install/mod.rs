@@ -10,6 +10,7 @@ mod webui;
 pub(super) use binary::replace_binary;
 #[cfg(windows)]
 pub(super) use binary::replace_binary_windows;
+
 #[cfg(test)]
 pub(super) use webui::copy_dir_all;
 pub(super) use webui::{find_extracted_webui, replace_webui};

@@ -382,15 +382,20 @@ mod tests {
         response.set_message_type(MessageType::Response);
         let name = Name::from_ascii("large.example.com.").unwrap();
         response.add_question(Question::new(name.clone(), RecordType::A, DNSClass::IN));
-        for index in 0..700u16 {
+        let mut index = 0usize;
+        let wire = loop {
             response.add_answer(Record::from_rdata(
                 name.clone(),
                 60,
                 RData::A(A(Ipv4Addr::new(192, 0, 2, (index % 250 + 1) as u8))),
             ));
-        }
+            index += 1;
 
-        let wire = response.to_bytes().expect("large response should encode");
+            let wire = response.to_bytes().expect("large response should encode");
+            if wire.len() > 8_196 {
+                break wire;
+            }
+        };
         assert!(
             wire.len() > 8_196,
             "test response must exceed legacy buffer"
