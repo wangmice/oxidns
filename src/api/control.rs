@@ -464,7 +464,7 @@ enum ConfigSaveError {
 }
 
 fn validate_config_file(path: &Path) -> std::result::Result<ConfigCheckResponse, String> {
-    let summary = config::validate_file(path).map_err(|err| err.to_string())?;
+    let summary = config::validate_file_strict(path).map_err(|err| err.to_string())?;
     Ok(ConfigCheckResponse {
         ok: true,
         source: "file",
@@ -476,7 +476,7 @@ fn validate_config_file(path: &Path) -> std::result::Result<ConfigCheckResponse,
 }
 
 fn validate_config_text(text: &str) -> std::result::Result<ConfigCheckResponse, String> {
-    let summary = config::validate_text(text).map_err(|err| err.to_string())?;
+    let summary = config::validate_text_strict(text).map_err(|err| err.to_string())?;
     Ok(ConfigCheckResponse {
         ok: true,
         source: "body",
@@ -521,7 +521,7 @@ fn save_config_file(
     }
 
     let summary = if request.validate.unwrap_or(true) {
-        config::validate_text(&request.content)
+        config::validate_text_strict(&request.content)
             .map_err(|err| ConfigSaveError::Validation(err.to_string()))?
     } else {
         let parsed: crate::config::types::Config = serde_yaml_ng::from_str(&request.content)

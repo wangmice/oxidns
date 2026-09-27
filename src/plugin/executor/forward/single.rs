@@ -60,18 +60,20 @@ impl Executor for SingleDnsForwarder {
     #[hotpath::measure]
     async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
         let start_ms = self.metrics.record_query_start();
-        self.metrics.record_upstream_start(0);
+        let up_start = self.metrics.record_upstream_start(0);
         match self.upstream.query(context.request.clone()).await {
             Ok(res) => {
                 context.set_response(res);
                 self.metrics.record_success(start_ms);
-                self.metrics.record_upstream_success(0, start_ms);
+                self.metrics.record_upstream_success(0, up_start);
             }
             Err(e) => {
                 let timeout = is_timeout_error(&e);
                 self.metrics.record_error(start_ms, timeout);
-                if !e.is_rate_limit_cooldown() {
-                    self.metrics.record_upstream_error(0, start_ms, timeout);
+                if e.is_rate_limit_cooldown() {
+                    self.metrics.cancel_upstream_start(0);
+                } else {
+                    self.metrics.record_upstream_error(0, up_start, timeout);
                 }
                 let upstream_error =
                     contextualize_upstream_error(self.upstream.connection_info(), e);

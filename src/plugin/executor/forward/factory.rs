@@ -15,7 +15,9 @@ use super::selection::ResponseSelectionMode;
 use super::single::SingleDnsForwarder;
 use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::upstream::{ConnectionInfo, Upstream, UpstreamBuilder, UpstreamConfig};
+use crate::infra::network::upstream::{
+    ConnectionInfo, ConnectionType, Upstream, UpstreamBuilder, UpstreamConfig,
+};
 use crate::plugin::{PluginFactory, UninitializedPlugin};
 use crate::plugin_factory;
 
@@ -25,6 +27,10 @@ use crate::plugin_factory;
 pub struct ForwardFactory;
 
 impl PluginFactory for ForwardFactory {
+    fn validate_plugin_config(&self, plugin_config: &PluginConfig) -> Result<()> {
+        parse_forward_config(plugin_config).map(|_| ())
+    }
+
     fn create(
         &self,
         plugin_config: &PluginConfig,
@@ -67,6 +73,10 @@ impl PluginFactory for ForwardFactory {
                 upstreams.push(build_upstream(upstream_config)?.into());
             }
 
+            let has_doh_upstream = upstreams.iter().any(|upstream: &Arc<dyn Upstream>| {
+                upstream.connection_type() == ConnectionType::DoH
+            });
+
             let infos: Vec<&ConnectionInfo> = upstreams
                 .iter()
                 .map(|u: &Arc<dyn Upstream>| u.connection_info())
@@ -78,6 +88,7 @@ impl PluginFactory for ForwardFactory {
                 ConcurrentForwarder {
                     tag: plugin_config.tag.clone(),
                     active_concurrent,
+                    has_doh_upstream,
                     upstreams: Arc::new(upstreams),
                     short_circuit,
                     on_error,
@@ -120,6 +131,9 @@ impl PluginFactory for ForwardFactory {
             for upstream_config in upstream_configs {
                 upstreams.push(build_upstream(upstream_config)?.into());
             }
+            let has_doh_upstream = upstreams.iter().any(|upstream: &Arc<dyn Upstream>| {
+                upstream.connection_type() == ConnectionType::DoH
+            });
             let infos: Vec<&ConnectionInfo> = upstreams
                 .iter()
                 .map(|u: &Arc<dyn Upstream>| u.connection_info())
@@ -132,6 +146,7 @@ impl PluginFactory for ForwardFactory {
                         Some(MAX_CONCURRENT_QUERIES),
                         upstreams.len(),
                     ),
+                    has_doh_upstream,
                     upstreams: Arc::new(upstreams),
                     short_circuit,
                     on_error: ForwardErrorPolicy::Fail,

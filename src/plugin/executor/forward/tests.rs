@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -199,6 +199,107 @@ impl Upstream for CoolingFailureUpstream {
     }
 }
 
+#[derive(Debug)]
+struct LocalCooldownUpstream {
+    connection_info: ConnectionInfo,
+}
+
+impl LocalCooldownUpstream {
+    fn new() -> Self {
+        Self {
+            connection_info: ConnectionInfo::with_addr("https://dns.example/dns-query")
+                .expect("mock upstream addr must be valid"),
+        }
+    }
+}
+
+#[async_trait]
+impl Upstream for LocalCooldownUpstream {
+    async fn inner_query(&self, _request: Message, _deadline: QueryDeadline) -> Result<Message> {
+        Err(DnsError::rate_limit_cooldown(1_000))
+    }
+
+    fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
+    }
+}
+
+#[derive(Debug)]
+struct LocalCooldownThenSuccessUpstream {
+    connection_info: ConnectionInfo,
+    calls: Arc<AtomicUsize>,
+}
+
+impl LocalCooldownThenSuccessUpstream {
+    fn new(calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            connection_info: ConnectionInfo::with_addr("https://dns.example/dns-query")
+                .expect("mock upstream addr must be valid"),
+            calls,
+        }
+    }
+}
+
+#[async_trait]
+impl Upstream for LocalCooldownThenSuccessUpstream {
+    async fn inner_query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(DnsError::rate_limit_cooldown(1_000));
+        }
+        Ok(request.response(Rcode::NoError))
+    }
+
+    fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
+    }
+}
+
+#[derive(Debug)]
+struct DeadlineSequenceUpstream {
+    connection_info: ConnectionInfo,
+    calls: Arc<AtomicUsize>,
+    first_expires_at_ms: Arc<AtomicU64>,
+    second_expires_at_ms: Arc<AtomicU64>,
+}
+
+impl DeadlineSequenceUpstream {
+    fn new(
+        timeout: Duration,
+        calls: Arc<AtomicUsize>,
+        first_expires_at_ms: Arc<AtomicU64>,
+        second_expires_at_ms: Arc<AtomicU64>,
+    ) -> Self {
+        let mut connection_info = ConnectionInfo::with_addr("https://dns.example/dns-query")
+            .expect("mock upstream addr must be valid");
+        connection_info.timeout = timeout;
+        Self {
+            connection_info,
+            calls,
+            first_expires_at_ms,
+            second_expires_at_ms,
+        }
+    }
+}
+
+#[async_trait]
+impl Upstream for DeadlineSequenceUpstream {
+    async fn inner_query(&self, request: Message, deadline: QueryDeadline) -> Result<Message> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        if call == 0 {
+            self.first_expires_at_ms
+                .store(deadline.expires_at_ms, Ordering::Release);
+            return Err(DnsError::doh_rate_limited(None, "mock 429"));
+        }
+        self.second_expires_at_ms
+            .store(deadline.expires_at_ms, Ordering::Release);
+        Ok(request.response(Rcode::NoError))
+    }
+
+    fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
+    }
+}
+
 fn make_context() -> DnsContext {
     AppClock::start();
     let mut request = Message::new();
@@ -231,6 +332,7 @@ async fn concurrent_returns_error_when_all_upstreams_fail() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::fail("u1 fail", Duration::ZERO)),
             Arc::new(MockUpstream::fail("u2 fail", Duration::ZERO)),
@@ -261,6 +363,7 @@ async fn concurrent_on_error_continue_returns_next_without_response() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::fail("u1 fail", Duration::ZERO)),
             Arc::new(MockUpstream::fail("u2 fail", Duration::ZERO)),
@@ -444,6 +547,7 @@ async fn concurrent_success_sets_response() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: false,
         on_error: ForwardErrorPolicy::Fail,
@@ -462,6 +566,7 @@ async fn concurrent_skips_temporarily_unavailable_upstream() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::cooling()),
             Arc::new(MockUpstream::ok()),
@@ -485,6 +590,7 @@ async fn concurrent_replaces_attempt_that_enters_cooldown() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(CoolingFailureUpstream::new(calls.clone())),
             Arc::new(CoolingFailureUpstream::new(calls.clone())),
@@ -500,6 +606,81 @@ async fn concurrent_replaces_attempt_that_enters_cooldown() {
 
     assert!(context.response().is_some());
     assert_eq!(calls.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn concurrent_local_cooldown_does_not_count_upstream_attempt() {
+    let metrics = test_metrics();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        has_doh_upstream: true,
+        upstreams: Arc::new(vec![
+            Arc::new(LocalCooldownThenSuccessUpstream::new(calls.clone())),
+            Arc::new(LocalCooldownThenSuccessUpstream::new(calls.clone())),
+        ]),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    forwarder.execute(&mut context).await.unwrap();
+
+    assert!(context.response().is_some());
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        metrics.upstream_query_total_for_test(0) + metrics.upstream_query_total_for_test(1),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_retry_reuses_first_attempt_deadline_budget() {
+    let metrics = test_metrics();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_deadline = Arc::new(AtomicU64::new(0));
+    let second_deadline = Arc::new(AtomicU64::new(0));
+    let timeout = Duration::from_secs(5);
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        has_doh_upstream: true,
+        upstreams: Arc::new(vec![
+            Arc::new(DeadlineSequenceUpstream::new(
+                timeout,
+                calls.clone(),
+                first_deadline.clone(),
+                second_deadline.clone(),
+            )),
+            Arc::new(DeadlineSequenceUpstream::new(
+                timeout,
+                calls.clone(),
+                first_deadline.clone(),
+                second_deadline.clone(),
+            )),
+        ]),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    forwarder.execute(&mut context).await.unwrap();
+
+    let first = first_deadline.load(Ordering::Acquire);
+    let second = second_deadline.load(Ordering::Acquire);
+    assert!(context.response().is_some());
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_ne!(first, 0);
+    assert_eq!(second, first);
+    assert_eq!(
+        metrics.upstream_query_total_for_test(0) + metrics.upstream_query_total_for_test(1),
+        2
+    );
 }
 
 #[tokio::test]
@@ -570,6 +751,29 @@ async fn single_on_error_continue_returns_next_without_response() {
 }
 
 #[tokio::test]
+async fn single_local_cooldown_does_not_count_upstream_attempt() {
+    let metrics = test_metrics();
+    let forwarder = SingleDnsForwarder {
+        tag: "forward-test".to_string(),
+        upstream: Box::new(LocalCooldownUpstream::new()),
+        short_circuit: false,
+        on_error: ForwardErrorPolicy::Fail,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let err = forwarder
+        .execute(&mut context)
+        .await
+        .expect_err("local cooldown should fail the forwarder");
+
+    assert!(err.to_string().contains("cooldown"));
+    assert_eq!(metrics.query_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.upstream_query_total_for_test(0), 0);
+}
+
+#[tokio::test]
 async fn single_does_not_classify_for_incomplete_alias_metric() {
     let metrics = test_metrics();
     let forwarder = SingleDnsForwarder {
@@ -598,6 +802,7 @@ async fn concurrent_selection_records_selected_incomplete_alias() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
@@ -626,6 +831,7 @@ async fn fastest_does_not_classify_for_incomplete_alias_metric() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
@@ -653,6 +859,7 @@ async fn concurrent_success_stops_when_short_circuit_enabled() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 1,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![Arc::new(MockUpstream::ok())]),
         short_circuit: true,
         on_error: ForwardErrorPolicy::Fail,
@@ -671,6 +878,7 @@ async fn concurrent_prefers_noerror_over_early_servfail() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::ServFail, Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -698,6 +906,7 @@ async fn concurrent_returns_last_non_preferred_rcode_when_no_preferred_response(
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::ServFail, Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -725,6 +934,7 @@ async fn fastest_selection_returns_early_nxdomain() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
@@ -749,6 +959,7 @@ async fn balanced_selection_waits_briefly_for_positive_after_negative() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
@@ -772,6 +983,7 @@ async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
@@ -795,6 +1007,7 @@ async fn balanced_selection_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -822,6 +1035,7 @@ async fn prefer_positive_waits_for_late_positive() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
@@ -845,6 +1059,7 @@ async fn prefer_positive_waits_for_complete_answer_after_cname_only() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
@@ -868,6 +1083,7 @@ async fn prefer_positive_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -895,6 +1111,7 @@ async fn consensus_selection_returns_after_two_negative_votes() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -926,6 +1143,7 @@ async fn consensus_selection_returns_negative_over_incomplete_alias() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -959,6 +1177,7 @@ async fn consensus_selection_waits_when_negative_votes_disagree() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::response(Rcode::NXDomain, Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -989,6 +1208,7 @@ async fn consensus_selection_does_not_count_cname_only_as_negative_vote() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 3,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -1019,6 +1239,7 @@ async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
             Arc::new(MockUpstream::response(
@@ -1046,6 +1267,7 @@ async fn consensus_selection_counts_cname_with_soa_as_nodata() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
         active_concurrent: 2,
+        has_doh_upstream: false,
         upstreams: Arc::new(vec![
             Arc::new(MockUpstream::ok_with_cname_nodata(Duration::ZERO)),
             Arc::new(MockUpstream::ok_with_cname_nodata(Duration::from_millis(

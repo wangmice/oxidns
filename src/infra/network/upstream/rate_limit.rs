@@ -80,6 +80,17 @@ impl Upstream for DohRateLimitedUpstream {
         result
     }
 
+    async fn query_with_deadline(
+        &self,
+        request: Message,
+        deadline: QueryDeadline,
+    ) -> Result<Message> {
+        // The wrapped upstream owns the actual deadline enforcement. Calling
+        // the trait default here would perform a redundant `remaining()`
+        // preflight before `inner_query` delegates the same deadline again.
+        self.inner_query(request, deadline).await
+    }
+
     fn connection_info(&self) -> &ConnectionInfo {
         self.inner.connection_info()
     }
@@ -490,14 +501,17 @@ mod tests {
 
         let probe = state.acquire().expect("probe should be admitted");
         assert!(probe.is_probe());
+        let before_drop_ms = AppClock::elapsed_millis();
         drop(probe);
 
         assert!(!state.probe_inflight.load(Ordering::Acquire));
         assert!(is_cooling(state.state_word.load(Ordering::Acquire)));
-        let remaining_ms = state
-            .cooldown_until_ms
-            .load(Ordering::Acquire)
-            .saturating_sub(AppClock::elapsed_millis());
+        let cooldown_until_ms = state.cooldown_until_ms.load(Ordering::Acquire);
+        assert!(
+            cooldown_until_ms
+                >= before_drop_ms.saturating_add(duration_millis_u64(CANCELLED_PROBE_RETRY))
+        );
+        let remaining_ms = cooldown_until_ms.saturating_sub(AppClock::elapsed_millis());
         assert!(remaining_ms <= duration_millis_u64(CANCELLED_PROBE_RETRY));
     }
 }

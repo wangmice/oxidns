@@ -118,6 +118,24 @@ impl ForwardMetrics {
         AppClock::elapsed_millis()
     }
 
+    /// Undo an upstream start that was rejected locally before any upstream
+    /// I/O was issued, for example when a DoH cooldown wins the admission race
+    /// after the caller's lock-free precheck.
+    #[inline]
+    pub(super) fn cancel_upstream_start(&self, idx: usize) {
+        if let Some(up) = self.upstreams.get(idx) {
+            up.query_total.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn upstream_query_total_for_test(&self, idx: usize) -> u64 {
+        self.upstreams
+            .get(idx)
+            .map_or(0, |up| up.query_total.load(Ordering::Relaxed))
+    }
+
     #[inline]
     pub(super) fn record_upstream_success(&self, idx: usize, start_ms: u64) {
         if let Some(up) = self.upstreams.get(idx) {
