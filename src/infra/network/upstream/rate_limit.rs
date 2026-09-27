@@ -263,11 +263,25 @@ impl DohRateLimitState {
                 if !is_cooling(word) || permit.generation != current_generation {
                     return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
                 }
+
+                // Generation ownership alone is not sufficient for a probe:
+                // a same-wave 429 may already have invalidated this permit's
+                // probe epoch while leaving the cooldown generation intact.
+                if !self.try_claim_probe_rate_limit(permit) {
+                    return self.record_invalidated_probe_rate_limit(
+                        current_generation,
+                        backoff_streak,
+                        now,
+                        retry_after_ms,
+                    );
+                }
+
                 if let Some(observation) =
                     self.try_enter_cooldown(word, current_generation, now, retry_after_ms)
                 {
                     return observation;
                 }
+                self.revert_probe_commit_claim(permit.probe_epoch);
                 continue;
             }
 
@@ -301,9 +315,6 @@ impl DohRateLimitState {
         let backoff_streak = state_backoff_streak(word);
 
         let invalidation = self.invalidate_active_probe();
-        if invalidation == ProbeInvalidation::SuccessCommitting {
-            return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
-        }
 
         let current_until = self.cooldown_until_for_generation(generation).unwrap_or(0);
         let local_rearm_ms = if current_until <= now {
@@ -321,6 +332,42 @@ impl DohRateLimitState {
             // Catch a probe reservation that raced with the deadline update.
             let _ = self.invalidate_active_probe();
         }
+
+        RateLimitObservation {
+            entered_new_cooldown: false,
+            cooldown_ms: cooldown_until.saturating_sub(now),
+            retry_after_ms,
+            backoff_streak,
+        }
+    }
+
+    fn record_invalidated_probe_rate_limit(
+        &self,
+        generation: u64,
+        backoff_streak: u32,
+        now: u64,
+        retry_after_ms: u64,
+    ) -> RateLimitObservation {
+        let word = self.state_word.load(Ordering::Acquire);
+        if !is_cooling(word) || state_generation(word) != generation {
+            return RateLimitObservation::ignored(retry_after_ms, state_backoff_streak(word));
+        }
+
+        // The probe is stale, so it must not advance either generation or
+        // streak. Its 429 is still a useful server signal, however: it may
+        // extend the current cooldown, but it can never shorten a deadline
+        // that was already published by the request which invalidated it.
+        let current_until = self.cooldown_until_for_generation(generation).unwrap_or(0);
+        let local_rearm_ms = if current_until <= now {
+            self.backoff_for_streak(backoff_streak.saturating_sub(1))
+        } else {
+            0
+        };
+        let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
+        let Some(cooldown_until) = self.extend_cooldown_for_generation(generation, requested_until)
+        else {
+            return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
+        };
 
         RateLimitObservation {
             entered_new_cooldown: false,
@@ -356,9 +403,19 @@ impl DohRateLimitState {
             .ok()?;
 
         let cooldown_until = now.saturating_add(cooldown_ms);
-        let published_until = self
-            .extend_cooldown_for_generation(next_generation, cooldown_until)
-            .unwrap_or(cooldown_until);
+        let Some(published_until) =
+            self.advance_cooldown_generation(generation, next_generation, cooldown_until)
+        else {
+            // Do not leave state and deadline ownership permanently split if
+            // publication cannot complete.
+            let _ = self.state_word.compare_exchange(
+                next_word,
+                expected_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return None;
+        };
 
         Some(RateLimitObservation {
             entered_new_cooldown: true,
@@ -373,20 +430,42 @@ impl DohRateLimitState {
             return false;
         }
 
+        let cooldown = self.cooldown_word.load(Ordering::Acquire);
         let word = self.state_word.load(Ordering::Acquire);
-        if !permit.is_probe() || !is_cooling(word) || permit.generation != state_generation(word) {
-            self.revert_probe_success_claim(permit.probe_epoch);
+        let now = AppClock::elapsed_millis();
+        if !permit.is_probe()
+            || !is_cooling(word)
+            || permit.generation != state_generation(word)
+            || !cooldown_matches_generation(cooldown, permit.generation)
+            || cooldown_until_ms(cooldown) > now
+        {
+            self.revert_probe_commit_claim(permit.probe_epoch);
             return false;
         }
 
-        let next_word = pack_state(next_generation(permit.generation), false, 0);
+        let previous_until = cooldown_until_ms(cooldown);
+        let next_generation = next_generation(permit.generation);
+        if !self.clear_cooldown_generation(cooldown, permit.generation, next_generation) {
+            self.revert_probe_commit_claim(permit.probe_epoch);
+            return false;
+        }
+
+        let next_word = pack_state(next_generation, false, 0);
         match self
             .state_word
             .compare_exchange(word, next_word, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => true,
             Err(_) => {
-                self.revert_probe_success_claim(permit.probe_epoch);
+                // `Committing` prevents a same-wave 429 from taking ownership
+                // during the success transition, so restoring the old owner is
+                // safe if the state CAS unexpectedly loses.
+                let _ = self.restore_cooldown_generation(
+                    next_generation,
+                    permit.generation,
+                    previous_until,
+                );
+                self.revert_probe_commit_claim(permit.probe_epoch);
                 false
             }
         }
@@ -495,6 +574,21 @@ impl DohRateLimitState {
         }
     }
 
+    fn try_claim_probe_rate_limit(&self, permit: &RateLimitPermit<'_>) -> bool {
+        if !permit.is_probe() || !permit.in_flight {
+            return false;
+        }
+
+        self.probe_word
+            .compare_exchange(
+                pack_probe(permit.probe_epoch, ProbePhase::Active),
+                pack_probe(permit.probe_epoch, ProbePhase::Committing),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn try_claim_probe_success(&self, permit: &RateLimitPermit<'_>) -> bool {
         if !permit.is_probe() || !permit.in_flight {
             return false;
@@ -532,13 +626,13 @@ impl DohRateLimitState {
             || !cooldown_matches_generation(latest_cooldown, permit.generation)
             || cooldown_until_ms(latest_cooldown) > now
         {
-            self.revert_probe_success_claim(permit.probe_epoch);
+            self.revert_probe_commit_claim(permit.probe_epoch);
             return false;
         }
         true
     }
 
-    fn revert_probe_success_claim(&self, epoch: u64) {
+    fn revert_probe_commit_claim(&self, epoch: u64) {
         let _ = self.probe_word.compare_exchange(
             pack_probe(epoch, ProbePhase::Committing),
             pack_probe(epoch, ProbePhase::Active),
@@ -550,6 +644,104 @@ impl DohRateLimitState {
     fn cooldown_until_for_generation(&self, generation: u64) -> Option<u64> {
         let cooldown = self.cooldown_word.load(Ordering::Acquire);
         cooldown_matches_generation(cooldown, generation).then_some(cooldown_until_ms(cooldown))
+    }
+
+    /// Move deadline ownership forward while preserving the longest already
+    /// published deadline. This is the only normal path that may retag a
+    /// cooldown word across generations.
+    fn advance_cooldown_generation(
+        &self,
+        previous_generation: u64,
+        generation: u64,
+        requested_until_ms: u64,
+    ) -> Option<u64> {
+        loop {
+            let current = self.cooldown_word.load(Ordering::Acquire);
+            if cooldown_matches_generation(current, generation) {
+                let current_until = cooldown_until_ms(current);
+                if requested_until_ms <= current_until {
+                    return Some(current_until);
+                }
+                let next = pack_cooldown(generation, requested_until_ms);
+                match self.cooldown_word.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some(cooldown_until_ms(next)),
+                    Err(_) => continue,
+                }
+            }
+
+            if !cooldown_matches_generation(current, previous_generation) {
+                return None;
+            }
+
+            let next = pack_cooldown(
+                generation,
+                requested_until_ms.max(cooldown_until_ms(current)),
+            );
+            match self.cooldown_word.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(cooldown_until_ms(next)),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn clear_cooldown_generation(
+        &self,
+        expected: u64,
+        previous_generation: u64,
+        generation: u64,
+    ) -> bool {
+        if !cooldown_matches_generation(expected, previous_generation) {
+            return false;
+        }
+
+        // Use the exact snapshot validated by probe success. If a late 429
+        // extends the deadline after that validation, this CAS fails and the
+        // success path must not erase the newer server signal.
+        self.cooldown_word
+            .compare_exchange(
+                expected,
+                pack_cooldown(generation, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn restore_cooldown_generation(
+        &self,
+        previous_generation: u64,
+        generation: u64,
+        until_ms: u64,
+    ) -> bool {
+        loop {
+            let current = self.cooldown_word.load(Ordering::Acquire);
+            if cooldown_matches_generation(current, generation) {
+                return true;
+            }
+            if !cooldown_matches_generation(current, previous_generation) {
+                return false;
+            }
+            let next = pack_cooldown(generation, until_ms);
+            match self.cooldown_word.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
     }
 
     fn extend_cooldown_for_generation(
@@ -564,16 +756,15 @@ impl DohRateLimitState {
             }
 
             let current = self.cooldown_word.load(Ordering::Acquire);
-            let current_until = if cooldown_matches_generation(current, generation) {
-                cooldown_until_ms(current)
-            } else {
-                0
-            };
+            if !cooldown_matches_generation(current, generation) {
+                return None;
+            }
+            let current_until = cooldown_until_ms(current);
             if requested_until_ms <= current_until {
                 return Some(current_until);
             }
 
-            let next = pack_cooldown(generation, requested_until_ms.max(current_until));
+            let next = pack_cooldown(generation, requested_until_ms);
             match self.cooldown_word.compare_exchange_weak(
                 current,
                 next,
@@ -853,6 +1044,64 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_probe_429_preserves_newer_retry_after_and_streak() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        let late = state.acquire().expect("late query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+
+        let before = AppClock::elapsed_millis();
+        state.record_rate_limit(&late, Some(Duration::from_secs(300)));
+        let extended_until = current_cooldown_until(&state);
+        assert!(extended_until >= before.saturating_add(300_000));
+
+        let observation = state.record_rate_limit(&probe, None);
+        probe.complete();
+        drop(probe);
+
+        let word = state.state_word.load(Ordering::Acquire);
+        assert!(is_cooling(word));
+        assert_eq!(state_generation(word), 1);
+        assert_eq!(state_backoff_streak(word), 1);
+        assert!(!observation.entered_new_cooldown);
+        assert_eq!(current_cooldown_until(&state), extended_until);
+    }
+
+    #[test]
+    fn probe_429_transition_never_shortens_existing_deadline() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+
+        let generation = state_generation(state.state_word.load(Ordering::Acquire));
+        let before = AppClock::elapsed_millis();
+        let longer_until = before.saturating_add(5_000);
+        assert_eq!(
+            state.extend_cooldown_for_generation(generation, longer_until),
+            Some(longer_until)
+        );
+
+        let observation = state.record_rate_limit(&probe, None);
+        probe.complete();
+        drop(probe);
+
+        assert!(observation.entered_new_cooldown);
+        assert!(current_cooldown_until(&state) >= longer_until);
+    }
+
+    #[test]
     fn stale_429_cannot_reclose_after_probe_success() {
         let state = state();
         let old = state.acquire().expect("old query should be admitted");
@@ -896,6 +1145,42 @@ mod tests {
         let word = state.state_word.load(Ordering::Acquire);
         assert_eq!(state_generation(word), 2);
         assert_eq!(state_backoff_streak(word), 2);
+    }
+
+    #[test]
+    fn stale_generation_cannot_overwrite_newer_cooldown_owner() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        assert!(state.reset_after_probe_success(&probe));
+        probe.complete();
+        drop(probe);
+
+        let next = state
+            .acquire()
+            .expect("healthy generation should admit a new query");
+        state.record_rate_limit(&next, Some(Duration::from_secs(5)));
+
+        let current_word = state.state_word.load(Ordering::Acquire);
+        let current_generation = state_generation(current_word);
+        let current_cooldown = state.cooldown_word.load(Ordering::Acquire);
+        assert!(is_cooling(current_word));
+        assert!(cooldown_matches_generation(
+            current_cooldown,
+            current_generation
+        ));
+
+        assert_eq!(state.extend_cooldown_for_generation(1, u64::MAX), None);
+        assert_eq!(
+            state.cooldown_word.load(Ordering::Acquire),
+            current_cooldown
+        );
     }
 
     #[test]
