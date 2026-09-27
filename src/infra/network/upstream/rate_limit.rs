@@ -260,8 +260,11 @@ impl DohRateLimitState {
             let backoff_streak = state_backoff_streak(word);
 
             if permit.is_probe() {
-                if !is_cooling(word) || permit.generation != current_generation {
+                if !is_cooling(word) {
                     return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
+                }
+                if permit.generation != current_generation {
+                    return self.record_cooling_rate_limit(current_generation, now, retry_after_ms);
                 }
 
                 // Generation ownership alone is not sufficient for a probe:
@@ -294,22 +297,16 @@ impl DohRateLimitState {
                 continue;
             }
 
-            if is_cooling(word) && next_generation(permit.generation) == current_generation {
-                return self.record_same_wave_rate_limit(
-                    permit.generation,
-                    current_generation,
-                    now,
-                    retry_after_ms,
-                );
+            if is_cooling(word) {
+                return self.record_cooling_rate_limit(current_generation, now, retry_after_ms);
             }
 
             return RateLimitObservation::ignored(retry_after_ms, backoff_streak);
         }
     }
 
-    fn record_same_wave_rate_limit(
+    fn record_cooling_rate_limit(
         &self,
-        previous_generation: u64,
         generation: u64,
         now: u64,
         retry_after_ms: u64,
@@ -329,6 +326,7 @@ impl DohRateLimitState {
             0
         };
         let requested_until = now.saturating_add(retry_after_ms.max(local_rearm_ms));
+        let previous_generation = previous_generation(generation);
         let Some(cooldown_until) =
             self.advance_cooldown_generation(previous_generation, generation, requested_until)
         else {
@@ -950,6 +948,10 @@ fn next_generation(generation: u64) -> u64 {
     generation.wrapping_add(1) & GENERATION_MASK
 }
 
+fn previous_generation(generation: u64) -> u64 {
+    generation.wrapping_sub(1) & GENERATION_MASK
+}
+
 fn next_probe_epoch(epoch: u64) -> u64 {
     epoch.wrapping_add(1) & PROBE_EPOCH_MASK
 }
@@ -1302,6 +1304,82 @@ mod tests {
         let word = state.state_word.load(Ordering::Acquire);
         assert_eq!(state_generation(word), 2);
         assert_eq!(state_backoff_streak(word), 2);
+    }
+
+    #[test]
+    fn multi_generation_stale_429_extends_current_cooldown_without_advancing_streak() {
+        let state = state();
+        let stale = state.acquire().expect("stale query should be admitted");
+        let first = state.acquire().expect("first query should be admitted");
+
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut probe)
+            .expect("probe should enter in-flight state");
+        let probe_observation = state.record_rate_limit(&probe, None);
+        probe.complete();
+        drop(probe);
+
+        assert!(probe_observation.entered_new_cooldown);
+        let before = AppClock::elapsed_millis();
+        let stale_observation = state.record_rate_limit(&stale, Some(Duration::from_secs(300)));
+
+        let word = state.state_word.load(Ordering::Acquire);
+        assert!(is_cooling(word));
+        assert_eq!(state_generation(word), 2);
+        assert_eq!(state_backoff_streak(word), 2);
+        assert!(!stale_observation.entered_new_cooldown);
+        assert!(
+            current_cooldown_until(&state) >= before.saturating_add(300_000),
+            "stale but newly received 429 must preserve its Retry-After"
+        );
+    }
+
+    #[test]
+    fn stale_probe_429_extends_newer_cooling_generation_without_advancing_streak() {
+        let state = state();
+        let first = state.acquire().expect("first query should be admitted");
+        let late = state.acquire().expect("late query should be admitted");
+        state.record_rate_limit(&first, None);
+        expire_current_cooldown(&state);
+
+        let mut stale_probe = state.acquire().expect("probe should be admitted");
+        state
+            .begin_probe_io(&mut stale_probe)
+            .expect("probe should enter in-flight state");
+
+        // A same-wave normal request invalidates this probe without advancing
+        // the cooldown generation.
+        state.record_rate_limit(&late, None);
+        expire_current_cooldown(&state);
+
+        // A replacement probe then observes another 429 and advances the
+        // limiter to the next cooling generation while `stale_probe` is still
+        // outstanding.
+        let mut replacement = state
+            .acquire()
+            .expect("replacement probe should be admitted");
+        state
+            .begin_probe_io(&mut replacement)
+            .expect("replacement probe should enter in-flight state");
+        let replacement_observation = state.record_rate_limit(&replacement, None);
+        replacement.complete();
+        drop(replacement);
+        assert!(replacement_observation.entered_new_cooldown);
+
+        let before = AppClock::elapsed_millis();
+        let observation = state.record_rate_limit(&stale_probe, Some(Duration::from_secs(300)));
+        stale_probe.complete();
+        drop(stale_probe);
+
+        let current = state.state_word.load(Ordering::Acquire);
+        assert_eq!(state_generation(current), 2);
+        assert_eq!(state_backoff_streak(current), 2);
+        assert!(!observation.entered_new_cooldown);
+        assert!(current_cooldown_until(&state) >= before.saturating_add(300_000));
     }
 
     #[test]
