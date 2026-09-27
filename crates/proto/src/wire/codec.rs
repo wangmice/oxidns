@@ -1559,19 +1559,21 @@ mod tests {
     fn limited_encode_rejects_trailer_larger_than_limit() {
         let mut message = Message::new();
         message.set_message_type(MessageType::Response);
-        message.add_question(Question::new(
-            Name::from_ascii("example.com.").unwrap(),
-            RecordType::A,
-            DNSClass::IN,
-        ));
-        message.set_edns(Edns::new());
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Local(EdnsLocal::new(65001, vec![0x5A; 64])));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        let limit = lens.trailer_len - 1;
+        assert!(limit >= DNS_HEADER_LEN);
+        assert!(lens.trailer_len > limit);
 
         let err = message
-            .to_bytes_with_limit(10)
+            .to_bytes_with_limit(limit)
             .expect_err("trailer larger than limit should fail");
         let text = err.to_string();
         assert!(
-            text.contains("cannot fit within UDP payload while preserving EDNS/signature trailer"),
+            text.contains("cannot fit within UDP payload while preserving questions and trailer"),
             "unexpected error: {text}"
         );
     }
