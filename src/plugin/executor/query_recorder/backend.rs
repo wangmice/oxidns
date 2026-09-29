@@ -4,7 +4,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender as ReplySender, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver as ReplyReceiver, RecvTimeoutError, Sender as ReplySender, SyncSender, TrySendError,
+    sync_channel,
+};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
 };
@@ -21,6 +24,10 @@ use crate::infra::error::{DnsError, Result};
 
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 const COORDINATOR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MANAGEMENT_START_TIMEOUT: Duration = Duration::from_secs(1);
+const MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(500);
+const SHUTDOWN_QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
 enum DropKind {
@@ -88,6 +95,9 @@ pub(super) struct RecorderBackend {
     pub(super) reader_semaphore: Arc<Semaphore>,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
     writer_interrupt: Arc<WriterInterrupt>,
+    accepting_records: AtomicBool,
+    writer_recovering: Arc<AtomicBool>,
+    management_inflight: Arc<AtomicBool>,
     drop_log_state: Mutex<DropLogState>,
     drop_queue_full: AtomicU64,
     drop_writer_disconnected: AtomicU64,
@@ -149,10 +159,17 @@ pub(super) enum WriterCommand {
     Insert(Box<PendingRecord>),
     Cleanup {
         cutoff_ms: i64,
+        started_tx: ReplySender<()>,
         reply_tx: ReplySender<CleanupReply>,
+        cancelled: Arc<AtomicBool>,
     },
     ClearHistory {
+        started_tx: ReplySender<()>,
         reply_tx: ReplySender<ClearHistoryReply>,
+        cancelled: Arc<AtomicBool>,
+    },
+    Shutdown {
+        reply_tx: ReplySender<std::result::Result<(), String>>,
     },
     #[cfg(test)]
     Flush {
@@ -173,6 +190,8 @@ pub(super) struct WriterThreadContext {
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
     pub(super) dropped_total: Arc<AtomicU64>,
     pub(super) writer_interrupt: Arc<WriterInterrupt>,
+    pub(super) writer_recovering: Arc<AtomicBool>,
+    pub(super) management_inflight: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -413,9 +432,13 @@ impl RecorderBackend {
         let dropped_total = Arc::new(AtomicU64::new(0));
         let reader_semaphore = Arc::new(Semaphore::new(config.reader_concurrency));
         let writer_interrupt = Arc::new(WriterInterrupt::default());
+        let writer_recovering = Arc::new(AtomicBool::new(false));
+        let management_inflight = Arc::new(AtomicBool::new(false));
         writer_interrupt.install(&conn);
         let writer_dropped_total = dropped_total.clone();
         let writer_interrupt_for_thread = writer_interrupt.clone();
+        let writer_recovering_for_thread = writer_recovering.clone();
+        let management_inflight_for_thread = management_inflight.clone();
 
         let writer_tables = tables.clone();
         let writer_path = config.path.clone();
@@ -442,6 +465,8 @@ impl RecorderBackend {
                         database_coordinator: writer_database_coordinator,
                         dropped_total: writer_dropped_total,
                         writer_interrupt: writer_interrupt_for_thread,
+                        writer_recovering: writer_recovering_for_thread,
+                        management_inflight: management_inflight_for_thread,
                     },
                     queue_rx,
                     conn,
@@ -464,6 +489,9 @@ impl RecorderBackend {
             reader_semaphore,
             database_coordinator,
             writer_interrupt,
+            accepting_records: AtomicBool::new(true),
+            writer_recovering,
+            management_inflight,
             drop_log_state: Mutex::new(DropLogState::default()),
             drop_queue_full: AtomicU64::new(0),
             drop_writer_disconnected: AtomicU64::new(0),
@@ -472,7 +500,7 @@ impl RecorderBackend {
     }
 
     pub(super) fn enqueue(&self, pending: PendingRecord) {
-        if self.stop_requested.load(Ordering::Acquire) {
+        if !self.accepting_records.load(Ordering::Relaxed) {
             return;
         }
         match self
@@ -485,9 +513,109 @@ impl RecorderBackend {
         }
     }
 
-    pub(super) fn request_stop(&self) {
+    fn hard_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         self.writer_interrupt.interrupt();
+    }
+
+    pub(super) fn shutdown(&self) {
+        self.accepting_records.store(false, Ordering::Release);
+        if self.writer_recovering.load(Ordering::Acquire) {
+            self.hard_stop();
+            return;
+        }
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE_TIMEOUT;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut command = WriterCommand::Shutdown { reply_tx };
+        loop {
+            match self.queue_tx.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        self.hard_stop();
+                        return;
+                    }
+                    command = returned;
+                    thread::sleep(SHUTDOWN_QUEUE_RETRY_INTERVAL);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.stop_requested.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.hard_stop();
+            return;
+        }
+        match reply_rx.recv_timeout(remaining) {
+            Ok(_) => {
+                self.stop_requested.store(true, Ordering::Release);
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                self.hard_stop();
+            }
+        }
+    }
+
+    fn begin_management(&self) -> std::result::Result<(), String> {
+        if !self.accepting_records.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+        {
+            return Err("query_recorder is stopping".to_string());
+        }
+        if self.writer_recovering.load(Ordering::Acquire) {
+            return Err("query_recorder storage is recovering".to_string());
+        }
+        if self
+            .management_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("query_recorder management operation already in progress".to_string());
+        }
+        if !self.accepting_records.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+            || self.writer_recovering.load(Ordering::Acquire)
+        {
+            self.management_inflight.store(false, Ordering::Release);
+            return Err("query_recorder storage is unavailable".to_string());
+        }
+        Ok(())
+    }
+
+    fn wait_management<T>(
+        &self,
+        started_rx: ReplyReceiver<()>,
+        reply_rx: ReplyReceiver<std::result::Result<T, String>>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> std::result::Result<T, String> {
+        match started_rx.recv_timeout(MANAGEMENT_START_TIMEOUT) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                cancelled.store(true, Ordering::Release);
+                return Err("query_recorder management request start timed out".to_string());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.management_inflight.store(false, Ordering::Release);
+                return Err("query_recorder writer became unavailable".to_string());
+            }
+        }
+        match reply_rx.recv_timeout(MANAGEMENT_OPERATION_TIMEOUT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                cancelled.store(true, Ordering::Release);
+                self.writer_interrupt.interrupt();
+                Err("query_recorder management operation timed out".to_string())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.management_inflight.store(false, Ordering::Release);
+                Err("query_recorder writer became unavailable".to_string())
+            }
+        }
     }
 
     pub(super) fn drop_oversized_record(&self) {
@@ -538,20 +666,29 @@ impl RecorderBackend {
     }
 
     pub(super) fn cleanup(&self, cutoff_ms: i64) -> CleanupReply {
-        if self.stop_requested.load(Ordering::Acquire) {
-            return Err("query_recorder is stopping".to_string());
-        }
+        self.begin_management()?;
         let started = Instant::now();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.queue_tx
-            .send(WriterCommand::Cleanup {
-                cutoff_ms,
-                reply_tx,
-            })
-            .map_err(|err| format!("query_recorder cleanup enqueue failed: {err}"))?;
-        let result = reply_rx
-            .recv()
-            .map_err(|err| format!("query_recorder cleanup reply failed: {err}"))?;
+        let command = WriterCommand::Cleanup {
+            cutoff_ms,
+            started_tx,
+            reply_tx,
+            cancelled: cancelled.clone(),
+        };
+        match self.queue_tx.try_send(command) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.management_inflight.store(false, Ordering::Release);
+                return Err("query_recorder writer queue is busy".to_string());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.management_inflight.store(false, Ordering::Release);
+                return Err("query_recorder writer is unavailable".to_string());
+            }
+        }
+        let result = self.wait_management(started_rx, reply_rx, &cancelled);
         if let Ok(result) = &result {
             log_space_reclaim(
                 &self.tag,
@@ -565,17 +702,28 @@ impl RecorderBackend {
     }
 
     pub(super) fn clear_history(&self) -> ClearHistoryReply {
-        if self.stop_requested.load(Ordering::Acquire) {
-            return Err("query_recorder is stopping".to_string());
-        }
+        self.begin_management()?;
         let started = Instant::now();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.queue_tx
-            .send(WriterCommand::ClearHistory { reply_tx })
-            .map_err(|err| format!("query_recorder clear enqueue failed: {err}"))?;
-        let result = reply_rx
-            .recv()
-            .map_err(|err| format!("query_recorder clear reply failed: {err}"))?;
+        let command = WriterCommand::ClearHistory {
+            started_tx,
+            reply_tx,
+            cancelled: cancelled.clone(),
+        };
+        match self.queue_tx.try_send(command) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.management_inflight.store(false, Ordering::Release);
+                return Err("query_recorder writer queue is busy".to_string());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.management_inflight.store(false, Ordering::Release);
+                return Err("query_recorder writer is unavailable".to_string());
+            }
+        }
+        let result = self.wait_management(started_rx, reply_rx, &cancelled);
         if let Ok(result) = &result {
             log_space_reclaim(
                 &self.tag,
@@ -597,6 +745,11 @@ impl RecorderBackend {
         reply_rx
             .recv()
             .map_err(|err| format!("query_recorder flush reply failed: {err}"))?
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_recovering_for_test(&self, recovering: bool) {
+        self.writer_recovering.store(recovering, Ordering::Release);
     }
 }
 

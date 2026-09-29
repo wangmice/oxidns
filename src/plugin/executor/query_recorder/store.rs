@@ -79,12 +79,19 @@ fn open_writer_database_for_recovery(
     // so all PRAGMA/schema work that follows is interruptible during shutdown.
     let conn = Connection::open(path)?;
     writer_interrupt.install(&conn);
+
     if stop_requested.load(Ordering::Acquire) {
         writer_interrupt.interrupt();
         return Err(writer_stopping());
     }
     configure_writer_database(&conn)?;
-    ensure_maintenance_running(stop_requested)?;
+
+    // Shutdown may have been requested while the PRAGMA configuration above
+    // was running. Check again before returning the recovered connection.
+    if stop_requested.load(Ordering::Acquire) {
+        writer_interrupt.interrupt();
+        return Err(writer_stopping());
+    }
     Ok(conn)
 }
 
@@ -172,6 +179,8 @@ pub(super) fn run_writer_thread(
         database_coordinator,
         dropped_total,
         writer_interrupt,
+        writer_recovering,
+        management_inflight,
     } = context;
 
     let mut pending = Vec::with_capacity(batch_size);
@@ -197,6 +206,7 @@ pub(super) fn run_writer_thread(
                         &dropped_total,
                         &writer_interrupt,
                         &mut recovery_delay,
+                        &writer_recovering,
                     )
                 {
                     break;
@@ -204,8 +214,19 @@ pub(super) fn run_writer_thread(
             }
             Ok(WriterCommand::Cleanup {
                 cutoff_ms,
+                started_tx,
                 reply_tx,
+                cancelled,
             }) => {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = started_tx.send(());
+                    management_inflight.store(false, Ordering::Release);
+                    let _ = reply_tx.send(Err(
+                        "query_recorder management request expired before start".to_string(),
+                    ));
+                    continue;
+                }
+                let _ = started_tx.send(());
                 let result = (|| {
                     let prepared = prepare_pending(&mut pending)?;
                     let Some(_access) =
@@ -221,12 +242,33 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                     )?;
-                    run_cleanup_cancellable(&mut conn, &path, &tables, cutoff_ms, &stop_requested)
+                    run_cleanup_cancellable(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        cutoff_ms,
+                        &stop_requested,
+                        &cancelled,
+                    )
                 })()
                 .map_err(|err: DnsError| err.to_string());
+                management_inflight.store(false, Ordering::Release);
                 let _ = reply_tx.send(result);
             }
-            Ok(WriterCommand::ClearHistory { reply_tx }) => {
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                reply_tx,
+                cancelled,
+            }) => {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = started_tx.send(());
+                    management_inflight.store(false, Ordering::Release);
+                    let _ = reply_tx.send(Err(
+                        "query_recorder management request expired before start".to_string(),
+                    ));
+                    continue;
+                }
+                let _ = started_tx.send(());
                 let result = (|| {
                     let prepared = prepare_pending(&mut pending)?;
                     let Some(_access) =
@@ -242,10 +284,38 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                     )?;
-                    run_clear_history_cancellable(&mut conn, &path, &tables, &tail, &stop_requested)
+                    run_clear_history_cancellable(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &tail,
+                        &stop_requested,
+                        &cancelled,
+                    )
                 })()
                 .map_err(|err: DnsError| err.to_string());
+                management_inflight.store(false, Ordering::Release);
                 let _ = reply_tx.send(result);
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
+                drain_writer_queue_for_graceful_shutdown(&rx, &mut pending, &management_inflight);
+                let record_count = pending.len();
+                let result = flush_pending_coordinated(
+                    &mut conn,
+                    &tables,
+                    &mut pending,
+                    &tail,
+                    memory_tail,
+                    &broadcaster,
+                    &database_coordinator,
+                    &stop_requested,
+                )
+                .map_err(|err| err.to_string());
+                if result.is_err() && record_count != 0 {
+                    dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+                }
+                let _ = reply_tx.send(result);
+                break;
             }
             #[cfg(test)]
             Ok(WriterCommand::Flush { reply_tx }) => {
@@ -276,6 +346,7 @@ pub(super) fn run_writer_thread(
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
+                    &writer_recovering,
                 ) {
                     break;
                 }
@@ -294,6 +365,7 @@ pub(super) fn run_writer_thread(
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
+                    &writer_recovering,
                 );
                 break;
             }
@@ -301,7 +373,7 @@ pub(super) fn run_writer_thread(
     }
 
     if stop_requested.load(Ordering::Acquire) {
-        drain_writer_queue_on_stop(&rx, &mut pending, &dropped_total);
+        drain_writer_queue_on_stop(&rx, &mut pending, &dropped_total, &management_inflight);
     }
     writer_interrupt.clear();
     Ok(())
@@ -321,6 +393,7 @@ fn flush_pending_resilient(
     dropped_total: &AtomicU64,
     writer_interrupt: &WriterInterrupt,
     recovery_delay: &mut Duration,
+    writer_recovering: &AtomicBool,
 ) -> bool {
     if pending.is_empty() {
         return !stop_requested.load(Ordering::Acquire);
@@ -339,6 +412,7 @@ fn flush_pending_resilient(
     ) {
         Ok(()) => {
             *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+            writer_recovering.store(false, Ordering::Release);
             true
         }
         Err(err) => {
@@ -352,7 +426,8 @@ fn flush_pending_resilient(
                 return false;
             }
             if storage_error_requires_reopen(&err) {
-                recover_writer_connection(
+                writer_recovering.store(true, Ordering::Release);
+                let recovered = recover_writer_connection(
                     conn,
                     path,
                     tables,
@@ -360,7 +435,11 @@ fn flush_pending_resilient(
                     stop_requested,
                     writer_interrupt,
                     recovery_delay,
-                )
+                );
+                if recovered {
+                    writer_recovering.store(false, Ordering::Release);
+                }
+                recovered
             } else {
                 true
             }
@@ -456,10 +535,49 @@ fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
     !stop_requested.load(Ordering::Acquire)
 }
 
+fn drain_writer_queue_for_graceful_shutdown(
+    rx: &Receiver<WriterCommand>,
+    pending: &mut Vec<PendingRecord>,
+    management_inflight: &AtomicBool,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(WriterCommand::Insert(record)) => pending.push(*record),
+            Ok(WriterCommand::Cleanup {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is already stopping".to_string()));
+            }
+            #[cfg(test)]
+            Ok(WriterCommand::Flush { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 fn drain_writer_queue_on_stop(
     rx: &Receiver<WriterCommand>,
     pending: &mut Vec<PendingRecord>,
     dropped_total: &AtomicU64,
+    management_inflight: &AtomicBool,
 ) {
     let mut dropped = pending.len() as u64;
     pending.clear();
@@ -469,10 +587,25 @@ fn drain_writer_queue_on_stop(
             Ok(WriterCommand::Insert(_)) => {
                 dropped = dropped.saturating_add(1);
             }
-            Ok(WriterCommand::Cleanup { reply_tx, .. }) => {
+            Ok(WriterCommand::Cleanup {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
                 let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
             }
-            Ok(WriterCommand::ClearHistory { reply_tx }) => {
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
                 let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
             }
             #[cfg(test)]
@@ -623,7 +756,8 @@ fn run_cleanup(
     cutoff_ms: i64,
 ) -> Result<CleanupResult> {
     let stop_requested = AtomicBool::new(false);
-    run_cleanup_cancellable(conn, path, tables, cutoff_ms, &stop_requested)
+    let cancelled = AtomicBool::new(false);
+    run_cleanup_cancellable(conn, path, tables, cutoff_ms, &stop_requested, &cancelled)
 }
 
 fn run_cleanup_cancellable(
@@ -632,15 +766,16 @@ fn run_cleanup_cancellable(
     tables: &TableNames,
     cutoff_ms: i64,
     stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<CleanupResult> {
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     checkpoint_wal(conn)?;
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let before = read_space_stats(conn, path)?;
     let mut deleted_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
-        ensure_maintenance_running(stop_requested)?;
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let deleted = delete_batch(conn, tables, Some(cutoff_ms))?;
         if deleted == 0 {
             break;
@@ -649,7 +784,7 @@ fn run_cleanup_cancellable(
         observe_wal_size(path, &mut peak_wal_bytes)?;
         checkpoint_wal(conn)?;
     }
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let reclaimable = read_space_stats(conn, path)?;
     let space = reclaim_database_space_cancellable(
         conn,
@@ -658,6 +793,7 @@ fn run_cleanup_cancellable(
         reclaimable,
         peak_wal_bytes,
         stop_requested,
+        cancelled,
     )?;
     Ok(CleanupResult {
         deleted_records,
@@ -673,7 +809,8 @@ fn run_clear_history(
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
     let stop_requested = AtomicBool::new(false);
-    run_clear_history_cancellable(conn, path, tables, tail, &stop_requested)
+    let cancelled = AtomicBool::new(false);
+    run_clear_history_cancellable(conn, path, tables, tail, &stop_requested, &cancelled)
 }
 
 fn run_clear_history_cancellable(
@@ -682,6 +819,7 @@ fn run_clear_history_cancellable(
     tables: &TableNames,
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
     stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<ClearHistoryResult> {
     run_clear_history_with_checkpoint_and_stop(
         conn,
@@ -689,6 +827,7 @@ fn run_clear_history_cancellable(
         tables,
         tail,
         stop_requested,
+        cancelled,
         &mut checkpoint_wal,
     )
 }
@@ -705,12 +844,14 @@ where
     F: FnMut(&Connection) -> Result<()>,
 {
     let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
     run_clear_history_with_checkpoint_and_stop(
         conn,
         path,
         tables,
         tail,
         &stop_requested,
+        &cancelled,
         checkpoint,
     )
 }
@@ -721,23 +862,24 @@ fn run_clear_history_with_checkpoint_and_stop<F>(
     tables: &TableNames,
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
     stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
     checkpoint: &mut F,
 ) -> Result<ClearHistoryResult>
 where
     F: FnMut(&Connection) -> Result<()>,
 {
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     // Start from an empty WAL and keep it bounded throughout the operation.
     // A single DELETE transaction for a large recorder can otherwise grow the
     // WAL close to the amount of history being removed before the final
     // checkpoint gets a chance to truncate it.
     checkpoint(conn)?;
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let before = read_space_stats(conn, path)?;
     let mut cleared_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
-        ensure_maintenance_running(stop_requested)?;
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let deleted = delete_batch(conn, tables, None)?;
         if deleted == 0 {
             break;
@@ -749,7 +891,7 @@ where
     }
 
     clear_tail(tail);
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let reclaimable = read_space_stats(conn, path)?;
     let space = reclaim_database_space_cancellable(
         conn,
@@ -758,6 +900,7 @@ where
         reclaimable,
         peak_wal_bytes,
         stop_requested,
+        cancelled,
     )
     .map_err(|err| {
         DnsError::runtime(format!(
@@ -783,17 +926,24 @@ fn reclaim_database_space_cancellable(
     reclaimable: SpaceStats,
     mut peak_wal_bytes: u64,
     stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<SpaceReclaimResult> {
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let migrated = match reclaimable.auto_vacuum {
         0 => {
             conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
-            ensure_maintenance_running(stop_requested)?;
+            ensure_maintenance_running(stop_requested, cancelled)?;
             true
         }
         1 => false,
         2 => {
-            run_incremental_vacuum_cancellable(conn, path, &mut peak_wal_bytes, stop_requested)?;
+            run_incremental_vacuum_cancellable(
+                conn,
+                path,
+                &mut peak_wal_bytes,
+                stop_requested,
+                cancelled,
+            )?;
             false
         }
         mode => {
@@ -806,7 +956,7 @@ fn reclaim_database_space_cancellable(
     observe_wal_size(path, &mut peak_wal_bytes)?;
     checkpoint_wal(conn)?;
 
-    ensure_maintenance_running(stop_requested)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let after = read_space_stats(conn, path)?;
     if migrated && after.auto_vacuum != 2 {
         return Err(DnsError::runtime(format!(
@@ -841,6 +991,7 @@ fn run_incremental_vacuum_cancellable(
     path: &Path,
     peak_wal_bytes: &mut u64,
     stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<()> {
     // `PRAGMA incremental_vacuum` is a multi-step statement that yields one
     // zero-column row per reclaimed page. `Connection::execute_batch` only
@@ -848,7 +999,7 @@ fn run_incremental_vacuum_cancellable(
     // pages per statement and truncate the WAL between batches so a manual
     // clear cannot trade a smaller main file for an unbounded WAL peak.
     loop {
-        ensure_maintenance_running(stop_requested)?;
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let before = pragma_u64(conn, "PRAGMA freelist_count")?;
         if before == 0 {
             return Ok(());
@@ -872,9 +1023,14 @@ fn run_incremental_vacuum_cancellable(
     }
 }
 
-fn ensure_maintenance_running(stop_requested: &AtomicBool) -> Result<()> {
+fn ensure_maintenance_running(stop_requested: &AtomicBool, cancelled: &AtomicBool) -> Result<()> {
     if stop_requested.load(Ordering::Acquire) {
         return Err(writer_stopping());
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(DnsError::runtime(
+            "query_recorder management operation cancelled",
+        ));
     }
     Ok(())
 }

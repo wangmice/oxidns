@@ -902,6 +902,74 @@ async fn test_query_recorder_destroy_does_not_wait_for_coordinator_lock() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_query_recorder_management_fails_fast_while_recovering() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+    backend.set_recovering_for_test(true);
+
+    let cleanup_backend = backend.clone();
+    let cleanup = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX))
+        .await
+        .unwrap();
+    assert!(cleanup.unwrap_err().contains("storage is recovering"));
+
+    let clear_backend = backend.clone();
+    let clear = tokio::task::spawn_blocking(move || clear_backend.clear_history())
+        .await
+        .unwrap();
+    assert!(clear.unwrap_err().contains("storage is recovering"));
+
+    backend.set_recovering_for_test(false);
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_healthy_shutdown_flushes_pending_records() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        1_000,
+        77,
+        "shutdown-flush.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    plugin.destroy().await.unwrap();
+
+    let records = query_records(backend, list_query(QueryRecordFilter::default()))
+        .unwrap()
+        .0;
+    assert!(records.iter().any(|record| record.request_id == 77));
+}
+
 #[test]
 fn test_query_recorder_waiting_writer_blocks_new_readers() {
     let coordinator = Arc::new(DatabaseCoordinator::default());
@@ -956,7 +1024,7 @@ fn test_query_recorder_waiting_writer_blocks_new_readers() {
 }
 
 #[tokio::test]
-async fn test_query_recorder_cleanup_is_not_skipped_when_record_queue_is_full() {
+async fn test_query_recorder_cleanup_fails_fast_when_record_queue_is_full() {
     AppClock::start();
 
     let temp = NamedTempFile::new().unwrap();
@@ -1017,21 +1085,16 @@ async fn test_query_recorder_cleanup_is_not_skipped_when_record_queue_is_full() 
     assert!(queue_was_full);
 
     let cleanup_backend = backend.clone();
-    let mut cleanup_task = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut cleanup_task)
-            .await
-            .is_err()
-    );
+    let cleanup_task = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_task)
+        .await
+        .expect("cleanup should fail fast while the writer queue is full")
+        .unwrap()
+        .unwrap_err();
+    assert!(result.contains("writer queue is busy"));
 
     release_tx.send(()).unwrap();
     maintenance_holder.join().unwrap();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(result.deleted_records > 0);
 
     plugin.destroy().await.unwrap();
 }

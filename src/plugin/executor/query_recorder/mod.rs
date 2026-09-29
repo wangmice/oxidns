@@ -77,14 +77,18 @@ impl Plugin for QueryRecorder {
     }
 
     async fn destroy(&self) -> Result<()> {
-        // Interrupt SQLite before stopping the periodic wrapper. A cleanup
-        // already running inside spawn_blocking cannot be aborted by Tokio,
-        // but sqlite3_interrupt makes its current SQLite operation unwind.
-        if let Some(backend) = &self.backend {
-            backend.request_stop();
-        }
         if let Some(task_handle) = &self.cleanup_task_handle {
             task_handle.stop().await;
+        }
+        if let Some(backend) = &self.backend {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.shutdown())
+                .await
+                .map_err(|err| {
+                    DnsError::runtime(format!(
+                        "query_recorder shutdown coordination failed: {err}"
+                    ))
+                })?;
         }
         let join_handle = if let Some(backend) = &self.backend {
             let mut guard = backend
