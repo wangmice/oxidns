@@ -929,6 +929,40 @@ async fn test_query_recorder_management_fails_fast_while_recovering() {
     plugin.destroy().await.unwrap();
 }
 
+#[test]
+fn test_query_recorder_management_write_wait_honors_cancel() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let first_reader = coordinator.read_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    let writer_coordinator = coordinator.clone();
+    let writer_stop = stop_requested.clone();
+    let writer_cancelled = cancelled.clone();
+    let writer = std::thread::spawn(move || {
+        match writer_coordinator.write_access_until_stop_or_cancel(&writer_stop, &writer_cancelled)
+        {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("cancelled management writer unexpectedly acquired access"),
+        }
+    });
+
+    let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while coordinator.waiting_writers_for_test() == 0 {
+        assert!(
+            std::time::Instant::now() < waiter_deadline,
+            "management writer did not register for exclusive access"
+        );
+        std::thread::yield_now();
+    }
+
+    cancelled.store(true, Ordering::Release);
+    let error = writer.join().unwrap();
+    assert!(error.contains("management operation cancelled"));
+    assert_eq!(coordinator.waiting_writers_for_test(), 0);
+    drop(first_reader);
+}
+
 #[tokio::test]
 async fn test_query_recorder_healthy_shutdown_flushes_pending_records() {
     AppClock::start();
@@ -952,22 +986,25 @@ async fn test_query_recorder_healthy_shutdown_flushes_pending_records() {
     plugin.init_without_api_for_test().await.unwrap();
     let backend = plugin.backend.as_ref().unwrap().clone();
 
-    backend.enqueue(pending_record(
-        1_000,
-        77,
-        "shutdown-flush.example.com.",
-        RecordType::A,
-        Ipv4Addr::LOCALHOST,
-        Some(Rcode::NoError),
-        None,
-        &[],
-    ));
+    for request_id in 1..=24 {
+        backend.enqueue(pending_record(
+            i64::from(request_id),
+            request_id,
+            "shutdown-flush.example.com.",
+            RecordType::A,
+            Ipv4Addr::LOCALHOST,
+            Some(Rcode::NoError),
+            None,
+            &[],
+        ));
+    }
     plugin.destroy().await.unwrap();
 
-    let records = query_records(backend, list_query(QueryRecordFilter::default()))
-        .unwrap()
-        .0;
-    assert!(records.iter().any(|record| record.request_id == 77));
+    let mut query = list_query(QueryRecordFilter::default());
+    query.limit = 50;
+    let records = query_records(backend, query).unwrap().0;
+    assert_eq!(records.len(), 24);
+    assert!(records.iter().any(|record| record.request_id == 24));
 }
 
 #[test]
@@ -1021,6 +1058,65 @@ fn test_query_recorder_waiting_writer_blocks_new_readers() {
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("reader should continue after writer release");
     reader.join().unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_management_preflush_failure_counts_dropped_records() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_management_preflush
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected management preflush failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        88,
+        "management-preflush.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let cleanup_backend = backend.clone();
+    let cleanup = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX))
+        .await
+        .unwrap();
+    assert!(cleanup.is_err());
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_management_preflush;")
+        .unwrap();
+    plugin.destroy().await.unwrap();
 }
 
 #[tokio::test]

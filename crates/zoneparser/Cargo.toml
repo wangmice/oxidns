@@ -4,7 +4,6 @@ version = "0.1.2"
 edition = "2024"
 # authors = ["Sven Shi <isvenshi@gmail.com>"]
 license = "MIT"
-readme = "README.md"
 description = "Vendored zonefile parser adapted for OxiDNS"
 repository = "https://github.com/svenshi/oxidns"
 keywords = ["dns", "zonefile", "parser"]

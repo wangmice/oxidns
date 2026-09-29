@@ -228,19 +228,20 @@ pub(super) fn run_writer_thread(
                 }
                 let _ = started_tx.send(());
                 let result = (|| {
-                    let prepared = prepare_pending(&mut pending)?;
-                    let Some(_access) =
-                        database_coordinator.write_access_until_stop(&stop_requested)?
+                    let Some(_access) = database_coordinator
+                        .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
                     else {
                         return Err(writer_stopping());
                     };
-                    flush_prepared(
+                    ensure_maintenance_running(&stop_requested, &cancelled)?;
+                    flush_pending_for_management(
                         &mut conn,
                         &tables,
-                        prepared,
+                        &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
+                        &dropped_total,
                     )?;
                     run_cleanup_cancellable(
                         &mut conn,
@@ -270,19 +271,20 @@ pub(super) fn run_writer_thread(
                 }
                 let _ = started_tx.send(());
                 let result = (|| {
-                    let prepared = prepare_pending(&mut pending)?;
-                    let Some(_access) =
-                        database_coordinator.write_access_until_stop(&stop_requested)?
+                    let Some(_access) = database_coordinator
+                        .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
                     else {
                         return Err(writer_stopping());
                     };
-                    flush_prepared(
+                    ensure_maintenance_running(&stop_requested, &cancelled)?;
+                    flush_pending_for_management(
                         &mut conn,
                         &tables,
-                        prepared,
+                        &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
+                        &dropped_total,
                     )?;
                     run_clear_history_cancellable(
                         &mut conn,
@@ -447,6 +449,45 @@ fn flush_pending_resilient(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_for_management(
+    conn: &mut Connection,
+    tables: &TableNames,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<RecordDetail>,
+    dropped_total: &AtomicU64,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let record_count = pending.len();
+    let prepared = match prepare_pending(pending) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+            warn!(
+                dropped_records = record_count,
+                error = %err,
+                "query_recorder management preflush preparation failed; dropping pending batch"
+            );
+            return Err(err);
+        }
+    };
+    if let Err(err) = flush_prepared(conn, tables, prepared, tail, memory_tail, broadcaster) {
+        dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+        warn!(
+            dropped_records = record_count,
+            error = %err,
+            "query_recorder management preflush failed; dropping pending batch"
+        );
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn storage_error_requires_reopen(error: &DnsError) -> bool {
     matches!(error, DnsError::Io(_) | DnsError::Rusqlite(_))
 }
@@ -485,6 +526,7 @@ fn recover_writer_connection(
             let mut new_conn =
                 open_writer_database_for_recovery(path, stop_requested, writer_interrupt)?;
             create_schema(&mut new_conn, tables)?;
+            verify_writer_database_writable(&mut new_conn, tables)?;
             Ok(new_conn)
         })();
 
@@ -500,7 +542,7 @@ fn recover_writer_connection(
                     .min(WRITER_RECOVERY_MAX_DELAY);
                 info!(
                     path = %path.display(),
-                    "query_recorder writer database connection reopened"
+                    "query_recorder writer database connection recovered"
                 );
                 return true;
             }
@@ -533,6 +575,29 @@ fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
         remaining = remaining.saturating_sub(sleep_for);
     }
     !stop_requested.load(Ordering::Acquire)
+}
+
+fn verify_writer_database_writable(conn: &mut Connection, tables: &TableNames) -> Result<()> {
+    // Reopening and reading the schema does not prove that the storage can
+    // still commit writes. Touch a recorder-internal probe key and remove it
+    // in the same transaction so the logical database contents are unchanged
+    // while WAL/write/commit failures are still exercised.
+    const PROBE_KEY: &str = "__oxidns_writer_health_probe__";
+    let tx = conn.transaction()?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {} (key,value) VALUES (?1,'1') \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            tables.meta
+        ),
+        [PROBE_KEY],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM {} WHERE key=?1", tables.meta),
+        [PROBE_KEY],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn drain_writer_queue_for_graceful_shutdown(

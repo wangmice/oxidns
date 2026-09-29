@@ -26,7 +26,8 @@ const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 const COORDINATOR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MANAGEMENT_START_TIMEOUT: Duration = Duration::from_secs(1);
 const MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
-const SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_millis(500);
+const SHUTDOWN_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
@@ -324,6 +325,43 @@ impl DatabaseCoordinator {
         }
     }
 
+    pub(super) fn write_access_until_stop_or_cancel(
+        &self,
+        stop_requested: &AtomicBool,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<DatabaseWriteGuard<'_>>> {
+        self.waiting_writers.fetch_add(1, Ordering::AcqRel);
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                return Ok(None);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                return Err(DnsError::runtime(
+                    "query_recorder management operation cancelled",
+                ));
+            }
+            match self.access.try_write() {
+                Ok(guard) => {
+                    return Ok(Some(DatabaseWriteGuard {
+                        _guard: guard,
+                        waiting_writers: &self.waiting_writers,
+                    }));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
+    }
+
     pub(super) fn writer_until_stop(
         &self,
         stop_requested: &AtomicBool,
@@ -349,6 +387,10 @@ impl DatabaseCoordinator {
     #[cfg(test)]
     pub(super) fn waiting_writers_for_test(&self) -> usize {
         self.waiting_writers.load(Ordering::Acquire)
+    }
+
+    fn exclusive_access_active_or_waiting(&self) -> bool {
+        self.waiting_writers.load(Ordering::Acquire) != 0
     }
 }
 
@@ -520,19 +562,24 @@ impl RecorderBackend {
 
     pub(super) fn shutdown(&self) {
         self.accepting_records.store(false, Ordering::Release);
-        if self.writer_recovering.load(Ordering::Acquire) {
+        if self.writer_recovering.load(Ordering::Acquire)
+            || self.management_inflight.load(Ordering::Acquire)
+            || self
+                .database_coordinator
+                .exclusive_access_active_or_waiting()
+        {
             self.hard_stop();
             return;
         }
 
-        let deadline = Instant::now() + SHUTDOWN_GRACE_TIMEOUT;
+        let enqueue_deadline = Instant::now() + SHUTDOWN_ENQUEUE_TIMEOUT;
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let mut command = WriterCommand::Shutdown { reply_tx };
         loop {
             match self.queue_tx.try_send(command) {
                 Ok(()) => break,
                 Err(TrySendError::Full(returned)) => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= enqueue_deadline {
                         self.hard_stop();
                         return;
                     }
@@ -546,12 +593,7 @@ impl RecorderBackend {
             }
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            self.hard_stop();
-            return;
-        }
-        match reply_rx.recv_timeout(remaining) {
+        match reply_rx.recv_timeout(SHUTDOWN_FLUSH_TIMEOUT) {
             Ok(_) => {
                 self.stop_requested.store(true, Ordering::Release);
             }
