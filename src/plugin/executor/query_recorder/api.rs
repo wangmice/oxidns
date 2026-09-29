@@ -134,9 +134,17 @@ where
         .await
         .map_err(|err| DnsError::runtime(format!("query_recorder reader closed: {err}")))?;
     let database_coordinator = backend.database_coordinator.clone();
+    let stop_requested = backend.stop_requested.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let _access = database_coordinator.read_access()?;
+        let Some(_access) = database_coordinator.read_access_until_stop(&stop_requested)? else {
+            return Err(DnsError::runtime(
+                "query_recorder reader stopped before database access",
+            ));
+        };
+        if stop_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(DnsError::runtime("query_recorder reader is stopping"));
+        }
         op(backend)
     })
     .await

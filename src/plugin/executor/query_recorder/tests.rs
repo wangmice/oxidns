@@ -17,7 +17,8 @@ use super::model::{
 use super::store::{
     create_schema, load_latency_summary, load_plugin_stats, load_qtype_distribution,
     load_rcode_distribution, load_timeseries, load_top_clients, load_top_qnames,
-    open_reader_database, open_writer_database, query_records, table_names,
+    open_reader_database, open_writer_database, query_records, storage_error_requires_reopen,
+    table_names,
 };
 use super::{QueryRecorder, QueryRecorderFactory, resolve_config};
 use crate::core::context::{DnsContext, ExecutionPathEvent};
@@ -795,7 +796,7 @@ async fn test_query_recorder_cleanup_failure_does_not_stop_writer() {
 }
 
 #[tokio::test]
-async fn test_query_recorder_writer_recovers_after_insert_failure() {
+async fn test_query_recorder_writer_continues_after_non_storage_insert_failure() {
     AppClock::start();
 
     let temp = NamedTempFile::new().unwrap();
@@ -860,6 +861,41 @@ async fn test_query_recorder_writer_recovers_after_insert_failure() {
     assert!(records.iter().any(|record| record.request_id == 2));
 
     plugin.destroy().await.unwrap();
+}
+
+#[test]
+fn test_query_recorder_non_storage_sqlite_errors_do_not_force_reopen() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE storage_error_test (id INTEGER PRIMARY KEY);
+         INSERT INTO storage_error_test VALUES (1);",
+    )
+    .unwrap();
+    let error = conn
+        .execute("INSERT INTO storage_error_test VALUES (1)", [])
+        .unwrap_err();
+    assert!(!storage_error_requires_reopen(&DnsError::from(error)));
+}
+
+#[test]
+fn test_query_recorder_reader_wait_honors_stop() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let writer_guard = coordinator.write_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let reader_coordinator = coordinator.clone();
+    let reader_stop = stop_requested.clone();
+    let reader = std::thread::spawn(move || {
+        reader_coordinator
+            .read_access_until_stop(&reader_stop)
+            .unwrap()
+            .is_none()
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    stop_requested.store(true, Ordering::Release);
+    assert!(reader.join().unwrap());
+    drop(writer_guard);
 }
 
 #[tokio::test]

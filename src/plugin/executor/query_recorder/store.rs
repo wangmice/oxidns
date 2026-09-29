@@ -10,13 +10,14 @@ use std::thread;
 use std::time::Duration;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params, params_from_iter};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::backend::{
-    CleanupResult, ClearHistoryResult, DatabaseCoordinator, RecorderBackend, SpaceReclaimResult,
-    SpaceStats, WriterCommand, WriterInterrupt, WriterThreadContext,
+    CleanupResult, ClearHistoryResult, DatabaseCoordinator, MANAGEMENT_START_CLAIMED,
+    MANAGEMENT_START_PENDING, RecorderBackend, SpaceReclaimResult, SpaceStats, WriterCommand,
+    WriterInterrupt, WriterThreadContext,
 };
 #[cfg(test)]
 use super::model::StepJson;
@@ -215,10 +216,20 @@ pub(super) fn run_writer_thread(
             Ok(WriterCommand::Cleanup {
                 cutoff_ms,
                 started_tx,
+                start_state,
                 reply_tx,
                 cancelled,
             }) => {
-                if cancelled.load(Ordering::Acquire) {
+                if start_state
+                    .compare_exchange(
+                        MANAGEMENT_START_PENDING,
+                        MANAGEMENT_START_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    cancelled.store(true, Ordering::Release);
                     let _ = started_tx.send(());
                     management_inflight.store(false, Ordering::Release);
                     let _ = reply_tx.send(Err(
@@ -227,7 +238,7 @@ pub(super) fn run_writer_thread(
                     continue;
                 }
                 let _ = started_tx.send(());
-                let result = (|| {
+                let result: Result<CleanupResult> = (|| {
                     let Some(_access) = database_coordinator
                         .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
                     else {
@@ -251,17 +262,49 @@ pub(super) fn run_writer_thread(
                         &stop_requested,
                         &cancelled,
                     )
-                })()
-                .map_err(|err: DnsError| err.to_string());
+                })();
+                let recover_storage = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(storage_error_requires_reopen)
+                    && !cancelled.load(Ordering::Acquire)
+                    && !stop_requested.load(Ordering::Acquire);
                 management_inflight.store(false, Ordering::Release);
-                let _ = reply_tx.send(result);
+                let _ = reply_tx.send(result.map_err(|err| err.to_string()));
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                    let recovered = recover_writer_connection(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &database_coordinator,
+                        &stop_requested,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                    );
+                    if recovered {
+                        writer_recovering.store(false, Ordering::Release);
+                    } else {
+                        break;
+                    }
+                }
             }
             Ok(WriterCommand::ClearHistory {
                 started_tx,
+                start_state,
                 reply_tx,
                 cancelled,
             }) => {
-                if cancelled.load(Ordering::Acquire) {
+                if start_state
+                    .compare_exchange(
+                        MANAGEMENT_START_PENDING,
+                        MANAGEMENT_START_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    cancelled.store(true, Ordering::Release);
                     let _ = started_tx.send(());
                     management_inflight.store(false, Ordering::Release);
                     let _ = reply_tx.send(Err(
@@ -270,7 +313,7 @@ pub(super) fn run_writer_thread(
                     continue;
                 }
                 let _ = started_tx.send(());
-                let result = (|| {
+                let result: Result<ClearHistoryResult> = (|| {
                     let Some(_access) = database_coordinator
                         .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
                     else {
@@ -294,10 +337,32 @@ pub(super) fn run_writer_thread(
                         &stop_requested,
                         &cancelled,
                     )
-                })()
-                .map_err(|err: DnsError| err.to_string());
+                })();
+                let recover_storage = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(storage_error_requires_reopen)
+                    && !cancelled.load(Ordering::Acquire)
+                    && !stop_requested.load(Ordering::Acquire);
                 management_inflight.store(false, Ordering::Release);
-                let _ = reply_tx.send(result);
+                let _ = reply_tx.send(result.map_err(|err| err.to_string()));
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                    let recovered = recover_writer_connection(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &database_coordinator,
+                        &stop_requested,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                    );
+                    if recovered {
+                        writer_recovering.store(false, Ordering::Release);
+                    } else {
+                        break;
+                    }
+                }
             }
             Ok(WriterCommand::Shutdown { reply_tx }) => {
                 drain_writer_queue_for_graceful_shutdown(&rx, &mut pending, &management_inflight);
@@ -488,8 +553,24 @@ fn flush_pending_for_management(
     Ok(())
 }
 
-fn storage_error_requires_reopen(error: &DnsError) -> bool {
-    matches!(error, DnsError::Io(_) | DnsError::Rusqlite(_))
+pub(super) fn storage_error_requires_reopen(error: &DnsError) -> bool {
+    match error {
+        DnsError::Io(_) => true,
+        DnsError::Rusqlite(error) => matches!(
+            error.sqlite_error_code(),
+            Some(
+                ErrorCode::PermissionDenied
+                    | ErrorCode::ReadOnly
+                    | ErrorCode::SystemIoFailure
+                    | ErrorCode::DatabaseCorrupt
+                    | ErrorCode::DiskFull
+                    | ErrorCode::CannotOpen
+                    | ErrorCode::FileLockingProtocolFailed
+                    | ErrorCode::NotADatabase
+            )
+        ),
+        _ => false,
+    }
 }
 
 fn recover_writer_connection(

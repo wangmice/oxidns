@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver as ReplyReceiver, RecvTimeoutError, Sender as ReplySender, SyncSender, TrySendError,
     sync_channel,
@@ -29,6 +29,9 @@ const MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+pub(super) const MANAGEMENT_START_PENDING: u8 = 0;
+pub(super) const MANAGEMENT_START_CLAIMED: u8 = 1;
+pub(super) const MANAGEMENT_START_CANCELLED: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 enum DropKind {
@@ -161,11 +164,13 @@ pub(super) enum WriterCommand {
     Cleanup {
         cutoff_ms: i64,
         started_tx: ReplySender<()>,
+        start_state: Arc<AtomicU8>,
         reply_tx: ReplySender<CleanupReply>,
         cancelled: Arc<AtomicBool>,
     },
     ClearHistory {
         started_tx: ReplySender<()>,
+        start_state: Arc<AtomicU8>,
         reply_tx: ReplySender<ClearHistoryReply>,
         cancelled: Arc<AtomicBool>,
     },
@@ -214,6 +219,7 @@ impl Drop for DatabaseWriteGuard<'_> {
 }
 
 impl DatabaseCoordinator {
+    #[cfg(test)]
     pub(super) fn read_access(&self) -> Result<RwLockReadGuard<'_, ()>> {
         loop {
             if self.waiting_writers.load(Ordering::Acquire) != 0 {
@@ -633,13 +639,33 @@ impl RecorderBackend {
         &self,
         started_rx: ReplyReceiver<()>,
         reply_rx: ReplyReceiver<std::result::Result<T, String>>,
+        start_state: &Arc<AtomicU8>,
         cancelled: &Arc<AtomicBool>,
     ) -> std::result::Result<T, String> {
         match started_rx.recv_timeout(MANAGEMENT_START_TIMEOUT) {
             Ok(()) => {}
             Err(RecvTimeoutError::Timeout) => {
-                cancelled.store(true, Ordering::Release);
-                return Err("query_recorder management request start timed out".to_string());
+                match start_state.compare_exchange(
+                    MANAGEMENT_START_PENDING,
+                    MANAGEMENT_START_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) | Err(MANAGEMENT_START_CANCELLED) => {
+                        cancelled.store(true, Ordering::Release);
+                        return Err("query_recorder management request start timed out".to_string());
+                    }
+                    Err(MANAGEMENT_START_CLAIMED) => {
+                        // The writer atomically claimed the request before the
+                        // start deadline. Treat it as started even if the
+                        // notification raced with recv_timeout().
+                    }
+                    Err(_) => {
+                        cancelled.store(true, Ordering::Release);
+                        return Err("query_recorder management request entered an invalid state"
+                            .to_string());
+                    }
+                }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.management_inflight.store(false, Ordering::Release);
@@ -711,11 +737,13 @@ impl RecorderBackend {
         self.begin_management()?;
         let started = Instant::now();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let start_state = Arc::new(AtomicU8::new(MANAGEMENT_START_PENDING));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let command = WriterCommand::Cleanup {
             cutoff_ms,
             started_tx,
+            start_state: start_state.clone(),
             reply_tx,
             cancelled: cancelled.clone(),
         };
@@ -730,7 +758,7 @@ impl RecorderBackend {
                 return Err("query_recorder writer is unavailable".to_string());
             }
         }
-        let result = self.wait_management(started_rx, reply_rx, &cancelled);
+        let result = self.wait_management(started_rx, reply_rx, &start_state, &cancelled);
         if let Ok(result) = &result {
             log_space_reclaim(
                 &self.tag,
@@ -747,10 +775,12 @@ impl RecorderBackend {
         self.begin_management()?;
         let started = Instant::now();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let start_state = Arc::new(AtomicU8::new(MANAGEMENT_START_PENDING));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let command = WriterCommand::ClearHistory {
             started_tx,
+            start_state: start_state.clone(),
             reply_tx,
             cancelled: cancelled.clone(),
         };
@@ -765,7 +795,7 @@ impl RecorderBackend {
                 return Err("query_recorder writer is unavailable".to_string());
             }
         }
-        let result = self.wait_management(started_rx, reply_rx, &cancelled);
+        let result = self.wait_management(started_rx, reply_rx, &start_state, &cancelled);
         if let Ok(result) = &result {
             log_space_reclaim(
                 &self.tag,
