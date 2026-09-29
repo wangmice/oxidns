@@ -31,7 +31,6 @@ mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -78,11 +77,16 @@ impl Plugin for QueryRecorder {
     }
 
     async fn destroy(&self) -> Result<()> {
+        // Interrupt SQLite before stopping the periodic wrapper. A cleanup
+        // already running inside spawn_blocking cannot be aborted by Tokio,
+        // but sqlite3_interrupt makes its current SQLite operation unwind.
+        if let Some(backend) = &self.backend {
+            backend.request_stop();
+        }
         if let Some(task_handle) = &self.cleanup_task_handle {
             task_handle.stop().await;
         }
         let join_handle = if let Some(backend) = &self.backend {
-            backend.stop_requested.store(true, Ordering::Relaxed);
             let mut guard = backend
                 .writer_handle
                 .lock()
@@ -128,6 +132,18 @@ impl Executor for QueryRecorder {
         let instant = AppClock::now();
         let timestamp = Timestamp::now();
         let result = continue_next!(next, context);
+
+        // Keep the recorder strictly best-effort. Do not clone an unexpectedly
+        // large DNS message or execution trace into the bounded writer queue.
+        if !PendingRecord::capture_within_limits(
+            &request,
+            context.response.as_ref(),
+            &context.execution_path,
+            step_start_index,
+        ) {
+            backend.drop_oversized_record();
+            return result;
+        }
         let pending_record = PendingRecord::new(
             request,
             context.response.clone(),

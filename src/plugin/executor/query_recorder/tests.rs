@@ -304,6 +304,31 @@ fn test_record_capture_with_structured_response() {
     assert_eq!(record.authorities_json[0].payload_kind, "CNAME");
 }
 
+#[test]
+fn test_record_capture_rejects_excessive_execution_path() {
+    let request = Message::new();
+    let mut ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    ctx.enable_execution_path();
+    for index in 0..4_097 {
+        ctx.push_execution_path_event(ExecutionPathEvent::new(
+            "seq",
+            Some(index),
+            "executor",
+            Some("test"),
+            "executed",
+        ));
+    }
+    assert!(!PendingRecord::capture_within_limits(
+        &request,
+        None,
+        &ctx.execution_path,
+        0,
+    ));
+}
+
 #[tokio::test]
 async fn test_query_recorder_execute_enqueues_record() {
     AppClock::start();
@@ -768,6 +793,114 @@ async fn test_query_recorder_cleanup_failure_does_not_stop_writer() {
     assert!(records.iter().any(|record| record.request_id == 10));
 
     plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_writer_recovers_after_insert_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_insert
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected writer failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "fail.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if backend.dropped_total.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer should report the failed batch");
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_insert;")
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        2_000,
+        2,
+        "recovered.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
+        .unwrap()
+        .0;
+    assert!(records.iter().any(|record| record.request_id == 2));
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_destroy_does_not_wait_for_coordinator_lock() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let coordinator = backend.database_coordinator.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = coordinator.write_access().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "shutdown.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let destroy_result =
+        tokio::time::timeout(std::time::Duration::from_secs(1), plugin.destroy()).await;
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    destroy_result
+        .expect("destroy should stop while the coordinator is contended")
+        .unwrap();
 }
 
 #[tokio::test]

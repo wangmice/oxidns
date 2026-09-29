@@ -3,17 +3,20 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio::sync::broadcast;
+use tracing::{info, warn};
 
 use super::backend::{
     CleanupResult, ClearHistoryResult, DatabaseCoordinator, RecorderBackend, SpaceReclaimResult,
-    SpaceStats, WriterCommand, WriterThreadContext,
+    SpaceStats, WriterCommand, WriterInterrupt, WriterThreadContext,
 };
 #[cfg(test)]
 use super::model::StepJson;
@@ -35,6 +38,10 @@ const SCHEMA_VERSION: &str = "v2";
 const CLEANUP_BATCH_SIZE: usize = 1_000;
 const VACUUM_BATCH_PAGES: u64 = 1_000;
 const PLUGIN_STATS_SAMPLE_LIMIT: usize = 10_000;
+const WRITER_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const WRITER_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
+const WRITER_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // Tuned for the dedicated writer thread. Keep WAL and incremental vacuum
@@ -139,23 +146,37 @@ pub(super) fn run_writer_thread(
         batch_size,
         flush_interval,
         database_coordinator,
+        dropped_total,
+        writer_interrupt,
     } = context;
 
     let mut pending = Vec::with_capacity(batch_size);
+    let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
     loop {
+        if stop_requested.load(Ordering::Acquire) {
+            drop_pending_on_stop(&mut pending, &dropped_total);
+            break;
+        }
         match rx.recv_timeout(flush_interval) {
             Ok(WriterCommand::Insert(record)) => {
                 pending.push(*record);
-                if pending.len() >= batch_size {
-                    flush_pending_coordinated(
+                if pending.len() >= batch_size
+                    && !flush_pending_resilient(
                         &mut conn,
+                        &path,
                         &tables,
                         &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
                         &database_coordinator,
-                    )?;
+                        &stop_requested,
+                        &dropped_total,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                    )
+                {
+                    break;
                 }
             }
             Ok(WriterCommand::Cleanup {
@@ -164,7 +185,11 @@ pub(super) fn run_writer_thread(
             }) => {
                 let result = (|| {
                     let prepared = prepare_pending(&mut pending)?;
-                    let _access = database_coordinator.write_access()?;
+                    let Some(_access) =
+                        database_coordinator.write_access_until_stop(&stop_requested)?
+                    else {
+                        return Err(writer_stopping());
+                    };
                     flush_prepared(
                         &mut conn,
                         &tables,
@@ -173,7 +198,7 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                     )?;
-                    run_cleanup(&mut conn, &path, &tables, cutoff_ms)
+                    run_cleanup_cancellable(&mut conn, &path, &tables, cutoff_ms, &stop_requested)
                 })()
                 .map_err(|err: DnsError| err.to_string());
                 let _ = reply_tx.send(result);
@@ -181,7 +206,11 @@ pub(super) fn run_writer_thread(
             Ok(WriterCommand::ClearHistory { reply_tx }) => {
                 let result = (|| {
                     let prepared = prepare_pending(&mut pending)?;
-                    let _access = database_coordinator.write_access()?;
+                    let Some(_access) =
+                        database_coordinator.write_access_until_stop(&stop_requested)?
+                    else {
+                        return Err(writer_stopping());
+                    };
                     flush_prepared(
                         &mut conn,
                         &tables,
@@ -190,7 +219,7 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                     )?;
-                    run_clear_history(&mut conn, &path, &tables, &tail)
+                    run_clear_history_cancellable(&mut conn, &path, &tables, &tail, &stop_requested)
                 })()
                 .map_err(|err: DnsError| err.to_string());
                 let _ = reply_tx.send(result);
@@ -205,42 +234,209 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
+                    &stop_requested,
                 )
                 .map_err(|err| err.to_string());
                 let _ = reply_tx.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_pending_coordinated(
+                if !flush_pending_resilient(
                     &mut conn,
+                    &path,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                )?;
-                if stop_requested.load(Ordering::Relaxed) {
+                    &stop_requested,
+                    &dropped_total,
+                    &writer_interrupt,
+                    &mut recovery_delay,
+                ) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                flush_pending_coordinated(
+                let _ = flush_pending_resilient(
                     &mut conn,
+                    &path,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                )?;
+                    &stop_requested,
+                    &dropped_total,
+                    &writer_interrupt,
+                    &mut recovery_delay,
+                );
                 break;
             }
         }
     }
 
+    writer_interrupt.clear();
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_resilient(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<RecordDetail>,
+    database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
+    dropped_total: &AtomicU64,
+    writer_interrupt: &WriterInterrupt,
+    recovery_delay: &mut Duration,
+) -> bool {
+    if pending.is_empty() {
+        return !stop_requested.load(Ordering::Acquire);
+    }
+
+    let record_count = pending.len();
+    match flush_pending_coordinated(
+        conn,
+        tables,
+        pending,
+        tail,
+        memory_tail,
+        broadcaster,
+        database_coordinator,
+        stop_requested,
+    ) {
+        Ok(()) => {
+            *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+            true
+        }
+        Err(err) => {
+            dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+            warn!(
+                dropped_records = record_count,
+                error = %err,
+                "query_recorder writer flush failed; dropping batch and keeping writer alive"
+            );
+            if stop_requested.load(Ordering::Acquire) {
+                return false;
+            }
+            if storage_error_requires_reopen(&err) {
+                recover_writer_connection(
+                    conn,
+                    path,
+                    tables,
+                    database_coordinator,
+                    stop_requested,
+                    writer_interrupt,
+                    recovery_delay,
+                )
+            } else {
+                true
+            }
+        }
+    }
+}
+
+fn storage_error_requires_reopen(error: &DnsError) -> bool {
+    matches!(error, DnsError::Io(_) | DnsError::Rusqlite(_))
+}
+
+fn recover_writer_connection(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
+    writer_interrupt: &WriterInterrupt,
+    recovery_delay: &mut Duration,
+) -> bool {
+    loop {
+        if !sleep_with_stop(stop_requested, *recovery_delay) {
+            return false;
+        }
+
+        if !path.exists() {
+            warn!(
+                path = %path.display(),
+                retry_ms = recovery_delay.as_millis(),
+                "query_recorder database path is unavailable; waiting for storage to return"
+            );
+            *recovery_delay = recovery_delay
+                .saturating_mul(2)
+                .min(WRITER_RECOVERY_MAX_DELAY);
+            continue;
+        }
+
+        let reopened = (|| -> Result<Connection> {
+            let Some(_access) = database_coordinator.write_access_until_stop(stop_requested)?
+            else {
+                return Err(writer_stopping());
+            };
+            let mut new_conn = open_writer_database(path)?;
+            create_schema(&mut new_conn, tables)?;
+            Ok(new_conn)
+        })();
+
+        match reopened {
+            Ok(new_conn) => {
+                *conn = new_conn;
+                writer_interrupt.install(conn);
+                *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+                info!(
+                    path = %path.display(),
+                    "query_recorder writer database connection recovered"
+                );
+                return true;
+            }
+            Err(err) => {
+                if stop_requested.load(Ordering::Acquire) {
+                    return false;
+                }
+                warn!(
+                    path = %path.display(),
+                    retry_ms = recovery_delay.as_millis(),
+                    error = %err,
+                    "query_recorder database reopen failed"
+                );
+                *recovery_delay = recovery_delay
+                    .saturating_mul(2)
+                    .min(WRITER_RECOVERY_MAX_DELAY);
+            }
+        }
+    }
+}
+
+fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        let sleep_for = remaining.min(WRITER_RECOVERY_POLL_INTERVAL);
+        thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
+    !stop_requested.load(Ordering::Acquire)
+}
+
+fn drop_pending_on_stop(pending: &mut Vec<PendingRecord>, dropped_total: &AtomicU64) {
+    let dropped = pending.len();
+    if dropped != 0 {
+        pending.clear();
+        dropped_total.fetch_add(dropped as u64, Ordering::Relaxed);
+    }
+}
+
+fn writer_stopping() -> DnsError {
+    DnsError::runtime("query_recorder writer is stopping")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flush_pending_coordinated(
     conn: &mut Connection,
     tables: &TableNames,
@@ -249,10 +445,15 @@ fn flush_pending_coordinated(
     memory_tail: usize,
     broadcaster: &broadcast::Sender<RecordDetail>,
     database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
 ) -> Result<()> {
     let prepared = prepare_pending(pending)?;
-    let _access = database_coordinator.read_access()?;
-    let _writer = database_coordinator.writer()?;
+    let Some(_access) = database_coordinator.read_access_until_stop(stop_requested)? else {
+        return Err(writer_stopping());
+    };
+    let Some(_writer) = database_coordinator.writer_until_stop(stop_requested)? else {
+        return Err(writer_stopping());
+    };
     flush_prepared(conn, tables, prepared, tail, memory_tail, broadcaster)
 }
 
@@ -358,17 +559,32 @@ fn delete_batch(
     Ok(selected.len())
 }
 
+#[cfg(test)]
 fn run_cleanup(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
     cutoff_ms: i64,
 ) -> Result<CleanupResult> {
+    let stop_requested = AtomicBool::new(false);
+    run_cleanup_cancellable(conn, path, tables, cutoff_ms, &stop_requested)
+}
+
+fn run_cleanup_cancellable(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    cutoff_ms: i64,
+    stop_requested: &AtomicBool,
+) -> Result<CleanupResult> {
+    ensure_maintenance_running(stop_requested)?;
     checkpoint_wal(conn)?;
+    ensure_maintenance_running(stop_requested)?;
     let before = read_space_stats(conn, path)?;
     let mut deleted_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
+        ensure_maintenance_running(stop_requested)?;
         let deleted = delete_batch(conn, tables, Some(cutoff_ms))?;
         if deleted == 0 {
             break;
@@ -377,23 +593,51 @@ fn run_cleanup(
         observe_wal_size(path, &mut peak_wal_bytes)?;
         checkpoint_wal(conn)?;
     }
+    ensure_maintenance_running(stop_requested)?;
     let reclaimable = read_space_stats(conn, path)?;
-    let space = reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes)?;
+    let space = reclaim_database_space_cancellable(
+        conn,
+        path,
+        before,
+        reclaimable,
+        peak_wal_bytes,
+        stop_requested,
+    )?;
     Ok(CleanupResult {
         deleted_records,
         space,
     })
 }
 
+#[cfg(test)]
 fn run_clear_history(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
-    run_clear_history_with_checkpoint(conn, path, tables, tail, &mut checkpoint_wal)
+    let stop_requested = AtomicBool::new(false);
+    run_clear_history_cancellable(conn, path, tables, tail, &stop_requested)
 }
 
+fn run_clear_history_cancellable(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    stop_requested: &AtomicBool,
+) -> Result<ClearHistoryResult> {
+    run_clear_history_with_checkpoint_and_stop(
+        conn,
+        path,
+        tables,
+        tail,
+        stop_requested,
+        &mut checkpoint_wal,
+    )
+}
+
+#[cfg(test)]
 fn run_clear_history_with_checkpoint<F>(
     conn: &mut Connection,
     path: &Path,
@@ -404,38 +648,66 @@ fn run_clear_history_with_checkpoint<F>(
 where
     F: FnMut(&Connection) -> Result<()>,
 {
+    let stop_requested = AtomicBool::new(false);
+    run_clear_history_with_checkpoint_and_stop(
+        conn,
+        path,
+        tables,
+        tail,
+        &stop_requested,
+        checkpoint,
+    )
+}
+
+fn run_clear_history_with_checkpoint_and_stop<F>(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    stop_requested: &AtomicBool,
+    checkpoint: &mut F,
+) -> Result<ClearHistoryResult>
+where
+    F: FnMut(&Connection) -> Result<()>,
+{
+    ensure_maintenance_running(stop_requested)?;
     // Start from an empty WAL and keep it bounded throughout the operation.
     // A single DELETE transaction for a large recorder can otherwise grow the
     // WAL close to the amount of history being removed before the final
     // checkpoint gets a chance to truncate it.
     checkpoint(conn)?;
+    ensure_maintenance_running(stop_requested)?;
     let before = read_space_stats(conn, path)?;
     let mut cleared_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
+        ensure_maintenance_running(stop_requested)?;
         let deleted = delete_batch(conn, tables, None)?;
         if deleted == 0 {
             break;
         }
         cleared_records = cleared_records.saturating_add(deleted);
-        // Deletes and dictionary reclamation commit per batch. Clear the
-        // in-memory replay buffer before the next fallible checkpoint
-        // so a partial clear can never advertise rows that no longer
-        // exist in SQLite.
         clear_tail(tail);
         observe_wal_size(path, &mut peak_wal_bytes)?;
         checkpoint(conn)?;
     }
 
     clear_tail(tail);
-
+    ensure_maintenance_running(stop_requested)?;
     let reclaimable = read_space_stats(conn, path)?;
-    let space =
-        reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes).map_err(|err| {
-            DnsError::runtime(format!(
-                "query history cleared ({cleared_records} records), but space reclaim failed: {err}"
-            ))
-        })?;
+    let space = reclaim_database_space_cancellable(
+        conn,
+        path,
+        before,
+        reclaimable,
+        peak_wal_bytes,
+        stop_requested,
+    )
+    .map_err(|err| {
+        DnsError::runtime(format!(
+            "query history cleared ({cleared_records} records), but space reclaim failed: {err}"
+        ))
+    })?;
 
     Ok(ClearHistoryResult {
         cleared_records,
@@ -448,21 +720,24 @@ fn clear_tail(tail: &Arc<Mutex<VecDeque<RecordDetail>>>) {
     tail_guard.clear();
 }
 
-fn reclaim_database_space(
+fn reclaim_database_space_cancellable(
     conn: &Connection,
     path: &Path,
     before: SpaceStats,
     reclaimable: SpaceStats,
     mut peak_wal_bytes: u64,
+    stop_requested: &AtomicBool,
 ) -> Result<SpaceReclaimResult> {
+    ensure_maintenance_running(stop_requested)?;
     let migrated = match reclaimable.auto_vacuum {
         0 => {
             conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+            ensure_maintenance_running(stop_requested)?;
             true
         }
         1 => false,
         2 => {
-            run_incremental_vacuum(conn, path, &mut peak_wal_bytes)?;
+            run_incremental_vacuum_cancellable(conn, path, &mut peak_wal_bytes, stop_requested)?;
             false
         }
         mode => {
@@ -475,6 +750,7 @@ fn reclaim_database_space(
     observe_wal_size(path, &mut peak_wal_bytes)?;
     checkpoint_wal(conn)?;
 
+    ensure_maintenance_running(stop_requested)?;
     let after = read_space_stats(conn, path)?;
     if migrated && after.auto_vacuum != 2 {
         return Err(DnsError::runtime(format!(
@@ -504,13 +780,19 @@ fn reclaim_database_space(
     })
 }
 
-fn run_incremental_vacuum(conn: &Connection, path: &Path, peak_wal_bytes: &mut u64) -> Result<()> {
+fn run_incremental_vacuum_cancellable(
+    conn: &Connection,
+    path: &Path,
+    peak_wal_bytes: &mut u64,
+    stop_requested: &AtomicBool,
+) -> Result<()> {
     // `PRAGMA incremental_vacuum` is a multi-step statement that yields one
     // zero-column row per reclaimed page. `Connection::execute_batch` only
     // steps a result-producing statement once. Reclaim a bounded number of
     // pages per statement and truncate the WAL between batches so a manual
     // clear cannot trade a smaller main file for an unbounded WAL peak.
     loop {
+        ensure_maintenance_running(stop_requested)?;
         let before = pragma_u64(conn, "PRAGMA freelist_count")?;
         if before == 0 {
             return Ok(());
@@ -532,6 +814,13 @@ fn run_incremental_vacuum(conn: &Connection, path: &Path, peak_wal_bytes: &mut u
             )));
         }
     }
+}
+
+fn ensure_maintenance_running(stop_requested: &AtomicBool) -> Result<()> {
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(writer_stopping());
+    }
+    Ok(())
 }
 
 fn checkpoint_wal(conn: &Connection) -> Result<()> {

@@ -4,19 +4,77 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender as ReplySender, SyncSender, sync_channel};
+use std::sync::mpsc::{Sender as ReplySender, SyncSender, TrySendError, sync_channel};
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rusqlite::{Connection, InterruptHandle};
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{error, info, warn};
 
 use super::model::{PendingRecord, RecordDetail, ResolvedRecorderConfig, TableNames};
 use super::store::{create_schema, open_writer_database, run_writer_thread, table_names};
 use crate::infra::error::{DnsError, Result};
+
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
+const COORDINATOR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy)]
+enum DropKind {
+    QueueFull,
+    WriterDisconnected,
+    Oversized,
+}
+
+#[derive(Debug, Default)]
+struct DropLogState {
+    last_warn: Option<Instant>,
+    queue_full: u64,
+    writer_disconnected: u64,
+    oversized: u64,
+}
+
+#[derive(Default)]
+pub(super) struct WriterInterrupt {
+    handle: Mutex<Option<InterruptHandle>>,
+}
+
+impl std::fmt::Debug for WriterInterrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterInterrupt").finish_non_exhaustive()
+    }
+}
+
+impl WriterInterrupt {
+    pub(super) fn install(&self, conn: &Connection) {
+        let mut guard = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(conn.get_interrupt_handle());
+    }
+
+    pub(super) fn interrupt(&self) {
+        let guard = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = guard.as_ref() {
+            handle.interrupt();
+        }
+    }
+
+    pub(super) fn clear(&self) {
+        let mut guard = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct RecorderBackend {
@@ -32,6 +90,8 @@ pub(super) struct RecorderBackend {
     pub(super) dropped_total: Arc<AtomicU64>,
     pub(super) reader_semaphore: Arc<Semaphore>,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
+    writer_interrupt: Arc<WriterInterrupt>,
+    drop_log_state: Mutex<DropLogState>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +171,8 @@ pub(super) struct WriterThreadContext {
     pub(super) batch_size: usize,
     pub(super) flush_interval: Duration,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
+    pub(super) dropped_total: Arc<AtomicU64>,
+    pub(super) writer_interrupt: Arc<WriterInterrupt>,
 }
 
 #[derive(Debug, Default)]
@@ -132,10 +194,70 @@ impl DatabaseCoordinator {
             .map_err(|_| DnsError::runtime("query_recorder database access lock poisoned"))
     }
 
-    pub(super) fn writer(&self) -> Result<MutexGuard<'_, ()>> {
-        self.writer
-            .lock()
-            .map_err(|_| DnsError::runtime("query_recorder database writer lock poisoned"))
+    pub(super) fn read_access_until_stop(
+        &self,
+        stop_requested: &AtomicBool,
+    ) -> Result<Option<RwLockReadGuard<'_, ()>>> {
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match self.access.try_read() {
+                Ok(guard) => return Ok(Some(guard)),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn write_access_until_stop(
+        &self,
+        stop_requested: &AtomicBool,
+    ) -> Result<Option<RwLockWriteGuard<'_, ()>>> {
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match self.access.try_write() {
+                Ok(guard) => return Ok(Some(guard)),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn writer_until_stop(
+        &self,
+        stop_requested: &AtomicBool,
+    ) -> Result<Option<MutexGuard<'_, ()>>> {
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            match self.writer.try_lock() {
+                Ok(guard) => return Ok(Some(guard)),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(DnsError::runtime(
+                        "query_recorder database writer lock poisoned",
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -218,6 +340,10 @@ impl RecorderBackend {
         let (broadcaster, _) = broadcast::channel(config.memory_tail.max(16));
         let dropped_total = Arc::new(AtomicU64::new(0));
         let reader_semaphore = Arc::new(Semaphore::new(config.reader_concurrency));
+        let writer_interrupt = Arc::new(WriterInterrupt::default());
+        writer_interrupt.install(&conn);
+        let writer_dropped_total = dropped_total.clone();
+        let writer_interrupt_for_thread = writer_interrupt.clone();
 
         let writer_tables = tables.clone();
         let writer_path = config.path.clone();
@@ -242,6 +368,8 @@ impl RecorderBackend {
                         batch_size,
                         flush_interval,
                         database_coordinator: writer_database_coordinator,
+                        dropped_total: writer_dropped_total,
+                        writer_interrupt: writer_interrupt_for_thread,
                     },
                     queue_rx,
                     conn,
@@ -263,20 +391,72 @@ impl RecorderBackend {
             dropped_total,
             reader_semaphore,
             database_coordinator,
+            writer_interrupt,
+            drop_log_state: Mutex::new(DropLogState::default()),
         }))
     }
 
     pub(super) fn enqueue(&self, pending: PendingRecord) {
-        if let Err(err) = self
+        if self.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        match self
             .queue_tx
             .try_send(WriterCommand::Insert(Box::new(pending)))
         {
-            self.dropped_total.fetch_add(1, Ordering::Relaxed);
-            warn!("query_recorder dropped record: {}", err);
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.record_drop(DropKind::QueueFull),
+            Err(TrySendError::Disconnected(_)) => self.record_drop(DropKind::WriterDisconnected),
+        }
+    }
+
+    pub(super) fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.writer_interrupt.interrupt();
+    }
+
+    pub(super) fn drop_oversized_record(&self) {
+        self.record_drop(DropKind::Oversized);
+    }
+
+    fn record_drop(&self, kind: DropKind) {
+        self.dropped_total.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut state = self
+            .drop_log_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match kind {
+            DropKind::QueueFull => state.queue_full = state.queue_full.saturating_add(1),
+            DropKind::WriterDisconnected => {
+                state.writer_disconnected = state.writer_disconnected.saturating_add(1)
+            }
+            DropKind::Oversized => state.oversized = state.oversized.saturating_add(1),
+        }
+
+        let should_warn = match state.last_warn {
+            Some(last_warn) => now.duration_since(last_warn) >= DROP_WARN_INTERVAL,
+            None => true,
+        };
+        if should_warn {
+            warn!(
+                query_recorder_tag = %self.tag,
+                queue_full = state.queue_full,
+                writer_disconnected = state.writer_disconnected,
+                oversized = state.oversized,
+                "query_recorder dropped records"
+            );
+            state.queue_full = 0;
+            state.writer_disconnected = 0;
+            state.oversized = 0;
+            state.last_warn = Some(now);
         }
     }
 
     pub(super) fn cleanup(&self, cutoff_ms: i64) -> CleanupReply {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return Err("query_recorder is stopping".to_string());
+        }
         let started = Instant::now();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.queue_tx
@@ -301,6 +481,9 @@ impl RecorderBackend {
     }
 
     pub(super) fn clear_history(&self) -> ClearHistoryReply {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return Err("query_recorder is stopping".to_string());
+        }
         let started = Instant::now();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.queue_tx

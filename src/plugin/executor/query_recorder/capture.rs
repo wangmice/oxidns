@@ -16,6 +16,11 @@ use crate::plugin::executor::rdata_json::{RDataPayloadMode, rdata_payload};
 use crate::proto::rdata::{ClientSubnet, Edns, EdnsCode, EdnsExtendedDnsError, EdnsOption};
 use crate::proto::{DNSClass, Message, Opcode, Question, Rcode, Record, RecordType};
 
+const MAX_CAPTURE_MESSAGE_BYTES: usize = u16::MAX as usize;
+const MAX_EXECUTION_PATH_EVENTS: usize = 4_096;
+const MAX_ERROR_BYTES: usize = 16 * 1024;
+const ERROR_TRUNCATION_SUFFIX: &str = "...[truncated]";
+
 impl PendingRecord {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -28,6 +33,7 @@ impl PendingRecord {
         client_ip: SocketAddr,
         error: Option<String>,
     ) -> Self {
+        let error = error.map(|value| truncate_utf8(value, MAX_ERROR_BYTES));
         Self {
             request,
             response,
@@ -38,6 +44,20 @@ impl PendingRecord {
             client_ip,
             error,
         }
+    }
+
+    pub(super) fn capture_within_limits(
+        request: &Message,
+        response: Option<&Message>,
+        exec_path: &ExecutionPath,
+        step_start_index: usize,
+    ) -> bool {
+        let execution_events = exec_path.len().saturating_sub(step_start_index);
+        execution_events <= MAX_EXECUTION_PATH_EVENTS
+            && request.bytes_len() <= MAX_CAPTURE_MESSAGE_BYTES
+            && response
+                .map(|message| message.bytes_len() <= MAX_CAPTURE_MESSAGE_BYTES)
+                .unwrap_or(true)
     }
 
     pub(super) fn take_to_record(self) -> (RecordRow, Vec<StepJson>) {
@@ -133,6 +153,21 @@ impl PendingRecord {
 
         (record, steps)
     }
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let prefix_limit = max_bytes.saturating_sub(ERROR_TRUNCATION_SUFFIX.len());
+    let mut end = prefix_limit.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(ERROR_TRUNCATION_SUFFIX);
+    value
 }
 
 fn question_json(question: &Question) -> QuestionJson {
