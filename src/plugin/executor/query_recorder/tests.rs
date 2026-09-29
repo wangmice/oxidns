@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-use super::backend::WriterCommand;
+use super::backend::{DatabaseCoordinator, WriterCommand};
 use super::model::{
     DistributionQuery, LatencyQuery, ListQuery, PendingRecord, PluginStatsKind, PluginsStatsQuery,
     QueryRecordFilter, QueryRecordStatus, QueryRecorderConfig, TimeseriesBucket, TimeseriesQuery,
@@ -321,11 +322,9 @@ fn test_record_capture_rejects_excessive_execution_path() {
             "executed",
         ));
     }
-    assert!(!PendingRecord::capture_within_limits(
-        &request,
-        None,
+    assert!(!PendingRecord::execution_path_within_limit(
         &ctx.execution_path,
-        0,
+        0
     ));
 }
 
@@ -901,6 +900,59 @@ async fn test_query_recorder_destroy_does_not_wait_for_coordinator_lock() {
     destroy_result
         .expect("destroy should stop while the coordinator is contended")
         .unwrap();
+}
+
+#[test]
+fn test_query_recorder_waiting_writer_blocks_new_readers() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let first_reader = coordinator.read_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let writer_coordinator = coordinator.clone();
+    let writer_stop = stop_requested.clone();
+    let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let guard = writer_coordinator
+            .write_access_until_stop(&writer_stop)
+            .unwrap()
+            .expect("writer should acquire the coordinator");
+        writer_acquired_tx.send(()).unwrap();
+        release_writer_rx.recv().unwrap();
+        drop(guard);
+    });
+
+    let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while coordinator.waiting_writers_for_test() == 0 {
+        assert!(
+            std::time::Instant::now() < waiter_deadline,
+            "writer did not register for exclusive access"
+        );
+        std::thread::yield_now();
+    }
+
+    let reader_coordinator = coordinator.clone();
+    let (reader_acquired_tx, reader_acquired_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _guard = reader_coordinator.read_access().unwrap();
+        reader_acquired_tx.send(()).unwrap();
+    });
+
+    drop(first_reader);
+    writer_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("waiting writer should acquire before a new reader");
+    assert!(
+        reader_acquired_rx.try_recv().is_err(),
+        "new reader bypassed a waiting writer"
+    );
+
+    release_writer_tx.send(()).unwrap();
+    writer.join().unwrap();
+    reader_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("reader should continue after writer release");
+    reader.join().unwrap();
 }
 
 #[tokio::test]

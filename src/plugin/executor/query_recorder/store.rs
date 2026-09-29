@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -44,6 +44,11 @@ const WRITER_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    configure_writer_database(&conn)?;
+    Ok(conn)
+}
+
+fn configure_writer_database(conn: &Connection) -> rusqlite::Result<()> {
     // Tuned for the dedicated writer thread. Keep WAL and incremental vacuum
     // behavior, but avoid giving the single writer the same large read cache
     // and mmap footprint that used to be applied to every reader.
@@ -61,6 +66,25 @@ pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> 
          PRAGMA cache_size=-4096;
          PRAGMA mmap_size=0;",
     )?;
+    Ok(())
+}
+
+fn open_writer_database_for_recovery(
+    path: &Path,
+    stop_requested: &AtomicBool,
+    writer_interrupt: &WriterInterrupt,
+) -> Result<Connection> {
+    // Connection::open itself is a filesystem operation and cannot be
+    // interrupted through SQLite. Install the handle immediately afterwards
+    // so all PRAGMA/schema work that follows is interruptible during shutdown.
+    let conn = Connection::open(path)?;
+    writer_interrupt.install(&conn);
+    if stop_requested.load(Ordering::Acquire) {
+        writer_interrupt.interrupt();
+        return Err(writer_stopping());
+    }
+    configure_writer_database(&conn)?;
+    ensure_maintenance_running(stop_requested)?;
     Ok(conn)
 }
 
@@ -154,7 +178,6 @@ pub(super) fn run_writer_thread(
     let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
     loop {
         if stop_requested.load(Ordering::Acquire) {
-            drop_pending_on_stop(&mut pending, &dropped_total);
             break;
         }
         match rx.recv_timeout(flush_interval) {
@@ -277,6 +300,9 @@ pub(super) fn run_writer_thread(
         }
     }
 
+    if stop_requested.load(Ordering::Acquire) {
+        drain_writer_queue_on_stop(&rx, &mut pending, &dropped_total);
+    }
     writer_interrupt.clear();
     Ok(())
 }
@@ -377,7 +403,8 @@ fn recover_writer_connection(
             else {
                 return Err(writer_stopping());
             };
-            let mut new_conn = open_writer_database(path)?;
+            let mut new_conn =
+                open_writer_database_for_recovery(path, stop_requested, writer_interrupt)?;
             create_schema(&mut new_conn, tables)?;
             Ok(new_conn)
         })();
@@ -385,7 +412,6 @@ fn recover_writer_connection(
         match reopened {
             Ok(new_conn) => {
                 *conn = new_conn;
-                writer_interrupt.install(conn);
                 // Reopening the file only proves that SQLite can open and
                 // initialize it. Keep increasing the retry delay until a real
                 // record flush commits successfully; that success path resets
@@ -430,11 +456,35 @@ fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
     !stop_requested.load(Ordering::Acquire)
 }
 
-fn drop_pending_on_stop(pending: &mut Vec<PendingRecord>, dropped_total: &AtomicU64) {
-    let dropped = pending.len();
+fn drain_writer_queue_on_stop(
+    rx: &Receiver<WriterCommand>,
+    pending: &mut Vec<PendingRecord>,
+    dropped_total: &AtomicU64,
+) {
+    let mut dropped = pending.len() as u64;
+    pending.clear();
+
+    loop {
+        match rx.try_recv() {
+            Ok(WriterCommand::Insert(_)) => {
+                dropped = dropped.saturating_add(1);
+            }
+            Ok(WriterCommand::Cleanup { reply_tx, .. }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            Ok(WriterCommand::ClearHistory { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            #[cfg(test)]
+            Ok(WriterCommand::Flush { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+
     if dropped != 0 {
-        pending.clear();
-        dropped_total.fetch_add(dropped as u64, Ordering::Relaxed);
+        dropped_total.fetch_add(dropped, Ordering::Relaxed);
     }
 }
 

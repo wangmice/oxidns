@@ -133,14 +133,11 @@ impl Executor for QueryRecorder {
         let timestamp = Timestamp::now();
         let result = continue_next!(next, context);
 
-        // Keep the recorder strictly best-effort. Do not clone an unexpectedly
-        // large DNS message or execution trace into the bounded writer queue.
-        if !PendingRecord::capture_within_limits(
-            &request,
-            context.response.as_ref(),
-            &context.execution_path,
-            step_start_index,
-        ) {
+        // Keep the recorder strictly best-effort without adding a full DNS
+        // message-size traversal to the query hot path. Snapshot size remains
+        // bounded on the writer side; only the O(1) execution-path count is
+        // checked here before cloning the path into the queue.
+        if !PendingRecord::execution_path_within_limit(&context.execution_path, step_start_index) {
             backend.drop_oversized_record();
             return result;
         }

@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender as ReplySender, SyncSender, TrySendError, sync_channel};
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
@@ -179,19 +179,68 @@ pub(super) struct WriterThreadContext {
 pub(super) struct DatabaseCoordinator {
     access: RwLock<()>,
     writer: Mutex<()>,
+    waiting_writers: AtomicUsize,
+}
+
+pub(super) struct DatabaseWriteGuard<'a> {
+    _guard: RwLockWriteGuard<'a, ()>,
+    waiting_writers: &'a AtomicUsize,
+}
+
+impl Drop for DatabaseWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl DatabaseCoordinator {
     pub(super) fn read_access(&self) -> Result<RwLockReadGuard<'_, ()>> {
-        self.access
-            .read()
-            .map_err(|_| DnsError::runtime("query_recorder database access lock poisoned"))
+        loop {
+            if self.waiting_writers.load(Ordering::Acquire) != 0 {
+                thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                continue;
+            }
+            match self.access.try_read() {
+                Ok(guard) => {
+                    if self.waiting_writers.load(Ordering::Acquire) == 0 {
+                        return Ok(guard);
+                    }
+                    drop(guard);
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
     }
 
-    pub(super) fn write_access(&self) -> Result<RwLockWriteGuard<'_, ()>> {
-        self.access
-            .write()
-            .map_err(|_| DnsError::runtime("query_recorder database access lock poisoned"))
+    pub(super) fn write_access(&self) -> Result<DatabaseWriteGuard<'_>> {
+        self.waiting_writers.fetch_add(1, Ordering::AcqRel);
+        loop {
+            match self.access.try_write() {
+                Ok(guard) => {
+                    return Ok(DatabaseWriteGuard {
+                        _guard: guard,
+                        waiting_writers: &self.waiting_writers,
+                    });
+                }
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
     }
 
     pub(super) fn read_access_until_stop(
@@ -202,8 +251,18 @@ impl DatabaseCoordinator {
             if stop_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            if self.waiting_writers.load(Ordering::Acquire) != 0 {
+                thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                continue;
+            }
             match self.access.try_read() {
-                Ok(guard) => return Ok(Some(guard)),
+                Ok(guard) => {
+                    if self.waiting_writers.load(Ordering::Acquire) == 0 {
+                        return Ok(Some(guard));
+                    }
+                    drop(guard);
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
                 Err(TryLockError::WouldBlock) => {
                     thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
                 }
@@ -219,17 +278,25 @@ impl DatabaseCoordinator {
     pub(super) fn write_access_until_stop(
         &self,
         stop_requested: &AtomicBool,
-    ) -> Result<Option<RwLockWriteGuard<'_, ()>>> {
+    ) -> Result<Option<DatabaseWriteGuard<'_>>> {
+        self.waiting_writers.fetch_add(1, Ordering::AcqRel);
         loop {
             if stop_requested.load(Ordering::Acquire) {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
                 return Ok(None);
             }
             match self.access.try_write() {
-                Ok(guard) => return Ok(Some(guard)),
+                Ok(guard) => {
+                    return Ok(Some(DatabaseWriteGuard {
+                        _guard: guard,
+                        waiting_writers: &self.waiting_writers,
+                    }));
+                }
                 Err(TryLockError::WouldBlock) => {
                     thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
                 }
                 Err(TryLockError::Poisoned(_)) => {
+                    self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
                     return Err(DnsError::runtime(
                         "query_recorder database access lock poisoned",
                     ));
@@ -258,6 +325,11 @@ impl DatabaseCoordinator {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn waiting_writers_for_test(&self) -> usize {
+        self.waiting_writers.load(Ordering::Acquire)
     }
 }
 

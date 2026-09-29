@@ -16,7 +16,6 @@ use crate::plugin::executor::rdata_json::{RDataPayloadMode, rdata_payload};
 use crate::proto::rdata::{ClientSubnet, Edns, EdnsCode, EdnsExtendedDnsError, EdnsOption};
 use crate::proto::{DNSClass, Message, Opcode, Question, Rcode, Record, RecordType};
 
-const MAX_CAPTURE_MESSAGE_BYTES: usize = u16::MAX as usize;
 const MAX_EXECUTION_PATH_EVENTS: usize = 4_096;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 const ERROR_TRUNCATION_SUFFIX: &str = "...[truncated]";
@@ -46,18 +45,12 @@ impl PendingRecord {
         }
     }
 
-    pub(super) fn capture_within_limits(
-        request: &Message,
-        response: Option<&Message>,
+    pub(super) fn execution_path_within_limit(
         exec_path: &ExecutionPath,
         step_start_index: usize,
     ) -> bool {
         let execution_events = exec_path.len().saturating_sub(step_start_index);
         execution_events <= MAX_EXECUTION_PATH_EVENTS
-            && request.bytes_len() <= MAX_CAPTURE_MESSAGE_BYTES
-            && response
-                .map(|message| message.bytes_len() <= MAX_CAPTURE_MESSAGE_BYTES)
-                .unwrap_or(true)
     }
 
     pub(super) fn take_to_record(self) -> (RecordRow, Vec<StepJson>) {
