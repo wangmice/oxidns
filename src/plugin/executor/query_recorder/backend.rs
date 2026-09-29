@@ -566,7 +566,7 @@ impl RecorderBackend {
         self.writer_interrupt.interrupt();
     }
 
-    pub(super) fn shutdown(&self) {
+    pub(super) fn shutdown(&self) -> std::result::Result<(), String> {
         self.accepting_records.store(false, Ordering::Release);
         if self.writer_recovering.load(Ordering::Acquire)
             || self.management_inflight.load(Ordering::Acquire)
@@ -575,7 +575,7 @@ impl RecorderBackend {
                 .exclusive_access_active_or_waiting()
         {
             self.hard_stop();
-            return;
+            return Ok(());
         }
 
         let enqueue_deadline = Instant::now() + SHUTDOWN_ENQUEUE_TIMEOUT;
@@ -587,24 +587,32 @@ impl RecorderBackend {
                 Err(TrySendError::Full(returned)) => {
                     if Instant::now() >= enqueue_deadline {
                         self.hard_stop();
-                        return;
+                        return Err("query_recorder shutdown enqueue timed out".to_string());
                     }
                     command = returned;
                     thread::sleep(SHUTDOWN_QUEUE_RETRY_INTERVAL);
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     self.stop_requested.store(true, Ordering::Release);
-                    return;
+                    return Err(
+                        "query_recorder writer became unavailable during shutdown".to_string()
+                    );
                 }
             }
         }
 
         match reply_rx.recv_timeout(SHUTDOWN_FLUSH_TIMEOUT) {
-            Ok(_) => {
+            Ok(result) => {
                 self.stop_requested.store(true, Ordering::Release);
+                result
             }
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Timeout) => {
                 self.hard_stop();
+                Err("query_recorder graceful shutdown flush timed out".to_string())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.hard_stop();
+                Err("query_recorder writer disconnected during shutdown".to_string())
             }
         }
     }

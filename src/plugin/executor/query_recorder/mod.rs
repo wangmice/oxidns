@@ -80,16 +80,19 @@ impl Plugin for QueryRecorder {
         if let Some(task_handle) = &self.cleanup_task_handle {
             task_handle.stop().await;
         }
-        if let Some(backend) = &self.backend {
+        let shutdown_result = if let Some(backend) = &self.backend {
             let backend = backend.clone();
-            tokio::task::spawn_blocking(move || backend.shutdown())
+            let result = tokio::task::spawn_blocking(move || backend.shutdown())
                 .await
                 .map_err(|err| {
                     DnsError::runtime(format!(
                         "query_recorder shutdown coordination failed: {err}"
                     ))
                 })?;
-        }
+            Some(result)
+        } else {
+            None
+        };
         let join_handle = if let Some(backend) = &self.backend {
             let mut guard = backend
                 .writer_handle
@@ -103,9 +106,30 @@ impl Plugin for QueryRecorder {
             let join_result = tokio::task::spawn_blocking(move || handle.join())
                 .await
                 .map_err(|err| DnsError::runtime(format!("query_recorder join failed: {err}")))?;
-            let _ = join_result;
+            map_writer_join_result(join_result)?;
+        }
+        if let Some(Err(err)) = shutdown_result {
+            return Err(DnsError::runtime(err));
         }
         Ok(())
+    }
+}
+
+fn map_writer_join_result(result: std::thread::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            Err(DnsError::runtime(format!(
+                "query_recorder writer thread panicked: {message}"
+            )))
+        }
     }
 }
 

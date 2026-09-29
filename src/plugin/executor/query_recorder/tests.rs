@@ -20,7 +20,7 @@ use super::store::{
     open_reader_database, open_writer_database, query_records, storage_error_requires_reopen,
     table_names,
 };
-use super::{QueryRecorder, QueryRecorderFactory, resolve_config};
+use super::{QueryRecorder, QueryRecorderFactory, map_writer_join_result, resolve_config};
 use crate::core::context::{DnsContext, ExecutionPathEvent};
 use crate::infra::clock::AppClock;
 use crate::infra::error::DnsError;
@@ -861,6 +861,64 @@ async fn test_query_recorder_writer_continues_after_non_storage_insert_failure()
     assert!(records.iter().any(|record| record.request_id == 2));
 
     plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_destroy_reports_graceful_flush_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_shutdown_flush
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected shutdown flush failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "shutdown-error.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let error = plugin.destroy().await.unwrap_err().to_string();
+    assert!(error.contains("injected shutdown flush failure"));
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_query_recorder_writer_panic_is_reported() {
+    let join_result = std::thread::spawn(|| panic!("injected writer panic")).join();
+    let error = map_writer_join_result(join_result).unwrap_err().to_string();
+    assert!(error.contains("query_recorder writer thread panicked: injected writer panic"));
 }
 
 #[test]

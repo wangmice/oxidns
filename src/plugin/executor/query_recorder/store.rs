@@ -269,10 +269,15 @@ pub(super) fn run_writer_thread(
                     .is_some_and(storage_error_requires_reopen)
                     && !cancelled.load(Ordering::Acquire)
                     && !stop_requested.load(Ordering::Acquire);
+                // Publish recovery before releasing the management single-flight
+                // owner. Otherwise a new cleanup/clear request can slip through
+                // begin_management() before writer_recovering becomes visible.
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                }
                 management_inflight.store(false, Ordering::Release);
                 let _ = reply_tx.send(result.map_err(|err| err.to_string()));
                 if recover_storage {
-                    writer_recovering.store(true, Ordering::Release);
                     let recovered = recover_writer_connection(
                         &mut conn,
                         &path,
@@ -344,10 +349,14 @@ pub(super) fn run_writer_thread(
                     .is_some_and(storage_error_requires_reopen)
                     && !cancelled.load(Ordering::Acquire)
                     && !stop_requested.load(Ordering::Acquire);
+                // See the cleanup path above: recovery must become visible
+                // before management_inflight is released.
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                }
                 management_inflight.store(false, Ordering::Release);
                 let _ = reply_tx.send(result.map_err(|err| err.to_string()));
                 if recover_storage {
-                    writer_recovering.store(true, Ordering::Release);
                     let recovered = recover_writer_connection(
                         &mut conn,
                         &path,
