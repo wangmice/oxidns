@@ -386,10 +386,16 @@ fn recover_writer_connection(
             Ok(new_conn) => {
                 *conn = new_conn;
                 writer_interrupt.install(conn);
-                *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+                // Reopening the file only proves that SQLite can open and
+                // initialize it. Keep increasing the retry delay until a real
+                // record flush commits successfully; that success path resets
+                // the delay back to WRITER_RECOVERY_INITIAL_DELAY.
+                *recovery_delay = recovery_delay
+                    .saturating_mul(2)
+                    .min(WRITER_RECOVERY_MAX_DELAY);
                 info!(
                     path = %path.display(),
-                    "query_recorder writer database connection recovered"
+                    "query_recorder writer database connection reopened"
                 );
                 return true;
             }

@@ -96,6 +96,9 @@ impl EncodedPayload {
         }
         let raw_len =
             usize::try_from(self.raw_len).map_err(|_| invalid("invalid payload length"))?;
+        if raw_len > MAX_SNAPSHOT_BYTES {
+            return Err(invalid("payload exceeds 16 MiB decode limit"));
+        }
         match self.codec {
             RAW => {
                 if raw_len != self.data.len() {
@@ -209,7 +212,16 @@ mod tests {
         let mut corrupt = valid.clone();
         corrupt.data.extend_from_slice(&valid.data);
         assert!(corrupt.decode().is_err());
-        for len in [-1, 0, 4095, 4097, MAX_SNAPSHOT_BYTES as i64 + 1] {
+        let mut oversized = valid.clone();
+        oversized.raw_len = MAX_SNAPSHOT_BYTES as i64 + 1;
+        assert!(
+            oversized
+                .decode()
+                .unwrap_err()
+                .to_string()
+                .contains("payload exceeds 16 MiB decode limit")
+        );
+        for len in [-1, 0, 4095, 4097] {
             let mut corrupt = valid.clone();
             corrupt.raw_len = len;
             assert!(corrupt.decode().is_err());

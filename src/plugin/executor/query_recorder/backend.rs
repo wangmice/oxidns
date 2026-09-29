@@ -32,9 +32,6 @@ enum DropKind {
 #[derive(Debug, Default)]
 struct DropLogState {
     last_warn: Option<Instant>,
-    queue_full: u64,
-    writer_disconnected: u64,
-    oversized: u64,
 }
 
 #[derive(Default)]
@@ -92,6 +89,9 @@ pub(super) struct RecorderBackend {
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
     writer_interrupt: Arc<WriterInterrupt>,
     drop_log_state: Mutex<DropLogState>,
+    drop_queue_full: AtomicU64,
+    drop_writer_disconnected: AtomicU64,
+    drop_oversized: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +393,9 @@ impl RecorderBackend {
             database_coordinator,
             writer_interrupt,
             drop_log_state: Mutex::new(DropLogState::default()),
+            drop_queue_full: AtomicU64::new(0),
+            drop_writer_disconnected: AtomicU64::new(0),
+            drop_oversized: AtomicU64::new(0),
         }))
     }
 
@@ -421,36 +424,45 @@ impl RecorderBackend {
 
     fn record_drop(&self, kind: DropKind) {
         self.dropped_total.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
-        let mut state = self
-            .drop_log_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match kind {
-            DropKind::QueueFull => state.queue_full = state.queue_full.saturating_add(1),
-            DropKind::WriterDisconnected => {
-                state.writer_disconnected = state.writer_disconnected.saturating_add(1)
+            DropKind::QueueFull => {
+                self.drop_queue_full.fetch_add(1, Ordering::Relaxed);
             }
-            DropKind::Oversized => state.oversized = state.oversized.saturating_add(1),
+            DropKind::WriterDisconnected => {
+                self.drop_writer_disconnected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DropKind::Oversized => {
+                self.drop_oversized.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
+        let now = Instant::now();
+        let mut state = match self.drop_log_state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         let should_warn = match state.last_warn {
             Some(last_warn) => now.duration_since(last_warn) >= DROP_WARN_INTERVAL,
             None => true,
         };
-        if should_warn {
-            warn!(
-                query_recorder_tag = %self.tag,
-                queue_full = state.queue_full,
-                writer_disconnected = state.writer_disconnected,
-                oversized = state.oversized,
-                "query_recorder dropped records"
-            );
-            state.queue_full = 0;
-            state.writer_disconnected = 0;
-            state.oversized = 0;
-            state.last_warn = Some(now);
+        if !should_warn {
+            return;
         }
+        state.last_warn = Some(now);
+        drop(state);
+
+        let queue_full = self.drop_queue_full.swap(0, Ordering::Relaxed);
+        let writer_disconnected = self.drop_writer_disconnected.swap(0, Ordering::Relaxed);
+        let oversized = self.drop_oversized.swap(0, Ordering::Relaxed);
+        warn!(
+            query_recorder_tag = %self.tag,
+            queue_full,
+            writer_disconnected,
+            oversized,
+            "query_recorder dropped records"
+        );
     }
 
     pub(super) fn cleanup(&self, cutoff_ms: i64) -> CleanupReply {
