@@ -336,6 +336,7 @@ pub(super) fn run_writer_thread(
                         &tables,
                         &database_coordinator,
                         stop_requested,
+                        shutdown_requested,
                         &writer_interrupt,
                         &mut recovery_delay,
                     );
@@ -415,6 +416,7 @@ pub(super) fn run_writer_thread(
                         &tables,
                         &database_coordinator,
                         stop_requested,
+                        shutdown_requested,
                         &writer_interrupt,
                         &mut recovery_delay,
                     );
@@ -557,25 +559,29 @@ fn flush_pending_resilient(
             }
             if storage_error_requires_reopen(&err) {
                 non_storage_failure_backoff.reset();
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return true;
+                }
                 warn!(
                     dropped_records = record_count,
                     error = %err,
                     "query_recorder writer flush failed; dropping batch and reopening storage"
                 );
                 writer_recovering.store(true, Ordering::Release);
-                let recovered = recover_writer_connection(
+                let keep_running = recover_writer_connection(
                     conn,
                     path,
                     tables,
                     database_coordinator,
                     stop_requested,
+                    shutdown_requested,
                     writer_interrupt,
                     recovery_delay,
                 );
-                if recovered {
+                if keep_running {
                     writer_recovering.store(false, Ordering::Release);
                 }
-                recovered
+                keep_running
             } else {
                 let retry_delay = non_storage_failure_backoff.next_delay();
                 if non_storage_failure_backoff.should_warn(Instant::now()) {
@@ -651,18 +657,32 @@ pub(super) fn storage_error_requires_reopen(error: &DnsError) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_writer_connection(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
     database_coordinator: &DatabaseCoordinator,
     stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
     writer_interrupt: &WriterInterrupt,
     recovery_delay: &mut Duration,
 ) -> bool {
+    // `true` means the writer may return to its command loop. A graceful
+    // shutdown therefore skips further recovery work without stopping the
+    // writer, so it can consume the queued Shutdown command.
     loop {
-        if !sleep_with_stop(stop_requested, *recovery_delay) {
+        if stop_requested.load(Ordering::Acquire) {
             return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        if !sleep_with_stop_or_shutdown(stop_requested, shutdown_requested, *recovery_delay) {
+            return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
         }
 
         if !path.exists() {
@@ -675,6 +695,9 @@ fn recover_writer_connection(
                 .saturating_mul(2)
                 .min(WRITER_RECOVERY_MAX_DELAY);
             continue;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
         }
 
         let reopened = (|| -> Result<Connection> {
@@ -709,6 +732,9 @@ fn recover_writer_connection(
                 if stop_requested.load(Ordering::Acquire) {
                     return false;
                 }
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return true;
+                }
                 warn!(
                     path = %path.display(),
                     retry_ms = recovery_delay.as_millis(),
@@ -721,19 +747,6 @@ fn recover_writer_connection(
             }
         }
     }
-}
-
-fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
-    let mut remaining = duration;
-    while !remaining.is_zero() {
-        if stop_requested.load(Ordering::Acquire) {
-            return false;
-        }
-        let sleep_for = remaining.min(WRITER_RECOVERY_POLL_INTERVAL);
-        thread::sleep(sleep_for);
-        remaining = remaining.saturating_sub(sleep_for);
-    }
-    !stop_requested.load(Ordering::Acquire)
 }
 
 fn sleep_with_stop_or_shutdown(
@@ -2226,6 +2239,39 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.next_delay(), NON_STORAGE_FAILURE_INITIAL_DELAY);
         assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+    }
+
+    #[test]
+    fn test_writer_recovery_yields_to_graceful_shutdown_before_reopen() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tables = table_names("recovery_shutdown");
+        let coordinator = DatabaseCoordinator::default();
+        let stop_requested = AtomicBool::new(false);
+        let shutdown_requested = AtomicBool::new(true);
+        let writer_interrupt = WriterInterrupt::default();
+        let mut recovery_delay = Duration::ZERO;
+
+        assert!(recover_writer_connection(
+            &mut conn,
+            temp.path(),
+            &tables,
+            &coordinator,
+            &stop_requested,
+            &shutdown_requested,
+            &writer_interrupt,
+            &mut recovery_delay,
+        ));
+
+        let probe = Connection::open(temp.path()).unwrap();
+        let table_count: i64 = probe
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![&tables.records],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
     }
 
     #[test]
