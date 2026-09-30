@@ -15,9 +15,10 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::backend::{
-    CleanupResult, ClearHistoryResult, DatabaseCoordinator, MANAGEMENT_START_CLAIMED,
-    MANAGEMENT_START_PENDING, NO_PERIODIC_CLEANUP, RecorderBackend, RecorderLifecycle,
-    SpaceReclaimResult, SpaceStats, WriterCommand, WriterInterrupt, WriterThreadContext,
+    CleanupResult, ClearHistoryResult, DatabaseCoordinator, MANAGEMENT_OPERATION_TIMEOUT,
+    MANAGEMENT_START_CLAIMED, MANAGEMENT_START_PENDING, NO_PERIODIC_CLEANUP, RecorderBackend,
+    RecorderLifecycle, SpaceReclaimResult, SpaceStats, WriterCommand, WriterInterrupt,
+    WriterThreadContext,
 };
 #[cfg(test)]
 use super::model::StepJson;
@@ -45,6 +46,8 @@ const WRITER_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NON_STORAGE_FAILURE_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const NON_STORAGE_FAILURE_MAX_DELAY: Duration = Duration::from_secs(1);
 const NON_STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+const PERIODIC_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct NonStorageFailureBackoff {
@@ -260,6 +263,7 @@ pub(super) fn run_writer_thread(
     let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
     let mut non_storage_failure_backoff = NonStorageFailureBackoff::default();
     let mut shutdown_write_failure = ShutdownWriteFailure::default();
+    let mut periodic_cleanup_retry_at = None;
     loop {
         if stop_requested.load(Ordering::Acquire) {
             break;
@@ -279,6 +283,7 @@ pub(super) fn run_writer_thread(
             &mut recovery_delay,
             &writer_recovering,
             &management_inflight,
+            &mut periodic_cleanup_retry_at,
         ) {
             break;
         }
@@ -590,6 +595,24 @@ pub(super) fn run_writer_thread(
     Ok(())
 }
 
+fn spawn_periodic_cleanup_watchdog(
+    writer_interrupt: Arc<WriterInterrupt>,
+    owner: Arc<AtomicBool>,
+    timeout: Duration,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, thread::JoinHandle<bool>)> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = thread::Builder::new()
+        .name("query-recorder-periodic-cleanup-timeout".to_string())
+        .spawn(move || match done_rx.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {
+                owner.store(true, Ordering::Release);
+                writer_interrupt.interrupt_management(&owner)
+            }
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+        })?;
+    Ok((done_tx, handle))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_periodic_cleanup_if_requested(
     conn: &mut Connection,
@@ -602,10 +625,11 @@ fn run_periodic_cleanup_if_requested(
     broadcaster: &broadcast::Sender<SharedRecordDetail>,
     database_coordinator: &DatabaseCoordinator,
     dropped_total: &AtomicU64,
-    writer_interrupt: &WriterInterrupt,
+    writer_interrupt: &Arc<WriterInterrupt>,
     recovery_delay: &mut Duration,
     writer_recovering: &AtomicBool,
     management_inflight: &AtomicBool,
+    retry_at: &mut Option<Instant>,
 ) -> bool {
     let stop_requested = &lifecycle.stop_requested;
     let shutdown_requested = &lifecycle.shutdown_requested;
@@ -614,6 +638,12 @@ fn run_periodic_cleanup_if_requested(
     }
     if shutdown_requested.load(Ordering::Acquire) {
         return true;
+    }
+    if let Some(deadline) = *retry_at {
+        if Instant::now() < deadline {
+            return true;
+        }
+        *retry_at = None;
     }
 
     let cutoff_ms = lifecycle
@@ -639,7 +669,47 @@ fn run_periodic_cleanup_if_requested(
     }
 
     let started = Instant::now();
-    let cancelled = AtomicBool::new(false);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let management_interrupt_guard = match writer_interrupt.claim_management(cancelled.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            lifecycle
+                .periodic_cleanup_cutoff_ms
+                .fetch_max(cutoff_ms, Ordering::AcqRel);
+            *retry_at = Some(Instant::now() + PERIODIC_CLEANUP_RETRY_DELAY);
+            management_inflight.store(false, Ordering::Release);
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                error = %err,
+                "query_recorder periodic cleanup could not claim interrupt ownership; retry scheduled"
+            );
+            return true;
+        }
+    };
+    let (watchdog_done_tx, watchdog_handle) = match spawn_periodic_cleanup_watchdog(
+        writer_interrupt.clone(),
+        cancelled.clone(),
+        MANAGEMENT_OPERATION_TIMEOUT,
+    ) {
+        Ok(watchdog) => watchdog,
+        Err(err) => {
+            drop(management_interrupt_guard);
+            lifecycle
+                .periodic_cleanup_cutoff_ms
+                .fetch_max(cutoff_ms, Ordering::AcqRel);
+            *retry_at = Some(Instant::now() + PERIODIC_CLEANUP_RETRY_DELAY);
+            management_inflight.store(false, Ordering::Release);
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                error = %err,
+                "query_recorder periodic cleanup watchdog could not start; retry scheduled"
+            );
+            return true;
+        }
+    };
+
     let result: Result<CleanupResult> = (|| {
         let Some(_access) =
             database_coordinator.write_access_until_stop_or_cancel(stop_requested, &cancelled)?
@@ -659,34 +729,68 @@ fn run_periodic_cleanup_if_requested(
         run_cleanup_cancellable(conn, path, tables, cutoff_ms, stop_requested, &cancelled)
     })();
 
+    drop(management_interrupt_guard);
+    let _ = watchdog_done_tx.send(());
+    let timed_out = match watchdog_handle.join() {
+        Ok(timed_out) => timed_out,
+        Err(_) => {
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                "query_recorder periodic cleanup watchdog panicked"
+            );
+            false
+        }
+    };
+    if timed_out
+        && !stop_requested.load(Ordering::Acquire)
+        && !shutdown_requested.load(Ordering::Acquire)
+    {
+        lifecycle
+            .periodic_cleanup_cutoff_ms
+            .fetch_max(cutoff_ms, Ordering::AcqRel);
+        *retry_at = Some(Instant::now() + PERIODIC_CLEANUP_RETRY_DELAY);
+    }
+
     let recover_storage = result
         .as_ref()
         .err()
         .is_some_and(storage_error_requires_reopen)
+        && !timed_out
         && !stop_requested.load(Ordering::Acquire);
     if recover_storage {
         writer_recovering.store(true, Ordering::Release);
     }
     management_inflight.store(false, Ordering::Release);
 
-    match &result {
-        Ok(result) => {
-            info!(
-                path = %path.display(),
-                cutoff_ms,
-                deleted_records = result.deleted_records,
-                reclaimed_bytes = result.space.reclaimed_bytes(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "query_recorder periodic cleanup completed"
-            );
-        }
-        Err(err) => {
-            warn!(
-                path = %path.display(),
-                cutoff_ms,
-                error = %err,
-                "query_recorder periodic cleanup failed"
-            );
+    if timed_out {
+        warn!(
+            path = %path.display(),
+            cutoff_ms,
+            retry_ms = PERIODIC_CLEANUP_RETRY_DELAY.as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "query_recorder periodic cleanup timed out; retry scheduled"
+        );
+    } else {
+        match &result {
+            Ok(result) => {
+                info!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    deleted_records = result.deleted_records,
+                    reclaimed_bytes = result.space.reclaimed_bytes(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "query_recorder periodic cleanup completed"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    error = %err,
+                    "query_recorder periodic cleanup failed"
+                );
+            }
         }
     }
 
@@ -2416,6 +2520,62 @@ mod tests {
 
     use super::super::model::{EdnsJson, EdnsOptionJson, QuestionJson, RecordJson};
     use super::*;
+
+    #[test]
+    fn test_periodic_cleanup_watchdog_times_out_only_for_live_owner() {
+        let writer_interrupt = Arc::new(WriterInterrupt::default());
+        let conn = Connection::open_in_memory().unwrap();
+        writer_interrupt.install(&conn);
+
+        let owner = Arc::new(AtomicBool::new(false));
+        let guard = writer_interrupt.claim_management(owner.clone()).unwrap();
+        let (_done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            owner.clone(),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+
+        assert!(handle.join().unwrap());
+        assert!(owner.load(Ordering::Acquire));
+        drop(guard);
+
+        let stale_owner = Arc::new(AtomicBool::new(false));
+        let stale_guard = writer_interrupt
+            .claim_management(stale_owner.clone())
+            .unwrap();
+        drop(stale_guard);
+        let (_done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            stale_owner.clone(),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+
+        assert!(!handle.join().unwrap());
+        assert!(stale_owner.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_periodic_cleanup_watchdog_can_be_disarmed() {
+        let writer_interrupt = Arc::new(WriterInterrupt::default());
+        let conn = Connection::open_in_memory().unwrap();
+        writer_interrupt.install(&conn);
+
+        let owner = Arc::new(AtomicBool::new(false));
+        let guard = writer_interrupt.claim_management(owner.clone()).unwrap();
+        let (done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            owner.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        done_tx.send(()).unwrap();
+        assert!(!handle.join().unwrap());
+        assert!(!owner.load(Ordering::Acquire));
+        drop(guard);
+    }
 
     #[test]
     fn test_non_storage_failure_backoff_is_bounded_and_resettable() {

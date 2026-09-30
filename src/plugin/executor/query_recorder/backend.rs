@@ -25,7 +25,7 @@ use crate::infra::error::{DnsError, Result};
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 const COORDINATOR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MANAGEMENT_START_TIMEOUT: Duration = Duration::from_secs(1);
-const MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
