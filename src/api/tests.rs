@@ -451,6 +451,7 @@ async fn test_duplicate_exact_route_does_not_replace_existing_handler() {
     hub.stop().await;
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 #[tokio::test]
 async fn test_plugin_route_batch_is_atomic_on_duplicate() {
     AppClock::start();

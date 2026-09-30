@@ -52,6 +52,7 @@ pub(crate) use global::global_api_test_guard;
 pub(crate) use global::set_global_api_register_for_test;
 pub use global::{clear_global_api, global_api_register, install_global_api};
 pub use handler::{ApiBody, ApiHandler, ApiResponse};
+#[cfg(feature = "plugin-query-recorder")]
 pub(crate) use hub::PluginApiRouteRegistration;
 pub use hub::{ApiHub, ApiRegister, PluginApiRegister};
 #[cfg(test)]
