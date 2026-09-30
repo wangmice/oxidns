@@ -218,7 +218,7 @@ pub(super) fn run_writer_thread(
     let WriterThreadContext {
         path,
         tables,
-        stop_requested,
+        lifecycle,
         tail,
         memory_tail,
         broadcaster,
@@ -230,6 +230,8 @@ pub(super) fn run_writer_thread(
         writer_recovering,
         management_inflight,
     } = context;
+    let stop_requested = &lifecycle.stop_requested;
+    let shutdown_requested = &lifecycle.shutdown_requested;
 
     let mut pending = Vec::with_capacity(batch_size);
     let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
@@ -251,7 +253,8 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                         &database_coordinator,
-                        &stop_requested,
+                        stop_requested,
+                        shutdown_requested,
                         &dropped_total,
                         &writer_interrupt,
                         &mut recovery_delay,
@@ -289,11 +292,11 @@ pub(super) fn run_writer_thread(
                 let _ = started_tx.send(());
                 let result: Result<CleanupResult> = (|| {
                     let Some(_access) = database_coordinator
-                        .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
+                        .write_access_until_stop_or_cancel(stop_requested, &cancelled)?
                     else {
                         return Err(writer_stopping());
                     };
-                    ensure_maintenance_running(&stop_requested, &cancelled)?;
+                    ensure_maintenance_running(stop_requested, &cancelled)?;
                     flush_pending_for_management(
                         &mut conn,
                         &tables,
@@ -308,7 +311,7 @@ pub(super) fn run_writer_thread(
                         &path,
                         &tables,
                         cutoff_ms,
-                        &stop_requested,
+                        stop_requested,
                         &cancelled,
                     )
                 })();
@@ -332,7 +335,7 @@ pub(super) fn run_writer_thread(
                         &path,
                         &tables,
                         &database_coordinator,
-                        &stop_requested,
+                        stop_requested,
                         &writer_interrupt,
                         &mut recovery_delay,
                     );
@@ -369,11 +372,11 @@ pub(super) fn run_writer_thread(
                 let _ = started_tx.send(());
                 let result: Result<ClearHistoryResult> = (|| {
                     let Some(_access) = database_coordinator
-                        .write_access_until_stop_or_cancel(&stop_requested, &cancelled)?
+                        .write_access_until_stop_or_cancel(stop_requested, &cancelled)?
                     else {
                         return Err(writer_stopping());
                     };
-                    ensure_maintenance_running(&stop_requested, &cancelled)?;
+                    ensure_maintenance_running(stop_requested, &cancelled)?;
                     flush_pending_for_management(
                         &mut conn,
                         &tables,
@@ -388,7 +391,7 @@ pub(super) fn run_writer_thread(
                         &path,
                         &tables,
                         &tail,
-                        &stop_requested,
+                        stop_requested,
                         &cancelled,
                     )
                 })();
@@ -411,7 +414,7 @@ pub(super) fn run_writer_thread(
                         &path,
                         &tables,
                         &database_coordinator,
-                        &stop_requested,
+                        stop_requested,
                         &writer_interrupt,
                         &mut recovery_delay,
                     );
@@ -433,7 +436,7 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                    &stop_requested,
+                    stop_requested,
                 )
                 .map_err(|err| err.to_string());
                 if result.is_err() && record_count != 0 {
@@ -452,7 +455,7 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                    &stop_requested,
+                    stop_requested,
                 )
                 .map_err(|err| err.to_string());
                 let _ = reply_tx.send(result);
@@ -467,7 +470,8 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                    &stop_requested,
+                    stop_requested,
+                    shutdown_requested,
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
@@ -487,7 +491,8 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                    &stop_requested,
+                    stop_requested,
+                    shutdown_requested,
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
@@ -517,6 +522,7 @@ fn flush_pending_resilient(
     broadcaster: &broadcast::Sender<RecordDetail>,
     database_coordinator: &DatabaseCoordinator,
     stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
     dropped_total: &AtomicU64,
     writer_interrupt: &WriterInterrupt,
     recovery_delay: &mut Duration,
@@ -580,7 +586,7 @@ fn flush_pending_resilient(
                         "query_recorder writer flush failed; dropping batch and backing off"
                     );
                 }
-                sleep_with_stop(stop_requested, retry_delay)
+                sleep_with_stop_or_shutdown(stop_requested, shutdown_requested, retry_delay)
             }
         }
     }
@@ -722,6 +728,28 @@ fn sleep_with_stop(stop_requested: &AtomicBool, duration: Duration) -> bool {
     while !remaining.is_zero() {
         if stop_requested.load(Ordering::Acquire) {
             return false;
+        }
+        let sleep_for = remaining.min(WRITER_RECOVERY_POLL_INTERVAL);
+        thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
+    !stop_requested.load(Ordering::Acquire)
+}
+
+fn sleep_with_stop_or_shutdown(
+    stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
+    duration: Duration,
+) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            // Graceful shutdown only wakes the backoff. The writer must stay
+            // alive so it can consume the queued Shutdown command.
+            return true;
         }
         let sleep_for = remaining.min(WRITER_RECOVERY_POLL_INTERVAL);
         thread::sleep(sleep_for);
@@ -2198,6 +2226,25 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.next_delay(), NON_STORAGE_FAILURE_INITIAL_DELAY);
         assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+    }
+
+    #[test]
+    fn test_non_storage_backoff_distinguishes_graceful_and_hard_stop() {
+        let stop_requested = AtomicBool::new(false);
+        let shutdown_requested = AtomicBool::new(true);
+
+        assert!(sleep_with_stop_or_shutdown(
+            &stop_requested,
+            &shutdown_requested,
+            Duration::from_secs(1),
+        ));
+
+        stop_requested.store(true, Ordering::Release);
+        assert!(!sleep_with_stop_or_shutdown(
+            &stop_requested,
+            &shutdown_requested,
+            Duration::from_secs(1),
+        ));
     }
 
     #[test]

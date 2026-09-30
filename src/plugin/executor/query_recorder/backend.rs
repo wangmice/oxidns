@@ -84,20 +84,25 @@ impl WriterInterrupt {
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct RecorderLifecycle {
+    pub(super) stop_requested: AtomicBool,
+    pub(super) shutdown_requested: AtomicBool,
+}
+
 #[derive(Debug)]
 pub(super) struct RecorderBackend {
     pub(super) tag: String,
     pub(super) path: PathBuf,
     pub(super) tables: TableNames,
     pub(super) queue_tx: SyncSender<WriterCommand>,
-    pub(super) stop_requested: Arc<AtomicBool>,
+    pub(super) lifecycle: Arc<RecorderLifecycle>,
     pub(super) writer_handle: Mutex<Option<JoinHandle<()>>>,
     pub(super) tail: Arc<Mutex<VecDeque<RecordDetail>>>,
     pub(super) memory_tail: usize,
     pub(super) broadcaster: broadcast::Sender<RecordDetail>,
     pub(super) dropped_total: Arc<AtomicU64>,
     pub(super) reader_semaphore: Arc<Semaphore>,
-    pub(super) reader_stopping: AtomicBool,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
     writer_interrupt: Arc<WriterInterrupt>,
     accepting_records: AtomicBool,
@@ -188,7 +193,7 @@ pub(super) enum WriterCommand {
 pub(super) struct WriterThreadContext {
     pub(super) path: PathBuf,
     pub(super) tables: TableNames,
-    pub(super) stop_requested: Arc<AtomicBool>,
+    pub(super) lifecycle: Arc<RecorderLifecycle>,
     pub(super) tail: Arc<Mutex<VecDeque<RecordDetail>>>,
     pub(super) memory_tail: usize,
     pub(super) broadcaster: broadcast::Sender<RecordDetail>,
@@ -473,7 +478,7 @@ impl RecorderBackend {
         };
 
         let (queue_tx, queue_rx) = sync_channel(config.queue_size);
-        let stop_requested = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(RecorderLifecycle::default());
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(
             config.memory_tail.max(1),
         )));
@@ -491,7 +496,7 @@ impl RecorderBackend {
 
         let writer_tables = tables.clone();
         let writer_path = config.path.clone();
-        let writer_stop = stop_requested.clone();
+        let writer_lifecycle = lifecycle.clone();
         let writer_tail = tail.clone();
         let writer_broadcaster = broadcaster.clone();
         let memory_tail = config.memory_tail.max(1);
@@ -505,7 +510,7 @@ impl RecorderBackend {
                     WriterThreadContext {
                         path: writer_path,
                         tables: writer_tables,
-                        stop_requested: writer_stop,
+                        lifecycle: writer_lifecycle,
                         tail: writer_tail,
                         memory_tail,
                         broadcaster: writer_broadcaster,
@@ -529,14 +534,13 @@ impl RecorderBackend {
             path: config.path,
             tables,
             queue_tx,
-            stop_requested,
+            lifecycle,
             writer_handle: Mutex::new(Some(writer_handle)),
             tail,
             memory_tail,
             broadcaster,
             dropped_total,
             reader_semaphore,
-            reader_stopping: AtomicBool::new(false),
             database_coordinator,
             writer_interrupt,
             accepting_records: AtomicBool::new(true),
@@ -564,13 +568,15 @@ impl RecorderBackend {
     }
 
     fn hard_stop(&self) {
-        self.stop_requested.store(true, Ordering::Release);
+        self.lifecycle.stop_requested.store(true, Ordering::Release);
         self.writer_interrupt.interrupt();
     }
 
     pub(super) fn shutdown(&self) -> std::result::Result<(), String> {
         self.accepting_records.store(false, Ordering::Release);
-        self.reader_stopping.store(true, Ordering::Release);
+        self.lifecycle
+            .shutdown_requested
+            .store(true, Ordering::Release);
         self.reader_semaphore.close();
         if self.writer_recovering.load(Ordering::Acquire)
             || self.management_inflight.load(Ordering::Acquire)
@@ -597,7 +603,7 @@ impl RecorderBackend {
                     thread::sleep(SHUTDOWN_QUEUE_RETRY_INTERVAL);
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    self.stop_requested.store(true, Ordering::Release);
+                    self.lifecycle.stop_requested.store(true, Ordering::Release);
                     return Err(
                         "query_recorder writer became unavailable during shutdown".to_string()
                     );
@@ -607,7 +613,7 @@ impl RecorderBackend {
 
         match reply_rx.recv_timeout(SHUTDOWN_FLUSH_TIMEOUT) {
             Ok(result) => {
-                self.stop_requested.store(true, Ordering::Release);
+                self.lifecycle.stop_requested.store(true, Ordering::Release);
                 result
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -623,7 +629,7 @@ impl RecorderBackend {
 
     fn begin_management(&self) -> std::result::Result<(), String> {
         if !self.accepting_records.load(Ordering::Acquire)
-            || self.stop_requested.load(Ordering::Acquire)
+            || self.lifecycle.stop_requested.load(Ordering::Acquire)
         {
             return Err("query_recorder is stopping".to_string());
         }
@@ -638,7 +644,7 @@ impl RecorderBackend {
             return Err("query_recorder management operation already in progress".to_string());
         }
         if !self.accepting_records.load(Ordering::Acquire)
-            || self.stop_requested.load(Ordering::Acquire)
+            || self.lifecycle.stop_requested.load(Ordering::Acquire)
             || self.writer_recovering.load(Ordering::Acquire)
         {
             self.management_inflight.store(false, Ordering::Release);

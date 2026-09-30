@@ -128,7 +128,7 @@ where
     T: Send + 'static,
     F: FnOnce(Arc<RecorderBackend>) -> std::result::Result<T, DnsError> + Send + 'static,
 {
-    if backend.reader_stopping.load(Ordering::Acquire) {
+    if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
         return Err(DnsError::runtime("query_recorder reader is stopping"));
     }
     let permit = backend
@@ -137,20 +137,20 @@ where
         .acquire_owned()
         .await
         .map_err(|err| DnsError::runtime(format!("query_recorder reader closed: {err}")))?;
-    if backend.reader_stopping.load(Ordering::Acquire) {
+    if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
         return Err(DnsError::runtime("query_recorder reader is stopping"));
     }
     let database_coordinator = backend.database_coordinator.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let Some(_access) =
-            database_coordinator.read_access_until_stop(&backend.reader_stopping)?
+            database_coordinator.read_access_until_stop(&backend.lifecycle.shutdown_requested)?
         else {
             return Err(DnsError::runtime(
                 "query_recorder reader stopped before database access",
             ));
         };
-        if backend.reader_stopping.load(Ordering::Acquire) {
+        if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
             return Err(DnsError::runtime("query_recorder reader is stopping"));
         }
         op(backend)

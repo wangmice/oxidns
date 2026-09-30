@@ -365,7 +365,7 @@ async fn test_query_recorder_shutdown_closes_reader_gate() {
 
     plugin.destroy().await.unwrap();
 
-    assert!(backend.reader_stopping.load(Ordering::Acquire));
+    assert!(backend.lifecycle.shutdown_requested.load(Ordering::Acquire));
     assert!(backend.reader_semaphore.is_closed());
     assert!(waiter.await.unwrap().is_err());
     drop(held_permit);
