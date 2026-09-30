@@ -27,19 +27,19 @@ impl PendingRecord {
         response: Option<Message>,
         created_at_ms: i64,
         elapsed_ms: u64,
-        exec_path: ExecutionPath,
+        exec_path: &ExecutionPath,
         step_start_index: usize,
         client_ip: SocketAddr,
         error: Option<String>,
     ) -> Self {
         let error = error.map(|value| truncate_utf8(value, MAX_ERROR_BYTES));
+        let execution_events = exec_path.events_from(step_start_index).to_vec();
         Self {
             request,
             response,
             created_at_ms,
             elapsed_ms,
-            exec_path,
-            step_start_index,
+            execution_events,
             client_ip,
             error,
         }
@@ -59,8 +59,7 @@ impl PendingRecord {
             response,
             created_at_ms,
             elapsed_ms,
-            exec_path,
-            step_start_index,
+            execution_events,
             client_ip,
             error,
         } = self;
@@ -71,8 +70,7 @@ impl PendingRecord {
             .map(question_json)
             .collect::<Vec<_>>();
         let req_edns_json = request.edns().as_ref().map(edns_json);
-        let steps = exec_path
-            .events_from(step_start_index)
+        let steps = execution_events
             .iter()
             .enumerate()
             .map(step_json)
@@ -160,7 +158,7 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     }
     value.truncate(end);
     value.push_str(ERROR_TRUNCATION_SUFFIX);
-    value
+    String::from(value.into_boxed_str())
 }
 
 fn question_json(question: &Question) -> QuestionJson {

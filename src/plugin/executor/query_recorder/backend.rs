@@ -18,7 +18,7 @@ use rusqlite::{Connection, InterruptHandle};
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{error, info, warn};
 
-use super::model::{PendingRecord, RecordDetail, ResolvedRecorderConfig, TableNames};
+use super::model::{PendingRecord, ResolvedRecorderConfig, SharedRecordDetail, TableNames};
 use super::store::{create_schema, open_writer_database, run_writer_thread, table_names};
 use crate::infra::error::{DnsError, Result};
 
@@ -98,9 +98,9 @@ pub(super) struct RecorderBackend {
     pub(super) queue_tx: SyncSender<WriterCommand>,
     pub(super) lifecycle: Arc<RecorderLifecycle>,
     pub(super) writer_handle: Mutex<Option<JoinHandle<()>>>,
-    pub(super) tail: Arc<Mutex<VecDeque<RecordDetail>>>,
+    pub(super) tail: Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     pub(super) memory_tail: usize,
-    pub(super) broadcaster: broadcast::Sender<RecordDetail>,
+    pub(super) broadcaster: broadcast::Sender<SharedRecordDetail>,
     pub(super) dropped_total: Arc<AtomicU64>,
     pub(super) reader_semaphore: Arc<Semaphore>,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
@@ -194,9 +194,9 @@ pub(super) struct WriterThreadContext {
     pub(super) path: PathBuf,
     pub(super) tables: TableNames,
     pub(super) lifecycle: Arc<RecorderLifecycle>,
-    pub(super) tail: Arc<Mutex<VecDeque<RecordDetail>>>,
+    pub(super) tail: Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     pub(super) memory_tail: usize,
-    pub(super) broadcaster: broadcast::Sender<RecordDetail>,
+    pub(super) broadcaster: broadcast::Sender<SharedRecordDetail>,
     pub(super) batch_size: usize,
     pub(super) flush_interval: Duration,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
@@ -551,6 +551,28 @@ impl RecorderBackend {
             drop_writer_disconnected: AtomicU64::new(0),
             drop_oversized: AtomicU64::new(0),
         }))
+    }
+
+    pub(super) fn subscribe_tail(
+        &self,
+        tail_count: usize,
+    ) -> std::result::Result<
+        (
+            Vec<SharedRecordDetail>,
+            broadcast::Receiver<SharedRecordDetail>,
+        ),
+        String,
+    > {
+        let guard = self
+            .tail
+            .lock()
+            .map_err(|_| "query_recorder tail buffer lock poisoned".to_string())?;
+        // Subscribe under the same lock used by writer publication so the
+        // history snapshot and live stream have one gap-free cut.
+        let receiver = self.broadcaster.subscribe();
+        let skip = guard.len().saturating_sub(tail_count);
+        let initial = guard.iter().skip(skip).cloned().collect();
+        Ok((initial, receiver))
     }
 
     pub(super) fn enqueue(&self, pending: PendingRecord) {

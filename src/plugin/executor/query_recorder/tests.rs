@@ -155,7 +155,7 @@ fn pending_record(
         response,
         created_at_ms,
         1,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         error.map(ToString::to_string),
@@ -241,7 +241,7 @@ fn test_record_capture_without_response_uses_empty_sections() {
         ctx.response.clone(),
         100,
         10,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         Some(DnsError::plugin("boom").to_string()),
@@ -292,7 +292,7 @@ fn test_record_capture_with_structured_response() {
         ctx.response.clone(),
         100,
         12,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         None,
@@ -327,6 +327,71 @@ fn test_record_capture_rejects_excessive_execution_path() {
         &ctx.execution_path,
         0
     ));
+}
+
+#[test]
+fn test_pending_record_snapshots_only_execution_path_suffix() {
+    let request = Message::new();
+    let mut ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    ctx.enable_execution_path();
+    ctx.push_execution_path_event(ExecutionPathEvent::new(
+        "seq",
+        Some(0),
+        "executor",
+        Some("before"),
+        "executed",
+    ));
+    let step_start_index = ctx.execution_path_len();
+    ctx.push_execution_path_event(ExecutionPathEvent::new(
+        "seq",
+        Some(1),
+        "executor",
+        Some("inside"),
+        "executed",
+    ));
+    let pending = PendingRecord::new(
+        request,
+        None,
+        100,
+        1,
+        &ctx.execution_path,
+        step_start_index,
+        ctx.peer_addr(),
+        None,
+    );
+    assert_eq!(pending.execution_events.len(), 1);
+    assert_eq!(pending.execution_events[0].tag.as_deref(), Some("inside"));
+    let (_, steps) = pending.take_to_record();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].tag.as_deref(), Some("inside"));
+}
+
+#[test]
+fn test_pending_record_truncated_error_releases_excess_capacity() {
+    let request = Message::new();
+    let ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    let pending = PendingRecord::new(
+        request,
+        None,
+        100,
+        1,
+        &ctx.execution_path,
+        0,
+        ctx.peer_addr(),
+        Some("x".repeat(1024 * 1024)),
+    );
+    let error = pending
+        .error
+        .as_ref()
+        .expect("truncated error should remain");
+    assert!(error.len() <= 16 * 1024);
+    assert!(error.capacity() <= 16 * 1024);
 }
 
 #[tokio::test]
@@ -2086,6 +2151,59 @@ fn test_resolve_config_rejects_zero_limits() {
     })
     .unwrap();
     assert!(resolve_config(Some(config)).is_err());
+}
+
+#[tokio::test]
+async fn test_query_recorder_tail_snapshot_and_live_stream_share_records() {
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("shared_tail".into(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "history.example.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+    let (initial, mut receiver) = backend.subscribe_tail(1).unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].record.request_id, 1);
+    backend.enqueue(pending_record(
+        2_000,
+        2,
+        "live.example.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+    let live = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.record.request_id, 2);
+    {
+        let tail = backend.tail.lock().unwrap();
+        let history = tail
+            .iter()
+            .find(|record| record.record.request_id == 1)
+            .expect("history record should remain in tail");
+        let current = tail
+            .iter()
+            .find(|record| record.record.request_id == 2)
+            .expect("live record should be in tail");
+        assert!(Arc::ptr_eq(history, &initial[0]));
+        assert!(Arc::ptr_eq(current, &live));
+    }
+    plugin.destroy().await.unwrap();
 }
 
 #[tokio::test]

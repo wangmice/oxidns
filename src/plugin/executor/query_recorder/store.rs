@@ -25,8 +25,8 @@ use super::model::{
     DistributionQuery, DistributionResponse, DistributionRow, LatencyHistogramBucket, LatencyQuery,
     LatencySlowRow, LatencySummary, ListCursor, ListQuery, PendingRecord, PluginStatsKind,
     PluginStatsRow, PluginsStatsQuery, QueryRecordFilter, QueryRecordStatus, RecordDetail,
-    RecordRow, TableNames, TimeseriesPoint, TimeseriesQuery, TimeseriesResponse, TopBucketRow,
-    TopBucketsResponse, TopQuery,
+    RecordRow, SharedRecordDetail, TableNames, TimeseriesPoint, TimeseriesQuery,
+    TimeseriesResponse, TopBucketRow, TopBucketsResponse, TopQuery,
 };
 use super::persistence::{
     PreparedRecord, RECORD_COLUMNS, StoredRecord, assemble_records, insert_batch, load_steps,
@@ -519,9 +519,9 @@ fn flush_pending_resilient(
     path: &Path,
     tables: &TableNames,
     pending: &mut Vec<PendingRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
     database_coordinator: &DatabaseCoordinator,
     stop_requested: &AtomicBool,
     shutdown_requested: &AtomicBool,
@@ -603,9 +603,9 @@ fn flush_pending_for_management(
     conn: &mut Connection,
     tables: &TableNames,
     pending: &mut Vec<PendingRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
     dropped_total: &AtomicU64,
 ) -> Result<()> {
     if pending.is_empty() {
@@ -889,9 +889,9 @@ fn flush_pending_coordinated(
     conn: &mut Connection,
     tables: &TableNames,
     pending: &mut Vec<PendingRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
     database_coordinator: &DatabaseCoordinator,
     stop_requested: &AtomicBool,
 ) -> Result<()> {
@@ -909,9 +909,9 @@ fn flush_prepared(
     conn: &mut Connection,
     tables: &TableNames,
     prepared: Vec<PreparedRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
 ) -> Result<()> {
     if prepared.is_empty() {
         return Ok(());
@@ -926,10 +926,11 @@ fn flush_prepared(
     for (prepared, id) in prepared.into_iter().zip(ids) {
         let mut detail = prepared.detail;
         detail.record.id = id;
+        let detail = Arc::new(detail);
         if tail_guard.len() >= memory_tail {
             tail_guard.pop_front();
         }
-        tail_guard.push_back(detail.clone());
+        tail_guard.push_back(Arc::clone(&detail));
         let _ = broadcaster.send(detail);
     }
     Ok(())
@@ -1065,7 +1066,7 @@ fn run_clear_history(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
     let stop_requested = AtomicBool::new(false);
     let cancelled = AtomicBool::new(false);
@@ -1076,7 +1077,7 @@ fn run_clear_history_cancellable(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     stop_requested: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<ClearHistoryResult> {
@@ -1096,7 +1097,7 @@ fn run_clear_history_with_checkpoint<F>(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     checkpoint: &mut F,
 ) -> Result<ClearHistoryResult>
 where
@@ -1119,7 +1120,7 @@ fn run_clear_history_with_checkpoint_and_stop<F>(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     stop_requested: &AtomicBool,
     cancelled: &AtomicBool,
     checkpoint: &mut F,
@@ -1173,7 +1174,7 @@ where
     })
 }
 
-fn clear_tail(tail: &Arc<Mutex<VecDeque<RecordDetail>>>) {
+fn clear_tail(tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>) {
     let mut tail_guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     tail_guard.clear();
 }
@@ -2368,7 +2369,9 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let tail = Arc::new(Mutex::new(VecDeque::from([first_detail.unwrap()])));
+        let tail = Arc::new(Mutex::new(VecDeque::from([Arc::new(
+            first_detail.unwrap(),
+        )])));
         let checkpoint_calls = Cell::new(0);
         let mut checkpoint = |_: &Connection| {
             let calls = checkpoint_calls.get() + 1;

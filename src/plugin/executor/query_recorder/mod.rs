@@ -164,7 +164,7 @@ impl Executor for QueryRecorder {
         // Keep the recorder strictly best-effort without adding a full DNS
         // message-size traversal to the query hot path. Snapshot size remains
         // bounded on the writer side; only the O(1) execution-path count is
-        // checked here before cloning the path into the queue.
+        // checked here before cloning the recorder-owned suffix into the queue.
         if !PendingRecord::execution_path_within_limit(&context.execution_path, step_start_index) {
             backend.drop_oversized_record();
             return result;
@@ -174,7 +174,7 @@ impl Executor for QueryRecorder {
             context.response.clone(),
             timestamp.as_millisecond(),
             instant.elapsed().as_millis() as u64,
-            context.execution_path.clone(),
+            &context.execution_path,
             step_start_index,
             context.peer_addr(),
             result.as_ref().err().map(ToString::to_string),
