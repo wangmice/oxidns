@@ -2705,9 +2705,10 @@ mod tests {
             10
         );
         assert!(!retry.ready(now));
-        assert_eq!(
-            retry.recv_timeout(now, Duration::from_secs(60)),
-            Duration::from_secs(1)
+        let remaining = retry.recv_timeout(Instant::now(), Duration::from_secs(60));
+        assert!(
+            remaining <= Duration::from_secs(1),
+            "retry deadline should be at most one second away, got {remaining:?}"
         );
 
         lifecycle

@@ -26,9 +26,11 @@ use super::store::{
 use crate::api::query::{
     optional_text, optional_upper_text, parse_u64_param, parse_usize_param, visit_query_params,
 };
-use crate::api::{ApiHandler, json_error, json_ok, simple_response, streaming_response};
+use crate::api::{
+    ApiHandler, PluginApiRouteRegistration, global_api_register, json_error, json_ok,
+    simple_response, streaming_response,
+};
 use crate::infra::error::{DnsError, Result};
-use crate::register_plugin_api;
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
@@ -779,44 +781,79 @@ fn sse_record_frame(record: &RecordDetail) -> Bytes {
 }
 
 pub(super) fn register(backend: &Arc<RecorderBackend>) -> Result<()> {
-    register_plugin_api!(
-        &backend.tag,
-        |plugin_api|
-        GET "/records" => RecordsListHandler {
-            backend: backend.clone(),
-        },
-        DELETE "/records" => RecordsClearHandler {
-            backend: backend.clone(),
-        },
-        GET_PREFIX "/records/" => RecordDetailHandler {
-            backend: backend.clone(),
-            path_prefix: plugin_api.path("/records/")?,
-        },
-        GET "/stats/plugins" => StatsPluginsHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/top_clients" => TopClientsHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/top_qnames" => TopQnamesHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/qtype" => QtypeDistributionHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/rcode" => RcodeDistributionHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/latency" => LatencyHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/timeseries" => TimeseriesHandler {
-            backend: backend.clone(),
-        },
-        GET "/stream" => StreamHandler {
-            backend: backend.clone(),
-        },
-    )?;
+    let Some(api_register) = global_api_register() else {
+        return Ok(());
+    };
+    let plugin_api = api_register.plugin(&backend.tag)?;
+    let record_path_prefix = plugin_api.path("/records/")?;
 
-    Ok(())
+    plugin_api.register_batch(vec![
+        PluginApiRouteRegistration::get(
+            "/records",
+            Arc::new(RecordsListHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::delete(
+            "/records",
+            Arc::new(RecordsClearHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get_prefix(
+            "/records/",
+            Arc::new(RecordDetailHandler {
+                backend: backend.clone(),
+                path_prefix: record_path_prefix,
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/plugins",
+            Arc::new(StatsPluginsHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/top_clients",
+            Arc::new(TopClientsHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/top_qnames",
+            Arc::new(TopQnamesHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/qtype",
+            Arc::new(QtypeDistributionHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/rcode",
+            Arc::new(RcodeDistributionHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/latency",
+            Arc::new(LatencyHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/timeseries",
+            Arc::new(TimeseriesHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stream",
+            Arc::new(StreamHandler {
+                backend: backend.clone(),
+            }),
+        ),
+    ])
 }

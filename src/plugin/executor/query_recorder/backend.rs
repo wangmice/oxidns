@@ -721,6 +721,18 @@ impl RecorderBackend {
     fn hard_stop(&self) {
         self.lifecycle.stop_requested.store(true, Ordering::Release);
         self.writer_interrupt.interrupt();
+        // Wake an idle writer immediately. If the bounded queue is full, the
+        // writer is already active and will observe stop_requested shortly.
+        let _ = self.queue_tx.try_send(WriterCommand::WakePeriodicCleanup);
+    }
+
+    pub(super) fn abort_initialization(&self) {
+        self.accepting_records.store(false, Ordering::Release);
+        self.lifecycle
+            .shutdown_requested
+            .store(true, Ordering::Release);
+        self.reader_semaphore.close();
+        self.hard_stop();
     }
 
     pub(super) fn shutdown(&self) -> std::result::Result<(), String> {

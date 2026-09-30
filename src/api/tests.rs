@@ -43,6 +43,16 @@ impl ApiHandler for TestEchoHandler {
     }
 }
 
+#[derive(Debug)]
+struct TestCreatedHandler;
+
+#[async_trait]
+impl ApiHandler for TestCreatedHandler {
+    async fn handle(&self, _request: Request<Bytes>) -> ApiResponse {
+        simple_response(StatusCode::CREATED, Bytes::from_static(b"created"))
+    }
+}
+
 fn reserve_local_addr() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("local addr");
@@ -404,6 +414,91 @@ fn test_register_helper_methods_register_without_error() {
     plugin_api
         .delete_prefix("/records/", Arc::new(TestEchoHandler))
         .expect("register scoped DELETE prefix");
+}
+
+#[tokio::test]
+async fn test_duplicate_exact_route_does_not_replace_existing_handler() {
+    AppClock::start();
+    let addr = reserve_local_addr();
+    let hub = test_api_hub(addr, None);
+    let register = ApiRegister::new(hub.clone());
+
+    register
+        .register_get("/duplicate-safe", Arc::new(TestEchoHandler))
+        .expect("register original route");
+    let error = register
+        .register_get("/duplicate-safe", Arc::new(TestCreatedHandler))
+        .expect_err("duplicate route should fail");
+    assert!(error.to_string().contains("duplicate API route registered"));
+
+    start_test_api_hub(&hub).await;
+    let client = http1_client();
+    let uri: Uri = format!("http://{addr}/api/duplicate-safe")
+        .parse()
+        .expect("duplicate route uri");
+    let response = client
+        .request(
+            HyperRequest::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Empty::new())
+                .expect("duplicate route request"),
+        )
+        .await
+        .expect("duplicate route response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn test_plugin_route_batch_is_atomic_on_duplicate() {
+    AppClock::start();
+    let addr = reserve_local_addr();
+    let hub = test_api_hub(addr, None);
+    let register = ApiRegister::new(hub.clone());
+    let plugin_api = register.plugin("batch_atomic").expect("plugin registrar");
+
+    plugin_api
+        .get("/taken", Arc::new(TestEchoHandler))
+        .expect("register existing route");
+    let error = plugin_api
+        .register_batch(vec![
+            PluginApiRouteRegistration::get("/new", Arc::new(TestCreatedHandler)),
+            PluginApiRouteRegistration::get_prefix("/new-prefix/", Arc::new(TestCreatedHandler)),
+            PluginApiRouteRegistration::get("/taken", Arc::new(TestCreatedHandler)),
+        ])
+        .expect_err("batch containing duplicate route should fail");
+    assert!(error.to_string().contains("duplicate API route registered"));
+
+    start_test_api_hub(&hub).await;
+    let client = http1_client();
+
+    for (path, expected) in [
+        ("/api/plugins/batch_atomic/taken", StatusCode::OK),
+        ("/api/plugins/batch_atomic/new", StatusCode::NOT_FOUND),
+        (
+            "/api/plugins/batch_atomic/new-prefix/value",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let uri: Uri = format!("http://{addr}{path}")
+            .parse()
+            .expect("batch route uri");
+        let response = client
+            .request(
+                HyperRequest::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Empty::new())
+                    .expect("batch route request"),
+            )
+            .await
+            .expect("batch route response");
+        assert_eq!(response.status(), expected, "unexpected status for {path}");
+    }
+
+    hub.stop().await;
 }
 
 #[tokio::test]

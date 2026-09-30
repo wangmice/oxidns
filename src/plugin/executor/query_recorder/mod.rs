@@ -92,25 +92,54 @@ impl Plugin for QueryRecorder {
         } else {
             None
         };
-        let join_handle = if let Some(backend) = &self.backend {
-            let mut guard = backend
-                .writer_handle
-                .lock()
-                .map_err(|_| DnsError::runtime("query_recorder writer lock poisoned"))?;
-            guard.take()
-        } else {
-            None
-        };
-        if let Some(handle) = join_handle {
-            let join_result = tokio::task::spawn_blocking(move || handle.join())
-                .await
-                .map_err(|err| DnsError::runtime(format!("query_recorder join failed: {err}")))?;
-            map_writer_join_result(join_result)?;
+        if let Some(backend) = &self.backend {
+            join_backend_writer(backend).await?;
         }
         if let Some(Err(err)) = shutdown_result {
             return Err(DnsError::runtime(err));
         }
         Ok(())
+    }
+}
+
+async fn join_backend_writer(backend: &Arc<RecorderBackend>) -> Result<()> {
+    let join_handle = {
+        let mut guard = backend
+            .writer_handle
+            .lock()
+            .map_err(|_| DnsError::runtime("query_recorder writer lock poisoned"))?;
+        guard.take()
+    };
+
+    if let Some(handle) = join_handle {
+        let join_result = tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .map_err(|err| DnsError::runtime(format!("query_recorder join failed: {err}")))?;
+        map_writer_join_result(join_result)?;
+    }
+    Ok(())
+}
+
+async fn rollback_initialization(
+    backend: &Arc<RecorderBackend>,
+    cleanup_task_handle: Option<&task_center::ManagedTaskHandle>,
+) -> Result<()> {
+    backend.abort_initialization();
+    if let Some(task_handle) = cleanup_task_handle {
+        task_handle.stop().await;
+    }
+    join_backend_writer(backend).await
+}
+
+fn initialization_error_with_rollback(
+    init_error: DnsError,
+    rollback_result: Result<()>,
+) -> DnsError {
+    match rollback_result {
+        Ok(()) => init_error,
+        Err(rollback_error) => DnsError::runtime(format!(
+            "query_recorder initialization failed: {init_error}; rollback also failed: {rollback_error}"
+        )),
     }
 }
 
@@ -195,13 +224,9 @@ impl QueryRecorder {
 
     async fn init_inner(&mut self, register_api: bool) -> Result<()> {
         let backend = RecorderBackend::run(self.tag.clone(), self.config.clone())?;
-        if register_api {
-            api::register(&backend)?;
-        }
-
         let recorder_backend = backend.clone();
         let retention_ms = self.config.retention_days.saturating_mul(ONE_DAY_MS) as i64;
-        self.cleanup_task_handle = Some(task_center::spawn_fixed(
+        let cleanup_task_handle = match task_center::spawn_fixed(
             format!("query_recorder:{}:cleanup", self.tag),
             Duration::from_secs(self.config.cleanup_interval_hours * 60 * 60),
             task_center::TaskOptions::default(),
@@ -212,8 +237,22 @@ impl QueryRecorder {
                     recorder_backend.request_periodic_cleanup(cutoff_ms);
                 }
             },
-        )?);
-        self.backend.replace(backend);
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                let rollback_result = rollback_initialization(&backend, None).await;
+                return Err(initialization_error_with_rollback(err, rollback_result));
+            }
+        };
+
+        if register_api && let Err(err) = api::register(&backend) {
+            let rollback_result =
+                rollback_initialization(&backend, Some(&cleanup_task_handle)).await;
+            return Err(initialization_error_with_rollback(err, rollback_result));
+        }
+
+        self.cleanup_task_handle = Some(cleanup_task_handle);
+        self.backend = Some(backend);
         Ok(())
     }
 

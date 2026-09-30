@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-use super::backend::{DatabaseCoordinator, WriterCommand, WriterInterrupt};
+use super::backend::{DatabaseCoordinator, RecorderBackend, WriterCommand, WriterInterrupt};
 use super::model::{
     DistributionQuery, LatencyQuery, ListQuery, PendingRecord, PluginStatsKind, PluginsStatsQuery,
     QueryRecordFilter, QueryRecordStatus, QueryRecorderConfig, TimeseriesBucket, TimeseriesQuery,
@@ -20,7 +20,10 @@ use super::store::{
     open_reader_database, open_writer_database, query_records, storage_error_requires_reopen,
     table_names,
 };
-use super::{QueryRecorder, QueryRecorderFactory, map_writer_join_result, resolve_config};
+use super::{
+    QueryRecorder, QueryRecorderFactory, map_writer_join_result, resolve_config,
+    rollback_initialization,
+};
 use crate::core::context::{DnsContext, ExecutionPathEvent};
 use crate::infra::clock::AppClock;
 use crate::infra::error::DnsError;
@@ -1277,6 +1280,39 @@ fn test_query_recorder_management_interrupt_is_bound_to_current_owner() {
     assert!(writer_interrupt.interrupt_management(&current_owner));
     drop(current_guard);
     assert!(!writer_interrupt.interrupt_management(&current_owner));
+}
+
+#[tokio::test]
+async fn test_query_recorder_init_rollback_wakes_and_joins_idle_writer() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let backend = RecorderBackend::run("rollback".to_string(), config).unwrap();
+
+    let started = std::time::Instant::now();
+    rollback_initialization(&backend, None).await.unwrap();
+
+    assert!(backend.lifecycle.stop_requested.load(Ordering::Acquire));
+    assert!(backend.lifecycle.shutdown_requested.load(Ordering::Acquire));
+    assert!(backend.writer_handle.lock().unwrap().is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "rollback should wake the idle writer instead of waiting for the 60s flush interval"
+    );
 }
 
 #[tokio::test]
