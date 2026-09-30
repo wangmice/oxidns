@@ -31,6 +31,7 @@ pub struct PluginApiRegister {
     tag: String,
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 pub(crate) struct PluginApiRouteRegistration {
     method: Method,
     subpath: String,
@@ -38,6 +39,7 @@ pub(crate) struct PluginApiRouteRegistration {
     prefix: bool,
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 impl PluginApiRouteRegistration {
     fn exact(method: Method, subpath: &str, handler: Arc<dyn ApiHandler>) -> Self {
         Self {
@@ -260,6 +262,7 @@ impl PluginApiRegister {
             .register_plugin_prefix_route(&self.tag, method, subpath, handler)
     }
 
+    #[cfg(feature = "plugin-query-recorder")]
     pub(crate) fn register_batch(
         &self,
         registrations: Vec<PluginApiRouteRegistration>,
@@ -409,6 +412,7 @@ impl ApiHub {
         Ok(())
     }
 
+    #[cfg(feature = "plugin-query-recorder")]
     fn register_plugin_route_batch(
         &self,
         plugin_tag: &str,

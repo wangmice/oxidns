@@ -22,6 +22,7 @@ pub(crate) fn parse_usize_param(
     raw.parse::<usize>().map_err(error)
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 pub(crate) fn parse_u64_param(
     raw: &str,
     error: impl FnOnce(ParseIntError) -> String,
@@ -34,6 +35,7 @@ pub(crate) fn optional_text(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 pub(crate) fn optional_upper_text(raw: &str) -> Option<String> {
     optional_text(raw).map(|value| value.to_ascii_uppercase())
 }
@@ -65,6 +67,7 @@ mod tests {
     fn optional_text_trims_and_filters_empty() {
         assert_eq!(optional_text("  value  "), Some("value".to_string()));
         assert_eq!(optional_text("   "), None);
+        #[cfg(feature = "plugin-query-recorder")]
         assert_eq!(
             optional_upper_text(" noerror "),
             Some("NOERROR".to_string())
