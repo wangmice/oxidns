@@ -234,6 +234,7 @@ pub(super) type FlushReply = std::result::Result<(), String>;
 #[derive(Debug)]
 pub(super) enum WriterCommand {
     Insert(Box<PendingRecord>),
+    WakePeriodicCleanup,
     #[cfg(test)]
     Cleanup {
         cutoff_ms: i64,
@@ -420,6 +421,50 @@ impl DatabaseCoordinator {
                 self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
                 return Err(DnsError::runtime(
                     "query_recorder management operation cancelled",
+                ));
+            }
+            match self.access.try_write() {
+                Ok(guard) => {
+                    return Ok(Some(DatabaseWriteGuard {
+                        _guard: guard,
+                        waiting_writers: &self.waiting_writers,
+                    }));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(COORDINATOR_LOCK_POLL_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                    return Err(DnsError::runtime(
+                        "query_recorder database access lock poisoned",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn write_access_until_stop_or_cancel_until(
+        &self,
+        stop_requested: &AtomicBool,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Option<DatabaseWriteGuard<'_>>> {
+        self.waiting_writers.fetch_add(1, Ordering::AcqRel);
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                return Ok(None);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                return Err(DnsError::runtime(
+                    "query_recorder management operation cancelled",
+                ));
+            }
+            if Instant::now() >= deadline {
+                self.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+                return Err(DnsError::runtime(
+                    "query_recorder periodic cleanup timed out waiting for database access",
                 ));
             }
             match self.access.try_write() {
@@ -631,6 +676,10 @@ impl RecorderBackend {
         self.lifecycle
             .periodic_cleanup_cutoff_ms
             .fetch_max(cutoff_ms, Ordering::AcqRel);
+        // This command is only a wake-up hint. If the bounded queue is full,
+        // the writer is already active and will observe the atomic request on
+        // its next loop iteration.
+        let _ = self.queue_tx.try_send(WriterCommand::WakePeriodicCleanup);
     }
 
     pub(super) fn subscribe_tail(

@@ -1236,6 +1236,27 @@ fn test_query_recorder_management_write_wait_honors_cancel() {
 }
 
 #[test]
+fn test_query_recorder_periodic_cleanup_access_wait_honors_deadline() {
+    let coordinator = DatabaseCoordinator::default();
+    let reader = coordinator.read_access().unwrap();
+    let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+
+    let error = match coordinator.write_access_until_stop_or_cancel_until(
+        &stop_requested,
+        &cancelled,
+        std::time::Instant::now() + std::time::Duration::from_millis(25),
+    ) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("periodic cleanup unexpectedly acquired database access"),
+    };
+
+    assert!(error.contains("timed out waiting for database access"));
+    assert_eq!(coordinator.waiting_writers_for_test(), 0);
+    drop(reader);
+}
+
+#[test]
 fn test_query_recorder_management_interrupt_is_bound_to_current_owner() {
     let writer_interrupt = WriterInterrupt::default();
     let conn = Connection::open_in_memory().unwrap();
@@ -1576,6 +1597,60 @@ async fn test_query_recorder_periodic_cleanup_survives_full_record_queue() {
         !records.iter().any(|record| record.request_id == 500),
         "periodic cleanup request was lost while the record queue was full"
     );
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_periodic_cleanup_wakes_idle_writer() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(8),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        500,
+        500,
+        "periodic-wake.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    backend.request_periodic_cleanup(i64::MAX);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
+                .unwrap()
+                .0;
+            if !records.iter().any(|record| record.request_id == 500) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic cleanup should wake an idle writer before the 60s flush timeout");
 
     plugin.destroy().await.unwrap();
 }
