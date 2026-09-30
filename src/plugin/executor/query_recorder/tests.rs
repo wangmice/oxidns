@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-use super::backend::{DatabaseCoordinator, WriterCommand};
+use super::backend::{DatabaseCoordinator, WriterCommand, WriterInterrupt};
 use super::model::{
     DistributionQuery, LatencyQuery, ListQuery, PendingRecord, PluginStatsKind, PluginsStatsQuery,
     QueryRecordFilter, QueryRecordStatus, QueryRecorderConfig, TimeseriesBucket, TimeseriesQuery,
@@ -1021,6 +1021,77 @@ async fn test_query_recorder_destroy_reports_graceful_flush_failure() {
     assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn test_query_recorder_shutdown_reports_prior_batch_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(1),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_prior_shutdown_batch
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected prior shutdown batch failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend
+        .lifecycle
+        .shutdown_requested
+        .store(true, Ordering::Release);
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "prior-shutdown-error.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if backend.dropped_total.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer should report the failed shutdown batch");
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_prior_shutdown_batch;")
+        .unwrap();
+
+    let error = plugin.destroy().await.unwrap_err().to_string();
+    assert!(error.contains("before final flush"));
+    assert!(error.contains("injected prior shutdown batch failure"));
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+}
+
 #[test]
 fn test_query_recorder_writer_panic_is_reported() {
     let join_result = std::thread::spawn(|| panic!("injected writer panic")).join();
@@ -1162,6 +1233,29 @@ fn test_query_recorder_management_write_wait_honors_cancel() {
     assert!(error.contains("management operation cancelled"));
     assert_eq!(coordinator.waiting_writers_for_test(), 0);
     drop(first_reader);
+}
+
+#[test]
+fn test_query_recorder_management_interrupt_is_bound_to_current_owner() {
+    let writer_interrupt = WriterInterrupt::default();
+    let conn = Connection::open_in_memory().unwrap();
+    writer_interrupt.install(&conn);
+
+    let old_owner = Arc::new(AtomicBool::new(false));
+    let current_owner = Arc::new(AtomicBool::new(false));
+
+    let old_guard = writer_interrupt
+        .claim_management(old_owner.clone())
+        .unwrap();
+    drop(old_guard);
+
+    let current_guard = writer_interrupt
+        .claim_management(current_owner.clone())
+        .unwrap();
+    assert!(!writer_interrupt.interrupt_management(&old_owner));
+    assert!(writer_interrupt.interrupt_management(&current_owner));
+    drop(current_guard);
+    assert!(!writer_interrupt.interrupt_management(&current_owner));
 }
 
 #[tokio::test]
@@ -1392,6 +1486,96 @@ async fn test_query_recorder_cleanup_fails_fast_when_record_queue_is_full() {
 
     release_tx.send(()).unwrap();
     maintenance_holder.join().unwrap();
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_periodic_cleanup_survives_full_record_queue() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(1),
+            batch_size: Some(1),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(8),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(2),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        500,
+        500,
+        "periodic-seed.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let coordinator = backend.database_coordinator.clone();
+    let maintenance_holder = std::thread::spawn(move || {
+        let _access = coordinator.write_access().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let mut queue_was_full = false;
+    for request_id in 1..=16 {
+        let record = pending_record(
+            i64::from(request_id),
+            request_id,
+            "periodic-busy.example.com.",
+            RecordType::A,
+            Ipv4Addr::new(192, 0, 2, 1),
+            Some(Rcode::NoError),
+            None,
+            &[],
+        );
+        match backend
+            .queue_tx
+            .try_send(WriterCommand::Insert(Box::new(record)))
+        {
+            Ok(()) => std::thread::yield_now(),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                queue_was_full = true;
+                break;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                panic!("query_recorder writer unexpectedly disconnected")
+            }
+        }
+    }
+    assert!(queue_was_full);
+
+    backend.request_periodic_cleanup(i64::MAX);
+
+    release_tx.send(()).unwrap();
+    maintenance_holder.join().unwrap();
+    flush_backend(&backend).await;
+
+    let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
+        .unwrap()
+        .0;
+    assert!(
+        !records.iter().any(|record| record.request_id == 500),
+        "periodic cleanup request was lost while the record queue was full"
+    );
 
     plugin.destroy().await.unwrap();
 }

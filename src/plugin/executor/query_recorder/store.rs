@@ -16,8 +16,8 @@ use tracing::{info, warn};
 
 use super::backend::{
     CleanupResult, ClearHistoryResult, DatabaseCoordinator, MANAGEMENT_START_CLAIMED,
-    MANAGEMENT_START_PENDING, RecorderBackend, SpaceReclaimResult, SpaceStats, WriterCommand,
-    WriterInterrupt, WriterThreadContext,
+    MANAGEMENT_START_PENDING, NO_PERIODIC_CLEANUP, RecorderBackend, RecorderLifecycle,
+    SpaceReclaimResult, SpaceStats, WriterCommand, WriterInterrupt, WriterThreadContext,
 };
 #[cfg(test)]
 use super::model::StepJson;
@@ -87,6 +87,29 @@ impl NonStorageFailureBackoff {
             self.last_warn = Some(now);
         }
         should_warn
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShutdownWriteFailure {
+    dropped_records: u64,
+    first_error: Option<String>,
+}
+
+impl ShutdownWriteFailure {
+    fn record(&mut self, record_count: usize, error: &DnsError) {
+        self.dropped_records = self.dropped_records.saturating_add(record_count as u64);
+        if self.first_error.is_none() {
+            self.first_error = Some(error.to_string());
+        }
+    }
+
+    fn message(&self) -> Option<String> {
+        let first_error = self.first_error.as_deref()?;
+        Some(format!(
+            "query_recorder graceful shutdown dropped {} record(s) before final flush; first write failure: {}",
+            self.dropped_records, first_error
+        ))
     }
 }
 
@@ -236,8 +259,27 @@ pub(super) fn run_writer_thread(
     let mut pending = Vec::with_capacity(batch_size);
     let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
     let mut non_storage_failure_backoff = NonStorageFailureBackoff::default();
+    let mut shutdown_write_failure = ShutdownWriteFailure::default();
     loop {
         if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        if !run_periodic_cleanup_if_requested(
+            &mut conn,
+            &path,
+            &tables,
+            &lifecycle,
+            &mut pending,
+            &tail,
+            memory_tail,
+            &broadcaster,
+            &database_coordinator,
+            &dropped_total,
+            &writer_interrupt,
+            &mut recovery_delay,
+            &writer_recovering,
+            &management_inflight,
+        ) {
             break;
         }
         match rx.recv_timeout(flush_interval) {
@@ -259,12 +301,14 @@ pub(super) fn run_writer_thread(
                         &writer_interrupt,
                         &mut recovery_delay,
                         &mut non_storage_failure_backoff,
+                        &mut shutdown_write_failure,
                         &writer_recovering,
                     )
                 {
                     break;
                 }
             }
+            #[cfg(test)]
             Ok(WriterCommand::Cleanup {
                 cutoff_ms,
                 started_tx,
@@ -289,6 +333,17 @@ pub(super) fn run_writer_thread(
                     ));
                     continue;
                 }
+                let management_interrupt_guard =
+                    match writer_interrupt.claim_management(cancelled.clone()) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            cancelled.store(true, Ordering::Release);
+                            let _ = started_tx.send(());
+                            management_inflight.store(false, Ordering::Release);
+                            let _ = reply_tx.send(Err(err.to_string()));
+                            continue;
+                        }
+                    };
                 let _ = started_tx.send(());
                 let result: Result<CleanupResult> = (|| {
                     let Some(_access) = database_coordinator
@@ -315,6 +370,7 @@ pub(super) fn run_writer_thread(
                         &cancelled,
                     )
                 })();
+                drop(management_interrupt_guard);
                 let recover_storage = result
                     .as_ref()
                     .err()
@@ -370,6 +426,17 @@ pub(super) fn run_writer_thread(
                     ));
                     continue;
                 }
+                let management_interrupt_guard =
+                    match writer_interrupt.claim_management(cancelled.clone()) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            cancelled.store(true, Ordering::Release);
+                            let _ = started_tx.send(());
+                            management_inflight.store(false, Ordering::Release);
+                            let _ = reply_tx.send(Err(err.to_string()));
+                            continue;
+                        }
+                    };
                 let _ = started_tx.send(());
                 let result: Result<ClearHistoryResult> = (|| {
                     let Some(_access) = database_coordinator
@@ -396,6 +463,7 @@ pub(super) fn run_writer_thread(
                         &cancelled,
                     )
                 })();
+                drop(management_interrupt_guard);
                 let recover_storage = result
                     .as_ref()
                     .err()
@@ -430,7 +498,7 @@ pub(super) fn run_writer_thread(
             Ok(WriterCommand::Shutdown { reply_tx }) => {
                 drain_writer_queue_for_graceful_shutdown(&rx, &mut pending, &management_inflight);
                 let record_count = pending.len();
-                let result = flush_pending_coordinated(
+                let final_result = flush_pending_coordinated(
                     &mut conn,
                     &tables,
                     &mut pending,
@@ -441,9 +509,16 @@ pub(super) fn run_writer_thread(
                     stop_requested,
                 )
                 .map_err(|err| err.to_string());
-                if result.is_err() && record_count != 0 {
+                if final_result.is_err() && record_count != 0 {
                     dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
                 }
+                let result = match (final_result, shutdown_write_failure.message()) {
+                    (Ok(()), Some(prior_error)) => Err(prior_error),
+                    (Err(final_error), Some(prior_error)) => {
+                        Err(format!("{prior_error}; final flush failed: {final_error}"))
+                    }
+                    (result, None) => result,
+                };
                 let _ = reply_tx.send(result);
                 break;
             }
@@ -478,6 +553,7 @@ pub(super) fn run_writer_thread(
                     &writer_interrupt,
                     &mut recovery_delay,
                     &mut non_storage_failure_backoff,
+                    &mut shutdown_write_failure,
                     &writer_recovering,
                 ) {
                     break;
@@ -499,6 +575,7 @@ pub(super) fn run_writer_thread(
                     &writer_interrupt,
                     &mut recovery_delay,
                     &mut non_storage_failure_backoff,
+                    &mut shutdown_write_failure,
                     &writer_recovering,
                 );
                 break;
@@ -511,6 +588,126 @@ pub(super) fn run_writer_thread(
     }
     writer_interrupt.clear();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_periodic_cleanup_if_requested(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    lifecycle: &RecorderLifecycle,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
+    database_coordinator: &DatabaseCoordinator,
+    dropped_total: &AtomicU64,
+    writer_interrupt: &WriterInterrupt,
+    recovery_delay: &mut Duration,
+    writer_recovering: &AtomicBool,
+    management_inflight: &AtomicBool,
+) -> bool {
+    let stop_requested = &lifecycle.stop_requested;
+    let shutdown_requested = &lifecycle.shutdown_requested;
+    if stop_requested.load(Ordering::Acquire) {
+        return false;
+    }
+    if shutdown_requested.load(Ordering::Acquire) {
+        return true;
+    }
+
+    let cutoff_ms = lifecycle
+        .periodic_cleanup_cutoff_ms
+        .swap(NO_PERIODIC_CLEANUP, Ordering::AcqRel);
+    if cutoff_ms == NO_PERIODIC_CLEANUP {
+        return true;
+    }
+
+    if management_inflight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        lifecycle
+            .periodic_cleanup_cutoff_ms
+            .fetch_max(cutoff_ms, Ordering::AcqRel);
+        return true;
+    }
+
+    if stop_requested.load(Ordering::Acquire) || shutdown_requested.load(Ordering::Acquire) {
+        management_inflight.store(false, Ordering::Release);
+        return !stop_requested.load(Ordering::Acquire);
+    }
+
+    let started = Instant::now();
+    let cancelled = AtomicBool::new(false);
+    let result: Result<CleanupResult> = (|| {
+        let Some(_access) =
+            database_coordinator.write_access_until_stop_or_cancel(stop_requested, &cancelled)?
+        else {
+            return Err(writer_stopping());
+        };
+        ensure_maintenance_running(stop_requested, &cancelled)?;
+        flush_pending_for_management(
+            conn,
+            tables,
+            pending,
+            tail,
+            memory_tail,
+            broadcaster,
+            dropped_total,
+        )?;
+        run_cleanup_cancellable(conn, path, tables, cutoff_ms, stop_requested, &cancelled)
+    })();
+
+    let recover_storage = result
+        .as_ref()
+        .err()
+        .is_some_and(storage_error_requires_reopen)
+        && !stop_requested.load(Ordering::Acquire);
+    if recover_storage {
+        writer_recovering.store(true, Ordering::Release);
+    }
+    management_inflight.store(false, Ordering::Release);
+
+    match &result {
+        Ok(result) => {
+            info!(
+                path = %path.display(),
+                cutoff_ms,
+                deleted_records = result.deleted_records,
+                reclaimed_bytes = result.space.reclaimed_bytes(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "query_recorder periodic cleanup completed"
+            );
+        }
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                error = %err,
+                "query_recorder periodic cleanup failed"
+            );
+        }
+    }
+
+    if recover_storage {
+        let recovered = recover_writer_connection(
+            conn,
+            path,
+            tables,
+            database_coordinator,
+            stop_requested,
+            shutdown_requested,
+            writer_interrupt,
+            recovery_delay,
+        );
+        if recovered {
+            writer_recovering.store(false, Ordering::Release);
+        }
+        return recovered;
+    }
+
+    !stop_requested.load(Ordering::Acquire)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -529,6 +726,7 @@ fn flush_pending_resilient(
     writer_interrupt: &WriterInterrupt,
     recovery_delay: &mut Duration,
     non_storage_failure_backoff: &mut NonStorageFailureBackoff,
+    shutdown_write_failure: &mut ShutdownWriteFailure,
     writer_recovering: &AtomicBool,
 ) -> bool {
     if pending.is_empty() {
@@ -553,6 +751,9 @@ fn flush_pending_resilient(
             true
         }
         Err(err) => {
+            if shutdown_requested.load(Ordering::Acquire) {
+                shutdown_write_failure.record(record_count, &err);
+            }
             dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
             if stop_requested.load(Ordering::Acquire) {
                 return false;
@@ -802,6 +1003,7 @@ fn drain_writer_queue_for_graceful_shutdown(
     loop {
         match rx.try_recv() {
             Ok(WriterCommand::Insert(record)) => pending.push(*record),
+            #[cfg(test)]
             Ok(WriterCommand::Cleanup {
                 started_tx,
                 reply_tx,
@@ -846,6 +1048,7 @@ fn drain_writer_queue_on_stop(
             Ok(WriterCommand::Insert(_)) => {
                 dropped = dropped.saturating_add(1);
             }
+            #[cfg(test)]
             Ok(WriterCommand::Cleanup {
                 started_tx,
                 reply_tx,

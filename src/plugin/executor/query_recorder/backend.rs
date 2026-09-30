@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver as ReplyReceiver, RecvTimeoutError, Sender as ReplySender, SyncSender, TrySendError,
     sync_channel,
@@ -33,6 +33,7 @@ pub(super) const MANAGEMENT_START_PENDING: u8 = 0;
 pub(super) const MANAGEMENT_START_CLAIMED: u8 = 1;
 pub(super) const MANAGEMENT_START_CANCELLED: u8 = 2;
 
+pub(super) const NO_PERIODIC_CLEANUP: i64 = i64::MIN;
 #[derive(Debug, Clone, Copy)]
 enum DropKind {
     QueueFull,
@@ -46,8 +47,25 @@ struct DropLogState {
 }
 
 #[derive(Default)]
+struct WriterInterruptState {
+    handle: Option<InterruptHandle>,
+    management_owner: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Default)]
 pub(super) struct WriterInterrupt {
-    handle: Mutex<Option<InterruptHandle>>,
+    state: Mutex<WriterInterruptState>,
+}
+
+pub(super) struct ManagementInterruptGuard<'a> {
+    writer_interrupt: &'a WriterInterrupt,
+    owner: Arc<AtomicBool>,
+}
+
+impl Drop for ManagementInterruptGuard<'_> {
+    fn drop(&mut self) {
+        self.writer_interrupt.release_management(&self.owner);
+    }
 }
 
 impl std::fmt::Debug for WriterInterrupt {
@@ -57,37 +75,85 @@ impl std::fmt::Debug for WriterInterrupt {
 }
 
 impl WriterInterrupt {
-    pub(super) fn install(&self, conn: &Connection) {
-        let mut guard = self
-            .handle
+    fn lock_state(&self) -> MutexGuard<'_, WriterInterruptState> {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(conn.get_interrupt_handle());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn install(&self, conn: &Connection) {
+        self.lock_state().handle = Some(conn.get_interrupt_handle());
     }
 
     pub(super) fn interrupt(&self) {
-        let guard = self
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(handle) = guard.as_ref() {
+        let state = self.lock_state();
+        if let Some(handle) = state.handle.as_ref() {
             handle.interrupt();
         }
     }
 
+    pub(super) fn claim_management(
+        &self,
+        owner: Arc<AtomicBool>,
+    ) -> Result<ManagementInterruptGuard<'_>> {
+        let mut state = self.lock_state();
+        if state.management_owner.is_some() {
+            return Err(DnsError::runtime(
+                "query_recorder management interrupt owner is already active",
+            ));
+        }
+        state.management_owner = Some(owner.clone());
+        Ok(ManagementInterruptGuard {
+            writer_interrupt: self,
+            owner,
+        })
+    }
+
+    pub(super) fn interrupt_management(&self, owner: &Arc<AtomicBool>) -> bool {
+        let state = self.lock_state();
+        let owns_interrupt = state
+            .management_owner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, owner));
+        if owns_interrupt && let Some(handle) = state.handle.as_ref() {
+            handle.interrupt();
+        }
+        owns_interrupt
+    }
+
+    fn release_management(&self, owner: &Arc<AtomicBool>) {
+        let mut state = self.lock_state();
+        if state
+            .management_owner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, owner))
+        {
+            state.management_owner = None;
+        }
+    }
+
     pub(super) fn clear(&self) {
-        let mut guard = self
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
+        let mut state = self.lock_state();
+        state.handle = None;
+        state.management_owner = None;
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct RecorderLifecycle {
     pub(super) stop_requested: AtomicBool,
     pub(super) shutdown_requested: AtomicBool,
+    pub(super) periodic_cleanup_cutoff_ms: AtomicI64,
+}
+
+impl Default for RecorderLifecycle {
+    fn default() -> Self {
+        Self {
+            stop_requested: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
+            periodic_cleanup_cutoff_ms: AtomicI64::new(NO_PERIODIC_CLEANUP),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -159,6 +225,7 @@ pub(super) struct ClearHistoryResult {
     pub(super) space: SpaceReclaimResult,
 }
 
+#[cfg(test)]
 pub(super) type CleanupReply = std::result::Result<CleanupResult, String>;
 pub(super) type ClearHistoryReply = std::result::Result<ClearHistoryResult, String>;
 #[cfg(test)]
@@ -167,6 +234,7 @@ pub(super) type FlushReply = std::result::Result<(), String>;
 #[derive(Debug)]
 pub(super) enum WriterCommand {
     Insert(Box<PendingRecord>),
+    #[cfg(test)]
     Cleanup {
         cutoff_ms: i64,
         started_tx: ReplySender<()>,
@@ -553,6 +621,18 @@ impl RecorderBackend {
         }))
     }
 
+    pub(super) fn request_periodic_cleanup(&self, cutoff_ms: i64) {
+        if !self.accepting_records.load(Ordering::Acquire)
+            || self.lifecycle.shutdown_requested.load(Ordering::Acquire)
+            || self.lifecycle.stop_requested.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.lifecycle
+            .periodic_cleanup_cutoff_ms
+            .fetch_max(cutoff_ms, Ordering::AcqRel);
+    }
+
     pub(super) fn subscribe_tail(
         &self,
         tail_count: usize,
@@ -716,7 +796,7 @@ impl RecorderBackend {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 cancelled.store(true, Ordering::Release);
-                self.writer_interrupt.interrupt();
+                self.writer_interrupt.interrupt_management(cancelled);
                 Err("query_recorder management operation timed out".to_string())
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -773,6 +853,7 @@ impl RecorderBackend {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup(&self, cutoff_ms: i64) -> CleanupReply {
         self.begin_management()?;
         let started = Instant::now();
