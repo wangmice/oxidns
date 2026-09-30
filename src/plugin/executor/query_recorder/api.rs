@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -127,22 +128,29 @@ where
     T: Send + 'static,
     F: FnOnce(Arc<RecorderBackend>) -> std::result::Result<T, DnsError> + Send + 'static,
 {
+    if backend.reader_stopping.load(Ordering::Acquire) {
+        return Err(DnsError::runtime("query_recorder reader is stopping"));
+    }
     let permit = backend
         .reader_semaphore
         .clone()
         .acquire_owned()
         .await
         .map_err(|err| DnsError::runtime(format!("query_recorder reader closed: {err}")))?;
+    if backend.reader_stopping.load(Ordering::Acquire) {
+        return Err(DnsError::runtime("query_recorder reader is stopping"));
+    }
     let database_coordinator = backend.database_coordinator.clone();
-    let stop_requested = backend.stop_requested.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let Some(_access) = database_coordinator.read_access_until_stop(&stop_requested)? else {
+        let Some(_access) =
+            database_coordinator.read_access_until_stop(&backend.reader_stopping)?
+        else {
             return Err(DnsError::runtime(
                 "query_recorder reader stopped before database access",
             ));
         };
-        if stop_requested.load(std::sync::atomic::Ordering::Acquire) {
+        if backend.reader_stopping.load(Ordering::Acquire) {
             return Err(DnsError::runtime("query_recorder reader is stopping"));
         }
         op(backend)

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params, params_from_iter};
@@ -42,6 +42,53 @@ const PLUGIN_STATS_SAMPLE_LIMIT: usize = 10_000;
 const WRITER_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const WRITER_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
 const WRITER_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NON_STORAGE_FAILURE_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const NON_STORAGE_FAILURE_MAX_DELAY: Duration = Duration::from_secs(1);
+const NON_STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct NonStorageFailureBackoff {
+    delay: Duration,
+    last_warn: Option<Instant>,
+}
+
+impl Default for NonStorageFailureBackoff {
+    fn default() -> Self {
+        Self {
+            delay: NON_STORAGE_FAILURE_INITIAL_DELAY,
+            last_warn: None,
+        }
+    }
+}
+
+impl NonStorageFailureBackoff {
+    fn reset(&mut self) {
+        self.delay = NON_STORAGE_FAILURE_INITIAL_DELAY;
+        self.last_warn = None;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.delay;
+        self.delay = self
+            .delay
+            .saturating_mul(2)
+            .min(NON_STORAGE_FAILURE_MAX_DELAY);
+        delay
+    }
+
+    fn should_warn(&mut self, now: Instant) -> bool {
+        let should_warn = match self.last_warn {
+            Some(last_warn) => {
+                now.saturating_duration_since(last_warn) >= NON_STORAGE_FAILURE_WARN_INTERVAL
+            }
+            None => true,
+        };
+        if should_warn {
+            self.last_warn = Some(now);
+        }
+        should_warn
+    }
+}
 
 pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
@@ -186,6 +233,7 @@ pub(super) fn run_writer_thread(
 
     let mut pending = Vec::with_capacity(batch_size);
     let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+    let mut non_storage_failure_backoff = NonStorageFailureBackoff::default();
     loop {
         if stop_requested.load(Ordering::Acquire) {
             break;
@@ -207,6 +255,7 @@ pub(super) fn run_writer_thread(
                         &dropped_total,
                         &writer_interrupt,
                         &mut recovery_delay,
+                        &mut non_storage_failure_backoff,
                         &writer_recovering,
                     )
                 {
@@ -422,6 +471,7 @@ pub(super) fn run_writer_thread(
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
+                    &mut non_storage_failure_backoff,
                     &writer_recovering,
                 ) {
                     break;
@@ -441,6 +491,7 @@ pub(super) fn run_writer_thread(
                     &dropped_total,
                     &writer_interrupt,
                     &mut recovery_delay,
+                    &mut non_storage_failure_backoff,
                     &writer_recovering,
                 );
                 break;
@@ -469,6 +520,7 @@ fn flush_pending_resilient(
     dropped_total: &AtomicU64,
     writer_interrupt: &WriterInterrupt,
     recovery_delay: &mut Duration,
+    non_storage_failure_backoff: &mut NonStorageFailureBackoff,
     writer_recovering: &AtomicBool,
 ) -> bool {
     if pending.is_empty() {
@@ -488,20 +540,22 @@ fn flush_pending_resilient(
     ) {
         Ok(()) => {
             *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+            non_storage_failure_backoff.reset();
             writer_recovering.store(false, Ordering::Release);
             true
         }
         Err(err) => {
             dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
-            warn!(
-                dropped_records = record_count,
-                error = %err,
-                "query_recorder writer flush failed; dropping batch and keeping writer alive"
-            );
             if stop_requested.load(Ordering::Acquire) {
                 return false;
             }
             if storage_error_requires_reopen(&err) {
+                non_storage_failure_backoff.reset();
+                warn!(
+                    dropped_records = record_count,
+                    error = %err,
+                    "query_recorder writer flush failed; dropping batch and reopening storage"
+                );
                 writer_recovering.store(true, Ordering::Release);
                 let recovered = recover_writer_connection(
                     conn,
@@ -517,7 +571,16 @@ fn flush_pending_resilient(
                 }
                 recovered
             } else {
-                true
+                let retry_delay = non_storage_failure_backoff.next_delay();
+                if non_storage_failure_backoff.should_warn(Instant::now()) {
+                    warn!(
+                        dropped_records = record_count,
+                        retry_ms = retry_delay.as_millis(),
+                        error = %err,
+                        "query_recorder writer flush failed; dropping batch and backing off"
+                    );
+                }
+                sleep_with_stop(stop_requested, retry_delay)
             }
         }
     }
@@ -2108,6 +2171,34 @@ mod tests {
 
     use super::super::model::{EdnsJson, EdnsOptionJson, QuestionJson, RecordJson};
     use super::*;
+
+    #[test]
+    fn test_non_storage_failure_backoff_is_bounded_and_resettable() {
+        let mut backoff = NonStorageFailureBackoff::default();
+        let delays = (0..8).map(|_| backoff.next_delay()).collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
+
+        let now = Instant::now();
+        assert!(backoff.should_warn(now));
+        assert!(!backoff.should_warn(now + Duration::from_secs(4)));
+        assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), NON_STORAGE_FAILURE_INITIAL_DELAY);
+        assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+    }
 
     #[test]
     fn test_read_record_row_matches_insert_and_select_column_order() {

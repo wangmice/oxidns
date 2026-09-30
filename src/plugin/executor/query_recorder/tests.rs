@@ -330,6 +330,48 @@ fn test_record_capture_rejects_excessive_execution_path() {
 }
 
 #[tokio::test]
+async fn test_query_recorder_shutdown_closes_reader_gate() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let held_permit = backend
+        .reader_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let waiting_semaphore = backend.reader_semaphore.clone();
+    let waiter = tokio::spawn(async move { waiting_semaphore.acquire_owned().await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    plugin.destroy().await.unwrap();
+
+    assert!(backend.reader_stopping.load(Ordering::Acquire));
+    assert!(backend.reader_semaphore.is_closed());
+    assert!(waiter.await.unwrap().is_err());
+    drop(held_permit);
+}
+
+#[tokio::test]
 async fn test_query_recorder_execute_enqueues_record() {
     AppClock::start();
 

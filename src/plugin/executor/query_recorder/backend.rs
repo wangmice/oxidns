@@ -97,6 +97,7 @@ pub(super) struct RecorderBackend {
     pub(super) broadcaster: broadcast::Sender<RecordDetail>,
     pub(super) dropped_total: Arc<AtomicU64>,
     pub(super) reader_semaphore: Arc<Semaphore>,
+    pub(super) reader_stopping: AtomicBool,
     pub(super) database_coordinator: Arc<DatabaseCoordinator>,
     writer_interrupt: Arc<WriterInterrupt>,
     accepting_records: AtomicBool,
@@ -535,6 +536,7 @@ impl RecorderBackend {
             broadcaster,
             dropped_total,
             reader_semaphore,
+            reader_stopping: AtomicBool::new(false),
             database_coordinator,
             writer_interrupt,
             accepting_records: AtomicBool::new(true),
@@ -568,6 +570,8 @@ impl RecorderBackend {
 
     pub(super) fn shutdown(&self) -> std::result::Result<(), String> {
         self.accepting_records.store(false, Ordering::Release);
+        self.reader_stopping.store(true, Ordering::Release);
+        self.reader_semaphore.close();
         if self.writer_recovering.load(Ordering::Acquire)
             || self.management_inflight.load(Ordering::Acquire)
             || self
