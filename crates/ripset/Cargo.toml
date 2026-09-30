@@ -7,7 +7,6 @@ homepage = "https://github.com/svenshi/oxidns/tree/main/crates/ripset"
 description = "Pure Rust implementation of ipset/nftset operations via netlink, maintained for OxiDNS"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/svenshi/oxidns"
-readme = "README.md"
 keywords = ["linux", "ipset", "netlink", "nftables", "networking"]
 categories = ["network-programming"]
 

@@ -16,7 +16,7 @@ const VERSION: i64 = 1;
 const RAW: i64 = 0;
 const ZLIB: i64 = 1;
 const MIN_COMPRESS_BYTES: usize = 2 * 1024;
-const MAX_COMPRESS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct EncodedPayload {
@@ -65,8 +65,11 @@ impl EncodedPayload {
     }
 
     fn encode_json(raw: Vec<u8>, compress: bool) -> Result<Self> {
+        if raw.len() > MAX_SNAPSHOT_BYTES {
+            return Err(invalid("snapshot exceeds 16 MiB limit"));
+        }
         let raw_len = i64::try_from(raw.len()).map_err(|_| invalid("snapshot is too large"))?;
-        if compress && (MIN_COMPRESS_BYTES..=MAX_COMPRESS_BYTES).contains(&raw.len()) {
+        if compress && raw.len() >= MIN_COMPRESS_BYTES {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
             encoder.write_all(&raw)?;
             let data = encoder.finish()?;
@@ -93,6 +96,9 @@ impl EncodedPayload {
         }
         let raw_len =
             usize::try_from(self.raw_len).map_err(|_| invalid("invalid payload length"))?;
+        if raw_len > MAX_SNAPSHOT_BYTES {
+            return Err(invalid("payload exceeds 16 MiB decode limit"));
+        }
         match self.codec {
             RAW => {
                 if raw_len != self.data.len() {
@@ -101,9 +107,6 @@ impl EncodedPayload {
                 Ok(serde_json::from_slice(&self.data)?)
             }
             ZLIB => {
-                if raw_len > MAX_COMPRESS_BYTES {
-                    return Err(invalid("compressed payload exceeds decode limit"));
-                }
                 let mut decoder = Decompress::new(true);
                 let mut raw = Vec::new();
                 loop {
@@ -157,12 +160,7 @@ mod tests {
 
     #[test]
     fn thresholds_and_lossless_fallback() {
-        for (size, codec) in [
-            (2047, RAW),
-            (2048, ZLIB),
-            (MAX_COMPRESS_BYTES, ZLIB),
-            (MAX_COMPRESS_BYTES + 1, RAW),
-        ] {
+        for (size, codec) in [(2047, RAW), (2048, ZLIB), (MAX_SNAPSHOT_BYTES, ZLIB)] {
             let encoded = EncodedPayload::encode_json(snapshot(size), true).unwrap();
             assert_eq!(encoded.codec, codec);
             assert_eq!(
@@ -173,6 +171,8 @@ mod tests {
                     .unwrap()
             );
         }
+        assert!(EncodedPayload::encode_json(snapshot(MAX_SNAPSHOT_BYTES + 1), true).is_err());
+
         // High entropy bytes exercise the compression policy independently of
         // JSON parsing.
         let mut state = 1u64;
@@ -212,7 +212,16 @@ mod tests {
         let mut corrupt = valid.clone();
         corrupt.data.extend_from_slice(&valid.data);
         assert!(corrupt.decode().is_err());
-        for len in [-1, 0, 4095, 4097, MAX_COMPRESS_BYTES as i64 + 1] {
+        let mut oversized = valid.clone();
+        oversized.raw_len = MAX_SNAPSHOT_BYTES as i64 + 1;
+        assert!(
+            oversized
+                .decode()
+                .unwrap_err()
+                .to_string()
+                .contains("payload exceeds 16 MiB decode limit")
+        );
+        for len in [-1, 0, 4095, 4097] {
             let mut corrupt = valid.clone();
             corrupt.raw_len = len;
             assert!(corrupt.decode().is_err());

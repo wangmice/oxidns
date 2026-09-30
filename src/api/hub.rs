@@ -31,6 +31,41 @@ pub struct PluginApiRegister {
     tag: String,
 }
 
+pub(crate) struct PluginApiRouteRegistration {
+    method: Method,
+    subpath: String,
+    handler: Arc<dyn ApiHandler>,
+    prefix: bool,
+}
+
+impl PluginApiRouteRegistration {
+    fn exact(method: Method, subpath: &str, handler: Arc<dyn ApiHandler>) -> Self {
+        Self {
+            method,
+            subpath: subpath.to_string(),
+            handler,
+            prefix: false,
+        }
+    }
+
+    pub(crate) fn get(subpath: &str, handler: Arc<dyn ApiHandler>) -> Self {
+        Self::exact(Method::GET, subpath, handler)
+    }
+
+    pub(crate) fn delete(subpath: &str, handler: Arc<dyn ApiHandler>) -> Self {
+        Self::exact(Method::DELETE, subpath, handler)
+    }
+
+    pub(crate) fn get_prefix(subpath: &str, handler: Arc<dyn ApiHandler>) -> Self {
+        Self {
+            method: Method::GET,
+            subpath: subpath.to_string(),
+            handler,
+            prefix: true,
+        }
+    }
+}
+
 impl ApiRegister {
     pub(crate) fn new(hub: Arc<ApiHub>) -> Self {
         Self { hub }
@@ -225,6 +260,15 @@ impl PluginApiRegister {
             .register_plugin_prefix_route(&self.tag, method, subpath, handler)
     }
 
+    pub(crate) fn register_batch(
+        &self,
+        registrations: Vec<PluginApiRouteRegistration>,
+    ) -> Result<()> {
+        self.register
+            .hub
+            .register_plugin_route_batch(&self.tag, registrations)
+    }
+
     /// Register one GET prefix handler under this plugin namespace.
     pub fn get_prefix(&self, subpath: &str, handler: Arc<dyn ApiHandler>) -> Result<()> {
         self.prefix_route(Method::GET, subpath, handler)
@@ -355,12 +399,82 @@ impl ApiHub {
             .lock()
             .map_err(|_| DnsError::runtime("API route registry lock poisoned"))?;
 
-        if routes.insert(key.clone(), handler).is_some() {
+        if routes.contains_key(&key) {
             return Err(DnsError::plugin(format!(
                 "duplicate API route registered: {} {}",
                 key.method, key.path
             )));
         }
+        routes.insert(key, handler);
+        Ok(())
+    }
+
+    fn register_plugin_route_batch(
+        &self,
+        plugin_tag: &str,
+        registrations: Vec<PluginApiRouteRegistration>,
+    ) -> Result<()> {
+        let plugin_tag = normalize_plugin_tag(plugin_tag)?;
+        let mut exact_routes = Vec::new();
+        let mut new_prefix_routes = Vec::new();
+
+        for registration in registrations {
+            let route_path = build_plugin_route_path(&plugin_tag, &registration.subpath)?;
+            if registration.prefix {
+                new_prefix_routes.push(PrefixRoute::new(
+                    registration.method,
+                    route_path,
+                    registration.handler,
+                ));
+            } else {
+                exact_routes.push((
+                    RouteKey::new(registration.method, route_path),
+                    registration.handler,
+                ));
+            }
+        }
+
+        // Hold both registries through validation and publication so callers
+        // observe either the complete batch or none of it.
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| DnsError::runtime("API route registry lock poisoned"))?;
+        let mut prefix_routes = self
+            .prefix_routes
+            .lock()
+            .map_err(|_| DnsError::runtime("API route registry lock poisoned"))?;
+
+        for (index, (key, _)) in exact_routes.iter().enumerate() {
+            if routes.contains_key(key)
+                || exact_routes[..index]
+                    .iter()
+                    .any(|(previous, _)| previous == key)
+            {
+                return Err(DnsError::plugin(format!(
+                    "duplicate API route registered: {} {}",
+                    key.method, key.path
+                )));
+            }
+        }
+
+        for (index, route) in new_prefix_routes.iter().enumerate() {
+            if prefix_routes.iter().any(|existing| {
+                existing.method == route.method && existing.path_prefix == route.path_prefix
+            }) || new_prefix_routes[..index].iter().any(|previous| {
+                previous.method == route.method && previous.path_prefix == route.path_prefix
+            }) {
+                return Err(DnsError::plugin(format!(
+                    "duplicate API prefix route registered: {} {}",
+                    route.method, route.path_prefix
+                )));
+            }
+        }
+
+        for (key, handler) in exact_routes {
+            routes.insert(key, handler);
+        }
+        prefix_routes.extend(new_prefix_routes);
         Ok(())
     }
 

@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-use super::backend::WriterCommand;
+use super::backend::{DatabaseCoordinator, RecorderBackend, WriterCommand, WriterInterrupt};
 use super::model::{
     DistributionQuery, LatencyQuery, ListQuery, PendingRecord, PluginStatsKind, PluginsStatsQuery,
     QueryRecordFilter, QueryRecordStatus, QueryRecorderConfig, TimeseriesBucket, TimeseriesQuery,
@@ -16,9 +17,13 @@ use super::model::{
 use super::store::{
     create_schema, load_latency_summary, load_plugin_stats, load_qtype_distribution,
     load_rcode_distribution, load_timeseries, load_top_clients, load_top_qnames,
-    open_reader_database, open_writer_database, query_records, table_names,
+    open_reader_database, open_writer_database, query_records, storage_error_requires_reopen,
+    table_names,
 };
-use super::{QueryRecorder, QueryRecorderFactory, resolve_config};
+use super::{
+    QueryRecorder, QueryRecorderFactory, map_writer_join_result, resolve_config,
+    rollback_initialization,
+};
 use crate::core::context::{DnsContext, ExecutionPathEvent};
 use crate::infra::clock::AppClock;
 use crate::infra::error::DnsError;
@@ -153,7 +158,7 @@ fn pending_record(
         response,
         created_at_ms,
         1,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         error.map(ToString::to_string),
@@ -239,7 +244,7 @@ fn test_record_capture_without_response_uses_empty_sections() {
         ctx.response.clone(),
         100,
         10,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         Some(DnsError::plugin("boom").to_string()),
@@ -290,7 +295,7 @@ fn test_record_capture_with_structured_response() {
         ctx.response.clone(),
         100,
         12,
-        ctx.execution_path.clone(),
+        &ctx.execution_path,
         0,
         ctx.peer_addr(),
         None,
@@ -302,6 +307,136 @@ fn test_record_capture_with_structured_response() {
     assert_eq!(record.authority_count, 1);
     assert_eq!(record.answers_json[0].payload_kind, "A");
     assert_eq!(record.authorities_json[0].payload_kind, "CNAME");
+}
+
+#[test]
+fn test_record_capture_rejects_excessive_execution_path() {
+    let request = Message::new();
+    let mut ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    ctx.enable_execution_path();
+    for index in 0..4_097 {
+        ctx.push_execution_path_event(ExecutionPathEvent::new(
+            "seq",
+            Some(index),
+            "executor",
+            Some("test"),
+            "executed",
+        ));
+    }
+    assert!(!PendingRecord::execution_path_within_limit(
+        &ctx.execution_path,
+        0
+    ));
+}
+
+#[test]
+fn test_pending_record_snapshots_only_execution_path_suffix() {
+    let request = Message::new();
+    let mut ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    ctx.enable_execution_path();
+    ctx.push_execution_path_event(ExecutionPathEvent::new(
+        "seq",
+        Some(0),
+        "executor",
+        Some("before"),
+        "executed",
+    ));
+    let step_start_index = ctx.execution_path_len();
+    ctx.push_execution_path_event(ExecutionPathEvent::new(
+        "seq",
+        Some(1),
+        "executor",
+        Some("inside"),
+        "executed",
+    ));
+    let pending = PendingRecord::new(
+        request,
+        None,
+        100,
+        1,
+        &ctx.execution_path,
+        step_start_index,
+        ctx.peer_addr(),
+        None,
+    );
+    assert_eq!(pending.execution_events.len(), 1);
+    assert_eq!(pending.execution_events[0].tag.as_deref(), Some("inside"));
+    let (_, steps) = pending.take_to_record();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].tag.as_deref(), Some("inside"));
+}
+
+#[test]
+fn test_pending_record_truncated_error_releases_excess_capacity() {
+    let request = Message::new();
+    let ctx = DnsContext::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)),
+        request.clone(),
+    );
+    let pending = PendingRecord::new(
+        request,
+        None,
+        100,
+        1,
+        &ctx.execution_path,
+        0,
+        ctx.peer_addr(),
+        Some("x".repeat(1024 * 1024)),
+    );
+    let error = pending
+        .error
+        .as_ref()
+        .expect("truncated error should remain");
+    assert!(error.len() <= 16 * 1024);
+    assert!(error.capacity() <= 16 * 1024);
+}
+
+#[tokio::test]
+async fn test_query_recorder_shutdown_closes_reader_gate() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let held_permit = backend
+        .reader_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let waiting_semaphore = backend.reader_semaphore.clone();
+    let waiter = tokio::spawn(async move { waiting_semaphore.acquire_owned().await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    plugin.destroy().await.unwrap();
+
+    assert!(backend.lifecycle.shutdown_requested.load(Ordering::Acquire));
+    assert!(backend.reader_semaphore.is_closed());
+    assert!(waiter.await.unwrap().is_err());
+    drop(held_permit);
 }
 
 #[tokio::test]
@@ -771,7 +906,573 @@ async fn test_query_recorder_cleanup_failure_does_not_stop_writer() {
 }
 
 #[tokio::test]
-async fn test_query_recorder_cleanup_is_not_skipped_when_record_queue_is_full() {
+async fn test_query_recorder_writer_continues_after_non_storage_insert_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_insert
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected writer failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "fail.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if backend.dropped_total.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer should report the failed batch");
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_insert;")
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        2_000,
+        2,
+        "recovered.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
+        .unwrap()
+        .0;
+    assert!(records.iter().any(|record| record.request_id == 2));
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_destroy_reports_graceful_flush_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_shutdown_flush
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected shutdown flush failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "shutdown-error.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let error = plugin.destroy().await.unwrap_err().to_string();
+    assert!(error.contains("injected shutdown flush failure"));
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_query_recorder_shutdown_reports_prior_batch_failure() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(1),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_prior_shutdown_batch
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected prior shutdown batch failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend
+        .lifecycle
+        .shutdown_requested
+        .store(true, Ordering::Release);
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "prior-shutdown-error.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if backend.dropped_total.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer should report the failed shutdown batch");
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_prior_shutdown_batch;")
+        .unwrap();
+
+    let error = plugin.destroy().await.unwrap_err().to_string();
+    assert!(error.contains("before final flush"));
+    assert!(error.contains("injected prior shutdown batch failure"));
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_query_recorder_writer_panic_is_reported() {
+    let join_result = std::thread::spawn(|| panic!("injected writer panic")).join();
+    let error = map_writer_join_result(join_result).unwrap_err().to_string();
+    assert!(error.contains("query_recorder writer thread panicked: injected writer panic"));
+}
+
+#[test]
+fn test_query_recorder_non_storage_sqlite_errors_do_not_force_reopen() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE storage_error_test (id INTEGER PRIMARY KEY);
+         INSERT INTO storage_error_test VALUES (1);",
+    )
+    .unwrap();
+    let error = conn
+        .execute("INSERT INTO storage_error_test VALUES (1)", [])
+        .unwrap_err();
+    assert!(!storage_error_requires_reopen(&DnsError::from(error)));
+}
+
+#[test]
+fn test_query_recorder_reader_wait_honors_stop() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let writer_guard = coordinator.write_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let reader_coordinator = coordinator.clone();
+    let reader_stop = stop_requested.clone();
+    let reader = std::thread::spawn(move || {
+        reader_coordinator
+            .read_access_until_stop(&reader_stop)
+            .unwrap()
+            .is_none()
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    stop_requested.store(true, Ordering::Release);
+    assert!(reader.join().unwrap());
+    drop(writer_guard);
+}
+
+#[tokio::test]
+async fn test_query_recorder_destroy_does_not_wait_for_coordinator_lock() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let coordinator = backend.database_coordinator.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = coordinator.write_access().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "shutdown.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let destroy_result =
+        tokio::time::timeout(std::time::Duration::from_secs(1), plugin.destroy()).await;
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    destroy_result
+        .expect("destroy should stop while the coordinator is contended")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_management_fails_fast_while_recovering() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+    backend.set_recovering_for_test(true);
+
+    let cleanup_backend = backend.clone();
+    let cleanup = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX))
+        .await
+        .unwrap();
+    assert!(cleanup.unwrap_err().contains("storage is recovering"));
+
+    let clear_backend = backend.clone();
+    let clear = tokio::task::spawn_blocking(move || clear_backend.clear_history())
+        .await
+        .unwrap();
+    assert!(clear.unwrap_err().contains("storage is recovering"));
+
+    backend.set_recovering_for_test(false);
+    plugin.destroy().await.unwrap();
+}
+
+#[test]
+fn test_query_recorder_management_write_wait_honors_cancel() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let first_reader = coordinator.read_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    let writer_coordinator = coordinator.clone();
+    let writer_stop = stop_requested.clone();
+    let writer_cancelled = cancelled.clone();
+    let writer = std::thread::spawn(move || {
+        match writer_coordinator.write_access_until_stop_or_cancel(&writer_stop, &writer_cancelled)
+        {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("cancelled management writer unexpectedly acquired access"),
+        }
+    });
+
+    let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while coordinator.waiting_writers_for_test() == 0 {
+        assert!(
+            std::time::Instant::now() < waiter_deadline,
+            "management writer did not register for exclusive access"
+        );
+        std::thread::yield_now();
+    }
+
+    cancelled.store(true, Ordering::Release);
+    let error = writer.join().unwrap();
+    assert!(error.contains("management operation cancelled"));
+    assert_eq!(coordinator.waiting_writers_for_test(), 0);
+    drop(first_reader);
+}
+
+#[test]
+fn test_query_recorder_periodic_cleanup_access_wait_honors_deadline() {
+    let coordinator = DatabaseCoordinator::default();
+    let reader = coordinator.read_access().unwrap();
+    let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+
+    let error = match coordinator.write_access_until_stop_or_cancel_until(
+        &stop_requested,
+        &cancelled,
+        std::time::Instant::now() + std::time::Duration::from_millis(25),
+    ) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("periodic cleanup unexpectedly acquired database access"),
+    };
+
+    assert!(error.contains("timed out waiting for database access"));
+    assert_eq!(coordinator.waiting_writers_for_test(), 0);
+    drop(reader);
+}
+
+#[test]
+fn test_query_recorder_management_interrupt_is_bound_to_current_owner() {
+    let writer_interrupt = WriterInterrupt::default();
+    let conn = Connection::open_in_memory().unwrap();
+    writer_interrupt.install(&conn);
+
+    let old_owner = Arc::new(AtomicBool::new(false));
+    let current_owner = Arc::new(AtomicBool::new(false));
+
+    let old_guard = writer_interrupt
+        .claim_management(old_owner.clone())
+        .unwrap();
+    drop(old_guard);
+
+    let current_guard = writer_interrupt
+        .claim_management(current_owner.clone())
+        .unwrap();
+    assert!(!writer_interrupt.interrupt_management(&old_owner));
+    assert!(writer_interrupt.interrupt_management(&current_owner));
+    drop(current_guard);
+    assert!(!writer_interrupt.interrupt_management(&current_owner));
+}
+
+#[tokio::test]
+async fn test_query_recorder_init_rollback_wakes_and_joins_idle_writer() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let backend = RecorderBackend::run("rollback".to_string(), config).unwrap();
+
+    let started = std::time::Instant::now();
+    rollback_initialization(&backend, None).await.unwrap();
+
+    assert!(backend.lifecycle.stop_requested.load(Ordering::Acquire));
+    assert!(backend.lifecycle.shutdown_requested.load(Ordering::Acquire));
+    assert!(backend.writer_handle.lock().unwrap().is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "rollback should wake the idle writer instead of waiting for the 60s flush interval"
+    );
+}
+
+#[tokio::test]
+async fn test_query_recorder_healthy_shutdown_flushes_pending_records() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    for request_id in 1..=24 {
+        backend.enqueue(pending_record(
+            i64::from(request_id),
+            request_id,
+            "shutdown-flush.example.com.",
+            RecordType::A,
+            Ipv4Addr::LOCALHOST,
+            Some(Rcode::NoError),
+            None,
+            &[],
+        ));
+    }
+    plugin.destroy().await.unwrap();
+
+    let mut query = list_query(QueryRecordFilter::default());
+    query.limit = 50;
+    let records = query_records(backend, query).unwrap().0;
+    assert_eq!(records.len(), 24);
+    assert!(records.iter().any(|record| record.request_id == 24));
+}
+
+#[test]
+fn test_query_recorder_waiting_writer_blocks_new_readers() {
+    let coordinator = Arc::new(DatabaseCoordinator::default());
+    let first_reader = coordinator.read_access().unwrap();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+
+    let writer_coordinator = coordinator.clone();
+    let writer_stop = stop_requested.clone();
+    let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let guard = writer_coordinator
+            .write_access_until_stop(&writer_stop)
+            .unwrap()
+            .expect("writer should acquire the coordinator");
+        writer_acquired_tx.send(()).unwrap();
+        release_writer_rx.recv().unwrap();
+        drop(guard);
+    });
+
+    let waiter_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while coordinator.waiting_writers_for_test() == 0 {
+        assert!(
+            std::time::Instant::now() < waiter_deadline,
+            "writer did not register for exclusive access"
+        );
+        std::thread::yield_now();
+    }
+
+    let reader_coordinator = coordinator.clone();
+    let (reader_acquired_tx, reader_acquired_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _guard = reader_coordinator.read_access().unwrap();
+        reader_acquired_tx.send(()).unwrap();
+    });
+
+    drop(first_reader);
+    writer_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("waiting writer should acquire before a new reader");
+    assert!(
+        reader_acquired_rx.try_recv().is_err(),
+        "new reader bypassed a waiting writer"
+    );
+
+    release_writer_tx.send(()).unwrap();
+    writer.join().unwrap();
+    reader_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("reader should continue after writer release");
+    reader.join().unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_management_preflush_failure_counts_dropped_records() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(16),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    let blocker = Connection::open(temp.path()).unwrap();
+    blocker
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_query_recorder_management_preflush
+             BEFORE INSERT ON {}
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected management preflush failure');
+             END;",
+            backend.tables.records
+        ))
+        .unwrap();
+
+    backend.enqueue(pending_record(
+        1_000,
+        88,
+        "management-preflush.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+
+    let cleanup_backend = backend.clone();
+    let cleanup = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX))
+        .await
+        .unwrap();
+    assert!(cleanup.is_err());
+    assert_eq!(backend.dropped_total.load(Ordering::Relaxed), 1);
+
+    blocker
+        .execute_batch("DROP TRIGGER fail_query_recorder_management_preflush;")
+        .unwrap();
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_cleanup_fails_fast_when_record_queue_is_full() {
     AppClock::start();
 
     let temp = NamedTempFile::new().unwrap();
@@ -832,21 +1533,160 @@ async fn test_query_recorder_cleanup_is_not_skipped_when_record_queue_is_full() 
     assert!(queue_was_full);
 
     let cleanup_backend = backend.clone();
-    let mut cleanup_task = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut cleanup_task)
-            .await
-            .is_err()
-    );
+    let cleanup_task = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_task)
+        .await
+        .expect("cleanup should fail fast while the writer queue is full")
+        .unwrap()
+        .unwrap_err();
+    assert!(result.contains("writer queue is busy"));
 
     release_tx.send(()).unwrap();
     maintenance_holder.join().unwrap();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_task)
-        .await
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_periodic_cleanup_survives_full_record_queue() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(1),
+            batch_size: Some(1),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(8),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(2),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        500,
+        500,
+        "periodic-seed.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let coordinator = backend.database_coordinator.clone();
+    let maintenance_holder = std::thread::spawn(move || {
+        let _access = coordinator.write_access().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let mut queue_was_full = false;
+    for request_id in 1..=16 {
+        let record = pending_record(
+            i64::from(request_id),
+            request_id,
+            "periodic-busy.example.com.",
+            RecordType::A,
+            Ipv4Addr::new(192, 0, 2, 1),
+            Some(Rcode::NoError),
+            None,
+            &[],
+        );
+        match backend
+            .queue_tx
+            .try_send(WriterCommand::Insert(Box::new(record)))
+        {
+            Ok(()) => std::thread::yield_now(),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                queue_was_full = true;
+                break;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                panic!("query_recorder writer unexpectedly disconnected")
+            }
+        }
+    }
+    assert!(queue_was_full);
+
+    backend.request_periodic_cleanup(i64::MAX);
+
+    release_tx.send(()).unwrap();
+    maintenance_holder.join().unwrap();
+    flush_backend(&backend).await;
+
+    let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
         .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(result.deleted_records > 0);
+        .0;
+    assert!(
+        !records.iter().any(|record| record.request_id == 500),
+        "periodic cleanup request was lost while the record queue was full"
+    );
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_query_recorder_periodic_cleanup_wakes_idle_writer() {
+    AppClock::start();
+
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(
+        serde_yaml_ng::to_value(QueryRecorderConfig {
+            path: temp.path().display().to_string(),
+            queue_size: Some(32),
+            batch_size: Some(512),
+            flush_interval_ms: Some(60_000),
+            memory_tail: Some(8),
+            retention_days: Some(7),
+            cleanup_interval_hours: Some(1),
+            reader_concurrency: Some(1),
+        })
+        .unwrap(),
+    ))
+    .unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        500,
+        500,
+        "periodic-wake.example.com.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+
+    backend.request_periodic_cleanup(i64::MAX);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let records = query_records(backend.clone(), list_query(QueryRecordFilter::default()))
+                .unwrap()
+                .0;
+            if !records.iter().any(|record| record.request_id == 500) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic cleanup should wake an idle writer before the 60s flush timeout");
 
     plugin.destroy().await.unwrap();
 }
@@ -1606,6 +2446,59 @@ fn test_resolve_config_rejects_zero_limits() {
     })
     .unwrap();
     assert!(resolve_config(Some(config)).is_err());
+}
+
+#[tokio::test]
+async fn test_query_recorder_tail_snapshot_and_live_stream_share_records() {
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("shared_tail".into(), config);
+    plugin.init_without_api_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "history.example.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+    let (initial, mut receiver) = backend.subscribe_tail(1).unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].record.request_id, 1);
+    backend.enqueue(pending_record(
+        2_000,
+        2,
+        "live.example.",
+        RecordType::A,
+        Ipv4Addr::LOCALHOST,
+        Some(Rcode::NoError),
+        None,
+        &[],
+    ));
+    flush_backend(&backend).await;
+    let live = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.record.request_id, 2);
+    {
+        let tail = backend.tail.lock().unwrap();
+        let history = tail
+            .iter()
+            .find(|record| record.record.request_id == 1)
+            .expect("history record should remain in tail");
+        let current = tail
+            .iter()
+            .find(|record| record.record.request_id == 2)
+            .expect("live record should be in tail");
+        assert!(Arc::ptr_eq(history, &initial[0]));
+        assert!(Arc::ptr_eq(current, &live));
+    }
+    plugin.destroy().await.unwrap();
 }
 
 #[tokio::test]

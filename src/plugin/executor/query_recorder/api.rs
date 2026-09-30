@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use super::backend::RecorderBackend;
 use super::model::{
     DistributionQuery, LatencyQuery, ListCursor, ListQuery, PluginStatsKind, PluginStatsRow,
     PluginsStatsQuery, QueryRecordFilter, QueryRecordStatus, RecordDetail, RecordRow,
-    TimeseriesBucket, TimeseriesQuery, TopQuery,
+    SharedRecordDetail, TimeseriesBucket, TimeseriesQuery, TopQuery,
 };
 use super::store::{
     load_latency_summary, load_plugin_stats, load_qtype_distribution, load_rcode_distribution,
@@ -25,9 +26,11 @@ use super::store::{
 use crate::api::query::{
     optional_text, optional_upper_text, parse_u64_param, parse_usize_param, visit_query_params,
 };
-use crate::api::{ApiHandler, json_error, json_ok, simple_response, streaming_response};
+use crate::api::{
+    ApiHandler, PluginApiRouteRegistration, global_api_register, json_error, json_ok,
+    simple_response, streaming_response,
+};
 use crate::infra::error::{DnsError, Result};
-use crate::register_plugin_api;
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
@@ -127,16 +130,31 @@ where
     T: Send + 'static,
     F: FnOnce(Arc<RecorderBackend>) -> std::result::Result<T, DnsError> + Send + 'static,
 {
+    if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
+        return Err(DnsError::runtime("query_recorder reader is stopping"));
+    }
     let permit = backend
         .reader_semaphore
         .clone()
         .acquire_owned()
         .await
         .map_err(|err| DnsError::runtime(format!("query_recorder reader closed: {err}")))?;
+    if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
+        return Err(DnsError::runtime("query_recorder reader is stopping"));
+    }
     let database_coordinator = backend.database_coordinator.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let _access = database_coordinator.read_access()?;
+        let Some(_access) =
+            database_coordinator.read_access_until_stop(&backend.lifecycle.shutdown_requested)?
+        else {
+            return Err(DnsError::runtime(
+                "query_recorder reader stopped before database access",
+            ));
+        };
+        if backend.lifecycle.shutdown_requested.load(Ordering::Acquire) {
+            return Err(DnsError::runtime("query_recorder reader is stopping"));
+        }
         op(backend)
     })
     .await
@@ -275,26 +293,21 @@ impl ApiHandler for StreamHandler {
             Err(err) => return json_error(StatusCode::BAD_REQUEST, "invalid_query", err),
         };
 
-        let initial = {
-            let guard = match self.backend.tail.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "query_recorder_stream_failed",
-                        "tail buffer lock poisoned",
-                    );
-                }
-            };
-            let skip = guard.len().saturating_sub(tail_count);
-            guard.iter().skip(skip).cloned().collect::<Vec<_>>()
+        let (initial, receiver) = match self.backend.subscribe_tail(tail_count) {
+            Ok(state) => state,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "query_recorder_stream_failed",
+                    err,
+                );
+            }
         };
 
         let pending = initial
             .into_iter()
-            .map(|record| sse_record_frame(&record))
+            .map(|record| sse_record_frame(record.as_ref()))
             .collect::<VecDeque<_>>();
-        let receiver = self.backend.broadcaster.subscribe();
         let heartbeat = tokio::time::interval(Duration::from_secs(SSE_HEARTBEAT_SECS));
         let stream = futures::stream::unfold(
             SseState {
@@ -311,7 +324,7 @@ impl ApiHandler for StreamHandler {
                     tokio::select! {
                         recv = state.receiver.recv() => {
                             match recv {
-                                Ok(record) => return Some((Ok(Frame::data(sse_record_frame(&record))), state)),
+                                Ok(record) => return Some((Ok(Frame::data(sse_record_frame(record.as_ref()))), state)),
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(broadcast::error::RecvError::Closed) => return None,
                             }
@@ -344,7 +357,7 @@ impl ApiHandler for StreamHandler {
 #[derive(Debug)]
 struct SseState {
     pending: VecDeque<Bytes>,
-    receiver: broadcast::Receiver<RecordDetail>,
+    receiver: broadcast::Receiver<SharedRecordDetail>,
     heartbeat: tokio::time::Interval,
 }
 
@@ -768,44 +781,79 @@ fn sse_record_frame(record: &RecordDetail) -> Bytes {
 }
 
 pub(super) fn register(backend: &Arc<RecorderBackend>) -> Result<()> {
-    register_plugin_api!(
-        &backend.tag,
-        |plugin_api|
-        GET "/records" => RecordsListHandler {
-            backend: backend.clone(),
-        },
-        DELETE "/records" => RecordsClearHandler {
-            backend: backend.clone(),
-        },
-        GET_PREFIX "/records/" => RecordDetailHandler {
-            backend: backend.clone(),
-            path_prefix: plugin_api.path("/records/")?,
-        },
-        GET "/stats/plugins" => StatsPluginsHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/top_clients" => TopClientsHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/top_qnames" => TopQnamesHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/qtype" => QtypeDistributionHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/rcode" => RcodeDistributionHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/latency" => LatencyHandler {
-            backend: backend.clone(),
-        },
-        GET "/stats/timeseries" => TimeseriesHandler {
-            backend: backend.clone(),
-        },
-        GET "/stream" => StreamHandler {
-            backend: backend.clone(),
-        },
-    )?;
+    let Some(api_register) = global_api_register() else {
+        return Ok(());
+    };
+    let plugin_api = api_register.plugin(&backend.tag)?;
+    let record_path_prefix = plugin_api.path("/records/")?;
 
-    Ok(())
+    plugin_api.register_batch(vec![
+        PluginApiRouteRegistration::get(
+            "/records",
+            Arc::new(RecordsListHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::delete(
+            "/records",
+            Arc::new(RecordsClearHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get_prefix(
+            "/records/",
+            Arc::new(RecordDetailHandler {
+                backend: backend.clone(),
+                path_prefix: record_path_prefix,
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/plugins",
+            Arc::new(StatsPluginsHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/top_clients",
+            Arc::new(TopClientsHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/top_qnames",
+            Arc::new(TopQnamesHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/qtype",
+            Arc::new(QtypeDistributionHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/rcode",
+            Arc::new(RcodeDistributionHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/latency",
+            Arc::new(LatencyHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stats/timeseries",
+            Arc::new(TimeseriesHandler {
+                backend: backend.clone(),
+            }),
+        ),
+        PluginApiRouteRegistration::get(
+            "/stream",
+            Arc::new(StreamHandler {
+                backend: backend.clone(),
+            }),
+        ),
+    ])
 }
