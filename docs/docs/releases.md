@@ -7,6 +7,58 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
 # 版本更新
 
+## 2026-10
+
+<div className="release-stack">
+   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01" defaultOpen>
+       **版本定位**
+
+       - Patch Release。v1.6.2 聚焦 `query_recorder` 存储故障恢复、管理操作、定期清理、优雅关闭与插件初始化生命周期稳定性。
+       - 同时修复 upstream HTTP 429 冷却恢复边界、API 路由批量注册一致性与 feature gating 问题；现有配置默认行为保持不变。
+
+       **主要变更**
+
+       - `fix(query_recorder)`：强化 SQLite 存储异常恢复，支持连接重建、可写性验证，并处理数据库损坏、只读、磁盘满和文件锁等错误。
+       - `fix(query_recorder)`：定期清理增加取消、超时、批量边界与公平重试；共享数据库的多个 recorder 不再因清理任务长期竞争而饥饿。
+       - `fix(query_recorder)`：管理 API 的查询、统计、清理和清空操作增加并发控制与停止检查，避免无限等待；shutdown 会主动关闭 reader gate。
+       - `fix(query_recorder)`：改进优雅关闭，尽可能完成健康状态下的 pending record flush，并报告此前批次和最终 flush 的失败信息。
+       - `fix(query_recorder)`：初始化失败时回滚 cleanup task、writer thread 和相关资源；API 路由采用批量原子注册，避免部分路由发布或失败 backend 被 handler 持有。
+       - `perf(query_recorder)`：execution path 只复制 recorder 自身新增部分；SSE tail 与广播记录使用共享对象，减少重复复制。
+       - `fix(forward)`：修复 HTTP 429 冷却状态在 half-open probe 恢复期间丢失 backoff 的问题，保留跨 generation 的退避状态。
+       - `fix(api/build)`：拒绝重复 exact/prefix API 路由，保证批量注册失败时注册表不变；修复 API-only 构建 warning，并将 `fs2` 限制到实际使用它的 feature。
+       - `test(query_recorder)`：补充初始化回滚、idle writer 唤醒、清理超时/公平重试、管理并发与 full-queue 场景覆盖。
+
+       **配置与升级说明**
+
+       - 目标根 crate 版本为 `1.6.2`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；发布前需完成版本号更新，release tag 使用 `v1.6.2`。
+       - v1.6.1 YAML 配置可以直接升级，本版本没有新增必填配置，也没有改变现有配置默认值。替换二进制前建议运行 `oxidns check -c <配置文件>`。
+       - query recorder 现有 SQLite 数据库可以继续使用；存储异常恢复和清理操作可能在后台产生额外磁盘 I/O，建议在升级后观察 writer、cleanup 和 dropped-record 日志。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.6.1" badge="Minor Release" date="2026-09-27">
+       **版本定位**
+
+       - v1.6.1 相比 v1.6.0 更新缓存生命周期与 ECS 语义、UDP/DoH/DoQ 网络可靠性、upstream 连接池、provider 文件自动重载、DoH POST、forward 错误策略和 HTTP 429 退避恢复。
+       - 新增配置项均保持兼容默认值：`runtime.provider_file_auto_reload` 默认关闭、DoH `use_post` 默认关闭、`keepalive_interval` 默认关闭、forward `on_error` 默认 `fail`。
+
+       **主要变更**
+
+       - `feat/fix(cache/ECS)`：缓存持久化升级为 framed v3 流式格式，强化跨重启 TTL、真实年龄、dirty 状态、lazy refresh、并发 miss 合并、过期清理、容量约束和 ECS scope 恢复。
+       - `feat(network)`：新增 SOCKS5 UDP，并支持通过 SOCKS5 代理 DoQ 与 DoH3；统一 UDP、TCP、DoT、DoH、DoH3、DoQ 响应关联校验。
+       - `feat(upstream)`：连接池强化并发容量、paced expansion、取消和回收生命周期；新增可选 `keepalive_interval` 与 upstream timeout stage 指标。
+       - `feat(provider)`：`domain_set`、`ip_set`、`adguard_rule`、`geosite`、`geoip` 文件源支持可选自动监听与重载，失败时保留上一份可用快照。
+       - `feat(doh/forward)`：DoH 支持可选 RFC 8484 POST；forward 新增 `on_error: fail | continue`；HTTP 429 增加 per-upstream cooldown、half-open probe 与指数退避。
+       - `fix(server/observability)`：加强 UDP admission、shutdown/drain、reply source/interface、响应大小限制和持续 receive-error backoff；WebUI 同步新的指标与配置项。
+
+       **配置与升级说明**
+
+       - 根 crate 版本为 `1.6.1`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；release tag 使用 `v1.6.1`。
+       - 缓存 flush API 已从 `GET` 调整为 `POST`；外部脚本和 API 客户端需要同步迁移。
+       - 如需 provider 文件自动重载，显式设置 `runtime.provider_file_auto_reload: true`；DoH POST、upstream keepalive 和 forward `continue` 策略也必须显式启用。
+       - DoH/DoH3 现在严格校验 `application/dns-message`，DNS 响应关联校验也更严格；不符合协议的第三方 upstream 响应可能在升级后被拒绝。
+   </ReleaseCard>
+</div>
+
 ## 2026-09
 
 <div className="release-stack">
