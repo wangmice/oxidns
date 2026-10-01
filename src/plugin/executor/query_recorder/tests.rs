@@ -1504,47 +1504,80 @@ async fn test_query_recorder_cleanup_fails_fast_when_record_queue_is_full() {
     });
     ready_rx.recv().unwrap();
 
-    let mut queue_was_full = false;
-    for request_id in 1..=16 {
-        let record = pending_record(
-            i64::from(request_id),
-            request_id,
-            "queue-full.example.com.",
-            RecordType::A,
-            Ipv4Addr::new(192, 0, 2, 1),
-            Some(Rcode::NoError),
-            None,
-            &[],
-        );
-        match backend
-            .queue_tx
-            .try_send(WriterCommand::Insert(Box::new(record)))
-        {
-            Ok(()) => std::thread::yield_now(),
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                queue_was_full = true;
-                break;
+    let first_record = pending_record(
+        1,
+        1,
+        "queue-full.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Some(Rcode::NoError),
+        None,
+        &[],
+    );
+    backend
+        .queue_tx
+        .try_send(WriterCommand::Insert(Box::new(first_record)))
+        .expect("initial record should fit in the empty writer queue");
+
+    // Keep retrying the second enqueue until the writer has consumed the first
+    // record. With batch_size=1 the writer immediately tries to flush that
+    // first record, where the held coordinator write lock blocks it before the
+    // writer can receive again. Therefore a successful second enqueue leaves
+    // the sole queue slot deterministically occupied.
+    let queue_fill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+
+    let queued_record = pending_record(
+        2,
+        2,
+        "queue-full.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Some(Rcode::NoError),
+        None,
+        &[],
+    );
+    let mut queued_command = WriterCommand::Insert(Box::new(queued_record));
+    loop {
+        match backend.queue_tx.try_send(queued_command) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                if std::time::Instant::now() >= queue_fill_deadline {
+                    release_tx.send(()).unwrap();
+                    maintenance_holder.join().unwrap();
+                    plugin.destroy().await.unwrap();
+                    panic!("query_recorder writer did not consume the first queued record in time");
+                }
+                queued_command = returned;
+                std::thread::yield_now();
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                release_tx.send(()).unwrap();
+                maintenance_holder.join().unwrap();
+                plugin.destroy().await.unwrap();
                 panic!("query_recorder writer unexpectedly disconnected")
             }
         }
     }
-    assert!(queue_was_full);
 
     let cleanup_backend = backend.clone();
     let cleanup_task = tokio::task::spawn_blocking(move || cleanup_backend.cleanup(i64::MAX));
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_task)
-        .await
-        .expect("cleanup should fail fast while the writer queue is full")
-        .unwrap()
-        .unwrap_err();
-    assert!(result.contains("writer queue is busy"));
+    let cleanup_outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_task).await;
 
     release_tx.send(()).unwrap();
     maintenance_holder.join().unwrap();
 
+    let result = cleanup_outcome
+        .expect("cleanup should fail fast while the writer queue is full")
+        .unwrap()
+        .unwrap_err();
+
     plugin.destroy().await.unwrap();
+
+    assert!(
+        result.contains("writer queue is busy"),
+        "unexpected cleanup error: {result}"
+    );
 }
 
 #[tokio::test]
