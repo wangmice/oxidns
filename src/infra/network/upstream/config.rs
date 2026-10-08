@@ -337,6 +337,9 @@ impl ConnectionInfo {
     pub(crate) const DEFAULT_MAX_CONNS_SIZE: usize = 64;
     pub(crate) const DEFAULT_MIN_CONNS_SIZE: usize = 0;
     pub(crate) const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+    /// H2 stores its last-used timestamp as a wrapping 32-bit millisecond tick.
+    /// Durations compared against that tick must stay below one complete wrap.
+    pub(crate) const H2_LAST_USED_TICK_RANGE_MS: u64 = 1u64 << 32;
     pub(crate) const MAX_CONFIGURED_CONNS_SIZE: usize = 4096;
 
     pub fn with_addr(addr: &str) -> Result<Self> {
@@ -432,6 +435,20 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             .unwrap_or(connection_type.default_port());
         let effective_idle_timeout = idle_timeout.unwrap_or(Self::DEFAULT_CONN_IDLE_TIME);
         let effective_query_timeout = timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT);
+
+        if connection_type == ConnectionType::DoH && !enable_http3 {
+            let tick_range = Duration::from_millis(Self::H2_LAST_USED_TICK_RANGE_MS);
+            if effective_idle_timeout >= tick_range {
+                return Err(DnsError::plugin(
+                    "DoH2 idle_timeout must be less than 2^32 milliseconds (~49.7 days)",
+                ));
+            }
+            if keepalive_interval.is_some_and(|interval| interval >= tick_range) {
+                return Err(DnsError::plugin(
+                    "DoH2 keepalive_interval must be less than 2^32 milliseconds (~49.7 days)",
+                ));
+            }
+        }
 
         if let Some(interval) = keepalive_interval {
             if interval.is_zero() {

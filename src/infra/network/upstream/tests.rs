@@ -701,6 +701,73 @@ fn test_keepalive_interval_is_preserved() {
 }
 
 #[test]
+fn test_doh2_rejects_idle_timeout_at_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let err = clean_connection_info_err(cfg, "DoH2 tick-range idle timeout should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("DoH2 idle_timeout must be less than 2^32 milliseconds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh2_accepts_idle_timeout_below_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS - 1,
+    ));
+
+    let info = clean_connection_info(cfg, "DoH2 idle timeout below tick range should parse");
+
+    assert_eq!(
+        info.idle_timeout,
+        Duration::from_millis(ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS - 1)
+    );
+}
+
+#[test]
+fn test_doh2_rejects_keepalive_at_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    // Zero bypasses the existing keepalive < idle_timeout relationship so
+    // this test isolates the H2 tick-range constraint itself.
+    cfg.idle_timeout = Some(Duration::ZERO);
+    cfg.keepalive_interval = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let err = clean_connection_info_err(cfg, "DoH2 tick-range keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("DoH2 keepalive_interval must be less than 2^32 milliseconds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh3_does_not_use_doh2_tick_range_limit() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.enable_http3 = Some(true);
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let info = clean_connection_info(cfg, "DoH3 should not inherit the DoH2 tick limit");
+
+    assert!(info.enable_http3);
+    assert_eq!(
+        info.idle_timeout,
+        Duration::from_millis(ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS)
+    );
+}
+
+#[test]
 fn test_keepalive_interval_rejects_zero() {
     let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
     cfg.keepalive_interval = Some(Duration::ZERO);
