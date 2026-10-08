@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
-#[cfg(test)]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -44,10 +42,33 @@ const H2_STREAM_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 // Query admission and failed-keepalive retirement therefore share one atomic
 // modification order, closing the race without a mutex or a CAS loop on the
 // H2 query hot path.
-const H2_ACTIVITY_COUNT_MASK: u64 = u32::MAX as u64;
-const H2_ACTIVITY_KEEPALIVE_GATE: u64 = 1 << 62;
-const H2_ACTIVITY_CLOSED: u64 = 1 << 63;
-const H2_ACTIVITY_STATE_MASK: u64 = H2_ACTIVITY_KEEPALIVE_GATE | H2_ACTIVITY_CLOSED;
+// A connection can expose at most a u16 stream limit. Keep the packed query
+// count in the low 16 bits, reserve bit 16 as a transient overflow marker,
+// and leave a wide gap before lifecycle state bits so count arithmetic cannot
+// carry into KEEPALIVE_GATE or CLOSED.
+const H2_ACTIVITY_COUNT_MASK: u32 = u16::MAX as u32;
+const H2_ACTIVITY_COUNT_OVERFLOW: u32 = 1 << 16;
+const H2_ACTIVITY_KEEPALIVE_GATE: u32 = 1 << 30;
+const H2_ACTIVITY_CLOSED: u32 = 1 << 31;
+const H2_ACTIVITY_STATE_MASK: u32 =
+    H2_ACTIVITY_COUNT_OVERFLOW | H2_ACTIVITY_KEEPALIVE_GATE | H2_ACTIVITY_CLOSED;
+const H2_ACTIVITY_QUERY_MASK: u32 = H2_ACTIVITY_COUNT_MASK | H2_ACTIVITY_COUNT_OVERFLOW;
+
+#[inline]
+fn h2_now_tick_ms() -> u32 {
+    AppClock::elapsed_millis() as u32
+}
+
+#[inline]
+fn h2_elapsed_tick_ms(now_tick: u32, earlier_tick: u32) -> u32 {
+    now_tick.wrapping_sub(earlier_tick)
+}
+
+#[inline]
+fn h2_reconstruct_last_used_ms(now_ms: u64, last_used_tick: u32) -> u64 {
+    let age_ms = h2_elapsed_tick_ms(now_ms as u32, last_used_tick) as u64;
+    now_ms.saturating_sub(age_ms)
+}
 
 struct H2ActivityGuard<'a> {
     connection: &'a H2Connection,
@@ -112,6 +133,11 @@ async fn run_h2_keepalive(
             continue;
         }
 
+        // Snapshot successful DNS activity immediately before starting the
+        // liveness probe. A generation change while the PING is pending proves
+        // the connection transported useful DNS traffic even if the PING fails.
+        let success_generation_before_ping = conn.success_generation.load(Ordering::Acquire);
+
         let last_used_before_ping = conn.last_used();
         let idle_ms = AppClock::elapsed_millis().saturating_sub(last_used_before_ping);
         if idle_ms < interval_ms {
@@ -130,7 +156,7 @@ async fn run_h2_keepalive(
             }
             Ok(Err(error)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Failed);
-                if conn.retire_after_keepalive_failure(last_used_before_ping) {
+                if conn.retire_after_keepalive_failure(success_generation_before_ping) {
                     debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
@@ -149,7 +175,7 @@ async fn run_h2_keepalive(
             }
             Err(_) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
-                if conn.retire_after_keepalive_failure(last_used_before_ping) {
+                if conn.retire_after_keepalive_failure(success_generation_before_ping) {
                     debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
@@ -176,13 +202,18 @@ pub struct H2Connection {
     id: u16,
     upstream: String,
     sender: SendRequest<Bytes>,
-    /// Lifecycle bits plus the lower 32-bit in-flight query count.
-    activity: AtomicU64,
-    /// `last_used` snapshot taken when a failed keepalive starts retirement.
-    /// Read only on the failed-keepalive cold path.
-    keepalive_failure_last_used: AtomicU64,
+    /// Lifecycle bits plus the low 16-bit in-flight query count.
+    activity: AtomicU32,
+    /// Successful DNS response generation captured when a failed keepalive
+    /// starts retirement. Read only on the failed-keepalive cold path.
+    keepalive_failure_generation: AtomicU32,
+    /// Increments after each validated DNS response. Generation comparison,
+    /// rather than timestamp comparison, avoids same-millisecond false negatives.
+    success_generation: AtomicU32,
     transport_error_reported: AtomicBool,
-    last_used: AtomicU64,
+    /// Low 32 bits of AppClock milliseconds. Age calculations use wrapping
+    /// subtraction; the public u64 timestamp is reconstructed on the cold path.
+    last_used: AtomicU32,
     request_uri: String,
     use_post: bool,
     close_notify: Notify,
@@ -225,7 +256,11 @@ impl Connection for H2Connection {
     }
 
     fn using_count(&self) -> u32 {
-        (self.activity.load(Ordering::Relaxed) & H2_ACTIVITY_COUNT_MASK) as u32
+        let activity = self.activity.load(Ordering::Relaxed);
+        if activity & H2_ACTIVITY_COUNT_OVERFLOW != 0 {
+            return H2_ACTIVITY_COUNT_MASK;
+        }
+        activity & H2_ACTIVITY_COUNT_MASK
     }
 
     fn available(&self) -> bool {
@@ -254,7 +289,11 @@ impl Connection for H2Connection {
     }
 
     fn last_used(&self) -> u64 {
-        self.last_used.load(Ordering::Relaxed)
+        // Read the tick before the clock so a concurrent successful query cannot
+        // publish a timestamp from the future relative to this snapshot.
+        let last_used_tick = self.last_used.load(Ordering::Acquire);
+        let now_ms = AppClock::elapsed_millis();
+        h2_reconstruct_last_used_ms(now_ms, last_used_tick)
     }
 }
 
@@ -276,7 +315,10 @@ impl H2Connection {
     fn release_query_activity(&self) {
         let previous = self.activity.fetch_sub(1, Ordering::AcqRel);
         let previous_count = previous & H2_ACTIVITY_COUNT_MASK;
-        debug_assert!(previous_count != 0, "H2 query activity counter underflow");
+        debug_assert!(
+            previous & H2_ACTIVITY_QUERY_MASK != 0,
+            "H2 query activity counter underflow"
+        );
 
         // Failed keepalive retirement keeps admission gated while pre-existing
         // DNS work drains. Whichever decrement takes the count from one to
@@ -284,6 +326,7 @@ impl H2Connection {
         // after the gate, temporarily incremented the packed count, and then
         // backed out before waiting.
         if previous_count == 1
+            && previous & H2_ACTIVITY_COUNT_OVERFLOW == 0
             && previous & H2_ACTIVITY_KEEPALIVE_GATE != 0
             && previous & H2_ACTIVITY_CLOSED == 0
         {
@@ -306,6 +349,18 @@ impl H2Connection {
 
             if previous & H2_ACTIVITY_COUNT_MASK == H2_ACTIVITY_COUNT_MASK {
                 self.activity.fetch_sub(1, Ordering::Release);
+                return Err(DnsError::protocol("H2 in-flight query counter exhausted"));
+            }
+
+            // Another admission may briefly expose the overflow marker while
+            // rolling back an exhausted count. Back out directly instead of
+            // running normal release logic, because the low count bits are
+            // wrapped during this transient state.
+            if state & H2_ACTIVITY_COUNT_OVERFLOW != 0 {
+                self.activity.fetch_sub(1, Ordering::Release);
+                if state & H2_ACTIVITY_CLOSED != 0 {
+                    return Err(DnsError::protocol("DoH connection closed"));
+                }
                 return Err(DnsError::protocol("H2 in-flight query counter exhausted"));
             }
 
@@ -338,11 +393,12 @@ impl H2Connection {
         }
     }
 
-    fn retire_after_keepalive_failure(&self, observed_last_used: u64) -> bool {
-        // Publish the success baseline before the gate. Any query release that
-        // observes the gate is therefore guaranteed to see this snapshot.
-        self.keepalive_failure_last_used
-            .store(observed_last_used, Ordering::Release);
+    fn retire_after_keepalive_failure(&self, observed_success_generation: u32) -> bool {
+        // Publish the successful-response generation before the gate. Any query
+        // release that observes the gate is therefore guaranteed to see this
+        // baseline and can detect useful DNS activity while the PING was pending.
+        self.keepalive_failure_generation
+            .store(observed_success_generation, Ordering::Release);
 
         // Gate new query admission first. Because this is the same atomic word
         // as the in-flight count, `previous` is an exact snapshot of whether a
@@ -355,7 +411,7 @@ impl H2Connection {
             return true;
         }
 
-        if previous & H2_ACTIVITY_COUNT_MASK != 0 {
+        if previous & H2_ACTIVITY_QUERY_MASK != 0 {
             // Do not kill a stream that entered while the PING was pending.
             // Keep the admission gate set, however, so this retirement attempt
             // cannot be defeated by an endless stream of new queries. The last
@@ -371,12 +427,11 @@ impl H2Connection {
             return true;
         }
 
-        let observed_last_used = self.keepalive_failure_last_used.load(Ordering::Acquire);
-        // A successful query that completed while the PING was pending proves
-        // useful transport activity. The successful path stores last_used
-        // before its AcqRel activity decrement, so the release that reaches
-        // zero makes that update visible here.
-        if self.last_used.load(Ordering::Acquire) != observed_last_used {
+        let observed_generation = self.keepalive_failure_generation.load(Ordering::Acquire);
+        // A generation change proves that at least one validated DNS response
+        // completed while the PING was pending. This remains correct even when
+        // the response lands in the same millisecond as the keepalive snapshot.
+        if self.success_generation.load(Ordering::Acquire) != observed_generation {
             self.activity
                 .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
             self.wake_keepalive_gate_waiters();
@@ -492,8 +547,8 @@ impl H2Connection {
                 let mut resp = Message::from_bytes(&bytes)?;
                 validate_dns_response(&request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
-                self.last_used
-                    .store(AppClock::elapsed_millis(), Ordering::Relaxed);
+                self.last_used.store(h2_now_tick_ms(), Ordering::Relaxed);
+                self.success_generation.fetch_add(1, Ordering::Release);
                 trace!(conn_id = self.id,
             upstream = %self.upstream, raw_id, "Received H2 response");
                 Ok(resp)
@@ -604,10 +659,11 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             id: conn_id,
             upstream: self.upstream.clone(),
             sender,
-            activity: AtomicU64::new(0),
-            keepalive_failure_last_used: AtomicU64::new(0),
+            activity: AtomicU32::new(0),
+            keepalive_failure_generation: AtomicU32::new(0),
+            success_generation: AtomicU32::new(0),
             transport_error_reported: AtomicBool::new(false),
-            last_used: AtomicU64::new(AppClock::elapsed_millis()),
+            last_used: AtomicU32::new(h2_now_tick_ms()),
             request_uri: self.request_uri.clone(),
             use_post: self.use_post,
             close_notify: Notify::new(),
@@ -753,7 +809,7 @@ mod tests {
     use super::*;
 
     async fn test_h2_connection(
-        last_used: u64,
+        last_used: u32,
     ) -> (
         Arc<H2Connection>,
         PingPong,
@@ -785,10 +841,11 @@ mod tests {
             id: 1,
             upstream: "https://dns.example.test/dns-query".to_string(),
             sender,
-            activity: AtomicU64::new(0),
-            keepalive_failure_last_used: AtomicU64::new(0),
+            activity: AtomicU32::new(0),
+            keepalive_failure_generation: AtomicU32::new(0),
+            success_generation: AtomicU32::new(0),
             transport_error_reported: AtomicBool::new(false),
-            last_used: AtomicU64::new(last_used),
+            last_used: AtomicU32::new(last_used),
             request_uri: "/dns-query".to_string(),
             use_post: false,
             close_notify: Notify::new(),
@@ -799,6 +856,31 @@ mod tests {
         });
 
         (connection, ping_pong, driver_task, server_task)
+    }
+
+    #[test]
+    fn h2_tick_age_and_timestamp_reconstruction_survive_u32_wrap() {
+        let earlier_tick = u32::MAX - 4;
+        let now_tick = 5;
+        assert_eq!(h2_elapsed_tick_ms(now_tick, earlier_tick), 10);
+
+        let now_ms = u32::MAX as u64 + 6;
+        assert_eq!(
+            h2_reconstruct_last_used_ms(now_ms, earlier_tick),
+            u32::MAX as u64 - 4
+        );
+    }
+
+    #[test]
+    fn h2_activity_layout_keeps_counter_carry_out_of_lifecycle_bits() {
+        assert_eq!(H2_ACTIVITY_COUNT_MASK, u16::MAX as u32);
+        assert_eq!(H2_ACTIVITY_COUNT_OVERFLOW, 1 << 16);
+        assert_eq!(H2_ACTIVITY_KEEPALIVE_GATE, 1 << 30);
+        assert_eq!(H2_ACTIVITY_CLOSED, 1 << 31);
+        assert_eq!(
+            H2_ACTIVITY_QUERY_MASK & (H2_ACTIVITY_KEEPALIVE_GATE | H2_ACTIVITY_CLOSED),
+            0
+        );
     }
 
     #[tokio::test]
@@ -853,7 +935,7 @@ mod tests {
             .expect("query should enter before keepalive retirement is gated");
 
         assert!(
-            !connection.retire_after_keepalive_failure(10),
+            !connection.retire_after_keepalive_failure(0),
             "a query admitted while the ping is pending must defer retirement"
         );
         assert!(connection.available());
@@ -886,11 +968,15 @@ mod tests {
             .expect("query should enter before keepalive retirement is gated");
 
         assert!(
-            !connection.retire_after_keepalive_failure(10),
+            !connection.retire_after_keepalive_failure(0),
             "retirement must wait for the overlapping query"
         );
 
-        connection.last_used.store(11, Ordering::Relaxed);
+        // Keep last_used unchanged to prove success detection does not depend
+        // on millisecond timestamp granularity.
+        connection
+            .success_generation
+            .fetch_add(1, Ordering::Release);
         drop(query_guard);
 
         assert!(
@@ -917,11 +1003,15 @@ mod tests {
             .acquire_query_activity()
             .await
             .expect("query should enter before keepalive retirement is gated");
-        connection.last_used.store(11, Ordering::Relaxed);
+        // Keep last_used unchanged to prove success detection does not depend
+        // on millisecond timestamp granularity.
+        connection
+            .success_generation
+            .fetch_add(1, Ordering::Release);
         drop(query_guard);
 
         assert!(
-            !connection.retire_after_keepalive_failure(10),
+            !connection.retire_after_keepalive_failure(0),
             "successful DNS activity during the pending ping must preserve the connection"
         );
         assert!(connection.available());
