@@ -49,11 +49,13 @@ const H2_ACTIVITY_KEEPALIVE_GATE: u64 = 1 << 62;
 const H2_ACTIVITY_CLOSED: u64 = 1 << 63;
 const H2_ACTIVITY_STATE_MASK: u64 = H2_ACTIVITY_KEEPALIVE_GATE | H2_ACTIVITY_CLOSED;
 
-struct H2ActivityGuard<'a>(&'a AtomicU64);
+struct H2ActivityGuard<'a> {
+    connection: &'a H2Connection,
+}
 
 impl Drop for H2ActivityGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        self.connection.release_query_activity();
     }
 }
 
@@ -140,7 +142,7 @@ async fn run_h2_keepalive(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         ?error,
-                        "H2 keepalive ping failed during DNS activity; keeping connection open and disabling keepalive"
+                        "H2 keepalive ping failed during DNS activity; deferring retirement until overlapping queries drain"
                     );
                 }
                 return;
@@ -159,7 +161,7 @@ async fn run_h2_keepalive(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         timeout_ms = ack_timeout.as_millis(),
-                        "H2 keepalive ping timed out during DNS activity; keeping connection open and disabling keepalive"
+                        "H2 keepalive ping timed out during DNS activity; deferring retirement until overlapping queries drain"
                     );
                 }
                 return;
@@ -176,11 +178,17 @@ pub struct H2Connection {
     sender: SendRequest<Bytes>,
     /// Lifecycle bits plus the lower 32-bit in-flight query count.
     activity: AtomicU64,
+    /// `last_used` snapshot taken when a failed keepalive starts retirement.
+    /// Read only on the failed-keepalive cold path.
+    keepalive_failure_last_used: AtomicU64,
     transport_error_reported: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
     use_post: bool,
     close_notify: Notify,
+    /// Wakes queries that arrived while failed-keepalive retirement gated
+    /// admission. The query hot path touches this only when the gate is set.
+    keepalive_gate_notify: Notify,
     pool_unavailable_notify: PoolUnavailableNotify,
     pool_capacity_notify: PoolCapacityNotify,
     cached_stream_limit: AtomicU16,
@@ -200,6 +208,9 @@ impl Connection for H2Connection {
         // A single background driver waits for this signal. `notify_one()`
         // stores a permit when the waiter has not registered yet,
         // avoiding a lost close wakeup.
+        // Also wake queries parked behind a keepalive retirement gate so they
+        // can observe CLOSED instead of waiting indefinitely.
+        self.keepalive_gate_notify.notify_waiters();
         self.close_notify.notify_one();
     }
 
@@ -262,6 +273,28 @@ impl H2Connection {
         self.activity.load(Ordering::Acquire) & H2_ACTIVITY_CLOSED != 0
     }
 
+    fn release_query_activity(&self) {
+        let previous = self.activity.fetch_sub(1, Ordering::AcqRel);
+        let previous_count = previous & H2_ACTIVITY_COUNT_MASK;
+        debug_assert!(previous_count != 0, "H2 query activity counter underflow");
+
+        // Failed keepalive retirement keeps admission gated while pre-existing
+        // DNS work drains. Whichever decrement takes the count from one to
+        // zero owns the final decision. This also covers a query that arrived
+        // after the gate, temporarily incremented the packed count, and then
+        // backed out before waiting.
+        if previous_count == 1
+            && previous & H2_ACTIVITY_KEEPALIVE_GATE != 0
+            && previous & H2_ACTIVITY_CLOSED == 0
+        {
+            let _ = self.finish_keepalive_retirement();
+        }
+    }
+
+    fn wake_keepalive_gate_waiters(&self) {
+        self.keepalive_gate_notify.notify_waiters();
+    }
+
     async fn acquire_query_activity(&self) -> Result<H2ActivityGuard<'_>> {
         loop {
             // `fetch_add` participates in the same modification order as the
@@ -277,21 +310,40 @@ impl H2Connection {
             }
 
             if state & H2_ACTIVITY_CLOSED != 0 {
-                self.activity.fetch_sub(1, Ordering::Release);
+                self.release_query_activity();
                 return Err(DnsError::protocol("DoH connection closed"));
             }
 
             if state & H2_ACTIVITY_KEEPALIVE_GATE != 0 {
-                self.activity.fetch_sub(1, Ordering::Release);
-                tokio::task::yield_now().await;
+                self.release_query_activity();
+
+                // Register before the final state re-check. `notify_waiters`
+                // does not retain permits, so enabling the Notified future
+                // first avoids losing a gate-clear/close wakeup in between.
+                let notified = self.keepalive_gate_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let current = self.activity.load(Ordering::Acquire);
+                if current & H2_ACTIVITY_CLOSED != 0 {
+                    return Err(DnsError::protocol("DoH connection closed"));
+                }
+                if current & H2_ACTIVITY_KEEPALIVE_GATE != 0 {
+                    notified.await;
+                }
                 continue;
             }
 
-            return Ok(H2ActivityGuard(&self.activity));
+            return Ok(H2ActivityGuard { connection: self });
         }
     }
 
     fn retire_after_keepalive_failure(&self, observed_last_used: u64) -> bool {
+        // Publish the success baseline before the gate. Any query release that
+        // observes the gate is therefore guaranteed to see this snapshot.
+        self.keepalive_failure_last_used
+            .store(observed_last_used, Ordering::Release);
+
         // Gate new query admission first. Because this is the same atomic word
         // as the in-flight count, `previous` is an exact snapshot of whether a
         // query won admission before the keepalive retirement gate.
@@ -303,18 +355,37 @@ impl H2Connection {
             return true;
         }
 
-        let had_active_query = previous & H2_ACTIVITY_COUNT_MASK != 0;
-        // A successful query that completed while the PING was pending proves
-        // useful transport activity. The guard's Release decrement and this
-        // AcqRel RMW make the preceding last_used update visible here.
-        let had_successful_activity = self.last_used.load(Ordering::Acquire) != observed_last_used;
+        if previous & H2_ACTIVITY_COUNT_MASK != 0 {
+            // Do not kill a stream that entered while the PING was pending.
+            // Keep the admission gate set, however, so this retirement attempt
+            // cannot be defeated by an endless stream of new queries. The last
+            // overlapping activity release will finish the decision.
+            return false;
+        }
 
-        if had_active_query || had_successful_activity {
+        self.finish_keepalive_retirement()
+    }
+
+    fn finish_keepalive_retirement(&self) -> bool {
+        if self.is_closed() {
+            return true;
+        }
+
+        let observed_last_used = self.keepalive_failure_last_used.load(Ordering::Acquire);
+        // A successful query that completed while the PING was pending proves
+        // useful transport activity. The successful path stores last_used
+        // before its AcqRel activity decrement, so the release that reaches
+        // zero makes that update visible here.
+        if self.last_used.load(Ordering::Acquire) != observed_last_used {
             self.activity
-                .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::Release);
+                .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
+            self.wake_keepalive_gate_waiters();
             return self.is_closed();
         }
 
+        // The PING failed and every overlapping DNS query drained without a
+        // successful response. Treat that combination as connection-level
+        // liveness failure and let the pool build a replacement.
         self.close();
         true
     }
@@ -534,11 +605,13 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             upstream: self.upstream.clone(),
             sender,
             activity: AtomicU64::new(0),
+            keepalive_failure_last_used: AtomicU64::new(0),
             transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
             request_uri: self.request_uri.clone(),
             use_post: self.use_post,
             close_notify: Notify::new(),
+            keepalive_gate_notify: Notify::new(),
             pool_unavailable_notify: PoolUnavailableNotify::default(),
             pool_capacity_notify: PoolCapacityNotify::default(),
             cached_stream_limit: AtomicU16::new(initial_stream_limit),
@@ -713,11 +786,13 @@ mod tests {
             upstream: "https://dns.example.test/dns-query".to_string(),
             sender,
             activity: AtomicU64::new(0),
+            keepalive_failure_last_used: AtomicU64::new(0),
             transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(last_used),
             request_uri: "/dns-query".to_string(),
             use_post: false,
             close_notify: Notify::new(),
+            keepalive_gate_notify: Notify::new(),
             pool_unavailable_notify: PoolUnavailableNotify::default(),
             pool_capacity_notify: PoolCapacityNotify::default(),
             cached_stream_limit: AtomicU16::new(1),
@@ -761,9 +836,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keepalive_timeout_does_not_close_query_started_while_ping_pending() {
+    async fn keepalive_timeout_retires_after_overlapping_query_finishes_without_success() {
         AppClock::start();
         let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+        let notifications = Arc::new(AtomicU32::new(0));
+        let notifications_for_callback = notifications.clone();
+        connection
+            .pool_unavailable_notify
+            .register(Arc::new(move || {
+                notifications_for_callback.fetch_add(1, Ordering::Relaxed);
+            }));
 
         let query_guard = connection
             .acquire_query_activity()
@@ -779,6 +861,48 @@ mod tests {
 
         drop(query_guard);
         assert_eq!(connection.using_count(), 0);
+        assert!(
+            !connection.available(),
+            "a failed keepalive plus a drained query with no successful response must retire the connection"
+        );
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            1,
+            "deferred retirement must notify the owning pool exactly once"
+        );
+
+        driver_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_preserves_connection_when_overlapping_query_succeeds() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+
+        let query_guard = connection
+            .acquire_query_activity()
+            .await
+            .expect("query should enter before keepalive retirement is gated");
+
+        assert!(
+            !connection.retire_after_keepalive_failure(10),
+            "retirement must wait for the overlapping query"
+        );
+
+        connection.last_used.store(11, Ordering::Relaxed);
+        drop(query_guard);
+
+        assert!(
+            connection.available(),
+            "successful DNS activity must cancel deferred keepalive retirement"
+        );
+        assert_eq!(connection.using_count(), 0);
+        assert_eq!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0,
+            "successful DNS activity must reopen query admission"
+        );
 
         driver_task.abort();
         server_task.abort();
