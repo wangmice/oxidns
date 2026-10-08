@@ -67,7 +67,12 @@ fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
     }
 }
 
-async fn run_h2_keepalive(conn: Weak<H2Connection>, mut ping_pong: PingPong, interval: Duration) {
+async fn run_h2_keepalive(
+    conn: Weak<H2Connection>,
+    mut ping_pong: PingPong,
+    interval: Duration,
+    ack_timeout: Duration,
+) {
     if interval.is_zero() {
         return;
     }
@@ -91,7 +96,7 @@ async fn run_h2_keepalive(conn: Weak<H2Connection>, mut ping_pong: PingPong, int
             continue;
         }
 
-        match timeout(H2_KEEPALIVE_ACK_TIMEOUT, ping_pong.ping(Ping::opaque())).await {
+        match timeout(ack_timeout, ping_pong.ping(Ping::opaque())).await {
             Ok(Ok(_)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Success);
                 trace!(
@@ -107,8 +112,9 @@ async fn run_h2_keepalive(conn: Weak<H2Connection>, mut ping_pong: PingPong, int
                     conn_id = conn.id,
                     upstream = %conn.upstream,
                     ?error,
-                    "H2 keepalive ping failed; disabling keepalive for this connection"
+                    "H2 keepalive ping failed; retiring connection"
                 );
+                conn.close();
                 return;
             }
             Err(_) => {
@@ -116,9 +122,10 @@ async fn run_h2_keepalive(conn: Weak<H2Connection>, mut ping_pong: PingPong, int
                 debug!(
                     conn_id = conn.id,
                     upstream = %conn.upstream,
-                    timeout_ms = H2_KEEPALIVE_ACK_TIMEOUT.as_millis(),
-                    "H2 keepalive ping timed out; disabling keepalive for this connection"
+                    timeout_ms = ack_timeout.as_millis(),
+                    "H2 keepalive ping timed out; retiring connection"
                 );
+                conn.close();
                 return;
             }
         }
@@ -445,7 +452,12 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
 
         if let (Some(ping_pong), Some(interval)) = (ping_pong, self.keepalive_interval) {
             let keepalive_conn = Arc::downgrade(&h2_conn);
-            tokio::spawn(run_h2_keepalive(keepalive_conn, ping_pong, interval));
+            tokio::spawn(run_h2_keepalive(
+                keepalive_conn,
+                ping_pong,
+                interval,
+                H2_KEEPALIVE_ACK_TIMEOUT,
+            ));
         }
 
         let _conn = h2_conn.clone();
@@ -572,6 +584,75 @@ async fn recv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keepalive_timeout_retires_connection_and_notifies_pool() {
+        AppClock::start();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _connection = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake should succeed");
+            std::future::pending::<()>().await;
+        });
+
+        let (sender, mut driver) = h2::client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let ping_pong = driver.ping_pong().expect("ping/pong should be available");
+        let driver_task = tokio::spawn(async move {
+            let _ = driver.await;
+        });
+
+        let connection = Arc::new(H2Connection {
+            connection_info: Arc::new(
+                ConnectionInfo::with_addr("https://dns.example.test/dns-query")
+                    .expect("connection info should parse"),
+            ),
+            id: 1,
+            upstream: "https://dns.example.test/dns-query".to_string(),
+            sender,
+            using_count: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+            transport_error_reported: AtomicBool::new(false),
+            last_used: AtomicU64::new(0),
+            request_uri: "/dns-query".to_string(),
+            use_post: false,
+            close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
+            pool_capacity_notify: PoolCapacityNotify::default(),
+            cached_stream_limit: AtomicU16::new(1),
+        });
+        let notifications = Arc::new(AtomicU32::new(0));
+        let notifications_for_callback = notifications.clone();
+        connection
+            .pool_unavailable_notify
+            .register(Arc::new(move || {
+                notifications_for_callback.fetch_add(1, Ordering::Relaxed);
+            }));
+
+        run_h2_keepalive(
+            Arc::downgrade(&connection),
+            ping_pong,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(
+            !connection.available(),
+            "a failed keepalive must make the H2 connection unavailable"
+        );
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            1,
+            "retiring the connection must notify its owning pool"
+        );
+
+        driver_task.abort();
+        server_task.abort();
+    }
 
     #[tokio::test]
     async fn recv_releases_flow_control_capacity_between_data_frames() {
