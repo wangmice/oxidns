@@ -29,23 +29,27 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
        - Existing v1.6.1 configurations and query-recorder databases remain usable. Run `oxidns check -c <config-file>` before upgrading and monitor storage-recovery and cleanup logs afterward.
    </ReleaseCard>
 
-   <ReleaseCard version="v1.6.1" badge="Patch Release" date="2026-10-08">
+   <ReleaseCard version="v1.6.1" badge="Minor Release" date="2026-09-27">
        **Release Scope**
 
-       - v1.6.1 focuses on upstream connection cleanup and IPv6 address parsing, fixing resources retained by background tasks after connection closure and improving connection-pool diagnostics.
+       - Compared with v1.6.0, v1.6.1 updates cache lifecycle and ECS semantics, UDP/DoH/DoQ reliability, upstream connection pools, provider file auto-reload, DoH POST, forwarding error policies, and HTTP 429 backoff recovery.
+       - New options retain compatible defaults: `runtime.provider_file_auto_reload`, DoH `use_post`, and `keepalive_interval` are disabled by default; forwarding `on_error` defaults to `fail`.
 
        **Changes**
 
-       - `fix(upstream)`: stop TCP/UDP background I/O tasks and cancel pending queries promptly when connections close. TCP senders also exit after write failures or when closure interrupts a blocked write, preventing closed connections from retaining memory and sockets.
-       - `fix(ipv6)`: recognize bracketed IPv6 literals in upstream URLs and connect directly to the IP instead of treating it as a domain requiring bootstrap resolution. Upstream probes also report these addresses as literals.
-       - `fix(logging)`: add upstream identity, host, port, and transport context to pool and connection-close logs. Record cancelled concurrent-forwarding queries at debug level to reduce warnings during normal races.
-       - `deps`: update locked Rust dependencies, including HTTP/TLS support libraries and serialization dependencies.
+       - `feat/fix(cache/ECS)`: move cache persistence to framed v3 streaming format and strengthen TTL across restarts, true age tracking, dirty state, lazy refresh, concurrent-miss coalescing, expiry cleanup, capacity limits, and ECS-scope restoration.
+       - `feat(network)`: add SOCKS5 UDP and support DoQ and DoH3 through SOCKS5; unify response-correlation validation across UDP, TCP, DoT, DoH, DoH3, and DoQ.
+       - `feat(upstream)`: strengthen connection-pool concurrency, paced expansion, cancellation, and recycling; add optional `keepalive_interval` and upstream timeout-stage metrics.
+       - `feat(provider)`: add optional file watching and auto-reload for `domain_set`, `ip_set`, `adguard_rule`, `geosite`, and `geoip`; retain the last usable snapshot when reload fails.
+       - `feat(doh/forward)`: add optional RFC 8484 POST for DoH, `on_error: fail | continue` for forwarding, and per-upstream HTTP 429 cooldown with half-open probes and exponential backoff.
+       - `fix(server/observability)`: strengthen UDP admission, shutdown/drain, reply source/interface selection, response-size limits, and sustained receive-error backoff; update WebUI metrics and configuration accordingly.
 
        **Compatibility and Upgrade Notes**
 
-       - The root crate is `1.6.1`; use release tag `v1.6.1`. Workspace support-crate versions remain unchanged.
-       - v1.6.0 YAML configurations upgrade directly. No fields are added, renamed, or removed, and existing defaults and bundles remain unchanged. Run `oxidns check -c <config-file>` before upgrading.
-       - Upgrading from v1.6.0 requires no query-history migration or Windows service reinstallation. Upgrades from earlier versions must still follow the v1.6.0 query-history and Windows service migration notes.
+       - The root crate is `1.6.1`, `oxidns-proto` is `0.1.6`, and `oxidns-ripset` is `0.1.3`; use release tag `v1.6.1`.
+       - The cache flush API changed from `GET` to `POST`; update external scripts and API clients.
+       - To use provider file auto-reload, explicitly set `runtime.provider_file_auto_reload: true`. DoH POST, upstream keepalive, and forwarding `continue` behavior must also be enabled explicitly.
+       - DoH/DoH3 now strictly validate `application/dns-message`, and DNS response-correlation checks are stricter. Responses from non-conforming third-party upstreams may be rejected after upgrading.
    </ReleaseCard>
 </div>
 
