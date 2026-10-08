@@ -17,9 +17,10 @@ use tracing::{debug, warn};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::metrics::UpstreamTimeoutStage;
+use crate::infra::network::upstream::config::ConnectionInfo;
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
-    QueryDeadline, QueryTimeoutPolicy, start_maintenance,
+    PoolSize, QueryDeadline, QueryTimeoutPolicy, start_maintenance,
 };
 use crate::infra::task as task_center;
 use crate::proto::Message;
@@ -89,6 +90,7 @@ impl SlotState {
 
 #[derive(Debug)]
 pub struct PipelinePool<C: Connection> {
+    connection_info: Arc<ConnectionInfo>,
     /// Round-robin index for load balancing across slots.
     index: AtomicUsize,
     /// List of connection slots (lock-free with ArcSwap).
@@ -251,9 +253,13 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
 
         if !close_after_swap.is_empty() {
             debug!(
-                "Pipeline pool maintenance: removed {} slots, {} active",
-                close_after_swap.len(),
-                new_len
+                upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
+                upstream_host = %self.connection_info.server_name,
+                target_ip = ?self.connection_info.remote_ip,
+                upstream_port = self.connection_info.port,
+                removed_slots = close_after_swap.len(),
+                active_slots = new_len,
+                "Pipeline pool maintenance removed connections"
             );
             self.notify_removed_pool_slot();
         }
@@ -277,8 +283,8 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
 
 impl<C: Connection> PipelinePool<C> {
     pub fn new(
-        min_size: usize,
-        max_size: usize,
+        connection_info: Arc<ConnectionInfo>,
+        size: PoolSize,
         max_load: u16,
         idle_time: Duration,
         connection_builder: Box<dyn ConnectionBuilder<C>>,
@@ -286,8 +292,8 @@ impl<C: Connection> PipelinePool<C> {
         connect_timeout: Duration,
     ) -> Arc<PipelinePool<C>> {
         Self::new_inner(
-            min_size,
-            max_size,
+            connection_info,
+            size,
             max_load,
             idle_time,
             connection_builder,
@@ -302,8 +308,8 @@ impl<C: Connection> PipelinePool<C> {
     /// worker so bursts cannot create a handshake storm.
     #[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
     pub fn new_multiplexed(
-        min_size: usize,
-        max_size: usize,
+        connection_info: Arc<ConnectionInfo>,
+        size: PoolSize,
         max_load: u16,
         idle_time: Duration,
         connection_builder: Box<dyn ConnectionBuilder<C>>,
@@ -311,8 +317,8 @@ impl<C: Connection> PipelinePool<C> {
         connect_timeout: Duration,
     ) -> Arc<PipelinePool<C>> {
         Self::new_inner(
-            min_size,
-            max_size,
+            connection_info,
+            size,
             max_load,
             idle_time,
             connection_builder,
@@ -324,8 +330,8 @@ impl<C: Connection> PipelinePool<C> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
-        min_size: usize,
-        max_size: usize,
+        connection_info: Arc<ConnectionInfo>,
+        size: PoolSize,
         max_load: u16,
         idle_time: Duration,
         connection_builder: Box<dyn ConnectionBuilder<C>>,
@@ -333,7 +339,21 @@ impl<C: Connection> PipelinePool<C> {
         connect_timeout: Duration,
         paced_expansion: Option<PacedExpansionPolicy>,
     ) -> Arc<PipelinePool<C>> {
+        let PoolSize {
+            min: min_size,
+            max: max_size,
+        } = size;
+        debug!(
+            upstream_tag = %connection_info.tag.as_deref().unwrap_or("<untagged>"),
+            upstream_host = %connection_info.server_name,
+            target_ip = ?connection_info.remote_ip,
+            upstream_port = connection_info.port,
+            min_size,
+            max_size,
+            "Creating PipelinePool"
+        );
         let pool = Arc::new_cyclic(|weak| Self {
+            connection_info,
             index: AtomicUsize::new(0),
             slots: ArcSwap::from_pointee(Vec::new()),
             reserved_slots: AtomicUsize::new(0),
@@ -821,6 +841,7 @@ impl<C: Connection> PipelinePool<C> {
         // connection timeout and may continue satisfying its old `min_size`.
         let weak = pool.self_weak.clone();
         let builder = pool.connection_builder.clone();
+        let connection_info = pool.connection_info.clone();
         let shutdown = pool.paced_build_shutdown.clone();
         let connect_timeout = pool.connect_timeout;
         let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
@@ -828,8 +849,12 @@ impl<C: Connection> PipelinePool<C> {
 
         tokio::spawn(async move {
             let deadline = QueryDeadline::background_connection(connect_timeout);
-            let build = AssertUnwindSafe(deadline.run(builder.create_connection(id, deadline)))
-                .catch_unwind();
+            let build = AssertUnwindSafe(deadline.run(builder.create_connection(
+                id,
+                deadline,
+                connection_info,
+            )))
+            .catch_unwind();
             tokio::pin!(build);
 
             let outcome = tokio::select! {
@@ -1177,7 +1202,11 @@ impl<C: Connection> PipelinePool<C> {
     ) -> Result<Option<Arc<PipelineSlot<C>>>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         match deadline
-            .run(self.connection_builder.create_connection(id, deadline))
+            .run(self.connection_builder.create_connection(
+                id,
+                deadline,
+                self.connection_info.clone(),
+            ))
             .await
         {
             DeadlineOutcome::Completed(Ok(conn)) => {
@@ -2048,6 +2077,7 @@ mod tests {
             &self,
             _conn_id: u16,
             _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
         ) -> Result<Arc<MockConnection>> {
             self.planned
                 .lock()
@@ -2068,6 +2098,7 @@ mod tests {
             &self,
             _conn_id: u16,
             _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
         ) -> Result<Arc<MockConnection>> {
             Err(DnsError::runtime(self.message))
         }
@@ -2085,6 +2116,7 @@ mod tests {
             &self,
             _conn_id: u16,
             _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
         ) -> Result<Arc<MockConnection>> {
             let call = self.calls.fetch_add(1, Ordering::AcqRel);
             if call == 0 {
@@ -2133,6 +2165,7 @@ mod tests {
             &self,
             _conn_id: u16,
             _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
         ) -> Result<Arc<MockConnection>> {
             self.stats.calls.fetch_add(1, Ordering::AcqRel);
             let _guard = LifecycleBuildGuard(self.stats.clone());
@@ -2157,6 +2190,7 @@ mod tests {
             &self,
             _conn_id: u16,
             _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
         ) -> Result<Arc<MockConnection>> {
             self.stats.calls.fetch_add(1, Ordering::AcqRel);
             let active = self.stats.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -2180,8 +2214,8 @@ mod tests {
     ) -> Arc<PipelinePool<MockConnection>> {
         AppClock::start();
         PipelinePool::new_multiplexed(
-            min_size,
-            max_size,
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(min_size, max_size),
             max_load,
             Duration::from_secs(30),
             Box::new(builder),
@@ -2224,6 +2258,7 @@ mod tests {
             .map(|conn| Arc::new(PipelineSlot::new(conn)))
             .collect();
         PipelinePool {
+            connection_info: Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
             index: AtomicUsize::new(0),
             slots: ArcSwap::from_pointee(slots),
             reserved_slots: AtomicUsize::new(0),
@@ -2852,8 +2887,8 @@ mod tests {
         AppClock::start();
         let stats = Arc::new(LifecycleBuilderStats::default());
         let pool = PipelinePool::new_multiplexed(
-            1,
-            1,
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(1, 1),
             32,
             Duration::from_secs(30),
             Box::new(LifecycleBlockingBuilder {
@@ -3661,8 +3696,8 @@ mod tests {
     async fn test_paced_worker_does_not_keep_pool_alive_during_backoff() {
         AppClock::start();
         let pool = PipelinePool::new_multiplexed(
-            1,
-            1,
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(1, 1),
             32,
             Duration::from_secs(30),
             Box::new(MockBuilder::new(vec![Err(DnsError::runtime(
@@ -3687,8 +3722,8 @@ mod tests {
     async fn test_paced_timeout_reports_recent_connection_failure() {
         AppClock::start();
         let pool = PipelinePool::new_multiplexed(
-            0,
-            1,
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(0, 1),
             32,
             Duration::from_secs(30),
             Box::new(AlwaysFailBuilder {
@@ -3778,8 +3813,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let connection = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
         let pool = PipelinePool::new_multiplexed(
-            0,
-            1,
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(0, 1),
             32,
             Duration::from_secs(30),
             Box::new(PanicOnceBuilder {

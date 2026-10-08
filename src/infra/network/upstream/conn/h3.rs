@@ -71,6 +71,7 @@ fn classify_h3_stream_error(context: &str, error: h3::error::StreamError) -> H3R
 }
 
 pub struct H3Connection {
+    connection_info: Arc<ConnectionInfo>,
     id: u16,
     upstream: String,
     sender: SendRequest<OpenStreams, Bytes>,
@@ -95,7 +96,10 @@ impl Connection for H3Connection {
             return;
         }
         debug!(conn_id = self.id,
-            upstream = %self.upstream, "Closing H3 connection");
+            upstream = %self.upstream,
+            upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
+            upstream_host = %self.connection_info.server_name,
+            upstream_port = self.connection_info.port, "Closing H3 connection");
         self.close_notify.notify_one();
     }
 
@@ -276,6 +280,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         &self,
         conn_id: u16,
         deadline: QueryDeadline,
+        connection_info: Arc<ConnectionInfo>,
     ) -> Result<Arc<H3Connection>> {
         let dial_options = QuicDialOptions::new(
             self.target.clone(),
@@ -333,6 +338,7 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         };
 
         let h3_conn = Arc::new(H3Connection {
+            connection_info,
             id: conn_id,
             upstream: self.upstream.clone(),
             sender: send_request,

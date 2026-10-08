@@ -27,6 +27,7 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
        - `fix(forward)`：修复 HTTP 429 冷却状态在 half-open probe 恢复期间丢失 backoff 的问题，保留跨 generation 的退避状态。
        - `fix(api/build)`：拒绝重复 exact/prefix API 路由，保证批量注册失败时注册表不变；修复 API-only 构建 warning，并将 `fs2` 限制到实际使用它的 feature。
        - `test(query_recorder)`：补充初始化回滚、idle writer 唤醒、清理超时/公平重试、管理并发与 full-queue 场景覆盖。
+       - `fix(upstream/ipv6)`：合入上游 v1.6.1 的连接关闭资源释放、带方括号 IPv6 字面量解析与连接池诊断日志修复；保留本地响应关联校验、SOCKS5 和多路复用连接池生命周期逻辑。
 
        **配置与升级说明**
 
@@ -62,7 +63,7 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-09
 
 <div className="release-stack">
-   <ReleaseCard version="v1.6.0" badge="Minor Release" date="2026-09-24" defaultOpen>
+   <ReleaseCard version="v1.6.0" badge="Minor Release" date="2026-09-24">
        **版本定位**
 
        - v1.6.0 更新查询记录存储与 Windows 服务恢复机制，并改进计划任务、手动下载、DNS 网络传输和 WebUI 配置编辑。

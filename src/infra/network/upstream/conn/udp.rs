@@ -32,6 +32,7 @@ use crate::proto::Message;
 /// of request IDs to response channels for asynchronous query handling.
 #[derive(Debug)]
 pub struct UdpConnection {
+    connection_info: Arc<ConnectionInfo>,
     /// Unique connection ID (for debugging/tracing)
     id: u16,
     /// Stable upstream identity used to disambiguate per-pool connection IDs.
@@ -75,6 +76,9 @@ impl Connection for UdpConnection {
         debug!(
             conn_id = self.id,
             upstream = %self.upstream,
+            upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
+            upstream_host = %self.connection_info.server_name,
+            upstream_port = self.connection_info.port,
             canceled_queries = cleared,
             "Closing UDP connection and signaling listener task"
         );
@@ -218,8 +222,10 @@ impl UdpConnection {
         upstream: String,
         transport: UdpTransport,
         request_map_capacity: u16,
+        connection_info: Arc<ConnectionInfo>,
     ) -> UdpConnection {
         Self {
+            connection_info,
             id: conn_id,
             upstream,
             transport,
@@ -260,6 +266,9 @@ impl UdpConnection {
 
             select! {
                 biased;
+                // `close()` clears pending queries and `notify_one()` latches
+                // a permit even if this listener has not registered yet.
+                _ = self.close_notify.notified() => break,
                 _ = self.transport.control_closed(), if !closing => {
                     warn!(
                         conn_id = self.id,
@@ -305,8 +314,7 @@ impl UdpConnection {
                         }
                         Err(e @ UdpReadError::Receive(_)) => {
                             if self.closed.load(Ordering::Acquire) {
-                                closing = true; // graceful shutdown path
-                                continue;
+                                break;
                             }
                             debug_assert!(e.should_backoff());
                             consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
@@ -342,11 +350,9 @@ impl UdpConnection {
                         }
                     }
                 }
-                _ = self.close_notify.notified() => {
-                    closing = true;
-                }
             }
         }
+        debug!(conn_id = self.id, "UDP listener task terminated");
     }
 }
 
@@ -396,6 +402,7 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
         &self,
         conn_id: u16,
         _deadline: QueryDeadline,
+        connection_info: Arc<ConnectionInfo>,
     ) -> Result<Arc<UdpConnection>> {
         let transport = if let Some(socks5) = self.socks5.clone() {
             UdpTransport::new_socks5(self.target.clone(), self.socket_options.clone(), socks5)
@@ -421,6 +428,7 @@ impl ConnectionBuilder<UdpConnection> for UdpConnectionBuilder {
             self.upstream.clone(),
             transport,
             self.request_map_capacity,
+            connection_info,
         );
         let arc = Arc::new(connection);
 
@@ -462,6 +470,47 @@ mod tests {
     use super::*;
     use crate::infra::network::upstream::ConnectionType;
     use crate::proto::{DNSClass, Name, Question, RecordType};
+
+    fn test_connection_info() -> Arc<ConnectionInfo> {
+        Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_close_stops_udp_listener_before_start_and_while_idle() {
+        AppClock::start();
+        for start_listener in [false, true] {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let connection = Arc::new(UdpConnection::new(
+                1,
+                "test".to_string(),
+                UdpTransport::new(socket),
+                1,
+                test_connection_info(),
+            ));
+            let weak = Arc::downgrade(&connection);
+            let (sender, receiver) = oneshot::channel();
+            let guard = connection.request_map.store(sender).unwrap();
+            let mut listener = Box::pin(connection.clone().listen_dns_response());
+            if start_listener {
+                assert!(futures::poll!(&mut listener).is_pending());
+            }
+            connection.close();
+            connection.close();
+            assert_eq!(connection.using_count(), 0);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), receiver)
+                    .await
+                    .expect("close must cancel pending queries")
+                    .is_err()
+            );
+            drop(guard);
+            drop(connection);
+            tokio::time::timeout(Duration::from_secs(1), listener)
+                .await
+                .expect("UDP listener must observe close");
+            assert!(weak.upgrade().is_none(), "listener retained the connection");
+        }
+    }
 
     #[test]
     fn test_builder_new_copies_connection_info_fields() {
@@ -535,7 +584,11 @@ mod tests {
         });
         let builder = UdpConnectionBuilder::new(&info, DEFAULT_REQUEST_MAP_CAPACITY);
         let connection = builder
-            .create_connection(1, QueryDeadline::new(Duration::from_secs(1)))
+            .create_connection(
+                1,
+                QueryDeadline::new(Duration::from_secs(1)),
+                Arc::new(info),
+            )
             .await
             .expect("SOCKS5 UDP connection should be created");
 
@@ -600,7 +653,11 @@ mod tests {
         });
         let builder = UdpConnectionBuilder::new(&info, DEFAULT_REQUEST_MAP_CAPACITY);
         let connection = builder
-            .create_connection(2, QueryDeadline::new(Duration::from_secs(1)))
+            .create_connection(
+                2,
+                QueryDeadline::new(Duration::from_secs(1)),
+                Arc::new(info),
+            )
             .await
             .expect("SOCKS5 UDP connection should be created");
 
