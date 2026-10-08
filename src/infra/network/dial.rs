@@ -124,12 +124,27 @@ impl DialTarget {
     }
 
     #[cfg(any(
+        test,
         feature = "_tls-client",
         feature = "_dns-client-doq",
         feature = "_dns-client-doh3"
     ))]
     fn server_name(&self) -> &str {
-        self.host.as_str()
+        // Keep `host` unchanged for DNS resolution and HTTP authority formatting;
+        // TLS libraries require IPv6 identities without URI authority brackets.
+        let Some(unbracketed) = self
+            .host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return self.host.as_str();
+        };
+
+        if matches!(unbracketed.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            unbracketed
+        } else {
+            self.host.as_str()
+        }
     }
 }
 
@@ -693,6 +708,30 @@ mod tests {
 
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn dial_target_uses_unbracketed_ipv6_for_tls_identity() {
+        let target = DialTarget::new(
+            Some("2001:db8::1".parse().expect("IPv6 should parse")),
+            "[2001:db8::1]".to_string(),
+            853,
+        );
+
+        assert_eq!(target.server_name(), "2001:db8::1");
+        assert_eq!(target.host(), "[2001:db8::1]");
+        #[cfg(feature = "_tls-client")]
+        assert!(
+            ServerName::try_from(target.server_name().to_string()).is_ok(),
+            "unbracketed IPv6 literal should be a valid TLS server identity"
+        );
+    }
+
+    #[test]
+    fn dial_target_preserves_dns_names_for_tls_identity() {
+        let target = DialTarget::new(None, "dns.example.test".to_string(), 853);
+
+        assert_eq!(target.server_name(), "dns.example.test");
     }
 
     #[test]
