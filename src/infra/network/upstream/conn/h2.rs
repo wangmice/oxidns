@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -15,7 +17,7 @@ use tokio::sync::Notify;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, trace, warn};
 
-use super::{PoolCapacityNotify, PoolUnavailableNotify, UsingCountGuard};
+use super::{PoolCapacityNotify, PoolUnavailableNotify};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
@@ -37,6 +39,23 @@ use crate::proto::Message;
 const H2_DATA_FRAME_BUDGET: usize = 256 * 1024;
 const H2_KEEPALIVE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const H2_STREAM_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+
+// Pack lifecycle bits and the in-flight query count into one atomic word.
+// Query admission and failed-keepalive retirement therefore share one atomic
+// modification order, closing the race without a mutex or a CAS loop on the
+// H2 query hot path.
+const H2_ACTIVITY_COUNT_MASK: u64 = u32::MAX as u64;
+const H2_ACTIVITY_KEEPALIVE_GATE: u64 = 1 << 62;
+const H2_ACTIVITY_CLOSED: u64 = 1 << 63;
+const H2_ACTIVITY_STATE_MASK: u64 = H2_ACTIVITY_KEEPALIVE_GATE | H2_ACTIVITY_CLOSED;
+
+struct H2ActivityGuard<'a>(&'a AtomicU64);
+
+impl Drop for H2ActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 #[inline]
 fn h2_pool_stream_limit(peer_limit: usize) -> u16 {
@@ -84,14 +103,15 @@ async fn run_h2_keepalive(
         let Some(conn) = conn.upgrade() else {
             return;
         };
-        if conn.closed.load(Ordering::Acquire) {
+        if conn.is_closed() {
             return;
         }
-        if conn.using_count.load(Ordering::Relaxed) != 0 {
+        if conn.using_count() != 0 {
             continue;
         }
 
-        let idle_ms = AppClock::elapsed_millis().saturating_sub(conn.last_used());
+        let last_used_before_ping = conn.last_used();
+        let idle_ms = AppClock::elapsed_millis().saturating_sub(last_used_before_ping);
         if idle_ms < interval_ms {
             continue;
         }
@@ -108,24 +128,40 @@ async fn run_h2_keepalive(
             }
             Ok(Err(error)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Failed);
-                debug!(
-                    conn_id = conn.id,
-                    upstream = %conn.upstream,
-                    ?error,
-                    "H2 keepalive ping failed; retiring connection"
-                );
-                conn.close();
+                if conn.retire_after_keepalive_failure(last_used_before_ping) {
+                    debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        ?error,
+                        "H2 keepalive ping failed; retiring idle connection"
+                    );
+                } else {
+                    debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        ?error,
+                        "H2 keepalive ping failed during DNS activity; keeping connection open and disabling keepalive"
+                    );
+                }
                 return;
             }
             Err(_) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
-                debug!(
-                    conn_id = conn.id,
-                    upstream = %conn.upstream,
-                    timeout_ms = ack_timeout.as_millis(),
-                    "H2 keepalive ping timed out; retiring connection"
-                );
-                conn.close();
+                if conn.retire_after_keepalive_failure(last_used_before_ping) {
+                    debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        timeout_ms = ack_timeout.as_millis(),
+                        "H2 keepalive ping timed out; retiring idle connection"
+                    );
+                } else {
+                    debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        timeout_ms = ack_timeout.as_millis(),
+                        "H2 keepalive ping timed out during DNS activity; keeping connection open and disabling keepalive"
+                    );
+                }
                 return;
             }
         }
@@ -138,8 +174,8 @@ pub struct H2Connection {
     id: u16,
     upstream: String,
     sender: SendRequest<Bytes>,
-    using_count: AtomicU32,
-    closed: AtomicBool,
+    /// Lifecycle bits plus the lower 32-bit in-flight query count.
+    activity: AtomicU64,
     transport_error_reported: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
@@ -168,30 +204,26 @@ impl Connection for H2Connection {
     }
 
     async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(DnsError::protocol("DoH connection closed"));
-        }
-        self.using_count.fetch_add(1, Ordering::Relaxed);
-        // Guard ensures using_count is decremented even if this future is
-        // cancelled by an outer timeout (cancel-safety).
-        let _guard = UsingCountGuard(&self.using_count);
-        if self.closed.load(Ordering::Acquire) {
+        let _guard = self.acquire_query_activity().await?;
+        // Preserve the old second close check so a transport error that races
+        // query admission is observed before a new H2 stream starts.
+        if self.is_closed() {
             return Err(DnsError::protocol("DoH connection closed"));
         }
         self.query_inner(request).await
     }
 
     fn using_count(&self) -> u32 {
-        self.using_count.load(Ordering::Relaxed)
+        (self.activity.load(Ordering::Relaxed) & H2_ACTIVITY_COUNT_MASK) as u32
     }
 
     fn available(&self) -> bool {
-        !self.closed.load(Ordering::Acquire)
+        !self.is_closed()
     }
 
     fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         self.pool_unavailable_notify.register(notify);
-        if self.closed.load(Ordering::Acquire) {
+        if self.is_closed() {
             self.pool_unavailable_notify.notify_pool();
         }
     }
@@ -225,8 +257,71 @@ impl H2Connection {
         }
     }
 
+    #[inline]
+    fn is_closed(&self) -> bool {
+        self.activity.load(Ordering::Acquire) & H2_ACTIVITY_CLOSED != 0
+    }
+
+    async fn acquire_query_activity(&self) -> Result<H2ActivityGuard<'_>> {
+        loop {
+            // `fetch_add` participates in the same modification order as the
+            // keepalive gate's `fetch_or`. A query admitted before the gate is
+            // visible to retirement; a query arriving after it cannot start
+            // protocol work and simply retries once the cold-path gate clears.
+            let previous = self.activity.fetch_add(1, Ordering::AcqRel);
+            let state = previous & H2_ACTIVITY_STATE_MASK;
+
+            if previous & H2_ACTIVITY_COUNT_MASK == H2_ACTIVITY_COUNT_MASK {
+                self.activity.fetch_sub(1, Ordering::Release);
+                return Err(DnsError::protocol("H2 in-flight query counter exhausted"));
+            }
+
+            if state & H2_ACTIVITY_CLOSED != 0 {
+                self.activity.fetch_sub(1, Ordering::Release);
+                return Err(DnsError::protocol("DoH connection closed"));
+            }
+
+            if state & H2_ACTIVITY_KEEPALIVE_GATE != 0 {
+                self.activity.fetch_sub(1, Ordering::Release);
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            return Ok(H2ActivityGuard(&self.activity));
+        }
+    }
+
+    fn retire_after_keepalive_failure(&self, observed_last_used: u64) -> bool {
+        // Gate new query admission first. Because this is the same atomic word
+        // as the in-flight count, `previous` is an exact snapshot of whether a
+        // query won admission before the keepalive retirement gate.
+        let previous = self
+            .activity
+            .fetch_or(H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
+
+        if previous & H2_ACTIVITY_CLOSED != 0 {
+            return true;
+        }
+
+        let had_active_query = previous & H2_ACTIVITY_COUNT_MASK != 0;
+        // A successful query that completed while the PING was pending proves
+        // useful transport activity. The guard's Release decrement and this
+        // AcqRel RMW make the preceding last_used update visible here.
+        let had_successful_activity = self.last_used.load(Ordering::Acquire) != observed_last_used;
+
+        if had_active_query || had_successful_activity {
+            self.activity
+                .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::Release);
+            return self.is_closed();
+        }
+
+        self.close();
+        true
+    }
+
     fn mark_closed(&self) -> bool {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        let previous = self.activity.fetch_or(H2_ACTIVITY_CLOSED, Ordering::AcqRel);
+        if previous & H2_ACTIVITY_CLOSED != 0 {
             return false;
         }
         self.pool_unavailable_notify.notify_pool();
@@ -438,10 +533,9 @@ impl ConnectionBuilder<H2Connection> for H2ConnectionBuilder {
             id: conn_id,
             upstream: self.upstream.clone(),
             sender,
-            closed: AtomicBool::new(false),
+            activity: AtomicU64::new(0),
             transport_error_reported: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
             use_post: self.use_post,
             close_notify: Notify::new(),
@@ -585,9 +679,14 @@ async fn recv(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn keepalive_timeout_retires_connection_and_notifies_pool() {
-        AppClock::start();
+    async fn test_h2_connection(
+        last_used: u64,
+    ) -> (
+        Arc<H2Connection>,
+        PingPong,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (client_io, server_io) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             let _connection = h2::server::handshake(server_io)
@@ -613,10 +712,9 @@ mod tests {
             id: 1,
             upstream: "https://dns.example.test/dns-query".to_string(),
             sender,
-            using_count: AtomicU32::new(0),
-            closed: AtomicBool::new(false),
+            activity: AtomicU64::new(0),
             transport_error_reported: AtomicBool::new(false),
-            last_used: AtomicU64::new(0),
+            last_used: AtomicU64::new(last_used),
             request_uri: "/dns-query".to_string(),
             use_post: false,
             close_notify: Notify::new(),
@@ -624,6 +722,14 @@ mod tests {
             pool_capacity_notify: PoolCapacityNotify::default(),
             cached_stream_limit: AtomicU16::new(1),
         });
+
+        (connection, ping_pong, driver_task, server_task)
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_retires_connection_and_notifies_pool() {
+        AppClock::start();
+        let (connection, ping_pong, driver_task, server_task) = test_h2_connection(0).await;
         let notifications = Arc::new(AtomicU32::new(0));
         let notifications_for_callback = notifications.clone();
         connection
@@ -649,6 +755,53 @@ mod tests {
             1,
             "retiring the connection must notify its owning pool"
         );
+
+        driver_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_does_not_close_query_started_while_ping_pending() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+
+        let query_guard = connection
+            .acquire_query_activity()
+            .await
+            .expect("query should enter before keepalive retirement is gated");
+
+        assert!(
+            !connection.retire_after_keepalive_failure(10),
+            "a query admitted while the ping is pending must defer retirement"
+        );
+        assert!(connection.available());
+        assert_eq!(connection.using_count(), 1);
+
+        drop(query_guard);
+        assert_eq!(connection.using_count(), 0);
+
+        driver_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_preserves_connection_after_query_completed_while_ping_pending() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+
+        let query_guard = connection
+            .acquire_query_activity()
+            .await
+            .expect("query should enter before keepalive retirement is gated");
+        connection.last_used.store(11, Ordering::Relaxed);
+        drop(query_guard);
+
+        assert!(
+            !connection.retire_after_keepalive_failure(10),
+            "successful DNS activity during the pending ping must preserve the connection"
+        );
+        assert!(connection.available());
+        assert_eq!(connection.using_count(), 0);
 
         driver_task.abort();
         server_task.abort();
