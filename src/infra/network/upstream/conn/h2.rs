@@ -12,7 +12,7 @@ use h2::{Ping, PingPong, SendStream};
 use http::Version;
 use tokio::select;
 use tokio::sync::Notify;
-use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, trace, warn};
 
 use super::{PoolCapacityNotify, PoolUnavailableNotify};
@@ -116,6 +116,22 @@ fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
     }
 }
 
+async fn poll_keepalive_probe_until_timeout<F>(
+    mut probe: std::pin::Pin<&mut F>,
+    ack_timeout: Duration,
+) -> Option<F::Output>
+where
+    F: std::future::Future + ?Sized,
+{
+    let timeout_sleep = sleep(ack_timeout);
+    tokio::pin!(timeout_sleep);
+    select! {
+        biased;
+        result = probe.as_mut() => Some(result),
+        _ = timeout_sleep.as_mut() => None,
+    }
+}
+
 async fn run_h2_keepalive(
     conn: Weak<H2Connection>,
     mut ping_pong: PingPong,
@@ -151,8 +167,10 @@ async fn run_h2_keepalive(
             continue;
         }
 
-        match timeout(ack_timeout, ping_pong.ping(Ping::opaque())).await {
-            Ok(Ok(_)) => {
+        let ping = ping_pong.ping(Ping::opaque());
+        tokio::pin!(ping);
+        match poll_keepalive_probe_until_timeout(ping.as_mut(), ack_timeout).await {
+            Some(Ok(_)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Success);
                 trace!(
                     conn_id = conn.id,
@@ -161,7 +179,7 @@ async fn run_h2_keepalive(
                     "H2 keepalive ping acknowledged"
                 );
             }
-            Ok(Err(error)) => {
+            Some(Err(error)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Failed);
                 match conn.retire_after_keepalive_failure(success_generation_before_ping) {
                     H2KeepaliveRetirement::Retired => debug!(
@@ -185,9 +203,11 @@ async fn run_h2_keepalive(
                 }
                 return;
             }
-            Err(_) => {
+            None => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
-                match conn.retire_after_keepalive_failure(success_generation_before_ping) {
+                let retirement =
+                    conn.retire_after_keepalive_failure(success_generation_before_ping);
+                match retirement {
                     H2KeepaliveRetirement::Retired => debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
@@ -207,7 +227,39 @@ async fn run_h2_keepalive(
                         "H2 keepalive ping timed out, but overlapping DNS activity proved the connection healthy"
                     ),
                 }
-                return;
+                if retirement == H2KeepaliveRetirement::Retired {
+                    return;
+                }
+
+                // `h2` permits only one user PING at a time. Dropping the
+                // timed-out future leaves that PING pending internally, so a
+                // preserved connection could never start keepalive again.
+                // Keep polling the same probe until a late PONG (or transport
+                // closure) resolves it. Do not retain the H2Connection itself
+                // while waiting indefinitely.
+                let weak_conn = Arc::downgrade(&conn);
+                drop(conn);
+                match ping.await {
+                    Ok(_) => {
+                        let Some(conn) = weak_conn.upgrade() else {
+                            return;
+                        };
+                        if conn.is_closed() {
+                            return;
+                        }
+                        let reopened_gate = conn.clear_keepalive_retirement_gate();
+                        trace!(
+                            conn_id = conn.id,
+                            upstream = %conn.upstream,
+                            reopened_gate,
+                            "H2 keepalive late ping acknowledgement received"
+                        );
+                    }
+                    Err(error) => {
+                        debug!(?error, "H2 keepalive pending ping failed after timeout");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -365,18 +417,24 @@ impl H2Connection {
         self.keepalive_gate_notify.notify_waiters();
     }
 
+    fn clear_keepalive_retirement_gate(&self) -> bool {
+        let previous = self
+            .activity
+            .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
+        if previous & H2_ACTIVITY_KEEPALIVE_GATE == 0 {
+            return false;
+        }
+        self.wake_keepalive_gate_waiters();
+        true
+    }
+
     fn cancel_keepalive_retirement_if_successful(&self) -> bool {
         let observed_generation = self.keepalive_failure_generation.load(Ordering::Acquire);
         if self.success_generation.load(Ordering::Acquire) == observed_generation {
             return false;
         }
 
-        let previous = self
-            .activity
-            .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
-        if previous & H2_ACTIVITY_KEEPALIVE_GATE != 0 {
-            self.wake_keepalive_gate_waiters();
-        }
+        let _ = self.clear_keepalive_retirement_gate();
         true
     }
 
@@ -910,6 +968,70 @@ mod tests {
         });
 
         (connection, ping_pong, driver_task, server_task)
+    }
+
+    #[tokio::test]
+    async fn keepalive_timeout_keeps_pending_probe_alive_for_late_completion() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<u8>();
+        let probe = async move {
+            receiver
+                .await
+                .expect("late keepalive completion should still be observed")
+        };
+        tokio::pin!(probe);
+
+        assert_eq!(
+            poll_keepalive_probe_until_timeout(probe.as_mut(), Duration::from_millis(1)).await,
+            None,
+            "the first wait should report timeout without consuming the pending probe"
+        );
+        sender
+            .send(7)
+            .expect("timed-out probe future must still be alive");
+        assert_eq!(probe.await, 7);
+    }
+
+    #[tokio::test]
+    async fn late_keepalive_ack_reopens_deferred_gate_without_dns_success() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+        let slow_query = connection
+            .acquire_query_activity()
+            .await
+            .expect("query should enter before keepalive retirement is gated");
+
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Deferred
+        );
+        assert_ne!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0,
+            "failed keepalive must gate admission while liveness is unresolved"
+        );
+
+        assert!(
+            connection.clear_keepalive_retirement_gate(),
+            "a late PONG must cancel deferred retirement"
+        );
+        assert_eq!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0
+        );
+
+        let admitted_query = tokio::time::timeout(
+            Duration::from_millis(50),
+            connection.acquire_query_activity(),
+        )
+        .await
+        .expect("late PONG must reopen admission before the old slow query drains")
+        .expect("connection should remain available after late PONG");
+        drop(admitted_query);
+        drop(slow_query);
+        assert!(connection.available());
+
+        driver_task.abort();
+        server_task.abort();
     }
 
     #[test]
