@@ -10,7 +10,31 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-10
 
 <div className="release-stack">
-   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01" defaultOpen>
+   <ReleaseCard version="v1.6.3" badge="Patch Release" date="2026-10-08" defaultOpen>
+       **版本定位**
+
+       - Patch Release。v1.6.3 聚焦 DoH HTTP/2 keepalive 与并发查询的生命周期竞争，并完善 IPv6 上游连接、关闭资源回收和连接池诊断。
+       - 没有新增配置字段或改变默认值；DoH2 的超长空闲超时与 keepalive 间隔新增校验限制，升级前请检查相关配置。
+
+       **主要变更**
+
+       - `fix(upstream/DoH2)`：keepalive PING 失败或超时时回收失效空闲连接并通知连接池，不再仅停用 keepalive 后继续复用该连接。
+       - `fix(upstream/DoH2)`：查询准入与连接回收使用统一原子状态，避免 PING 失败误杀重叠查询；等待在途查询完成后决定是否回收，任一通过校验的成功 DNS 响应会立即解除回收门控，不必等待其他慢查询。
+       - `refactor(upstream/DoH2)`：活动计数、成功响应 generation 和空闲时间跟踪采用 32 位原子，并补充时间 tick 回绕测试；正常查询路径不引入全局锁。
+       - `fix(network/IPv6)`：正确识别 URL 中带方括号的 IPv6 字面量，避免误走 bootstrap 域名解析；TLS server identity 去除 IPv6 方括号，同时保留原始主机与 HTTP authority 格式。
+       - `fix(upstream/lifecycle)`：合入上游连接关闭资源释放修复，并补充 UDP listener、TCP 收发任务、写入失败及阻塞写取消的回归测试。
+       - `fix(upstream/diagnostics)`：连接池和关闭日志增加 upstream tag、主机、端口及传输信息；正常并发转发中的查询取消降为 debug 日志。
+       - `chore(deps)`：更新 Rust 依赖；本次未修改 support crate 代码或版本。
+
+       **配置与升级说明**
+
+       - 根 crate 版本为 `1.6.3`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；release tag 使用 `v1.6.3`。
+       - v1.6.2 常规 YAML 配置、缓存文件和 query recorder 数据库无需迁移。替换二进制前运行 `oxidns check -c <配置文件>`。
+       - **DoH2 时长限制**：未启用 HTTP/3 的 DoH 上游，其有效 `idle_timeout` 与启用的 `keepalive_interval` 必须小于 `2^32` 毫秒（约 49.7 天）；达到或超过该值的配置现在会被拒绝，需缩短时长后升级。其他传输及启用 HTTP/3 的 DoH 不受此新增限制影响。
+       - `keepalive_interval` 仍默认关闭；已启用时建议升级后观察 keepalive、连接回收及 upstream timeout 日志。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01">
        **版本定位**
 
        - Patch Release。v1.6.2 聚焦 `query_recorder` 存储故障恢复、管理操作、定期清理、优雅关闭与插件初始化生命周期稳定性。

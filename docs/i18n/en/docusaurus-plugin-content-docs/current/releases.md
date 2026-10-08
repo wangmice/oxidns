@@ -10,7 +10,31 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-10
 
 <div className="release-stack">
-   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01" defaultOpen>
+   <ReleaseCard version="v1.6.3" badge="Patch Release" date="2026-10-08" defaultOpen>
+       **Release Scope**
+
+       - v1.6.3 is a Patch Release focused on DoH HTTP/2 keepalive races with concurrent queries, IPv6 upstream connections, connection cleanup, and pool diagnostics.
+       - No configuration fields are added and defaults remain unchanged. New validation limits very long DoH2 idle timeouts and keepalive intervals; check these settings before upgrading.
+
+       **Changes**
+
+       - `fix(upstream/DoH2)`: retire failed idle connections and notify the pool after a keepalive PING failure or timeout, instead of only disabling keepalive and continuing to reuse the connection.
+       - `fix(upstream/DoH2)`: coordinate query admission and retirement through one atomic state to avoid killing overlapping queries. Defer retirement until in-flight queries finish; any validated successful DNS response immediately reopens admission without waiting for unrelated slow queries.
+       - `refactor(upstream/DoH2)`: use 32-bit atomics for activity counts, successful-response generations, and idle tracking, with tick-wrap regression tests and no global lock on the normal query path.
+       - `fix(network/IPv6)`: recognize bracketed IPv6 URL literals without domain bootstrap resolution and remove IPv6 brackets from TLS server identities while preserving the original host and HTTP authority format.
+       - `fix(upstream/lifecycle)`: integrate upstream connection-cleanup fixes and add regression coverage for UDP listeners, TCP I/O tasks, write failures, and cancellation of blocked writes.
+       - `fix(upstream/diagnostics)`: include upstream tags, hosts, ports, and transport details in pool and close logs; log normal concurrent-forwarding query cancellation at debug level.
+       - `chore(deps)`: update Rust dependencies; support-crate code and versions are unchanged in this release.
+
+       **Compatibility and Upgrade Notes**
+
+       - The root crate is `1.6.3`, `oxidns-proto` is `0.1.6`, and `oxidns-ripset` is `0.1.3`; use release tag `v1.6.3`.
+       - Normal v1.6.2 YAML configurations, cache files, and query-recorder databases require no migration. Run `oxidns check -c <config-file>` before replacing the binary.
+       - **DoH2 duration limits**: for DoH upstreams without HTTP/3 enabled, the effective `idle_timeout` and enabled `keepalive_interval` must be less than `2^32` milliseconds (approximately 49.7 days). Configurations at or above this limit are now rejected; shorten these durations before upgrading. This new limit does not apply to other transports or DoH with HTTP/3 enabled.
+       - `keepalive_interval` remains disabled by default. If enabled, monitor keepalive, connection-retirement, and upstream-timeout logs after upgrading.
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01">
        **Release Scope**
 
        - v1.6.2 hardens `query_recorder` storage recovery, management operations, periodic cleanup, graceful shutdown, and initialization rollback.
