@@ -99,6 +99,13 @@ enum H2RecvError {
     InvalidResponse(DnsError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H2KeepaliveRetirement {
+    Retired,
+    Deferred,
+    Preserved,
+}
+
 fn classify_h2_error(context: &str, error: h2::Error) -> H2RecvError {
     let connection_scoped = error.is_go_away() || error.is_io();
     let error = DnsError::protocol(format!("{context}: {error}"));
@@ -156,39 +163,49 @@ async fn run_h2_keepalive(
             }
             Ok(Err(error)) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Failed);
-                if conn.retire_after_keepalive_failure(success_generation_before_ping) {
-                    debug!(
+                match conn.retire_after_keepalive_failure(success_generation_before_ping) {
+                    H2KeepaliveRetirement::Retired => debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         ?error,
                         "H2 keepalive ping failed; retiring idle connection"
-                    );
-                } else {
-                    debug!(
+                    ),
+                    H2KeepaliveRetirement::Deferred => debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         ?error,
                         "H2 keepalive ping failed during DNS activity; deferring retirement until overlapping queries drain"
-                    );
+                    ),
+                    H2KeepaliveRetirement::Preserved => debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        ?error,
+                        "H2 keepalive ping failed, but overlapping DNS activity proved the connection healthy"
+                    ),
                 }
                 return;
             }
             Err(_) => {
                 upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
-                if conn.retire_after_keepalive_failure(success_generation_before_ping) {
-                    debug!(
+                match conn.retire_after_keepalive_failure(success_generation_before_ping) {
+                    H2KeepaliveRetirement::Retired => debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         timeout_ms = ack_timeout.as_millis(),
                         "H2 keepalive ping timed out; retiring idle connection"
-                    );
-                } else {
-                    debug!(
+                    ),
+                    H2KeepaliveRetirement::Deferred => debug!(
                         conn_id = conn.id,
                         upstream = %conn.upstream,
                         timeout_ms = ack_timeout.as_millis(),
                         "H2 keepalive ping timed out during DNS activity; deferring retirement until overlapping queries drain"
-                    );
+                    ),
+                    H2KeepaliveRetirement::Preserved => debug!(
+                        conn_id = conn.id,
+                        upstream = %conn.upstream,
+                        timeout_ms = ack_timeout.as_millis(),
+                        "H2 keepalive ping timed out, but overlapping DNS activity proved the connection healthy"
+                    ),
                 }
                 return;
             }
@@ -314,28 +331,53 @@ impl H2Connection {
 
     fn release_query_activity(&self) {
         let previous = self.activity.fetch_sub(1, Ordering::AcqRel);
-        let previous_count = previous & H2_ACTIVITY_COUNT_MASK;
         debug_assert!(
             previous & H2_ACTIVITY_QUERY_MASK != 0,
             "H2 query activity counter underflow"
         );
 
-        // Failed keepalive retirement keeps admission gated while pre-existing
-        // DNS work drains. Whichever decrement takes the count from one to
-        // zero owns the final decision. This also covers a query that arrived
-        // after the gate, temporarily incremented the packed count, and then
-        // backed out before waiting.
-        if previous_count == 1
-            && previous & H2_ACTIVITY_COUNT_OVERFLOW == 0
-            && previous & H2_ACTIVITY_KEEPALIVE_GATE != 0
-            && previous & H2_ACTIVITY_CLOSED == 0
-        {
+        // Keep the normal query-completion path to one packed-state bit test.
+        // Generation loads and gate mutation stay on the failed-keepalive path.
+        if previous & H2_ACTIVITY_KEEPALIVE_GATE == 0 {
+            return;
+        }
+        if previous & (H2_ACTIVITY_COUNT_OVERFLOW | H2_ACTIVITY_CLOSED) != 0 {
+            return;
+        }
+
+        // A single validated response is enough to disprove the failed PING as
+        // a connection-level liveness signal. Reopen admission immediately;
+        // do not make new queries wait for unrelated slow streams to drain.
+        if self.cancel_keepalive_retirement_if_successful() {
+            return;
+        }
+
+        // With no successful DNS evidence yet, only the final overlapping
+        // activity release may turn the failed PING into connection retirement.
+        // This also covers a query that arrived after the gate, temporarily
+        // incremented the packed count, and then backed out before waiting.
+        if previous & H2_ACTIVITY_COUNT_MASK == 1 {
             let _ = self.finish_keepalive_retirement();
         }
     }
 
     fn wake_keepalive_gate_waiters(&self) {
         self.keepalive_gate_notify.notify_waiters();
+    }
+
+    fn cancel_keepalive_retirement_if_successful(&self) -> bool {
+        let observed_generation = self.keepalive_failure_generation.load(Ordering::Acquire);
+        if self.success_generation.load(Ordering::Acquire) == observed_generation {
+            return false;
+        }
+
+        let previous = self
+            .activity
+            .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
+        if previous & H2_ACTIVITY_KEEPALIVE_GATE != 0 {
+            self.wake_keepalive_gate_waiters();
+        }
+        true
     }
 
     async fn acquire_query_activity(&self) -> Result<H2ActivityGuard<'_>> {
@@ -393,7 +435,10 @@ impl H2Connection {
         }
     }
 
-    fn retire_after_keepalive_failure(&self, observed_success_generation: u32) -> bool {
+    fn retire_after_keepalive_failure(
+        &self,
+        observed_success_generation: u32,
+    ) -> H2KeepaliveRetirement {
         // Publish the successful-response generation before the gate. Any query
         // release that observes the gate is therefore guaranteed to see this
         // baseline and can detect useful DNS activity while the PING was pending.
@@ -408,41 +453,50 @@ impl H2Connection {
             .fetch_or(H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
 
         if previous & H2_ACTIVITY_CLOSED != 0 {
-            return true;
+            return H2KeepaliveRetirement::Retired;
+        }
+
+        // Useful DNS traffic may already have completed while the PING was
+        // pending. In that case the failed PING is stale evidence: reopen
+        // admission immediately even if another older stream is still slow.
+        if self.cancel_keepalive_retirement_if_successful() {
+            return if self.is_closed() {
+                H2KeepaliveRetirement::Retired
+            } else {
+                H2KeepaliveRetirement::Preserved
+            };
         }
 
         if previous & H2_ACTIVITY_QUERY_MASK != 0 {
             // Do not kill a stream that entered while the PING was pending.
-            // Keep the admission gate set, however, so this retirement attempt
-            // cannot be defeated by an endless stream of new queries. The last
-            // overlapping activity release will finish the decision.
-            return false;
+            // Keep the admission gate set only while there is still no
+            // successful DNS evidence. Any successful release will reopen it.
+            return H2KeepaliveRetirement::Deferred;
         }
 
         self.finish_keepalive_retirement()
     }
 
-    fn finish_keepalive_retirement(&self) -> bool {
+    fn finish_keepalive_retirement(&self) -> H2KeepaliveRetirement {
         if self.is_closed() {
-            return true;
+            return H2KeepaliveRetirement::Retired;
         }
 
-        let observed_generation = self.keepalive_failure_generation.load(Ordering::Acquire);
-        // A generation change proves that at least one validated DNS response
-        // completed while the PING was pending. This remains correct even when
-        // the response lands in the same millisecond as the keepalive snapshot.
-        if self.success_generation.load(Ordering::Acquire) != observed_generation {
-            self.activity
-                .fetch_and(!H2_ACTIVITY_KEEPALIVE_GATE, Ordering::AcqRel);
-            self.wake_keepalive_gate_waiters();
-            return self.is_closed();
+        // Re-check successful DNS activity because a response may race the last
+        // overlapping query release after an earlier cold-path check.
+        if self.cancel_keepalive_retirement_if_successful() {
+            return if self.is_closed() {
+                H2KeepaliveRetirement::Retired
+            } else {
+                H2KeepaliveRetirement::Preserved
+            };
         }
 
         // The PING failed and every overlapping DNS query drained without a
         // successful response. Treat that combination as connection-level
         // liveness failure and let the pool build a replacement.
         self.close();
-        true
+        H2KeepaliveRetirement::Retired
     }
 
     fn mark_closed(&self) -> bool {
@@ -934,8 +988,9 @@ mod tests {
             .await
             .expect("query should enter before keepalive retirement is gated");
 
-        assert!(
-            !connection.retire_after_keepalive_failure(0),
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Deferred,
             "a query admitted while the ping is pending must defer retirement"
         );
         assert!(connection.available());
@@ -958,6 +1013,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keepalive_failure_reopens_gate_when_success_precedes_failure_with_slow_query() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+
+        let successful_query = connection
+            .acquire_query_activity()
+            .await
+            .expect("successful query should enter before the keepalive failure");
+        let slow_query = connection
+            .acquire_query_activity()
+            .await
+            .expect("slow query should enter before the keepalive failure");
+
+        connection
+            .success_generation
+            .fetch_add(1, Ordering::Release);
+        drop(successful_query);
+        assert_eq!(connection.using_count(), 1);
+
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Preserved,
+            "success during the pending PING must cancel retirement immediately"
+        );
+        assert_eq!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0,
+            "a prior successful response must not leave admission gated behind a slow query"
+        );
+
+        let admitted_query = tokio::time::timeout(
+            Duration::from_millis(50),
+            connection.acquire_query_activity(),
+        )
+        .await
+        .expect("new query should not wait for the slow overlapping query")
+        .expect("connection should remain available after successful DNS activity");
+        drop(admitted_query);
+
+        drop(slow_query);
+        assert!(connection.available());
+
+        driver_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_failure_reopens_gate_on_first_success_while_slow_query_remains() {
+        AppClock::start();
+        let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
+
+        let successful_query = connection
+            .acquire_query_activity()
+            .await
+            .expect("successful query should enter before keepalive retirement is gated");
+        let slow_query = connection
+            .acquire_query_activity()
+            .await
+            .expect("slow query should enter before keepalive retirement is gated");
+
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Deferred,
+            "failed PING must initially wait while no DNS query has succeeded"
+        );
+        assert_ne!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0,
+            "admission must remain gated until useful DNS activity proves transport health"
+        );
+
+        connection
+            .success_generation
+            .fetch_add(1, Ordering::Release);
+        drop(successful_query);
+
+        assert_eq!(connection.using_count(), 1);
+        assert_eq!(
+            connection.activity.load(Ordering::Acquire) & H2_ACTIVITY_KEEPALIVE_GATE,
+            0,
+            "the first successful overlapping response must reopen admission immediately"
+        );
+
+        let admitted_query = tokio::time::timeout(
+            Duration::from_millis(50),
+            connection.acquire_query_activity(),
+        )
+        .await
+        .expect("new query should be released before the unrelated slow query drains")
+        .expect("connection should remain available after successful DNS activity");
+        drop(admitted_query);
+
+        drop(slow_query);
+        assert!(connection.available());
+
+        driver_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
     async fn keepalive_timeout_preserves_connection_when_overlapping_query_succeeds() {
         AppClock::start();
         let (connection, _ping_pong, driver_task, server_task) = test_h2_connection(10).await;
@@ -967,8 +1122,9 @@ mod tests {
             .await
             .expect("query should enter before keepalive retirement is gated");
 
-        assert!(
-            !connection.retire_after_keepalive_failure(0),
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Deferred,
             "retirement must wait for the overlapping query"
         );
 
@@ -1010,8 +1166,9 @@ mod tests {
             .fetch_add(1, Ordering::Release);
         drop(query_guard);
 
-        assert!(
-            !connection.retire_after_keepalive_failure(0),
+        assert_eq!(
+            connection.retire_after_keepalive_failure(0),
+            H2KeepaliveRetirement::Preserved,
             "successful DNS activity during the pending ping must preserve the connection"
         );
         assert!(connection.available());
