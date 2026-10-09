@@ -138,7 +138,7 @@ regex = "1.13"
 # Executor plugin dependencies, each gated by its own feature.
 cronexpr = { version = "1.7", optional = true }
 fast-socks5 = "1.0"
-mikrotik-rs = { package = "oxidns-mikrotik-rs", version = "0.8.1", optional = true }
+mikrotik-rs = { version = "0.9", optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/zoneparser", optional = true }
 
