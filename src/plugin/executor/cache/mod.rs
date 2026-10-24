@@ -1857,24 +1857,54 @@ impl Plugin for Cache {
         }
         register_metric_source(Arc::new(CacheMetricSource::new(self.store.clone())))?;
 
-        if let Some(dump_file) = &self.config.dump_file {
-            let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
-            let task_id =
-                self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval)?;
-            *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
+        let task_init: Result<()> = (|| {
+            if let Some(dump_file) = &self.config.dump_file {
+                let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
+                let task_id =
+                    self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval)?;
+                *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
+            }
+
+            let cleanup_task_id = self.spawn_cleanup_task(self.store.clone())?;
+            *self
+                .cleanup_task_id
+                .lock()
+                .expect("cleanup_task_id poisoned") = Some(cleanup_task_id);
+
+            let ecs_index_task_id = self.spawn_ecs_index_maintenance_task(self.store.clone())?;
+            *self
+                .ecs_index_task_id
+                .lock()
+                .expect("ecs_index_task_id poisoned") = Some(ecs_index_task_id);
+            Ok(())
+        })();
+        if let Err(error) = task_init {
+            // Roll back every task admitted before the failed spawn, including
+            // the local ECS maintenance task. Release mutex guards before await.
+            let dump_task = self
+                .dump_task_id
+                .lock()
+                .expect("dump_task_id poisoned")
+                .take();
+            let cleanup_task = self
+                .cleanup_task_id
+                .lock()
+                .expect("cleanup_task_id poisoned")
+                .take();
+            let ecs_index_task = self
+                .ecs_index_task_id
+                .lock()
+                .expect("ecs_index_task_id poisoned")
+                .take();
+            for task in [dump_task, cleanup_task, ecs_index_task]
+                .into_iter()
+                .flatten()
+            {
+                task.stop().await;
+            }
+            unregister_metric_source(&self.tag);
+            return Err(error);
         }
-
-        let cleanup_task_id = self.spawn_cleanup_task(self.store.clone())?;
-        *self
-            .cleanup_task_id
-            .lock()
-            .expect("cleanup_task_id poisoned") = Some(cleanup_task_id);
-
-        let ecs_index_task_id = self.spawn_ecs_index_maintenance_task(self.store.clone())?;
-        *self
-            .ecs_index_task_id
-            .lock()
-            .expect("ecs_index_task_id poisoned") = Some(ecs_index_task_id);
         Ok(())
     }
 
