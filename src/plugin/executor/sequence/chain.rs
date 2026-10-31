@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashSet;
 use tracing::debug;
@@ -17,6 +18,8 @@ use crate::plugin::executor::{ExecStep, Executor};
 use crate::plugin::matcher::{Matcher, MatcherRef};
 use crate::plugin::{PluginHolder, PluginInitContext};
 use crate::proto::Rcode;
+
+static NEXT_CHAIN_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "_sequence-step-recording")]
 macro_rules! record_sequence_event {
@@ -101,6 +104,9 @@ impl Instruction {
 
 #[derive(Debug)]
 pub struct ChainProgram {
+    /// Process-local identity used to isolate transient miss coalescing between
+    /// distinct sequence programs.
+    coalesce_id: u64,
     /// Owning sequence tag for execution-path attribution.
     #[cfg(feature = "_sequence-step-recording")]
     sequence_tag: String,
@@ -117,6 +123,7 @@ enum InstructionFlow {
 impl ChainProgram {
     fn new(_sequence_tag: String, instructions: Vec<Instruction>) -> Self {
         Self {
+            coalesce_id: NEXT_CHAIN_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(feature = "_sequence-step-recording")]
             sequence_tag: _sequence_tag,
             instructions,
@@ -433,6 +440,12 @@ fn exec_step_outcome(step: ExecStep) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub(crate) struct ExecutorNextIdentity {
+    program: u64,
+    pc: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorNext {
     program: Arc<ChainProgram>,
@@ -442,6 +455,14 @@ pub struct ExecutorNext {
 impl ExecutorNext {
     pub(crate) fn new(program: Arc<ChainProgram>, pc: usize) -> Self {
         Self { program, pc }
+    }
+
+    #[inline]
+    pub(crate) fn coalesce_identity(&self) -> ExecutorNextIdentity {
+        ExecutorNextIdentity {
+            program: self.program.coalesce_id,
+            pc: self.pc,
+        }
     }
 
     pub async fn next(&self, context: &mut DnsContext) -> Result<ExecStep> {

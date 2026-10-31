@@ -437,10 +437,8 @@ fn connection_destinations_command(family: RouteFamily, destinations: &[IpAddr])
         command = command.query_equal(CONNECTION_DST_FIELD, &ip.to_string());
     }
     if destinations.len() > 1 {
-        command = command.query_operations(std::iter::repeat_n(
-            QueryOperator::Or,
-            destinations.len().saturating_sub(1),
-        ));
+        let operations = vec![QueryOperator::Or; destinations.len().saturating_sub(1)];
+        command = command.query_operations(&operations);
     }
     command.build()
 }
@@ -855,6 +853,23 @@ mod tests {
         assert!(
             String::from_utf8_lossy(ipv6.data()).contains(COMMAND_IPV6_FIREWALL_CONNECTION_PRINT)
         );
+    }
+
+    #[test]
+    fn connection_query_preserves_or_semantics_across_multiple_destinations() {
+        for destination_count in 0usize..=5 {
+            let destinations = (1..=destination_count)
+                .map(|last| format!("203.0.113.{last}").parse::<IpAddr>().unwrap())
+                .collect::<Vec<_>>();
+            let command = connection_destinations_command(RouteFamily::Ipv4, &destinations);
+            let wire = String::from_utf8_lossy(command.data());
+            let or_operators = wire.matches("|").count();
+            assert_eq!(
+                or_operators,
+                destination_count.saturating_sub(1),
+                "expected one OR between each adjacent destination query"
+            );
+        }
     }
 
     #[test]

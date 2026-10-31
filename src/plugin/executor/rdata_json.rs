@@ -9,21 +9,32 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
+#[cfg(feature = "plugin-query-recorder")]
+use crate::proto::rdata;
 use crate::proto::rdata::{
-    self, CAA, DNSKEY, DS, NSEC, NSEC3, NSEC3PARAM, RRSIG, SOA, SSHFP, SVCB, TLSA, TXT, URI,
+    CAA, DNSKEY, DS, NSEC, NSEC3, NSEC3PARAM, RRSIG, SOA, SSHFP, SVCB, TLSA, TXT, URI,
 };
 use crate::proto::{Name, RData, RecordType};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RDataPayloadMode {
     Cache,
+    #[cfg(feature = "plugin-query-recorder")]
     Recorder,
 }
 
 impl RDataPayloadMode {
     #[inline]
     fn is_recorder(self) -> bool {
-        matches!(self, Self::Recorder)
+        #[cfg(feature = "plugin-query-recorder")]
+        {
+            matches!(self, Self::Recorder)
+        }
+        #[cfg(not(feature = "plugin-query-recorder"))]
+        {
+            let _ = self;
+            false
+        }
     }
 }
 
@@ -89,6 +100,7 @@ fn shared_payload(rdata: &RData, mode: RDataPayloadMode) -> Option<Payload> {
             "NULL".to_string(),
             json!({ "data_base64": STANDARD.encode(value.data()) }),
         ),
+        #[cfg(feature = "plugin-query-recorder")]
         RData::OPT(_) if matches!(mode, RDataPayloadMode::Recorder) => {
             ("OPT".to_string(), "OPT".to_string(), json!({}))
         }
@@ -294,6 +306,7 @@ fn uri_payload(value: &URI) -> (String, String, Value) {
 fn svcb_payload(kind: &str, value: &SVCB, mode: RDataPayloadMode) -> (String, String, Value) {
     let params = match mode {
         RDataPayloadMode::Cache => json!(value.params().len()),
+        #[cfg(feature = "plugin-query-recorder")]
         RDataPayloadMode::Recorder => json!(
             value
                 .params()
@@ -456,6 +469,7 @@ fn bytes_to_text_or_base64(bytes: &[u8]) -> TextOrBase64 {
     }
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 fn svcb_param_value_json(value: &rdata::SvcParamValue) -> Value {
     match value {
         rdata::SvcParamValue::Mandatory(values) => json!({ "mandatory": values }),
@@ -494,6 +508,7 @@ fn record_type_name(record_type: RecordType) -> String {
     }
 }
 
+#[cfg(feature = "plugin-query-recorder")]
 fn svcb_param_name(key: u16) -> &'static str {
     match key {
         0 => "mandatory",
