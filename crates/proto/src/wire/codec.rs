@@ -146,15 +146,25 @@ fn set_header(
 /// follows RFC 6891, while SIG0/TSIG placement checks follow RFC 2931 / RFC
 /// 8945.
 pub(crate) fn decode_message(packet: &[u8]) -> Result<Message> {
-    let (
-        mut header,
-        mut offset,
-        low_rcode,
-        question_count,
-        answer_count,
-        authority_count,
-        additional_count,
-    ) = parse_header(packet)?;
+    let wire_header = super::decode_header(packet)?;
+    decode_message_with_wire_header(packet, &wire_header)
+}
+
+pub(crate) fn decode_message_with_wire_header(
+    packet: &[u8],
+    wire_header: &super::WireHeader,
+) -> Result<Message> {
+    if packet.len() < DNS_HEADER_LEN {
+        return Err(DnsError::protocol("dns packet shorter than header"));
+    }
+
+    let mut header = *wire_header.header();
+    let mut offset = DNS_HEADER_LEN;
+    let low_rcode = wire_header.low_rcode;
+    let question_count = wire_header.question_count();
+    let answer_count = wire_header.answer_count();
+    let authority_count = wire_header.authority_count();
+    let additional_count = wire_header.additional_count();
 
     let mut questions = Vec::with_capacity(bounded_section_capacity(
         packet.len().saturating_sub(offset),
@@ -267,7 +277,7 @@ fn bounded_section_capacity(
 }
 
 /// Decode the fixed 12-byte DNS header defined by RFC 1035 section 4.1.1.
-fn parse_header(packet: &[u8]) -> Result<(Header, usize, u16, u16, u16, u16, u16)> {
+pub(crate) fn parse_header(packet: &[u8]) -> Result<(Header, usize, u16, u16, u16, u16, u16)> {
     if packet.len() < DNS_HEADER_LEN {
         return Err(DnsError::protocol("dns packet shorter than header"));
     }
@@ -458,6 +468,16 @@ pub(crate) fn encode_message_with_limit(
             return Ok(());
         }
 
+        // The question section and detached trailer are mandatory. If they do
+        // not fit together, no valid size-limited encoding can be produced
+        // without changing DNS message semantics. Reject before touching the
+        // caller-owned output buffer.
+        if lens.minimal_len() > limit {
+            return Err(DnsError::protocol(
+                "dns message cannot fit within UDP payload while preserving questions and trailer",
+            ));
+        }
+
         let header_offset = prepare_output_buffer_append(out);
         let mut compression = CompressionState::new(true);
 
@@ -470,11 +490,6 @@ pub(crate) fn encode_message_with_limit(
         // The main sections may consume only the remaining space after
         // reserving the fixed trailer block calculated by
         // `compute_truncation_lens`.
-        if lens.trailer_len > limit {
-            return Err(DnsError::protocol(
-                "dns message cannot fit within UDP payload while preserving EDNS/signature trailer",
-            ));
-        }
         let with_trailer_limit = limit - lens.trailer_len;
 
         let mut ancount = 0u16;
@@ -1544,19 +1559,21 @@ mod tests {
     fn limited_encode_rejects_trailer_larger_than_limit() {
         let mut message = Message::new();
         message.set_message_type(MessageType::Response);
-        message.add_question(Question::new(
-            Name::from_ascii("example.com.").unwrap(),
-            RecordType::A,
-            DNSClass::IN,
-        ));
-        message.set_edns(Edns::new());
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Local(EdnsLocal::new(65001, vec![0x5A; 64])));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        let limit = lens.trailer_len - 1;
+        assert!(limit >= DNS_HEADER_LEN);
+        assert!(lens.trailer_len > limit);
 
         let err = message
-            .to_bytes_with_limit(10)
+            .to_bytes_with_limit(limit)
             .expect_err("trailer larger than limit should fail");
         let text = err.to_string();
         assert!(
-            text.contains("cannot fit within UDP payload while preserving EDNS/signature trailer"),
+            text.contains("cannot fit within UDP payload while preserving questions and trailer"),
             "unexpected error: {text}"
         );
     }

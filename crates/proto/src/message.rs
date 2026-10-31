@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::core::error::{DnsError, Result};
 use crate::proto::rdata::{A, AAAA, Edns};
 use crate::proto::wire::{
-    DNS_HEADER_LEN, decode_message, edns_record_len, encode_message_into, encode_message_with_limit,
+    DNS_HEADER_LEN, WireHeader, decode_message, decode_message_with_wire_header, edns_record_len,
+    encode_message_into, encode_message_with_limit,
 };
 use crate::proto::{
     DNSClass, Header, MessageType, Name, Opcode, Question, RData, Rcode, Record, RecordType,
@@ -81,6 +82,14 @@ impl Message {
     #[hotpath::measure]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         decode_message(bytes)
+    }
+
+    /// Decode a DNS message while reusing a fixed header already decoded from
+    /// the same byte slice. This avoids parsing the 12-byte header twice on
+    /// ingress paths that perform header-only preclassification.
+    #[hotpath::measure]
+    pub fn from_bytes_with_wire_header(bytes: &[u8], header: &WireHeader) -> Result<Self> {
+        decode_message_with_wire_header(bytes, header)
     }
 
     /// Encode the message into a newly allocated byte vector.
@@ -191,6 +200,30 @@ impl Message {
         }
     }
 
+    /// Clone this message with a replacement ID while aging cached record TTLs.
+    ///
+    /// Each answer, authority, and additional record is aged independently by
+    /// `age_secs`, then capped by `max_ttl`. Records whose original TTL has
+    /// fully elapsed are omitted instead of being served past their cache
+    /// lifetime. EDNS metadata and detached signature records are preserved as
+    /// stored.
+    pub fn clone_with_id_and_aged_record_ttls(&self, id: u16, age_secs: u32, max_ttl: u32) -> Self {
+        Self {
+            header: {
+                let mut header = self.header;
+                header.set_id(id);
+                header
+            },
+            compress: self.compress,
+            questions: self.questions.clone(),
+            answers: clone_records_with_aged_ttl(&self.answers, age_secs, max_ttl),
+            authorities: clone_records_with_aged_ttl(&self.authorities, age_secs, max_ttl),
+            additionals: clone_records_with_aged_ttl(&self.additionals, age_secs, max_ttl),
+            signature: self.signature.clone(),
+            edns: self.edns.clone(),
+        }
+    }
+
     /// Rewrite TTLs in answer, authority, and additional records in place.
     pub fn rewrite_record_ttls(&mut self, mut policy: impl FnMut(u32) -> u32) {
         for record in &mut self.answers {
@@ -258,10 +291,9 @@ impl Message {
         // Even the smallest valid truncated response must keep the header,
         // questions, and the trailer block (OPT plus detached signature
         // records).
-        let minimal_len = lens.questions_end_len + lens.trailer_len;
-        if minimal_len > size {
+        if lens.minimal_len() > size {
             return Err(DnsError::protocol(
-                "dns message cannot fit within UDP payload while preserving EDNS/signature trailer",
+                "dns message cannot fit within UDP payload while preserving questions and trailer",
             ));
         }
 
@@ -826,6 +858,15 @@ fn clone_records_with_ttl(records: &[Record], ttl: u32) -> Vec<Record> {
     cloned
 }
 
+fn clone_records_with_aged_ttl(records: &[Record], age_secs: u32, max_ttl: u32) -> Vec<Record> {
+    let mut cloned = Vec::with_capacity(records.len());
+    cloned.extend(records.iter().filter_map(|record| {
+        let aged_ttl = record.ttl().saturating_sub(age_secs);
+        (aged_ttl != 0).then(|| record.clone_with_ttl(aged_ttl.min(max_ttl)))
+    }));
+    cloned
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TruncationLens {
     /// Total length after encoding the header and all questions.
@@ -843,6 +884,15 @@ pub(crate) struct TruncationLens {
     pub trailer_len: usize,
     /// Full message length when encoded with compression enabled.
     pub total_len: usize,
+}
+
+impl TruncationLens {
+    /// Smallest encoded message that preserves the complete question section
+    /// and the mandatory trailer block.
+    #[inline]
+    pub(crate) const fn minimal_len(&self) -> usize {
+        self.questions_end_len + self.trailer_len
+    }
 }
 
 impl Default for Message {
@@ -908,6 +958,31 @@ mod tests {
         let edns = cloned.edns().as_ref().expect("edns should be preserved");
         assert_eq!(edns.udp_payload_size(), 1232);
         assert!(edns.flags().dnssec_ok);
+    }
+
+    #[test]
+    fn clone_with_id_and_aged_record_ttls_preserves_individual_lifetimes() {
+        let message = message_with_record_sections();
+
+        let cloned = message.clone_with_id_and_aged_record_ttls(77, 100, 150);
+
+        assert_eq!(cloned.id(), 77);
+        assert_eq!(cloned.answers()[0].ttl(), 150);
+        assert_eq!(cloned.authorities()[0].ttl(), 100);
+        assert!(cloned.additionals().is_empty());
+        assert_eq!(cloned.signature()[0].ttl(), 999);
+        assert_eq!(message.answers()[0].ttl(), 300);
+    }
+
+    #[test]
+    fn clone_with_id_and_aged_record_ttls_keeps_live_records_at_zero_cap() {
+        let message = message_with_record_sections();
+
+        let cloned = message.clone_with_id_and_aged_record_ttls(77, 99, 0);
+
+        assert_eq!(cloned.answers()[0].ttl(), 0);
+        assert_eq!(cloned.authorities()[0].ttl(), 0);
+        assert_eq!(cloned.additionals()[0].ttl(), 0);
     }
 
     #[test]
@@ -1186,6 +1261,83 @@ mod tests {
             panic!("expected response local edns option");
         };
         assert_eq!(local.data(), &[9, 9, 9]);
+    }
+
+    #[test]
+    fn append_to_with_limit_rejects_oversized_question_section_without_writing() {
+        let mut message = Message::new();
+        let mut index = 0usize;
+        while message.compute_truncation_lens(true).questions_end_len <= 512 {
+            message.add_question(Question::new(
+                Name::from_ascii(&format!(
+                    "question-{index:03}.unique-{index:03}.example.invalid."
+                ))
+                .unwrap(),
+                RecordType::TXT,
+                DNSClass::IN,
+            ));
+            index += 1;
+        }
+
+        let lens = message.compute_truncation_lens(true);
+        assert!(lens.questions_end_len > 512);
+        assert_eq!(lens.trailer_len, 0);
+
+        let mut out = vec![0xAA, 0xBB];
+        let original = out.clone();
+        assert!(message.append_to_with_limit(512, &mut out).is_err());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn append_to_with_limit_rejects_questions_plus_trailer_over_budget() {
+        let mut message = Message::new();
+        message.add_question(Question::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::TXT,
+            DNSClass::IN,
+        ));
+
+        let mut edns = Edns::new();
+        edns.set_udp_payload_size(512);
+        edns.insert(crate::proto::EdnsOption::Local(
+            crate::proto::EdnsLocal::new(65001, vec![0x5A; 480]),
+        ));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        assert!(lens.trailer_len <= 512);
+        assert!(lens.minimal_len() > 512);
+
+        let mut out = vec![0xCC];
+        let original = out.clone();
+        assert!(message.append_to_with_limit(512, &mut out).is_err());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn append_to_with_limit_accepts_exact_minimal_budget() {
+        let mut message = Message::new();
+        message.add_question(Question::new(
+            Name::from_ascii("boundary.example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+
+        let mut edns = Edns::new();
+        edns.set_udp_payload_size(1232);
+        edns.insert(crate::proto::EdnsOption::Local(
+            crate::proto::EdnsLocal::new(65001, vec![1, 2, 3, 4]),
+        ));
+        message.set_edns(edns);
+
+        let lens = message.compute_truncation_lens(true);
+        let limit = lens.minimal_len();
+        assert_eq!(limit, lens.total_len);
+
+        let mut out = Vec::new();
+        message.append_to_with_limit(limit, &mut out).unwrap();
+        assert_eq!(out.len(), limit);
     }
 
     #[test]
