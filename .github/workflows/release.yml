@@ -3,6 +3,8 @@ name: Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -443,6 +445,55 @@ jobs:
           generate_release_notes: true
           draft: false
 
+  publish-nightly:
+    name: Publish nightly prerelease
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [release, slim-release]
+    outputs:
+      tag: ${{ steps.nightly.outputs.tag }}
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: oxidns-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Prepare nightly metadata
+        id: nightly
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          TAG="nightly-${RUN_ID}-${RUN_ATTEMPT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "# OxiDNS nightly"
+            echo
+            echo "Development build from commit ${SOURCE_SHA}."
+            echo "This is a prerelease and may contain unstable changes."
+          } > nightly-notes.md
+
+      - name: Create nightly prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.nightly.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Nightly ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          draft: false
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          body_path: nightly-notes.md
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/*.deb
+
       # - name: Notify Telegram
       #   env:
       #     TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -512,4 +563,14 @@ jobs:
     uses: ./.github/workflows/docker.yml
     with:
       OXIDNS_VERSION: ${{ github.ref_name }}
+    secrets: inherit
+
+  docker-nightly:
+    name: Publish nightly Docker images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: publish-nightly
+    uses: ./.github/workflows/docker.yml
+    with:
+      OXIDNS_VERSION: ${{ needs.publish-nightly.outputs.tag }}
+      NIGHTLY: true
     secrets: inherit

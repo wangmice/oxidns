@@ -3,6 +3,11 @@ name: Docker
 on:
   workflow_dispatch:
     inputs:
+      NIGHTLY:
+        description: "Publish only nightly image tags (never latest or semver aliases)"
+        required: false
+        default: false
+        type: boolean
       OXIDNS_VERSION:
         description: "OxiDNS version tag to embed into image metadata"
         required: false
@@ -15,6 +20,10 @@ on:
 
   workflow_call:
     inputs:
+      NIGHTLY:
+        required: false
+        default: false
+        type: boolean
       OXIDNS_VERSION:
         required: false
         type: string
@@ -80,15 +89,18 @@ jobs:
           images: |
             ${{ env.IMAGE_NAME_DOCKERHUB }}
             ${{ env.IMAGE_NAME_GHCR }}
+          flavor: |
+            latest=${{ inputs.NIGHTLY && 'false' || 'auto' }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=raw,value=${{ steps.vars.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=ref,event=branch,enable=${{ !inputs.NIGHTLY }}
+            type=ref,event=pr,enable=${{ !inputs.NIGHTLY }}
+            type=raw,value=${{ steps.vars.outputs.version }},enable=${{ inputs.NIGHTLY || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{version}},enable=${{ !inputs.NIGHTLY }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !inputs.NIGHTLY }}
+            type=semver,pattern={{major}},enable=${{ !inputs.NIGHTLY }}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=nightly,enable=${{ inputs.NIGHTLY }}
+            type=raw,value=latest,enable=${{ !inputs.NIGHTLY && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
   build-amd64:
     name: Build amd64
