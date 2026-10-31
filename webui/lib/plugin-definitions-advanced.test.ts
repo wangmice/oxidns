@@ -7,12 +7,14 @@ import {
 } from "@/lib/plugin-definitions";
 
 const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
+  "server/udp_server": ["recv_buffer_size"],
   "server/tcp_server": ["idle_timeout"],
   "server/http_server": ["entries[].json_api", "idle_timeout", "enable_http3"],
   "server/quic_server": ["idle_timeout"],
   "executor/forward": [
     "concurrent",
     "response_selection",
+    "on_error",
     "upstreams[].outbound",
     "upstreams[].dial_addr",
     "upstreams[].port",
@@ -20,15 +22,20 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
     "upstreams[].bootstrap_version",
     "upstreams[].socks5",
     "upstreams[].idle_timeout",
+    "upstreams[].keepalive_interval",
     "upstreams[].max_conns",
     "upstreams[].min_conns",
     "upstreams[].timeout",
     "upstreams[].enable_pipeline",
     "upstreams[].enable_http3",
+    "upstreams[].use_post",
     "upstreams[].so_mark",
     "upstreams[].bind_to_device",
   ],
   "executor/cache": [
+    "lazy_refresh_concurrency",
+    "lazy_refresh_timeout",
+    "lazy_refresh_failure_cooldown",
     "dump_file",
     "dump_interval",
     "max_negative_ttl",
@@ -205,5 +212,23 @@ describe("plugin advanced field classification", () => {
     );
 
     expect(hiddenRequiredFields).toEqual([]);
+  });
+
+  it("exposes the forward error policy as fail or continue", () => {
+    const forward = pluginKindDefinitions.find(
+      (definition) =>
+        definition.type === "executor" && definition.kind === "forward",
+    );
+    const field = forward?.configSchema.find(
+      (candidate) => candidate.key === "on_error",
+    );
+
+    expect(field?.type).toBe("select");
+    expect(field?.default).toBe("fail");
+    expect(field?.advanced).toBe(true);
+    expect(field?.options).toEqual([
+      { label: "失败并返回错误", value: "fail" },
+      { label: "记录失败并继续", value: "continue" },
+    ]);
   });
 });

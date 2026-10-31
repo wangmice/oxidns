@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { AppHeader } from "@/components/shell/app-header";
-import { useAppStore } from "@/lib/store";
+import { shouldPersistPluginMutation, useAppStore } from "@/lib/store";
 import { useAuthStore } from "@/lib/auth-store";
 import {
   useUpdateStore,
@@ -10,7 +10,8 @@ import {
   type UpgradeApplyPhase,
   type UpgradeBundle,
 } from "@/lib/update-store";
-import { stringifyOxiDnsConfig, type OxiDnsConfig } from "@/lib/oxidns-config";
+import type { OxiDnsConfig } from "@/lib/oxidns-config";
+import { applyProviderFileAutoReloadSetting } from "@/lib/runtime-settings";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -211,6 +212,63 @@ function OutboundMetricTile({
   );
 }
 
+const NETWORK_TIMEOUT_STAGES = [
+  {
+    stage: "pool_acquire",
+    labelKey: WEBUI.settings.networkTimeoutPoolAcquire,
+  },
+  {
+    stage: "connection_create",
+    labelKey: WEBUI.settings.networkTimeoutConnectionCreate,
+  },
+  {
+    stage: "protocol_handshake",
+    labelKey: WEBUI.settings.networkTimeoutProtocolHandshake,
+  },
+  {
+    stage: "query_io",
+    labelKey: WEBUI.settings.networkTimeoutQueryIo,
+  },
+] as const;
+
+function NetworkTimeoutMetricsPanel({ metrics }: { metrics: MetricSeries[] }) {
+  const { t, formatNumber } = useI18n();
+  const timeoutSeries = metrics.filter(
+    (item) => item.name === "network_upstream_timeout_total",
+  );
+
+  if (timeoutSeries.length === 0) return null;
+
+  return (
+    <div className="space-y-3 border-t pt-4">
+      <div>
+        <p className="text-sm font-medium">
+          {t(WEBUI.settings.networkTimeoutMetricsTitle)}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {t(WEBUI.settings.networkTimeoutMetricsDesc)}
+        </p>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {NETWORK_TIMEOUT_STAGES.map(({ stage, labelKey }) => (
+          <OutboundMetricTile
+            key={stage}
+            label={t(labelKey)}
+            value={formatMetricCount(
+              sumMetric(
+                timeoutSeries,
+                "network_upstream_timeout_total",
+                (item) => item.labels.stage === stage,
+              ),
+              formatNumber,
+            )}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function OutboundRuntimeMetricsPanel({
   metrics,
   configuredProfileNames,
@@ -364,16 +422,20 @@ export default function SettingsPage() {
   const system = useAppStore((s) => s.system);
   const buildInfo = useAppStore((s) => s.buildInfo);
   const reloadStatus = useAppStore((s) => s.reloadStatus);
-  const setYamlConfig = useAppStore((s) => s.setYamlConfig);
+  const stageSettingsConfig = useAppStore((s) => s.stageSettingsConfig);
   const saveConfig = useAppStore((s) => s.saveConfig);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const outboundMetrics = useAppStore((s) => s.outboundMetrics);
+  const networkMetrics = useAppStore((s) => s.networkMetrics);
   const isConfigSaving = useAppStore((s) => s.isConfigSaving);
   const isRestarting = useAppStore((s) => s.isRestarting);
   const restartApp = useAppStore((s) => s.restartApp);
 
   const [backendUrl, setBackendUrl] = useState(serverConfig.url);
   const [workerThreads, setWorkerThreads] = useState("");
+  const [providerFileAutoReload, setProviderFileAutoReload] = useState(false);
+  const [providerFileAutoReloadTouched, setProviderFileAutoReloadTouched] =
+    useState(false);
   const [apiListen, setApiListen] = useState("");
   const [apiSslEnabled, setApiSslEnabled] = useState(false);
   const [apiSslCert, setApiSslCert] = useState("");
@@ -421,6 +483,8 @@ export default function SettingsPage() {
       const outbound = asRecord(network.outbound);
 
       setWorkerThreads(String(runtime.worker_threads ?? ""));
+      setProviderFileAutoReload(runtime.provider_file_auto_reload === true);
+      setProviderFileAutoReloadTouched(false);
       setApiListen(String(httpObj.listen ?? ""));
       setApiSslEnabled(Boolean(ssl.cert || ssl.key));
       setApiSslCert(String(ssl.cert ?? ""));
@@ -588,15 +652,16 @@ export default function SettingsPage() {
       configModel,
       outboundRenameMap,
     );
-    const nextRuntime: Record<string, unknown> = {
-      ...asRecord(baseConfigModel.runtime),
-    };
+    const nextRuntime = applyProviderFileAutoReloadSetting(
+      asRecord(baseConfigModel.runtime),
+      providerFileAutoReload,
+      providerFileAutoReloadTouched,
+    );
     if (workerThreads.trim()) {
       nextRuntime.worker_threads = Number(workerThreads);
     } else {
       delete nextRuntime.worker_threads;
     }
-
     const nextApi: Record<string, unknown> = {
       ...asRecord(baseConfigModel.api),
     };
@@ -644,8 +709,8 @@ export default function SettingsPage() {
   const handleSaveTopLevelConfig = async () => {
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig()));
-      await saveConfig();
+      const resolution = await stageSettingsConfig(buildTopLevelConfig());
+      if (shouldPersistPluginMutation(resolution)) await saveConfig();
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;
@@ -655,8 +720,8 @@ export default function SettingsPage() {
   const handleRestartTopLevelConfig = async () => {
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig()));
-      await restartApp();
+      const resolution = await stageSettingsConfig(buildTopLevelConfig());
+      if (shouldPersistPluginMutation(resolution)) await restartApp();
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;
@@ -672,7 +737,10 @@ export default function SettingsPage() {
     const override: AuthOverride = { enabled, username: uname, password: pwd };
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig(override)));
+      const resolution = await stageSettingsConfig(
+        buildTopLevelConfig(override),
+      );
+      if (!shouldPersistPluginMutation(resolution)) return;
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;
@@ -1155,6 +1223,24 @@ export default function SettingsPage() {
                       className="font-mono max-w-xs"
                     />
                   </Field>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border p-4">
+                    <div>
+                      <p className="text-sm font-medium">
+                        {t(WEBUI.settings.providerFileAutoReload)}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {t(WEBUI.settings.providerFileAutoReloadDesc)}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={providerFileAutoReload}
+                      onCheckedChange={(checked) => {
+                        setProviderFileAutoReload(checked);
+                        setProviderFileAutoReloadTouched(true);
+                      }}
+                      aria-label={t(WEBUI.settings.providerFileAutoReload)}
+                    />
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     <Button
                       onClick={handleSaveTopLevelConfig}
@@ -1481,6 +1567,8 @@ export default function SettingsPage() {
                       ))}
                     </div>
                   )}
+
+                  <NetworkTimeoutMetricsPanel metrics={networkMetrics} />
 
                   <OutboundRuntimeMetricsPanel
                     metrics={outboundMetrics}

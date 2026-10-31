@@ -259,9 +259,12 @@ export const enUSWebui = {
     truncated: "Truncated response",
     noTtl: "No TTL",
     lowPositiveTtl: "Low positive TTL",
+    incompleteAnswer: "Incomplete answer",
     started: "Started",
     success: "Success",
     failed: "Failed",
+    skippedBusy: "Concurrency busy",
+    skippedCooldown: "Failure cooldown",
   },
   pluginDetail: {
     expand: "Expand detail",
@@ -521,6 +524,11 @@ export const enUSWebui = {
     readEntriesFailed: "Failed to read cache entries",
     deleteEntryFailed: "Failed to delete cache entry",
     flushFailed: "Failed to flush cache",
+    flushedResult: "Cleared {count} cache entries",
+    dumpEcsModeMismatch:
+      "This cache dump was created in shared ECS mode (ecs_in_key=false) and cannot be loaded into the current ECS-keyed cache instance.",
+    dumpEcsModeUnknown:
+      "This legacy cache dump does not record its ecs_in_key mode and cannot be safely loaded into the current ECS-keyed cache instance.",
     entriesTitle: "Cache entries",
     matchCount: "Matched {total} entries",
     totalCount: "{total} entries total",
@@ -529,6 +537,11 @@ export const enUSWebui = {
     flushDesc:
       'This will flush all cache entries currently saved by plugin "{tag}". This action cannot be undone.',
     qnameFilterLabel: "QNAME contains",
+    ipFilterLabel: "Answer IP equals",
+    ipFilterPlaceholder: "IPv4 or IPv6 address",
+    ipFilterHelp:
+      "Exact IPv4/IPv6 match in answer A/AAAA records, including answers with CNAMEs. Combined with QNAME using AND. Excludes additional/glue records and ECS; no PTR lookup is performed.",
+    invalidIp: "Enter a valid IPv4 or IPv6 address.",
     filterButton: "Filter",
     clearFilter: "Clear",
     cacheKey: "Cache key",
@@ -978,11 +991,14 @@ export const enUSWebui = {
     initOrderLabel: "Init Order",
     configOkBadge: "Config validation passed",
     runtimeCard: "Runtime",
-    runtimeCardDesc: "Tokio runtime parameters (runtime)",
+    runtimeCardDesc: "OxiDNS runtime parameters (runtime)",
     workerThreads: "Worker Threads",
     workerThreadsDesc:
       "Number of Tokio multi-thread runtime workers. Leave empty for automatic (system parallelism). Cannot be 0.",
     workerThreadsPlaceholder: "Leave empty for system default",
+    providerFileAutoReload: "Provider File Auto Reload",
+    providerFileAutoReloadDesc:
+      "Watch rule files owned by file-backed providers and reload them after external changes. Disabled by default; this is a runtime setting and requires an OxiDNS restart after saving.",
     outboundCard: "Outbound Network",
     outboundCardDesc:
       "Configure network.outbound profiles shared by HTTP clients, upgrades, downloads, and upstreams.",
@@ -1028,6 +1044,13 @@ export const enUSWebui = {
     outboundMetricsProtocols: "Protocols",
     outboundMetricsSystemProfile: "System resolver / direct",
     outboundMetricsLocalProfile: "Local bootstrap",
+    networkTimeoutMetricsTitle: "Upstream Timeout Stages",
+    networkTimeoutMetricsDesc:
+      "Global counts of upstream operation deadlines expiring at each network stage; connection creation and protocol handshake also include background pool expansion, and these are not attributed to a single outbound profile.",
+    networkTimeoutPoolAcquire: "Pool Acquire",
+    networkTimeoutConnectionCreate: "Connection Create",
+    networkTimeoutProtocolHandshake: "Protocol Handshake",
+    networkTimeoutQueryIo: "Query I/O",
     mgmtApiCard: "Management API",
     mgmtApiDesc: "HTTP management interface configuration (api.http)",
     listenSection: "Listen Address (listen)",

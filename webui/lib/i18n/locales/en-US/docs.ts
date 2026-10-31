@@ -7,6 +7,8 @@ export const enUSDocs = {
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the entry executor that handles all requests of the listener, usually the sequence plug-in.\n- Configuration requirements:\n  - Must reference a defined executor plugin.\n  - A common value is a `tag` of a certain `sequence`.\n- Operational impact:\n  - All requests entering the current `udp_server` will be handed over to this executor for continued processing.\n  - If the reference does not exist or is of the wrong type, plugin initialization will fail.",
     listen:
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the UDP listening address.\n- Supported formats:\n  - `ip:port`\n  - `:port`\n- Operational impact:\n  - Determine the address and port to which the listener is bound.\n  - The listener cannot be started when the address is invalid, the port conflicts, or the binding fails.",
+    recv_buffer_size:
+      "- Type: `integer`; Required: No; Default: `1048576` (1 MiB)\n- Unit: bytes\n- Function: Request the kernel receive-buffer size for the UDP socket.\n- Requirements:\n  - Valid range: `262144`–`16777216` bytes (256 KiB–16 MiB).\n  - Default/recommended: `1048576` (1 MiB). Use 256–512 KiB for light workloads; consider 2–4 MiB for higher concurrency or bursty traffic.\n  - Values outside the supported range fail plugin initialization instead of being silently adjusted.\n- Operational impact:\n  - A larger buffer can reduce kernel drops during high-PPS bursts.\n  - The operating system may clamp the effective value to its global socket-buffer limit.",
   },
   tcp_server: {
     entry:
@@ -54,6 +56,8 @@ export const enUSDocs = {
       "- Type: `integer`; required: no; default value: `1`\n- Value range: clamped to `1..=32` during actual operation, and never above the upstream count.\n- Recommended range: `2..=8`; higher values are intended for advanced observation or special deployments.\n- Function: Define the number of concurrent query fanouts in multi-upstream mode.\n- Operational impact:\n  - The larger the value, the more active the multi-upstream competition will be, but at the same time it will increase the amount of upstream requests.",
     response_selection:
       "- Type: `string`; Required: No; Default: `balanced`\n- Supported values: `fastest`, `balanced`, `prefer_positive`, `consensus`\n- Function: Defines how to choose among multiple responses returned by concurrent upstreams.\n- Operational impact:\n  - `fastest`: The first successful DNS response wins.\n  - `balanced`: Positive responses win immediately; negative responses wait briefly for a possible positive response.\n  - `prefer_positive`: Positive responses are preferred; negative responses wait until the current fanout completes.\n  - `consensus`: Positive responses are preferred; negative responses require compatible confirmation.",
+    on_error:
+      "- Type: `string`; Required: No; Default: `fail`\n- Values: `fail`, `continue`\n- Function: Defines control flow when all usable upstream attempts fail to produce a DNS response.\n- `fail`: return the forward error and stop the current sequence.\n- `continue`: record failure metrics, return `Next`, and continue the current sequence without producing a new response.",
     upstreams:
       "- Type: `array`; Required: Yes; Default: None\n- Function: Define one or more upstream targets.\n- Operational impact:\n  - Use single upstream mode when array length is `1`.\n  - Use competitive query mode when the array length is greater than `1`.",
     short_circuit:
@@ -65,7 +69,7 @@ export const enUSDocs = {
     "upstreams[].dial_addr":
       "- Type: `ip`; Required: No; Default: None\n- Function: Specify the actual connection IP, while retaining the host name in `addr` for SNI, Host and certificate verification.\n- Applicable scenarios: fixed dial-up address, bypassing local resolution or matching with custom routing exports.",
     "upstreams[].outbound":
-      "- Type: `string`; Required: No\n- Default: `network.outbound.default`; none when no default is configured\n- Function: Reference a profile from `network.outbound.profiles` to inject resolver and proxy defaults into this upstream.\n- Override rules: local `dial_addr` takes precedence over resolver use; local `bootstrap` takes precedence over the outbound resolver; local `socks5` takes precedence over the profile proxy.\n- Note: Profile proxying only applies to TCP, DoT, and DoH2; UDP, DoQ, and DoH3 upstreams ignore SOCKS5 proxying.",
+      "- Type: `string`; Required: No\n- Default: `network.outbound.default`; none when no default is configured\n- Function: Reference a profile from `network.outbound.profiles` to inject resolver and proxy defaults into this upstream.\n- Override rules: local `dial_addr` takes precedence over resolver use; local `bootstrap` takes precedence over the outbound resolver; local `socks5` takes precedence over the profile proxy.\n- Note: UDP, DoQ, and DoH3 upstreams require SOCKS5 `UDP ASSOCIATE` support.",
     "upstreams[].port":
       "- Type: `integer`; required: no; default value: protocol default port\n- Function: Override the protocol default port.",
     "upstreams[].bootstrap":
@@ -73,9 +77,11 @@ export const enUSDocs = {
     "upstreams[].bootstrap_version":
       "- Type: `integer`; required: no; default value: none\n- Function: Specify bootstrap to give priority to IPv4 or IPv6.\n- Value: `4` or `6`.",
     "upstreams[].socks5":
-      "- Type: `string`; Required: No; Default: None\n- Function: Specify SOCKS5 proxy for upstream connections.\n- Supported formats:\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 needs to be written as `[addr]:port`\n  - IPv6 with authentication needs to be written as `username:password@[addr]:port`\n- Rule description:\n  - The proxy host can be an IP or a host name; the host name will be resolved using the system.\n  - The authentication part only separates the username and password by the first `:`, so the format must be `username:password@...`.\n  - SOCKS5 only applies to TCP, DoT, and DoH2; UDP, DoQ, and DoH3 upstreams ignore this proxy.\n- Note: When the format is incorrect, the port is illegal, or the proxy host resolution fails, the upstream will not be created normally.",
+      "- Type: `string`; Required: No; Default: None\n- Function: Specify a SOCKS5 proxy for UDP, TCP, DoT, DoQ, DoH2, or DoH3 upstream connections.\n- Supported formats:\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 needs to be written as `[addr]:port`\n  - IPv6 with authentication needs to be written as `username:password@[addr]:port`\n- Rule description:\n  - The proxy host can be an IP or a host name; the host name will be resolved using the system.\n  - The authentication part only separates the username and password by the first `:`, so the format must be `username:password@...`.\n  - UDP, DoQ, and DoH3 require SOCKS5 `UDP ASSOCIATE` support.\n- Note: When the format is incorrect, the port is illegal, or the proxy host resolution fails, the upstream will not be created normally.",
     "upstreams[].idle_timeout":
       "- Type: `integer`; required: no; default value: none\n- Unit: seconds\n- Function: Define the connection pool idle connection retention time.",
+    "upstreams[].keepalive_interval":
+      "- Type: `duration`; Required: No; Default: disabled\n- Function: Enable keepalive for persistent upstream connections. DoH2 uses HTTP/2 PING; DoH3/DoQ use QUIC keepalive; TCP/DoT use TCP keepalive.\n- Constraint: Must be greater than 0 and less than `idle_timeout`; UDP upstreams are not supported. DoH3/DoQ must also fire before the QUIC idle timeout (currently `3 × timeout`).\n- Note: For TCP/DoT over SOCKS5, TCP keepalive only covers the local-to-proxy TCP segment.",
     "upstreams[].max_conns":
       "- Type: `integer`; Required: No; Default: Automatic\n- Function: Define the upper limit of connection pool connections.\n- Range: `1..4096`.",
     "upstreams[].min_conns":
@@ -88,6 +94,8 @@ export const enUSDocs = {
       "- Type: `boolean`; required: no; default value: protocol default behavior\n- Function: Control TCP or DoT pipeline.\n- Note: It can also be enabled directly in `addr` through `tcp+pipeline://` or `tls+pipeline://`.",
     "upstreams[].enable_http3":
       "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether DoH uses HTTP/3.\n- Note: It can also be enabled directly in `addr` through `h3://`.",
+    "upstreams[].use_post":
+      "- Type: `boolean`; Required: No; Default: `false`\n- Function: Controls whether DoH/DoH3 requests use HTTP POST.\n- `false`: use RFC 8484 GET and carry the DNS wire message in the `dns=` query parameter.\n- `true`: use POST with the raw `application/dns-message` wire message as the request body.\n- Existing fixed query parameters in the DoH URL are preserved; non-DoH upstreams ignore this setting.",
     "upstreams[].so_mark":
       "- Type: `integer`; required: no; default value: none\n- Function: Set Linux `SO_MARK`.",
     "upstreams[].bind_to_device":
@@ -97,6 +105,12 @@ export const enUSDocs = {
     size: "- Type: `integer`; required: no; default value: `1024`\n- Function: Define the maximum number of entries in the cache.",
     lazy_cache_ttl:
       "- Type: `integer`; required: no; default value: none\n- Unit: seconds\n- Function: Enable lazy cache for positive successful responses.\n- Operational impact:\n  - The original TTL determines the fresh-hit window.\n  - `lazy_cache_ttl` determines the TTL returned for stale responses and allows stale data to be returned briefly after the original TTL expires.\n  - Stale hits refresh the cache asynchronously in the background.\n  - This setting does not shorten the original fresh TTL.",
+    lazy_refresh_concurrency:
+      "- Type: `integer`; required: no; default value: `64`\n- Requirement: must be greater than 0.\n- Function: Limit the number of Lazy Cache background refresh tasks that may run concurrently.\n- Operational impact: values that are too low increase `skipped_busy`; values that are too high increase concurrent upstream traffic and resource use.",
+    lazy_refresh_timeout:
+      "- Type: `integer`; required: no; default value: `10`\n- Unit: seconds\n- Requirement: must be greater than 0.\n- Function: Limit the wall-clock time for one background Lazy Cache refresh.\n- Design note: the default is intentionally longer than the upstream default `5s` query timeout so upstream/forward can report its own timeout or error before the cache wrapper cancels the refresh.",
+    lazy_refresh_failure_cooldown:
+      "- Type: `integer`; required: no; default value: `30`\n- Unit: seconds\n- Requirement: must be greater than 0.\n- Function: Define the minimum wait before retrying the same cache entry after a Lazy refresh failure.\n- Operational impact: stale hits during the cooldown are recorded as `skipped_cooldown`, preventing repeated upstream pressure while refreshes keep failing.",
     dump_file:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the cache persistence file path.",
     dump_interval:
@@ -114,7 +128,7 @@ export const enUSDocs = {
     min_positive_ttl:
       "- Type: `integer`; Required: No; Default: None\n- Unit: seconds\n- Function: Define the minimum TTL required before writing a positive response to cache.\n- Notes: Positive responses whose effective cache TTL is lower than this value are not cached. The check runs after `max_positive_ttl` capping.",
     ecs_in_key:
-      "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether the ECS scope is included in cache key calculation.",
+      "- Type: `boolean`; required: no; default value: `false`\n- Function: Control whether ECS participates in cache keys and RFC 7871 scope reuse.\n- Disabled: client ECS may still be forwarded upstream unchanged, but is excluded from the CacheKey; response ECS is removed before the shared ordinary cache entry is stored, so ECS and non-ECS clients share that entry.\n- Enabled: ECS cache keys and reuse follow RFC 7871 FAMILY, SOURCE, SCOPE, and address-prefix semantics.\n- Persistence: a V4 dump created in shared mode cannot be loaded into an ECS-keyed instance; legacy dumps that do not record the mode are also rejected when ECS keying is enabled.",
   },
   fallback: {
     primary:

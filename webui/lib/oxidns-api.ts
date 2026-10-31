@@ -154,6 +154,18 @@ export class CronJobNotFoundError extends Error {}
 
 export class CronJobUnavailableError extends Error {}
 
+export class ApiResponseError extends Error {
+  readonly code?: string;
+  readonly status: number;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = "ApiResponseError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
 export type ProcessMemoryKind =
   | "rss"
   | "private_working_set"
@@ -614,68 +626,15 @@ export async function reloadProvider(
   }
 }
 
-export async function runCronJob(
-  tag: string,
-  jobName: string,
-  signal?: AbortSignal,
-): Promise<CronJobRunResponse> {
-  const response = await fetch(
-    apiUrl(
-      `/plugins/${encodeURIComponent(tag)}/jobs/${encodeURIComponent(jobName)}/run`,
-    ),
-    {
-      method: "POST",
-      headers: apiHeaders(),
-      signal,
-    },
-  );
-  try {
-    return await readJsonResponse<CronJobRunResponse>(response);
-  } catch (error) {
-    if (response.status === 409) {
-      throw new CronJobAlreadyRunningError(
-        error instanceof Error ? error.message : "Cron job is already running",
-      );
-    }
-    if (response.status === 404) {
-      throw new CronJobNotFoundError(
-        error instanceof Error ? error.message : "Cron job was not found",
-      );
-    }
-    if (response.status === 503) {
-      throw new CronJobUnavailableError(
-        error instanceof Error
-          ? error.message
-          : "Cron scheduler is unavailable",
-      );
-    }
-    throw error;
-  }
-}
-
-export async function fetchCronJobStatuses(
-  tag: string,
-  signal?: AbortSignal,
-): Promise<CronJobsStatusResponse> {
-  const response = await fetch(
-    apiUrl(`/plugins/${encodeURIComponent(tag)}/jobs/status`),
-    {
-      method: "GET",
-      headers: apiHeaders(),
-      signal,
-    },
-  );
-  return readJsonResponse<CronJobsStatusResponse>(response);
-}
-
 export async function fetchCacheEntries(
   tag: string,
-  options: { limit?: number; cursor?: string; qname?: string } = {},
+  options: { limit?: number; cursor?: string; qname?: string; ip?: string } = {},
 ): Promise<CacheEntriesResponse> {
   const params = new URLSearchParams();
   if (options.limit) params.set("limit", String(options.limit));
   if (options.cursor) params.set("cursor", options.cursor);
   if (options.qname) params.set("qname", options.qname);
+  if (options.ip) params.set("ip", options.ip);
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const response = await fetch(
     apiUrl(`/plugins/${encodeURIComponent(tag)}/entries${suffix}`),
@@ -694,15 +653,64 @@ export async function deleteCacheEntry(tag: string, id: string): Promise<void> {
   await readJsonResponse<unknown>(response);
 }
 
-export async function flushCache(tag: string): Promise<void> {
+export interface CacheFlushResponse {
+  ok: boolean;
+  cleared_entries: number;
+}
+
+export async function flushCache(tag: string): Promise<CacheFlushResponse> {
   const response = await fetch(
     apiUrl(`/plugins/${encodeURIComponent(tag)}/flush`),
     {
-      method: "GET",
+      method: "POST",
       headers: apiHeaders(),
     },
   );
-  await readJsonResponse<unknown>(response);
+  return readJsonResponse<CacheFlushResponse>(response);
+}
+
+export async function runCronJob(
+  tag: string,
+  jobName: string,
+  signal?: AbortSignal,
+): Promise<CronJobRunResponse> {
+  const response = await fetch(
+    apiUrl(
+      `/plugins/${encodeURIComponent(tag)}/jobs/${encodeURIComponent(jobName)}/run`,
+    ),
+    { method: "POST", headers: apiHeaders(), signal },
+  );
+  try {
+    return await readJsonResponse<CronJobRunResponse>(response);
+  } catch (error) {
+    if (response.status === 409) {
+      throw new CronJobAlreadyRunningError(
+        error instanceof Error ? error.message : "Cron job is already running",
+      );
+    }
+    if (response.status === 404) {
+      throw new CronJobNotFoundError(
+        error instanceof Error ? error.message : "Cron job was not found",
+      );
+    }
+    if (response.status === 503) {
+      throw new CronJobUnavailableError(
+        error instanceof Error ? error.message : "Cron scheduler is unavailable",
+      );
+    }
+    throw error;
+  }
+}
+
+export async function fetchCronJobStatuses(
+  tag: string,
+  signal?: AbortSignal,
+): Promise<CronJobsStatusResponse> {
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/jobs/status`),
+    { method: "GET", headers: apiHeaders(), signal },
+  );
+  return readJsonResponse<CronJobsStatusResponse>(response);
 }
 
 export async function fetchCacheDump(tag: string): Promise<Blob> {
@@ -1216,7 +1224,11 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
           : [],
       );
     }
-    throw new Error(message);
+    throw new ApiResponseError(
+      message,
+      response.status,
+      typeof bodyRecord?.code === "string" ? bodyRecord.code : undefined,
+    );
   }
 
   if (!parsed.ok) {
@@ -1290,11 +1302,7 @@ export async function fetchDownloads(
 ): Promise<DownloadListResponse> {
   const response = await fetch(
     apiUrl(`/plugins/${encodeURIComponent(tag)}/downloads`),
-    {
-      headers: apiHeaders(),
-      cache: "no-store",
-      signal,
-    },
+    { headers: apiHeaders(), cache: "no-store", signal },
   );
   return readJsonResponse<DownloadListResponse>(response);
 }

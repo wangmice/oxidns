@@ -37,6 +37,12 @@ export const enUSPluginDefined = {
           description: "Specify the UDP listening address.",
           example: "0.0.0.0:53",
         },
+        recv_buffer_size: {
+          label: "Receive buffer (bytes)",
+          description:
+            "Valid range: 256 KiB–16 MiB; default/recommended: 1 MiB. Values outside the range are rejected.",
+          example: "1048576 (1 MiB)",
+        },
       },
       metrics: {
         labels: {
@@ -47,6 +53,9 @@ export const enUSPluginDefined = {
           server_inflight: "In flight",
           server_latency_count: "Latency samples",
           server_latency_sum_ms: "Total latency (ms)",
+          server_admission_rejected_total: "Admission rejected",
+          server_invalid_datagram_total: "Invalid UDP datagrams",
+          server_protocol_error_send_failed_total: "Protocol error send failures",
         },
         help: {
           server_request_total:
@@ -63,6 +72,12 @@ export const enUSPluginDefined = {
             "The number of completed requests included in server latency statistics.",
           server_latency_sum_ms:
             "Total processing latency (milliseconds) of all completed requests.",
+          server_admission_rejected_total:
+            "The total number of UDP datagrams dropped before DNS parsing because the server concurrency limit was reached.",
+          server_invalid_datagram_total:
+            "The total number of malformed UDP DNS datagrams dropped before entering the request handling chain.",
+          server_protocol_error_send_failed_total:
+            "The total number of locally generated UDP DNS protocol-error responses that could not be sent.",
         },
         derived: {
           "latency:server": "Average latency",
@@ -339,6 +354,15 @@ export const enUSPluginDefined = {
             consensus: "Negative consensus",
           },
         },
+        on_error: {
+          label: "Failure handling",
+          description:
+            "Controls what happens when every usable upstream fails to produce a DNS response.",
+          options: {
+            fail: "Fail and return an error",
+            continue: "Record failure and continue",
+          },
+        },
         upstreams: {
           label: "upstream list",
           description: "Define one or more upstream targets.",
@@ -398,6 +422,12 @@ export const enUSPluginDefined = {
             "Define the connection pool idle connection retention time.",
           example: "30",
         },
+        "upstreams[].keepalive_interval": {
+          label: "Connection keepalive interval",
+          description:
+            "Optional keepalive interval; disabled by default. DoH2 uses H2 PING, DoH3/DoQ use QUIC keepalive, and TCP/DoT use TCP keepalive.",
+          example: "5s",
+        },
         "upstreams[].max_conns": {
           label: "Maximum number of connections",
           description:
@@ -427,6 +457,11 @@ export const enUSPluginDefined = {
           label: "Enable HTTP/3",
           description: "Controls whether DoH uses HTTP/3.",
         },
+        "upstreams[].use_post": {
+          label: "Use POST for DoH",
+          description:
+            "Controls whether DoH/DoH3 requests use HTTP POST; UDP, TCP, DoT, DoQ, and other non-DoH upstreams ignore this field.",
+        },
         "upstreams[].so_mark": {
           label: "SO_MARK",
           description: "Set Linux SO_MARK.",
@@ -452,6 +487,7 @@ export const enUSPluginDefined = {
           forward_success_total: "Successful forwards",
           forward_error_total: "Forward failures",
           forward_timeout_total: "Forward timeouts",
+          forward_incomplete_alias_selected_total: "Incomplete CNAME fallback selections",
           forward_latency_count: "Latency samples",
           forward_latency_sum_ms: "Total latency (ms)",
           forward_upstream_query_total: "Upstream queries",
@@ -470,6 +506,8 @@ export const enUSPluginDefined = {
             "The total number of queries for which the upstream returned an error or could not get a response.",
           forward_timeout_total:
             "The total number of queries that did not receive a response from the upstream due to timeout.",
+          forward_incomplete_alias_selected_total:
+            "Selection-aware concurrent forward queries that chose an incomplete CNAME alias response as the best available result; excludes single-upstream and fastest modes.",
           forward_latency_count:
             "The number of completed queries included in latency statistics.",
           forward_latency_sum_ms:
@@ -505,6 +543,21 @@ export const enUSPluginDefined = {
         lazy_cache_ttl: {
           label: "Lazy Cache TTL (seconds)",
           description: "Enable lazy cache for positive success responses.",
+        },
+        lazy_refresh_concurrency: {
+          label: "Lazy refresh concurrency",
+          description:
+            "Limits the number of Lazy Cache background refresh tasks that may run concurrently.",
+        },
+        lazy_refresh_timeout: {
+          label: "Lazy refresh timeout (seconds)",
+          description:
+            "Limits the wall-clock time for one background lazy refresh; the default is 10 seconds so the upstream 5-second query timeout can complete first.",
+        },
+        lazy_refresh_failure_cooldown: {
+          label: "Lazy refresh failure cooldown (seconds)",
+          description:
+            "Defines the minimum wait before retrying the same cache entry after a Lazy refresh failure.",
         },
         dump_file: {
           label: "Persistence file",
@@ -545,7 +598,7 @@ export const enUSPluginDefined = {
         ecs_in_key: {
           label: "Include ECS in cache key",
           description:
-            "Controls whether the ECS scope is included in cache key calculation.",
+            "When enabled, cache keys and reuse follow RFC 7871 scope semantics. When disabled, request ECS may still be forwarded upstream but is excluded from the key, and response ECS is removed before storing the shared ordinary cache entry.",
         },
       },
       quickSetup: {
@@ -554,8 +607,16 @@ export const enUSPluginDefined = {
       metrics: {
         labels: {
           cache_lookup_total: "Cache lookups",
+          cache_ecs_lookup_requests_total: "ECS cache lookups",
+          cache_ecs_lookup_candidates_total: "ECS candidates probed",
+          cache_ecs_lookup_exact_fallback_total: "ECS exact fallbacks",
+          cache_ecs_prefix_hint_count: "ECS prefix hints",
+          cache_ecs_lookup_index_base_keys: "ECS index base keys",
           cache_hit_total: "Hits",
           cache_miss_total: "Misses",
+          cache_miss_coalesced_total: "Coalesced misses",
+          cache_miss_coalesce_timeout_total: "Coalesce timeouts",
+          cache_miss_coalesce_reentrant_total: "Reentrant bypasses",
           cache_expired_total: "Expired",
           cache_insert_total: "Writes",
           cache_skip_total: "Skipped",
@@ -565,17 +626,33 @@ export const enUSPluginDefined = {
         help: {
           cache_lookup_total:
             "The total number of cached queries with cacheable request keys.",
+          cache_ecs_lookup_requests_total:
+            "The total number of ECS cache lookups performed while ECS participates in cache keys.",
+          cache_ecs_lookup_candidates_total:
+            "The total number of candidate cache keys actually probed from ECS prefix hints.",
+          cache_ecs_lookup_exact_fallback_total:
+            "The number of ECS lookups that fell back to the exact SOURCE key after reusable scopes missed.",
+          cache_ecs_prefix_hint_count:
+            "The current number of ECS prefix memberships in the advisory index, classified by address family.",
+          cache_ecs_lookup_index_base_keys:
+            "The current number of base DNS cache keys represented in the ECS prefix index.",
           cache_hit_total:
             "Total cache hits classified by freshness (fresh = direct hits, stale = stale available).",
           cache_miss_total: "The total number of cache misses for queries.",
+          cache_miss_coalesced_total:
+            "The number of concurrent misses coalesced behind the leader for the same cache key.",
+          cache_miss_coalesce_timeout_total:
+            "The number of coalesced miss waiters that timed out and continued downstream.",
+          cache_miss_coalesce_reentrant_total:
+            "The number of recursive or reentrant misses that bypassed coalescing.",
           cache_expired_total:
             "The number of times expired entries were found and removed during a lookup.",
           cache_insert_total:
             "The total number of times cache entries have been inserted or updated.",
           cache_skip_total:
-            "The total number of responses that were skipped from cache due to write policy (truncated responses, no TTL, low positive TTL).",
+            "The total number of responses skipped by cache admission policy (truncated responses, no TTL, incomplete answers, or low positive TTL).",
           cache_lazy_refresh_total:
-            "Total number of Lazy Cache background refresh attempts (by result: started / success / failed).",
+            "Lazy Cache background refresh states by result (started / success / failed / skipped_busy / skipped_cooldown).",
           cache_entry_count: "The number of entries currently in the cache.",
         },
         derived: {

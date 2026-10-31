@@ -248,9 +248,12 @@ export const zhCNWebui = {
     truncated: "截断响应",
     noTtl: "无 TTL",
     lowPositiveTtl: "正响应 TTL 过低",
+    incompleteAnswer: "不完整答案",
     started: "已启动",
     success: "成功",
     failed: "失败",
+    skippedBusy: "并发已满",
+    skippedCooldown: "失败冷却中",
   },
   pluginDetail: {
     expand: "放大详情",
@@ -501,6 +504,11 @@ export const zhCNWebui = {
     readEntriesFailed: "读取缓存项失败",
     deleteEntryFailed: "删除缓存项失败",
     flushFailed: "清空缓存失败",
+    flushedResult: "已清除 {count} 项缓存",
+    dumpEcsModeMismatch:
+      "该缓存文件由共享 ECS 模式（ecs_in_key=false）生成，不能加载到当前启用 ECS 缓存键的实例。",
+    dumpEcsModeUnknown:
+      "该旧版缓存文件未记录 ecs_in_key 模式，无法安全加载到当前启用 ECS 缓存键的实例。",
     entriesTitle: "缓存项",
     matchCount: "匹配 {total} 项",
     totalCount: "共 {total} 项",
@@ -508,6 +516,11 @@ export const zhCNWebui = {
     flushTitle: "清空缓存项？",
     flushDesc: '将清空插件 "{tag}" 当前保存的所有缓存项。此操作无法撤销。',
     qnameFilterLabel: "QNAME 包含",
+    ipFilterLabel: "答案 IP 等于",
+    ipFilterPlaceholder: "IPv4 或 IPv6 地址",
+    ipFilterHelp:
+      "精确匹配答案区 A/AAAA 记录中的 IPv4/IPv6 地址，包括含 CNAME 的响应。与 QNAME 条件同时满足才匹配。不匹配附加区、胶水记录或 ECS，不执行 PTR 反向查询。",
+    invalidIp: "请输入有效的 IPv4 或 IPv6 地址。",
     filterButton: "筛选",
     clearFilter: "清除",
     cacheKey: "缓存键",
@@ -936,11 +949,14 @@ export const zhCNWebui = {
     initOrderLabel: "初始化顺序",
     configOkBadge: "配置校验通过",
     runtimeCard: "运行时",
-    runtimeCardDesc: "Tokio 运行时参数（runtime）",
+    runtimeCardDesc: "OxiDNS 运行时参数（runtime）",
     workerThreads: "Worker 线程数",
     workerThreadsDesc:
       "Tokio 多线程运行时的 worker 数，留空自动取系统可用并行度，不能为 0",
     workerThreadsPlaceholder: "留空使用系统默认",
+    providerFileAutoReload: "Provider 文件自动重载",
+    providerFileAutoReloadDesc:
+      "监听文件型 provider 的规则文件并在外部修改后自动重载。默认关闭；此项属于 runtime 设置，保存后需要重启 OxiDNS 才会生效。",
     outboundCard: "出站网络",
     outboundCardDesc:
       "配置 network.outbound profiles，供 HTTP 客户端、升级、下载和上游复用",
@@ -986,6 +1002,13 @@ export const zhCNWebui = {
     outboundMetricsProtocols: "协议",
     outboundMetricsSystemProfile: "系统解析 / 直连",
     outboundMetricsLocalProfile: "本地 bootstrap",
+    networkTimeoutMetricsTitle: "上游超时阶段",
+    networkTimeoutMetricsDesc:
+      "全局统计上游网络操作在各阶段发生 deadline 超时的次数；连接创建和协议握手包含后台连接池扩容，不归属于单个 outbound profile",
+    networkTimeoutPoolAcquire: "连接池等待",
+    networkTimeoutConnectionCreate: "连接创建",
+    networkTimeoutProtocolHandshake: "协议握手",
+    networkTimeoutQueryIo: "查询 I/O",
     mgmtApiCard: "管理 API",
     mgmtApiDesc: "HTTP 管理接口配置（api.http）",
     listenSection: "监听地址 (listen)",

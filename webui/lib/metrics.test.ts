@@ -7,6 +7,8 @@ import {
 } from "./dashboard-traffic";
 import {
   formatMetricValue,
+  groupMetricRows,
+  parsePrometheusMetrics,
   selectCardMetrics,
   type PluginMetricsMap,
 } from "./metrics";
@@ -35,6 +37,29 @@ describe("plugin metric formatting", () => {
     );
 
     expect(unlabeled).toEqual([]);
+  });
+
+  it("localizes the forward incomplete CNAME selection metric", () => {
+    const series = [
+      {
+        name: "forward_incomplete_alias_selected_total",
+        labels: { plugin_tag: "forward_main" },
+        value: 3,
+        kind: "counter" as const,
+        help: "backend fallback help",
+      },
+    ];
+
+    expect(groupMetricRows(series, "zh-CN")[0]).toMatchObject({
+      label: "不完整 CNAME 兜底选择",
+      help:
+        "启用响应选择的并发转发在没有更完整结果时，将不完整 CNAME 别名响应作为最佳可用结果的查询总数；单上游和 fastest 模式不计入。",
+    });
+    expect(groupMetricRows(series, "en-US")[0]).toMatchObject({
+      label: "Incomplete CNAME fallback selections",
+      help:
+        "Selection-aware concurrent forward queries that chose an incomplete CNAME alias response as the best available result; excludes single-upstream and fastest modes.",
+    });
   });
 
   it("formats timestamp gauges as local date-times", () => {
@@ -116,6 +141,42 @@ describe("plugin metric formatting", () => {
         metricName: "ros_route_write_success_total",
       }),
     ).toBe("1,784,701,820");
+  });
+});
+
+describe("Prometheus network metric parsing", () => {
+  it("keeps global timeout-stage metrics separate from outbound profiles", () => {
+    const parsed = parsePrometheusMetrics(`
+# HELP network_upstream_timeout_total Total upstream operation deadline expirations by network stage.
+# TYPE network_upstream_timeout_total counter
+network_upstream_timeout_total{stage="pool_acquire"} 3
+network_upstream_timeout_total{stage="query_io"} 7
+network_resolver_cache_hit_total{outbound_profile="remote"} 11
+cache_hit_total{plugin_tag="cache"} 13
+`);
+
+    expect(parsed.network).toEqual([
+      expect.objectContaining({
+        name: "network_upstream_timeout_total",
+        labels: { stage: "pool_acquire" },
+        value: 3,
+      }),
+      expect.objectContaining({
+        name: "network_upstream_timeout_total",
+        labels: { stage: "query_io" },
+        value: 7,
+      }),
+    ]);
+    expect(parsed.outbound.remote).toEqual([
+      expect.objectContaining({
+        name: "network_resolver_cache_hit_total",
+        labels: {},
+        value: 11,
+      }),
+    ]);
+    expect(parsed.byTag.cache).toEqual([
+      expect.objectContaining({ name: "cache_hit_total", value: 13 }),
+    ]);
   });
 });
 

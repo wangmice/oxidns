@@ -4,6 +4,8 @@ export const zhCNDocs = {
       "- 类型：`string`；必填：是；默认值：无\n- 作用：指定处理该监听器全部请求的入口执行器，通常为sequence插件。\n- 配置要求：\n  - 必须引用已定义的执行器插件。\n  - 常见取值为某个 `sequence` 的 `tag`。\n- 运行影响：\n  - 所有进入当前 `udp_server` 的请求都会交由该执行器继续处理。\n  - 若引用不存在或类型错误，插件初始化将失败。",
     listen:
       "- 类型：`string`；必填：是；默认值：无\n- 作用：指定 UDP 监听地址。\n- 支持格式：\n  - `ip:port`\n  - `:port`\n- 运行影响：\n  - 决定监听器绑定的地址与端口。\n  - 地址无效、端口冲突或绑定失败时，监听器无法启动。",
+    recv_buffer_size:
+      "- 类型：`integer`；必填：否；默认值：`1048576`（1 MiB）\n- 单位：字节\n- 作用：请求设置 UDP socket 的内核接收缓冲区大小。\n- 配置要求：\n  - 有效范围：`262144`–`16777216`（256 KiB–16 MiB）。\n  - 默认/推荐值：`1048576`（1 MiB）。家庭或低负载场景可使用 256–512 KiB；高并发或突发流量可按需提高到 2–4 MiB。\n  - 超出范围会在插件初始化时直接报错，不会静默修正。\n- 运行影响：\n  - 较大的缓冲区可降低高 PPS 或突发流量下的内核丢包。\n  - 操作系统可能按全局 socket buffer 上限下调实际值。",
   },
   tcp_server: {
     entry:
@@ -51,6 +53,8 @@ export const zhCNDocs = {
       "- 类型：`integer`；必填：否；默认值：`1`\n- 取值范围：实际运行时会限制在 `1..=32`，且不会超过 upstream 数量。\n- 建议范围：`2..=8`；更高值适合高级观测或特殊部署。\n- 作用：定义多上游模式下的并发查询扇出数。\n- 运行影响：\n  - 值越大，多上游竞争越积极，但同时会增加上游请求量。",
     response_selection:
       "- 类型：`string`；必填：否；默认值：`balanced`\n- 可选值：`fastest`、`balanced`、`prefer_positive`、`consensus`\n- 作用：定义并发上游返回多个响应时的选择策略。\n- 运行影响：\n  - `fastest`：第一个成功返回的 DNS 响应胜出。\n  - `balanced`：正向响应立即胜出；负向响应会短暂等待可能的正向响应。\n  - `prefer_positive`：正向响应优先；负向响应需要等待本轮并发完成。\n  - `consensus`：正向响应优先；负向响应需要兼容结果确认。",
+    on_error:
+      "- 类型：`string`；必填：否；默认值：`fail`\n- 可选值：`fail`、`continue`\n- 作用：定义所有可尝试 upstream 都未产生 DNS 响应时的控制流。\n- `fail`：返回错误并终止当前 sequence。\n- `continue`：记录失败 metrics，返回 `Next` 继续当前 sequence，并且不生成新的 response。",
     upstreams:
       "- 类型：`array`；必填：是；默认值：无\n- 作用：定义一个或多个上游目标。\n- 运行影响：\n  - 数组长度为 `1` 时使用单上游模式。\n  - 数组长度大于 `1` 时使用竞争式查询模式。",
     short_circuit:
@@ -62,7 +66,7 @@ export const zhCNDocs = {
     "upstreams[].dial_addr":
       "- 类型：`ip`；必填：否；默认值：无\n- 作用：指定实际连接 IP，同时保留 `addr` 中的主机名用于 SNI、Host 和证书校验。\n- 适用场景：固定拨号地址、绕过本机解析或配合自定义路由出口。",
     "upstreams[].outbound":
-      "- 类型：`string`；必填：否\n- 默认值：`network.outbound.default`；没有 default 时为无\n- 作用：引用 `network.outbound.profiles` 中的出站配置，为该上游注入 resolver 和 proxy。\n- 覆盖规则：本地 `dial_addr` 优先于 resolver；本地 `bootstrap` 优先于 outbound resolver；本地 `socks5` 优先于 profile proxy。\n- 注意：profile proxy 只应用于 TCP、DoT 和 DoH2；UDP、DoQ、DoH3 upstream 会忽略 SOCKS5 proxy。",
+      "- 类型：`string`；必填：否\n- 默认值：`network.outbound.default`；没有 default 时为无\n- 作用：引用 `network.outbound.profiles` 中的出站配置，为该上游注入 resolver 和 proxy。\n- 覆盖规则：本地 `dial_addr` 优先于 resolver；本地 `bootstrap` 优先于 outbound resolver；本地 `socks5` 优先于 profile proxy。\n- 注意：UDP、DoQ、DoH3 upstream 要求 SOCKS5 服务端支持 `UDP ASSOCIATE`。",
     "upstreams[].port":
       "- 类型：`integer`；必填：否；默认值：协议默认端口\n- 作用：覆盖协议默认端口。",
     "upstreams[].bootstrap":
@@ -70,9 +74,11 @@ export const zhCNDocs = {
     "upstreams[].bootstrap_version":
       "- 类型：`integer`；必填：否；默认值：无\n- 作用：指定 bootstrap 优先使用 IPv4 或 IPv6。\n- 取值：`4` 或 `6`。",
     "upstreams[].socks5":
-      "- 类型：`string`；必填：否；默认值：无\n- 作用：为上游连接指定 SOCKS5 代理。\n- 支持格式：\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 需写成 `[addr]:port`\n  - 带认证的 IPv6 需写成 `username:password@[addr]:port`\n- 规则说明：\n  - 代理主机可以是 IP，也可以是主机名；主机名会使用系统解析。\n  - 认证部分只按第一个 `:` 分割用户名和密码，因此格式必须是 `username:password@...`。\n  - SOCKS5 仅应用于 TCP、DoT 和 DoH2；UDP、DoQ、DoH3 upstream 会忽略该代理。\n- 注意事项：格式错误、端口非法或代理主机解析失败时，该上游不会被正常创建。",
+      "- 类型：`string`；必填：否；默认值：无\n- 作用：为上游连接指定 SOCKS5 代理，支持 UDP、TCP、DoT、DoQ、DoH2 和 DoH3。\n- 支持格式：\n  - `host:port`\n  - `username:password@host:port`\n  - IPv6 需写成 `[addr]:port`\n  - 带认证的 IPv6 需写成 `username:password@[addr]:port`\n- 规则说明：\n  - 代理主机可以是 IP，也可以是主机名；主机名会使用系统解析。\n  - 认证部分只按第一个 `:` 分割用户名和密码，因此格式必须是 `username:password@...`。\n  - UDP、DoQ 和 DoH3 要求代理支持 SOCKS5 `UDP ASSOCIATE`。\n- 注意事项：格式错误、端口非法或代理主机解析失败时，该上游不会被正常创建。",
     "upstreams[].idle_timeout":
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：定义连接池空闲连接保留时间。",
+    "upstreams[].keepalive_interval":
+      "- 类型：`duration`；必填：否；默认值：关闭\n- 作用：为持久上游连接启用保活。DoH2 使用 HTTP/2 PING；DoH3/DoQ 使用 QUIC keepalive；TCP/DoT 使用 TCP keepalive。\n- 约束：必须大于 0，且小于 `idle_timeout`；UDP 上游不支持。DoH3/DoQ 还必须早于 QUIC idle timeout（当前为 `3 × timeout`）。\n- 注意：TCP/DoT 在平台支持时同时使用该值作为首次探测等待时间和后续探测间隔；DoT/TCP 经 SOCKS5 时，TCP keepalive 只作用于本机到代理这一段。",
     "upstreams[].max_conns":
       "- 类型：`integer`；必填：否；默认值：自动\n- 作用：定义连接池连接上限。\n- 取值范围：`1..4096`。",
     "upstreams[].min_conns":
@@ -85,6 +91,8 @@ export const zhCNDocs = {
       "- 类型：`boolean`；必填：否；默认值：协议默认行为\n- 作用：控制 TCP 或 DoT 流水线。\n- 说明：也可直接通过 `tcp+pipeline://` 或 `tls+pipeline://` 在 `addr` 中启用。",
     "upstreams[].enable_http3":
       "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH 是否使用 HTTP/3。\n- 说明：也可直接通过 `h3://` 在 `addr` 中启用。",
+    "upstreams[].use_post":
+      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 DoH/DoH3 请求是否使用 HTTP POST。\n- `false`：使用 RFC 8484 GET，通过 `dns=` 查询参数传输 DNS wire message。\n- `true`：使用 POST，请求体为原始 `application/dns-message` wire message。\n- DoH URL 中已有的固定 query 参数会继续保留；非 DoH upstream 忽略此项。",
     "upstreams[].so_mark":
       "- 类型：`integer`；必填：否；默认值：无\n- 作用：设置 Linux `SO_MARK`。",
     "upstreams[].bind_to_device":
@@ -94,6 +102,12 @@ export const zhCNDocs = {
     size: "- 类型：`integer`；必填：否；默认值：`1024`\n- 作用：定义缓存最大条目数。",
     lazy_cache_ttl:
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：为正向成功响应启用 lazy cache。\n- 运行影响：\n  - 原始 TTL 决定 fresh 命中窗口。\n  - `lazy_cache_ttl` 决定 stale 回包 TTL，并允许在原始 TTL 过期后短时间返回 stale 响应。\n  - stale 命中会在后台异步刷新缓存。\n  - 该配置不会缩短原始 fresh TTL。",
+    lazy_refresh_concurrency:
+      "- 类型：`integer`；必填：否；默认值：`64`\n- 配置要求：必须大于 0。\n- 作用：限制同时运行的 Lazy Cache 后台刷新任务数量。\n- 运行影响：过低会增加 `skipped_busy`，过高会增加并发上游查询和资源占用。",
+    lazy_refresh_timeout:
+      "- 类型：`integer`；必填：否；默认值：`10`\n- 单位：秒\n- 配置要求：必须大于 0。\n- 作用：限制单次 Lazy Cache 后台刷新的最长 wall-clock 时间。\n- 设计说明：默认值刻意长于上游默认 `5s` 查询超时，使 upstream/forward 能先返回自己的超时或错误，而不是被 cache 外层 timer 抢先取消。",
+    lazy_refresh_failure_cooldown:
+      "- 类型：`integer`；必填：否；默认值：`30`\n- 单位：秒\n- 配置要求：必须大于 0。\n- 作用：Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。\n- 运行影响：冷却期间的 stale 命中会记录为 `skipped_cooldown`，避免持续失败时反复打上游。",
     dump_file:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定缓存持久化文件路径。",
     dump_interval:
@@ -111,7 +125,7 @@ export const zhCNDocs = {
     min_positive_ttl:
       "- 类型：`integer`；必填：否；默认值：无\n- 单位：秒\n- 作用：定义正响应进入缓存所需的最小 TTL。\n- 说明：正响应的有效缓存 TTL 低于该值时不会写入缓存。该判断在 `max_positive_ttl` 裁剪之后执行。",
     ecs_in_key:
-      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 ECS scope 是否参与缓存键计算。",
+      "- 类型：`boolean`；必填：否；默认值：`false`\n- 作用：控制 ECS 是否参与缓存键与 RFC 7871 scope 复用。\n- 关闭时：客户端 ECS 仍可原样向上游转发，但不参与 CacheKey；上游响应中的 ECS 会在进入共享普通缓存前移除，因此 ECS 与非 ECS 客户端共享普通缓存条目。\n- 开启时：按 RFC 7871 的 FAMILY、SOURCE、SCOPE 与地址前缀构造和复用 ECS 缓存键。\n- 持久化：共享模式生成的 V4 dump 不能加载到开启 ECS 键的实例；旧版未记录模式的 dump 在开启 ECS 键时也会被拒绝。",
   },
   fallback: {
     primary: "- 类型：`string`；必填：是；默认值：无\n- 作用：指定主执行器。",

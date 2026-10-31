@@ -12,6 +12,7 @@ import {
   type OxiDnsConfig,
 } from "./oxidns-config";
 import {
+  patchConfigYaml,
   patchPluginsYaml,
   type PluginYamlPatchResult,
 } from "./oxidns-config-patch";
@@ -40,6 +41,7 @@ import {
 } from "./oxidns-api";
 import {
   parsePrometheusMetrics,
+  type GlobalNetworkMetrics,
   type OutboundMetricsMap,
   type PluginMetricsMap,
 } from "./metrics";
@@ -140,6 +142,7 @@ interface AppState {
   reloadStatus: ReloadSnapshot | null;
   pluginMetrics: PluginMetricsMap;
   outboundMetrics: OutboundMetricsMap;
+  networkMetrics: GlobalNetworkMetrics;
   trafficMetrics: DnsTrafficMetrics;
   dependencyGraph: DependencyGraphReport | null;
   runningDependencyGraph: DependencyGraphReport | null;
@@ -181,6 +184,9 @@ interface AppState {
   setEditorMode: (mode: boolean) => void;
   setHistoryOpen: (open: boolean) => void;
   setYamlConfig: (config: string) => void;
+  stageSettingsConfig: (
+    config: OxiDnsConfig,
+  ) => Promise<PluginMutationResolution>;
   resolveConfigPatchConfirmation: (
     choice: ConfigPatchConfirmationChoice,
   ) => void;
@@ -298,6 +304,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadStatus: null,
   pluginMetrics: {},
   outboundMetrics: {},
+  networkMetrics: [],
   trafficMetrics: {
     status: "pending",
     qps: null,
@@ -335,6 +342,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDetailOpen: (open) => set({ detailOpen: open }),
   setEditorMode: (mode) => set({ editorMode: mode }),
   setHistoryOpen: (open) => set({ historyOpen: open }),
+  stageSettingsConfig: (config) =>
+    stageConfigModelMutation(set, get, config, { patchSettings: true }),
   resolveConfigPatchConfirmation: (choice) => {
     const pending = pendingConfigPatch;
     if (!pending) return;
@@ -438,6 +447,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         reloadStatus: null,
         pluginMetrics: {},
         outboundMetrics: {},
+        networkMetrics: [],
         trafficMetrics: {
           status: "pending",
           qps: null,
@@ -706,6 +716,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({
           pluginMetrics: metrics.byTag,
           outboundMetrics: metrics.outbound,
+          networkMetrics: metrics.network,
           trafficMetrics,
         });
       } catch {
@@ -1424,6 +1435,7 @@ function applyConfigValidationResponse(
 }
 
 interface ConfigModelMutationOptions {
+  patchSettings?: boolean;
   plugins?: PluginInstance[];
   selectedTag?: string | null;
   renamedTags?: ReadonlyMap<string, string>;
@@ -1448,7 +1460,7 @@ async function stageConfigModelMutation(
 ): Promise<PluginMutationResolution> {
   if (pendingConfigPatch) return "cancelled";
   const state = get();
-  const result = patchPluginsYaml(
+  const result = (options.patchSettings ? patchConfigYaml : patchPluginsYaml)(
     state.configText,
     state.configModel,
     configModel,

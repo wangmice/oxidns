@@ -33,6 +33,12 @@ export const zhCNPluginDefined = {
           description: "指定 UDP 监听地址。",
           example: "0.0.0.0:53",
         },
+        recv_buffer_size: {
+          label: "接收缓冲区(字节)",
+          description:
+            "范围 256 KiB–16 MiB；默认/推荐 1 MiB。过小或过大的值会被配置校验拒绝。",
+          example: "1048576（1 MiB）",
+        },
       },
       metrics: {
         labels: {
@@ -43,6 +49,9 @@ export const zhCNPluginDefined = {
           server_inflight: "处理中",
           server_latency_count: "延迟样本",
           server_latency_sum_ms: "延迟累计(ms)",
+          server_admission_rejected_total: "准入丢弃",
+          server_invalid_datagram_total: "非法 UDP 报文",
+          server_protocol_error_send_failed_total: "协议错误响应发送失败",
         },
         help: {
           server_request_total: "服务器接收并处理的入站 DNS 请求总数。",
@@ -53,6 +62,12 @@ export const zhCNPluginDefined = {
           server_inflight: "当前服务器正在处理中的请求数量。",
           server_latency_count: "纳入服务器延迟统计的已完成请求数。",
           server_latency_sum_ms: "所有已完成请求的总处理延迟（毫秒）。",
+          server_admission_rejected_total:
+            "因服务器并发处理上限已满，在 DNS 解析前直接丢弃的 UDP 数据报总数。",
+          server_invalid_datagram_total:
+            "因 DNS 报文格式无效而在进入请求处理链前丢弃的 UDP 数据报总数。",
+          server_protocol_error_send_failed_total:
+            "本地生成的 UDP DNS 协议错误响应发送失败总数。",
         },
         derived: {
           "latency:server": "平均延迟",
@@ -302,6 +317,14 @@ export const zhCNPluginDefined = {
             consensus: "负向共识",
           },
         },
+        on_error: {
+          label: "失败处理",
+          description: "定义所有可尝试上游都未产生 DNS 响应时的控制流。",
+          options: {
+            fail: "失败并返回错误",
+            continue: "记录失败并继续",
+          },
+        },
         upstreams: {
           label: "上游列表",
           description: "定义一个或多个上游目标。",
@@ -358,6 +381,12 @@ export const zhCNPluginDefined = {
           description: "定义连接池空闲连接保留时间。",
           example: "30",
         },
+        "upstreams[].keepalive_interval": {
+          label: "连接保活间隔",
+          description:
+            "可选连接保活间隔；默认关闭。DoH2 使用 H2 PING，DoH3/DoQ 使用 QUIC keepalive，TCP/DoT 使用 TCP keepalive。",
+          example: "5s",
+        },
         "upstreams[].max_conns": {
           label: "最大连接数",
           description: "定义连接池连接上限，范围 1..4096。",
@@ -385,6 +414,11 @@ export const zhCNPluginDefined = {
           label: "启用 HTTP/3",
           description: "控制 DoH 是否使用 HTTP/3。",
         },
+        "upstreams[].use_post": {
+          label: "DoH 使用 POST",
+          description:
+            "控制 DoH/DoH3 请求是否使用 HTTP POST；UDP、TCP、DoT、DoQ 等非 DoH 上游忽略此项。",
+        },
         "upstreams[].so_mark": {
           label: "SO_MARK",
           description: "设置 Linux SO_MARK。",
@@ -410,6 +444,7 @@ export const zhCNPluginDefined = {
           forward_success_total: "成功",
           forward_error_total: "失败",
           forward_timeout_total: "超时",
+          forward_incomplete_alias_selected_total: "不完整 CNAME 兜底选择",
           forward_latency_count: "延迟样本",
           forward_latency_sum_ms: "延迟累计(ms)",
           forward_upstream_query_total: "上游查询",
@@ -424,6 +459,8 @@ export const zhCNPluginDefined = {
           forward_success_total: "成功获得上游响应的查询总数。",
           forward_error_total: "上游返回错误或无法获得响应的查询总数。",
           forward_timeout_total: "因超时未得到上游响应的查询总数。",
+          forward_incomplete_alias_selected_total:
+            "启用响应选择的并发转发在没有更完整结果时，将不完整 CNAME 别名响应作为最佳可用结果的查询总数；单上游和 fastest 模式不计入。",
           forward_latency_count: "纳入延迟统计的已完成查询数。",
           forward_latency_sum_ms: "所有已完成转发查询的总延迟（毫秒）。",
           forward_upstream_query_total: "向该上游发起的请求总数。",
@@ -450,6 +487,20 @@ export const zhCNPluginDefined = {
         lazy_cache_ttl: {
           label: "Lazy Cache TTL(秒)",
           description: "为正向成功响应启用 lazy cache。",
+        },
+        lazy_refresh_concurrency: {
+          label: "Lazy 刷新并发数",
+          description: "限制同时运行的 Lazy Cache 后台刷新任务数量。",
+        },
+        lazy_refresh_timeout: {
+          label: "Lazy 刷新超时(秒)",
+          description:
+            "限制单次 Lazy Cache 后台刷新的最长执行时间；默认 10 秒，避免与上游默认 5 秒查询超时抢跑。",
+        },
+        lazy_refresh_failure_cooldown: {
+          label: "Lazy 刷新失败冷却(秒)",
+          description:
+            "定义 Lazy 刷新失败后，同一缓存条目再次尝试刷新的最短等待时间。",
         },
         dump_file: {
           label: "持久化文件",
@@ -486,7 +537,8 @@ export const zhCNPluginDefined = {
         },
         ecs_in_key: {
           label: "ECS 参与缓存键",
-          description: "控制 ECS scope 是否参与缓存键计算。",
+          description:
+            "开启时按 RFC 7871 scope 建立和复用 ECS 缓存键；关闭时请求 ECS 仍可向上游转发，但不参与缓存键，响应 ECS 会在共享普通缓存前移除。",
         },
       },
       quickSetup: {
@@ -495,8 +547,16 @@ export const zhCNPluginDefined = {
       metrics: {
         labels: {
           cache_lookup_total: "缓存查询",
+          cache_ecs_lookup_requests_total: "ECS 缓存查询",
+          cache_ecs_lookup_candidates_total: "ECS 候选探测",
+          cache_ecs_lookup_exact_fallback_total: "ECS 精确回退",
+          cache_ecs_prefix_hint_count: "ECS 前缀提示",
+          cache_ecs_lookup_index_base_keys: "ECS 索引键",
           cache_hit_total: "命中",
           cache_miss_total: "未命中",
+          cache_miss_coalesced_total: "合并未命中",
+          cache_miss_coalesce_timeout_total: "合并等待超时",
+          cache_miss_coalesce_reentrant_total: "重入旁路",
           cache_expired_total: "过期",
           cache_insert_total: "写入",
           cache_skip_total: "跳过",
@@ -505,15 +565,23 @@ export const zhCNPluginDefined = {
         },
         help: {
           cache_lookup_total: "带有可缓存请求键的缓存查询总数。",
+          cache_ecs_lookup_requests_total: "启用 ECS 参与缓存键时执行的 ECS 缓存查询总数。",
+          cache_ecs_lookup_candidates_total: "ECS 查询根据前缀索引实际探测的候选缓存键总数。",
+          cache_ecs_lookup_exact_fallback_total: "ECS 查询未命中可复用 scope 后回退精确 SOURCE 键的次数。",
+          cache_ecs_prefix_hint_count: "当前 ECS 前缀提示索引中的前缀成员数量，按地址族分类。",
+          cache_ecs_lookup_index_base_keys: "当前 ECS 前缀提示索引包含的基础 DNS 缓存键数量。",
           cache_hit_total:
             "按新鲜度分类的缓存命中总数（fresh = 直接命中，stale = 过期可用）。",
           cache_miss_total: "缓存未命中的查询总数。",
+          cache_miss_coalesced_total: "同一缓存键的并发 miss 被合并并等待 leader 结果的次数。",
+          cache_miss_coalesce_timeout_total: "等待合并 miss leader 超时后绕过等待继续下游执行的次数。",
+          cache_miss_coalesce_reentrant_total: "检测到递归/重入 miss 后绕过合并等待的次数。",
           cache_expired_total: "查找时发现并移除过期条目的次数。",
           cache_insert_total: "缓存条目插入或更新的总次数。",
           cache_skip_total:
-            "因写入策略（截断响应、无 TTL、正响应 TTL 过低）而跳过缓存的响应总数。",
+            "因写入策略（截断响应、无 TTL、不完整答案、正响应 TTL 过低）而跳过缓存的响应总数。",
           cache_lazy_refresh_total:
-            "Lazy Cache 后台刷新尝试总数（按结果：started / success / failed）。",
+            "Lazy Cache 后台刷新状态总数（started / success / failed / skipped_busy / skipped_cooldown）。",
           cache_entry_count: "当前缓存中的条目数量。",
         },
         derived: {

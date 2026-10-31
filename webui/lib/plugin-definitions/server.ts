@@ -38,6 +38,25 @@ const serverMetrics: PluginMetricsDef = {
   ],
 };
 
+const udpServerMetrics: PluginMetricsDef = {
+  ...serverMetrics,
+  metricLabels: {
+    ...serverMetrics.metricLabels,
+    server_admission_rejected_total: "准入丢弃",
+    server_invalid_datagram_total: "非法 UDP 报文",
+    server_protocol_error_send_failed_total: "协议错误响应发送失败",
+  },
+  metricHelp: {
+    ...serverMetrics.metricHelp,
+    server_admission_rejected_total:
+      "因服务器并发处理上限已满，在 DNS 解析前直接丢弃的 UDP 数据报总数。",
+    server_invalid_datagram_total:
+      "因 DNS 报文格式无效而在进入请求处理链前丢弃的 UDP 数据报总数。",
+    server_protocol_error_send_failed_total:
+      "本地生成的 UDP DNS 协议错误响应发送失败总数。",
+  },
+};
+
 export const serverPluginDefinitions: PluginKindDefinition[] = [
   {
     kind: "udp_server",
@@ -45,7 +64,7 @@ export const serverPluginDefinitions: PluginKindDefinition[] = [
     name: "UDP Server",
     description: "标准 DNS UDP 入口，把请求交给指定执行器",
     icon: "Wifi",
-    metrics: serverMetrics,
+    metrics: udpServerMetrics,
     configSchema: [
       executorRef(
         "entry",
@@ -61,6 +80,18 @@ export const serverPluginDefinitions: PluginKindDefinition[] = [
         type: "text",
         example: "0.0.0.0:53",
         required: true,
+      },
+      {
+        key: "recv_buffer_size",
+        description:
+          "UDP socket 内核接收缓冲区，范围 262144–16777216 字节（256 KiB–16 MiB），默认/推荐 1048576（1 MiB）。",
+        label: "接收缓冲区(字节)",
+        type: "number",
+        min: 262144,
+        max: 16777216,
+        example: "1048576",
+        default: 1048576,
+        advanced: true,
       },
     ],
   },

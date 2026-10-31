@@ -540,6 +540,12 @@ export function isPluginConfigFormValid(
       if (typeof value !== "string" || !isValidTimeValue(value)) return false;
     }
 
+    if (field.type === "number" && !isEmptyConfigValue(value)) {
+      if (typeof value !== "number" || !Number.isFinite(value)) return false;
+      if (field.min !== undefined && value < field.min) return false;
+      if (field.max !== undefined && value > field.max) return false;
+    }
+
     if (field.timeRange?.role === "start") {
       const endField = findTimeRangePair(fields, field);
       if (!endField) return false;
@@ -1055,6 +1061,8 @@ function ConfigFieldInput({
       return (
         <Input
           type="number"
+          min={field.min}
+          max={field.max}
           value={(displayValue as number) ?? ""}
           onChange={(e) =>
             onChange(e.target.value ? Number(e.target.value) : "")
