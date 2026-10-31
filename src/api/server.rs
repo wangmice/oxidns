@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::auth::is_authorized;
 use crate::api::cors::add_cors_headers;
+use crate::api::handler::DEFAULT_MAX_REQUEST_BODY;
 use crate::api::health::HealthState;
 use crate::api::request::{read_hyper_request, rewrite_request_path, strip_api_prefix};
 use crate::api::route::{PrefixRoute, RouteKey, lookup_handler};
@@ -174,7 +175,19 @@ async fn handle_hyper_request(
     remote_addr: SocketAddr,
     context: Arc<ApiServerContext>,
 ) -> std::result::Result<ApiResponse, Infallible> {
-    let request = match read_hyper_request(request).await {
+    let body_limit = strip_api_prefix(request.uri().path())
+        .as_deref()
+        .and_then(|path| {
+            lookup_handler(
+                request.method(),
+                path,
+                &context.routes,
+                &context.prefix_routes,
+            )
+        })
+        .map(|handler| handler.max_request_body_bytes())
+        .unwrap_or(DEFAULT_MAX_REQUEST_BODY);
+    let request = match read_hyper_request(request, body_limit).await {
         Ok(request) => request,
         Err(status) => return Ok(simple_response(status, Bytes::new())),
     };

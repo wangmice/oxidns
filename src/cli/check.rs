@@ -58,7 +58,7 @@ fn prepare_working_dir(working_dir: Option<&PathBuf>) -> Result<()> {
 
 fn run_check(options: &CheckOptions) -> Result<ConfigValidationSummary> {
     prepare_working_dir(options.working_dir.as_ref())?;
-    config::validate_file(&options.config).map_err(|err| {
+    config::validate_file_strict(&options.config).map_err(|err| {
         DnsError::config(format!(
             "Configuration initialization failed for {}: {}",
             options.config.display(),
@@ -131,6 +131,37 @@ plugins:
         .expect_err("unsafe plugin tag should fail config check");
 
         assert!(err.to_string().contains("Invalid plugin tag 'cache..cn'"));
+    }
+
+    #[test]
+    fn run_check_rejects_invalid_forward_args() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_path = write_config(
+            temp.path(),
+            "config.yaml",
+            r#"
+plugins:
+  - tag: forward_invalid_policy
+    type: forward
+    args:
+      on_error: ignore
+      upstreams:
+        - addr: "udp://1.1.1.1:53"
+"#,
+        );
+
+        let err = run_check(&CheckOptions {
+            config: config_path,
+            working_dir: None,
+            graph: false,
+        })
+        .expect_err("strict CLI check should reject invalid forward arguments");
+
+        let message = err.to_string();
+        assert!(message.contains("failed to parse forward plugin config"));
+        assert!(message.contains("ignore"));
+        assert!(message.contains("fail"));
+        assert!(message.contains("continue"));
     }
 
     #[test]
