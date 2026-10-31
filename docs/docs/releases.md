@@ -10,23 +10,77 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-10
 
 <div className="release-stack">
-   <ReleaseCard version="v1.6.1" badge="Patch Release" date="2026-10-08" defaultOpen>
+   <ReleaseCard version="v1.6.3" badge="Patch Release" date="2026-10-08" defaultOpen>
        **版本定位**
 
-       - v1.6.1 聚焦上游连接的资源释放与 IPv6 地址解析，修复连接关闭后后台任务仍持有资源的问题，并改进连接池诊断日志。
+       - Patch Release。v1.6.3 聚焦 DoH HTTP/2 keepalive 与并发查询的生命周期竞争，并完善 IPv6 上游连接、关闭资源回收和连接池诊断。
+       - 没有新增配置字段或改变默认值；DoH2 的超长空闲超时与 keepalive 间隔新增校验限制，升级前请检查相关配置。
 
        **主要变更**
 
-       - `fix(upstream)`：TCP/UDP 连接关闭时及时结束后台收发任务并取消等待中的查询；TCP 写入失败或写入阻塞时也能退出，避免已关闭连接持续占用内存和套接字。
-       - `fix(ipv6)`：正确识别上游 URL 中带方括号的 IPv6 字面量，直接使用该 IP 建立连接，不再误走域名 bootstrap 解析；上游探测同步报告为字面量地址。
-       - `fix(logging)`：连接池和连接关闭日志补充上游标识、主机、端口与传输信息；并发转发中被取消的查询以 debug 级别记录，减少正常竞争产生的警告。
-       - `deps`：更新 Rust 依赖锁定版本，包括 HTTP/TLS 支持库与序列化相关依赖。
+       - `fix(upstream/DoH2)`：keepalive PING 失败或超时时回收失效空闲连接并通知连接池，不再仅停用 keepalive 后继续复用该连接。
+       - `fix(upstream/DoH2)`：查询准入与连接回收使用统一原子状态，避免 PING 失败误杀重叠查询；等待在途查询完成后决定是否回收，任一通过校验的成功 DNS 响应会立即解除回收门控，不必等待其他慢查询。
+       - `refactor(upstream/DoH2)`：活动计数、成功响应 generation 和空闲时间跟踪采用 32 位原子，并补充时间 tick 回绕测试；正常查询路径不引入全局锁。
+       - `fix(network/IPv6)`：正确识别 URL 中带方括号的 IPv6 字面量，避免误走 bootstrap 域名解析；TLS server identity 去除 IPv6 方括号，同时保留原始主机与 HTTP authority 格式。
+       - `fix(upstream/lifecycle)`：合入上游连接关闭资源释放修复，并补充 UDP listener、TCP 收发任务、写入失败及阻塞写取消的回归测试。
+       - `fix(upstream/diagnostics)`：连接池和关闭日志增加 upstream tag、主机、端口及传输信息；正常并发转发中的查询取消降为 debug 日志。
+       - `chore(deps)`：更新 Rust 依赖；本次未修改 support crate 代码或版本。
 
        **配置与升级说明**
 
-       - 根 crate 版本为 `1.6.1`，release tag 使用 `v1.6.1`；workspace 辅助 crate 版本保持不变。
-       - v1.6.0 YAML 配置可直接升级，没有新增、重命名或删除配置字段，现有默认值与 bundle 保持不变。建议先运行 `oxidns check -c <配置文件>`。
-       - 从 v1.6.0 升级无需迁移查询历史或重新安装 Windows 服务；从更早版本升级仍需遵循 v1.6.0 的查询历史与 Windows 服务迁移说明。
+       - 根 crate 版本为 `1.6.3`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；release tag 使用 `v1.6.3`。
+       - v1.6.2 常规 YAML 配置、缓存文件和 query recorder 数据库无需迁移。替换二进制前运行 `oxidns check -c <配置文件>`。
+       - **DoH2 时长限制**：未启用 HTTP/3 的 DoH 上游，其有效 `idle_timeout` 与启用的 `keepalive_interval` 必须小于 `2^32` 毫秒（约 49.7 天）；达到或超过该值的配置现在会被拒绝，需缩短时长后升级。其他传输及启用 HTTP/3 的 DoH 不受此新增限制影响。
+       - `keepalive_interval` 仍默认关闭；已启用时建议升级后观察 keepalive、连接回收及 upstream timeout 日志。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.6.2" badge="Patch Release" date="2026-10-01">
+       **版本定位**
+
+       - Patch Release。v1.6.2 聚焦 `query_recorder` 存储故障恢复、管理操作、定期清理、优雅关闭与插件初始化生命周期稳定性。
+       - 同时修复 upstream HTTP 429 冷却恢复边界、API 路由批量注册一致性与 feature gating 问题；现有配置默认行为保持不变。
+
+       **主要变更**
+
+       - `fix(query_recorder)`：强化 SQLite 存储异常恢复，支持连接重建、可写性验证，并处理数据库损坏、只读、磁盘满和文件锁等错误。
+       - `fix(query_recorder)`：定期清理增加取消、超时、批量边界与公平重试；共享数据库的多个 recorder 不再因清理任务长期竞争而饥饿。
+       - `fix(query_recorder)`：管理 API 的查询、统计、清理和清空操作增加并发控制与停止检查，避免无限等待；shutdown 会主动关闭 reader gate。
+       - `fix(query_recorder)`：改进优雅关闭，尽可能完成健康状态下的 pending record flush，并报告此前批次和最终 flush 的失败信息。
+       - `fix(query_recorder)`：初始化失败时回滚 cleanup task、writer thread 和相关资源；API 路由采用批量原子注册，避免部分路由发布或失败 backend 被 handler 持有。
+       - `perf(query_recorder)`：execution path 只复制 recorder 自身新增部分；SSE tail 与广播记录使用共享对象，减少重复复制。
+       - `fix(forward)`：修复 HTTP 429 冷却状态在 half-open probe 恢复期间丢失 backoff 的问题，保留跨 generation 的退避状态。
+       - `fix(api/build)`：拒绝重复 exact/prefix API 路由，保证批量注册失败时注册表不变；修复 API-only 构建 warning，并将 `fs2` 限制到实际使用它的 feature。
+       - `test(query_recorder)`：补充初始化回滚、idle writer 唤醒、清理超时/公平重试、管理并发与 full-queue 场景覆盖。
+       - `fix(upstream/ipv6)`：合入上游 v1.6.1 的连接关闭资源释放、带方括号 IPv6 字面量解析与连接池诊断日志修复；保留本地响应关联校验、SOCKS5 和多路复用连接池生命周期逻辑。
+
+       **配置与升级说明**
+
+       - 目标根 crate 版本为 `1.6.2`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；发布前需完成版本号更新，release tag 使用 `v1.6.2`。
+       - v1.6.1 YAML 配置可以直接升级，本版本没有新增必填配置，也没有改变现有配置默认值。替换二进制前建议运行 `oxidns check -c <配置文件>`。
+       - query recorder 现有 SQLite 数据库可以继续使用；存储异常恢复和清理操作可能在后台产生额外磁盘 I/O，建议在升级后观察 writer、cleanup 和 dropped-record 日志。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.6.1" badge="Minor Release" date="2026-09-27">
+       **版本定位**
+
+       - v1.6.1 相比 v1.6.0 更新缓存生命周期与 ECS 语义、UDP/DoH/DoQ 网络可靠性、upstream 连接池、provider 文件自动重载、DoH POST、forward 错误策略和 HTTP 429 退避恢复。
+       - 新增配置项均保持兼容默认值：`runtime.provider_file_auto_reload` 默认关闭、DoH `use_post` 默认关闭、`keepalive_interval` 默认关闭、forward `on_error` 默认 `fail`。
+
+       **主要变更**
+
+       - `feat/fix(cache/ECS)`：缓存持久化升级为 framed v3 流式格式，强化跨重启 TTL、真实年龄、dirty 状态、lazy refresh、并发 miss 合并、过期清理、容量约束和 ECS scope 恢复。
+       - `feat(network)`：新增 SOCKS5 UDP，并支持通过 SOCKS5 代理 DoQ 与 DoH3；统一 UDP、TCP、DoT、DoH、DoH3、DoQ 响应关联校验。
+       - `feat(upstream)`：连接池强化并发容量、paced expansion、取消和回收生命周期；新增可选 `keepalive_interval` 与 upstream timeout stage 指标。
+       - `feat(provider)`：`domain_set`、`ip_set`、`adguard_rule`、`geosite`、`geoip` 文件源支持可选自动监听与重载，失败时保留上一份可用快照。
+       - `feat(doh/forward)`：DoH 支持可选 RFC 8484 POST；forward 新增 `on_error: fail | continue`；HTTP 429 增加 per-upstream cooldown、half-open probe 与指数退避。
+       - `fix(server/observability)`：加强 UDP admission、shutdown/drain、reply source/interface、响应大小限制和持续 receive-error backoff；WebUI 同步新的指标与配置项。
+
+       **配置与升级说明**
+
+       - 根 crate 版本为 `1.6.1`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；release tag 使用 `v1.6.1`。
+       - 缓存 flush API 已从 `GET` 调整为 `POST`；外部脚本和 API 客户端需要同步迁移。
+       - 如需 provider 文件自动重载，显式设置 `runtime.provider_file_auto_reload: true`；DoH POST、upstream keepalive 和 forward `continue` 策略也必须显式启用。
+       - DoH/DoH3 现在严格校验 `application/dns-message`，DNS 响应关联校验也更严格；不符合协议的第三方 upstream 响应可能在升级后被拒绝。
    </ReleaseCard>
 </div>
 

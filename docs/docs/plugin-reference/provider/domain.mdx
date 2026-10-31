@@ -68,6 +68,7 @@ import Admonition from "@theme/Admonition";
   - 空行与注释行会被忽略。
 - 运行影响：
   - 文件内容会在初始化或 `reload_provider` 时重新读取，并编译进当前 provider 的本地 matcher。
+  - 启用 `runtime.provider_file_auto_reload` 后，外部修改这些文件会自动触发 provider reload；连续文件事件会经过约 `500ms` trailing debounce 合并。
 
 #### `sets`
 
@@ -304,7 +305,7 @@ plugins:
 - `RootDomain` 会映射为 `domain:` 规则。
 - `Full` 会映射为 `full:` 规则。
 - 可被 `qname`、`cname`、`question` 直接引用，也可被 `domain_set.sets` 继续聚合。
-- 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容。
+- 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容；启用 `runtime.provider_file_auto_reload` 后，外部修改 `file` 时也会自动触发 provider reload。
 - 如需在运行前把部分 selector 预导出成文本规则文件，可使用 `oxidns export-dat --kind geosite`。
 
 <Admonition type="note" title="Selector 注意事项">
@@ -350,7 +351,7 @@ plugins:
 
 - 支持：基础域名规则、`@@`、`important`、`badfilter`、`denyallow`、请求侧 `dnstype`
 - 不支持但会汇总 warning 并跳过：URL/路径过滤规则、`/etc/hosts` 风格规则、页面元素过滤规则、`dnsrewrite`、`$client`、`$ctag`、未知 modifier
-- 初始化与 reload 会流式读取规则文件；跳过日志按原因汇总，并且每类最多记录 5 个规则样例
+- 初始化与 reload 会流式读取规则文件；启用 `runtime.provider_file_auto_reload` 后，外部修改 `files` 中的规则文件会自动触发 provider reload；跳过日志按原因汇总，并且每类最多记录 5 个规则样例
 - 完整优先级顺序为：
   - `important` 例外
   - `important` 拦截

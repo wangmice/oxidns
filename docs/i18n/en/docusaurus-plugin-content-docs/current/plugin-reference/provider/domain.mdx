@@ -68,6 +68,7 @@ Provides a high-performance domain rule set that can be referenced by plugins su
   - Empty lines and comment lines are ignored.
 - Runtime impact:
   - File contents are re-read during initialization or `reload_provider` and compiled into the current provider's local matcher.
+  - When `runtime.provider_file_auto_reload` is enabled, external changes to these files automatically trigger a provider reload; bursts are coalesced with an approximately `500ms` trailing debounce.
 
 #### `sets`
 
@@ -299,7 +300,7 @@ Combine geosite data with local rules behind one reusable entrypoint:
 - `RootDomain` becomes `domain:`.
 - `Full` becomes `full:`.
 - Can be referenced directly by `qname`, `cname`, and `question`, or aggregated by `domain_set`.
-- Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`.
+- Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`; when `runtime.provider_file_auto_reload` is enabled, external changes to `file` also trigger an automatic provider reload.
 - To pre-export selected rules into text files before runtime, use `oxidns export-dat --kind geosite`.
 
 <Admonition type="note" title="Selector Notes">
@@ -348,8 +349,7 @@ This provider exposes two semantics:
 - Unsupported but skipped with summary warnings: URL/path filters,
   `/etc/hosts` style rules, cosmetic filters, `dnsrewrite`, `$client`, `$ctag`,
   and unknown modifiers
-- Initialization and reload stream rule files; skipped rules are summarized by
-  reason with at most five samples retained for each reason
+- Initialization and reload stream rule files; when `runtime.provider_file_auto_reload` is enabled, external changes to entries in `files` automatically trigger a provider reload; skipped rules are summarized by reason with at most five samples retained for each reason
 - Full precedence order:
   - `important` exceptions
   - `important` blocks

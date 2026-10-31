@@ -28,8 +28,15 @@ title: 插件扩展 API
 * `limit`：每页数量，默认 `100`，最大 `500`。
 * `cursor`：分页游标。
 * `qname`：按缓存键中的查询域名做大小写不敏感的包含筛选。
+* `ip`：按缓存响应 Answer 区的 `A` / `AAAA` 地址精确筛选，支持 IPv4 和 IPv6（IPv6 的不同等价写法视为同一地址）。与 `qname` 同时提供时，两项条件必须同时满足；筛选在分页前执行。
 
-#### `GET /api/plugins/<cache_tag>/flush`
+WebUI 缓存详情的 IP 筛选会列出对应的缓存键域名，包含 CNAME 响应中的地址记录；不会进行 PTR 查询，也不匹配 Authority、Additional 中的胶水地址或 ECS 网段。空 IP 不筛选，非法非空 IP 返回 `400 invalid_cache_ip`，不接受 CIDR、端口或方括号。
+
+分页游标应与相同筛选条件一起使用。列表包含仍在保留期内的 fresh/stale 条目；`total_entries` 是本轮分页快照的匹配数量，期间刷新或删除可能使后续页实际可用数量减少。刷新列表会重新扫描当前缓存。
+
+例如：`GET /api/plugins/cache_main/entries?ip=192.0.2.1`。
+
+#### `POST /api/plugins/<cache_tag>/flush`
 
 清空缓存。
 

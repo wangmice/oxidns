@@ -145,6 +145,7 @@ Field notes:
 ```yaml
 runtime:
   worker_threads: 4
+  provider_file_auto_reload: true
 ```
 
 Field notes:
@@ -153,6 +154,11 @@ Field notes:
   - Meaning: Number of Tokio multi-thread runtime workers.
   - Default: Uses system available parallelism when omitted.
   - Constraint: Must not be `0`.
+- `provider_file_auto_reload`
+  - Meaning: Automatically watch external files owned by file-backed providers and reload the affected provider after changes.
+  - Default: `false`.
+  - When enabled, covers `domain_set.files`, `ip_set.files`, `adguard_rule.files`, `geosite.file`, and `geoip.file`.
+  - This switch only controls the automatic file watcher; manual `reload_provider`, management API, and WebUI provider reloads remain available.
 
 ### `log`
 
@@ -225,7 +231,7 @@ Field notes:
   - Meaning: Which profile HTTP clients and upstreams use when they do not set `outbound` explicitly.
   - Default: none; without a default profile, OxiDNS uses system DNS + direct connections.
   - Constraint: If set, it must reference an existing entry in `profiles`.
-  - Note: The default profile proxy is applied strictly to upstreams. Startup fails if a default SOCKS5 proxy is applied to UDP, DoQ, or DoH3 upstreams, because those connection models do not support profile proxying.
+  - Note: The default profile proxy is applied strictly to every upstream protocol. UDP, DoQ, and DoH3 require the SOCKS5 server to support `UDP ASSOCIATE`.
 - `outbound.profiles.<name>.resolver`
   - `system`: Use system DNS. HTTP clients perform this lookup asynchronously so it does not block runtime worker threads.
   - `nameservers`: Resolve target names through configured DNS nameservers. Supports `udp://`, `tcp://`, `tls://`, `https://`, `doh://`, `h3://`, `quic://`, and `doq://`; no scheme defaults to UDP.

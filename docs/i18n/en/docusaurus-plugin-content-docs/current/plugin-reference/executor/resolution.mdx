@@ -22,6 +22,8 @@ Sends DNS queries to upstreams.
     concurrent: 3
     # Concurrent upstream response selection: fastest / balanced / prefer_positive / consensus
     response_selection: balanced
+    # Control flow after all upstreams fail: fail / continue
+    on_error: fail
     upstreams:
       # Simplest UDP upstream
       - tag: "cf_udp"
@@ -64,7 +66,8 @@ Sends DNS queries to upstreams.
 - Type: `integer`; Required: no; Default: `1`
 - Runtime range is clamped to `1..=32` and never exceeds the upstream count.
 - Purpose: Number of concurrent upstream fan-out requests.
-- This is the number of upstreams actually started for one request. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response, so `concurrent: 1` retains single-attempt selection semantics.
+- This controls how many upstream queries may be in flight at once. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response for response selection.
+- `concurrent: 1` normally queries one randomly selected upstream. The exception is DoH/DoH3 429 cooldown/recovery: if the current candidate is rate-limited or locally unavailable, the same lane may move sequentially to an untried candidate while keeping at most one query in flight.
 - Recommendation: use `2..=8` for routine racing; higher values are intended for short-term observation or explicit multi-protocol racing.
 
 #### `response_selection`
@@ -72,7 +75,7 @@ Sends DNS queries to upstreams.
 - Type: `string`; Required: no; Default: `balanced`
 - Values: `fastest`, `balanced`, `prefer_positive`, `consensus`
 - Purpose: Selects the winning response when concurrent upstreams return different results.
-- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, each request still starts only one randomly selected upstream; selection does not query additional upstreams.
+- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, response selection itself does not increase query fan-out; only 429 cooldown/recovery may move the single lane sequentially to another candidate.
 - Except in `fastest` mode, every response is classified against the original Question as:
   - **Complete positive**: the requested type exists at the original QNAME or its CNAME-chain terminal.
   - **Incomplete alias**: a CNAME chain exists, but neither the final requested type nor an SOA denial is present.
@@ -84,6 +87,28 @@ Sends DNS queries to upstreams.
   - `balanced`: default mode. A complete positive wins immediately. The first definitive negative starts a fixed 100ms grace window that still allows a complete positive to win. When the window expires, or all upstreams finish, the common fallback order is used. Incomplete aliases and other responses do not start the grace window by themselves.
   - `prefer_positive`: a complete positive wins immediately. Otherwise, OxiDNS waits for every started upstream and then uses the common fallback order. Consequently, an incomplete alias outranks a single negative when no complete positive exists.
   - `consensus`: one complete positive still wins immediately. `NXDOMAIN` and NODATA are counted separately; two negatives of the same kind can confirm and return a negative early, without requiring identical SOA data or identical wire messages. Fan-out below two falls back to `prefer_positive`. If every upstream finishes without negative consensus, the common fallback order still returns the best available response and may therefore return a single negative. This is a negative-confidence policy, not strict majority voting across all responses.
+
+#### `on_error`
+
+- Type: `string`; Required: no; Default: `fail`
+- Values: `fail`, `continue`
+- Purpose: Controls what `forward` does when every usable upstream fails to produce a DNS response.
+- Behavior:
+  - `fail`: preserves the default behavior. `forward` returns an error, stops the current sequence, and the error continues to bubble through parent sequences unless another executor explicitly catches it.
+  - `continue`: still records `forward_error_total`, timeout metrics, and per-upstream errors, but converts the terminal forwarding failure into `ExecStep::Next` so the current sequence can continue.
+  - `continue` does not create a new DNS response and does not count the failed forwarding attempt as a success. Any response that already existed in the context before `forward` is left unchanged.
+- Typical use: let a primary forwarding path fall through to later matchers and an explicit `fallback` executor after all upstreams time out, fail to connect, or remain in 429 cooldown.
+- `on_error` applies only when no upstream DNS Message is available. DNS Messages such as `SERVFAIL`, `REFUSED`, `NXDOMAIN`, or an incomplete alias are still handled by `response_selection`.
+
+#### DoH / DoH3 HTTP 429 backoff
+
+- A DoH/DoH3 upstream that returns HTTP `429 Too Many Requests` enters an upstream-local cooldown without closing a healthy H2/H3 transport.
+- Local exponential backoff starts at `1s`, then grows through `2s`, `4s`, `8s`, `16s`, and `32s` up to `60s`.
+- Numeric `Retry-After` values are honored and capped at `300s`.
+- While an upstream is cooling, multi-upstream forwarding skips it and fills the lane from other available candidates. A single-upstream forwarder fails fast with the local cooldown error.
+- When cooldown expires, only one half-open probe is admitted. Probe success resets the backoff; another 429 advances the backoff; an ordinary probe failure re-arms the current backoff level.
+- A half-open probe cancelled only because another racing upstream won is not treated as another rate-limit failure; it is rescheduled after a short suppression interval of about `500ms`.
+- Concurrent 429 responses from the same wave are coalesced, and a stale 429 from an older request cannot re-close an upstream after a successful probe.
 
 #### CNAME response handling
 
@@ -100,6 +125,7 @@ Sends DNS queries to upstreams.
 - Runtime impact:
   - One upstream means normal forwarding.
   - More than one enables racing behavior.
+  - A DoH/DoH3 upstream in 429 cooldown does not consume an effective query lane; the dispatcher continues with another available upstream.
 
 #### `short_circuit`
 
@@ -216,6 +242,16 @@ Sends DNS queries to upstreams.
 - Type: `boolean`; Required: no; Default: `false`
 - Purpose: Use HTTP/3 for DoH.
 
+#### `upstreams[].use_post`
+
+- Type: `boolean`; Required: no; Default: `false`
+- Purpose: Select HTTP POST for DoH/DoH3 requests.
+- Behavior:
+  - `false`: uses RFC 8484 GET and carries the DNS wire message in the URL `dns=` parameter.
+  - `true`: uses POST with the raw `application/dns-message` wire message in the request body.
+  - Fixed query parameters configured in the DoH URL are preserved for both GET and POST.
+  - Non-DoH upstreams such as UDP, TCP, DoT, and DoQ ignore this field.
+
 #### `upstreams[].so_mark`
 
 - Type: `integer`; Required: no
@@ -300,6 +336,12 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
     short_circuit: true
     # Serve stale responses briefly after original TTL expiry and refresh lazily
     lazy_cache_ttl: 120
+    # Bound concurrent background lazy refreshes across distinct cache keys
+    lazy_refresh_concurrency: 64
+    # Maximum wall-clock time for one background lazy refresh, in seconds
+    lazy_refresh_timeout: 10
+    # Minimum retry delay after a failed lazy refresh, in seconds
+    lazy_refresh_failure_cooldown: 30
     # Cache NXDOMAIN / NODATA responses too
     cache_negative: true
     # Upper bound for negative-cache TTL
@@ -335,6 +377,35 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
   - Stale hits trigger an asynchronous background refresh.
   - This setting does not shorten the original fresh TTL.
 
+#### `lazy_refresh_concurrency`
+
+- Type: `integer`; Required: no; Default: `64`
+- Purpose: Bound concurrent lazy refreshes across distinct cache keys.
+- Behavior:
+  - The existing per-key deduplication still prevents duplicate refreshes for the same key.
+  - When all refresh slots are busy, stale responses are still served, but no task is queued or spawned.
+  - Refreshes skipped by the concurrency limit increment `cache_lazy_refresh_total{result="skipped_busy"}`.
+  - A later stale request can retry once a refresh slot becomes available.
+
+#### `lazy_refresh_timeout`
+
+- Type: `integer`; Required: no; Default: `10`
+- Unit: seconds
+- Purpose: Limit the wall-clock time for one background lazy refresh.
+- Design note: the default is intentionally longer than the upstream default `5s` query timeout so upstream/forward can report its own timeout or error before the cache wrapper cancels the refresh.
+
+#### `lazy_refresh_failure_cooldown`
+
+- Type: `integer`; Required: no; Default: `30`
+- Unit: seconds
+- Purpose: Bound retry frequency for the same stale cache key after a lazy refresh failure.
+- Behavior:
+  - Upstream errors, timeouts, SERVFAIL/unusable responses, and similar refresh failures arm a cooldown on the current stale entry.
+  - During the cooldown, stale responses are still served but no new background refresh is started for that entry.
+  - Refreshes skipped by the failure cooldown increment `cache_lazy_refresh_total{result="skipped_cooldown"}`.
+  - A successful refresh publishes a new cache entry, so the previous entry's failure cooldown is not inherited.
+  - The 30-second default follows the RFC 8767 failure-recheck recommendation.
+
 #### `dump_file`
 
 - Type: `string`; Required: no
@@ -343,7 +414,11 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `dump_interval`
 
 - Type: `duration`; Required: no; Default: `600s`
-- Purpose: Periodic dump interval.
+- Purpose: Minimum interval between automatic periodic dump checks.
+- Behavior:
+  - Automatic periodic dumps never run more frequently than this configured interval.
+  - The internal dirty-age policy may defer a low-churn dump, but never shortens `dump_interval`.
+  - The final dump during shutdown and explicit API-triggered dumps are not delayed by this interval.
 
 #### `short_circuit`
 
@@ -382,7 +457,10 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 #### `ecs_in_key`
 
 - Type: `boolean`; Required: no; Default: `false`
-- Purpose: Include ECS information in the cache key.
+- Purpose: Control whether ECS participates in cache keying.
+- `false`: ECS from the client request is still forwarded unchanged to downstream/upstream plugins, but the cache key ignores ECS. ECS is stripped from the upstream response before the cache stage returns or stores it, so clients with different ECS values (or no ECS) share the same ordinary cache entry. This is a first-writer-wins policy: the first successfully cached ECS-steered answer may be reused by other ECS clients.
+- `true`: ECS participates in scope-aware cache keying and lookup. Cache isolation and reuse follow RFC 7871 FAMILY, SOURCE PREFIX-LENGTH, ADDRESS, and response SCOPE PREFIX-LENGTH semantics.
+- Regardless of this setting, invalid request ECS (for example, a non-zero SCOPE PREFIX-LENGTH or an out-of-range prefix) bypasses caching and continues through the downstream chain.
 
 ### quick setup
 
@@ -404,8 +482,8 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 ### Plugin API
 
 - `GET /plugins/<cache_tag>/entries`
-  - Reads cache entries with pagination. Supports `limit`, `cursor`, and `qname`; `qname` is a case-insensitive substring filter over the cache-key domain.
-- `GET /plugins/<cache_tag>/flush`
+  - Reads cache entries with pagination. Supports `limit`, `cursor`, `qname`, and `ip`. `qname` is a case-insensitive substring filter over the cache-key domain; `ip` exactly matches IPv4 / IPv6 addresses in the response's Answer section and returns the matching cache-key domains. Both filters can be combined and are applied before pagination. This does not perform PTR queries or match glue addresses or ECS networks. The WebUI cache detail page provides corresponding filter inputs.
+- `POST /plugins/<cache_tag>/flush`
 - `GET /plugins/<cache_tag>/dump`
 - `POST /plugins/<cache_tag>/load_dump`
 

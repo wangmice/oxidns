@@ -22,6 +22,8 @@ import Admonition from "@theme/Admonition";
     concurrent: 3
     # 并发上游结果选择模式：fastest / balanced / prefer_positive / consensus
     response_selection: balanced
+    # 全部上游失败后的控制流：fail / continue
+    on_error: fail
     upstreams:
       # 最简单的 UDP 上游
       - tag: "cf_udp"
@@ -65,7 +67,8 @@ import Admonition from "@theme/Admonition";
 - 作用：定义多上游模式下的并发查询扇出数。
 - 运行影响：
   - 值越大，多上游竞争越积极，但同时会增加上游请求量。
-  - 该值只决定本次实际启动的上游数量，不会在收到 CNAME-only 响应后自动顺序尝试尚未启动的上游；`concurrent: 1` 保持单次上游选择语义。
+  - 该值决定同时在途的上游查询数量，不会在收到 CNAME-only 响应后为了 response selection 自动顺序尝试尚未启动的上游。
+  - `concurrent: 1` 通常只查询一个随机上游；例外是 DoH/DoH3 429 cooldown/recovery，当前候选因限流不可用时，同一 lane 可以顺序切换到尚未尝试的候选，但同时在途查询仍最多为一个。
   - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。
 
 #### `response_selection`
@@ -73,7 +76,7 @@ import Admonition from "@theme/Admonition";
 - 类型：`string`；必填：否；默认值：`balanced`
 - 取值：`fastest`、`balanced`、`prefer_positive`、`consensus`
 - 作用：定义多上游并发返回不一致时的结果选择策略。
-- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，每次也只随机启动其中一个上游，不会为了 selection 再查询其他上游。
+- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，response selection 本身不会扩大查询数量，只有 429 cooldown/recovery 才可能在同一单 lane 内顺序换用其它候选。
 - 除 `fastest` 外，响应会按原始 Question 分类为：
   - **完整正响应（complete positive）**：请求类型位于原始 QNAME 或其 CNAME 链终点。
   - **不完整别名（incomplete alias）**：存在 CNAME 链，但没有最终请求类型，也没有 SOA 否定证明。
@@ -85,6 +88,28 @@ import Admonition from "@theme/Admonition";
   - `balanced`：默认模式。完整正响应立即胜出。第一个确定负响应会启动固定 100ms 的 grace window，窗口内仍等待完整正响应；窗口到期或全部上游完成后按上述统一排名选择。不完整别名和其他响应本身不会启动 grace window。
   - `prefer_positive`：完整正响应立即胜出；否则等待所有已启动上游完成，再按统一排名选择。因此在没有完整正响应时，不完整别名会优先于单个负响应。
   - `consensus`：完整正响应仍由一票立即胜出。`NXDOMAIN` 与 NODATA 分开计票，两个同类负响应可提前确认并返回对应负响应；不要求两个负响应的 SOA 或完整报文完全相同。若并发数小于 2，则退化为 `prefer_positive`。如果所有上游结束仍没有负共识，则按统一排名返回最佳可用响应，此时仍可能返回单个负响应；因此该模式是“负向谨慎”，不是严格的全响应多数决。
+
+#### `on_error`
+
+- 类型：`string`；必填：否；默认值：`fail`
+- 取值：`fail`、`continue`
+- 作用：定义所有可尝试 upstream 都未产生 DNS 响应时，`forward` 如何处理最终错误。
+- 行为：
+  - `fail`：保持默认行为，返回错误并终止当前 sequence；未被专门捕获的错误会继续向上级 sequence 传播。
+  - `continue`：仍按失败记录 `forward_error_total`、timeout 和各 upstream error 指标，但不把该失败作为 executor error 向上返回，而是返回 `ExecStep::Next` 继续当前 sequence。
+  - `continue` 不会生成新的 DNS response，也不会把失败计为 success；调用前已经存在于上下文中的 response 不会被主动清除。
+- 典型用途：让主转发链在全部 upstream timeout、连接失败、429 cooldown 等情况下继续执行后续 matcher，并落入显式的 `fallback` executor。
+- `on_error` 只处理“没有任何 upstream DNS Message 可选”的最终失败；如果 upstream 返回了 `SERVFAIL`、`REFUSED`、`NXDOMAIN` 或 incomplete alias，这些仍是 DNS Message，会按 `response_selection` 规则处理。
+
+#### DoH / DoH3 HTTP 429 退避
+
+- DoH/DoH3 upstream 返回 HTTP `429 Too Many Requests` 时，会进入该 upstream 独立的 cooldown，不关闭健康的 H2/H3 transport。
+- 本地指数退避从 `1s` 开始，连续 429 依次增长为 `2s`、`4s`、`8s`、`16s`、`32s`，最高 `60s`。
+- 数字形式的 `Retry-After` 会参与 cooldown，服务器请求的等待时间最高按 `300s` 处理。
+- cooldown 期间，多 upstream forward 会跳过该 upstream，并用其它可用候选补足当前并发 lane；只有一个 upstream 时会快速返回本地 cooldown 错误。
+- cooldown 到期后只允许一个 half-open probe。probe 成功会重置 backoff；再次收到 429 会进入下一档 backoff；probe 的普通失败会重新进入当前档 cooldown。
+- 如果 half-open probe 只是因为 `fastest` 等竞速结果被取消，不会视为新的限流失败，只会短暂抑制约 `500ms` 后允许再次 probe。
+- 同一波并发 429 会合并处理，旧请求迟到的 429 不会在成功 probe 后重新关闭已恢复的 upstream。
 
 #### CNAME 响应处理
 
@@ -101,6 +126,7 @@ import Admonition from "@theme/Admonition";
 - 运行影响：
   - 数组长度为 `1` 时使用单上游模式。
   - 数组长度大于 `1` 时使用竞争式查询模式。
+  - 处于 429 cooldown 的 DoH/DoH3 upstream 不会占用一个有效并发查询 lane；调度器会继续领取其它可用 upstream。
 
 #### `short_circuit`
 
@@ -257,6 +283,16 @@ import Admonition from "@theme/Admonition";
 - 示例：`enable_http3: true`
 - 说明：也可直接通过 `h3://` 在 `addr` 中启用。
 
+#### `upstreams[].use_post`
+
+- 类型：`boolean`；必填：否；默认值：`false`
+- 作用：控制 DoH/DoH3 是否使用 HTTP POST。
+- 行为：
+  - `false`：使用 RFC 8484 GET，DNS wire message 通过 URL 的 `dns=` 参数传输。
+  - `true`：使用 POST，请求体直接携带 `application/dns-message` wire message。
+  - 配置在 DoH URL 中的固定 query 参数在 GET 和 POST 下都会保留。
+  - UDP、TCP、DoT、DoQ 等非 DoH upstream 会忽略该字段。
+
 #### `upstreams[].so_mark`
 
 - 类型：`integer`；必填：否；默认值：无
@@ -348,6 +384,12 @@ import Admonition from "@theme/Admonition";
     short_circuit: true
     # 允许在原始 TTL 过期后短时间返回 stale 响应，并异步刷新缓存
     lazy_cache_ttl: 120
+    # 限制不同缓存键同时执行的后台 lazy refresh 数量
+    lazy_refresh_concurrency: 64
+    # 单次后台 lazy refresh 的最长 wall-clock 时间（秒）
+    lazy_refresh_timeout: 10
+    # lazy refresh 失败后，同一缓存键再次尝试刷新的最小间隔（秒）
+    lazy_refresh_failure_cooldown: 30
     # 开启 NXDOMAIN / NODATA 负缓存
     cache_negative: true
     # 负缓存 TTL 上限
@@ -384,6 +426,35 @@ import Admonition from "@theme/Admonition";
   - stale 命中会在后台异步刷新缓存。
   - 该配置不会缩短原始 fresh TTL。
 
+#### `lazy_refresh_concurrency`
+
+- 类型：`integer`；必填：否；默认值：`64`
+- 作用：限制不同缓存键同时运行的 lazy refresh 数量。
+- 运行影响：
+  - 同一个缓存键仍通过 per-key 去重避免重复刷新。
+  - 达到并发上限时继续返回 stale 响应，但不会排队或启动新的后台 refresh task。
+  - 被并发上限跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_busy"}`。
+  - 后续 stale 请求可在有空闲槽位时再次尝试刷新。
+
+#### `lazy_refresh_timeout`
+
+- 类型：`integer`；必填：否；默认值：`10`
+- 单位：秒
+- 作用：限制单次后台 lazy refresh 的最长 wall-clock 时间。
+- 设计说明：默认值刻意长于上游默认 `5s` 查询超时，使 upstream/forward 能先返回自身超时或错误，而不是被 cache 外层 timer 抢先取消。
+
+#### `lazy_refresh_failure_cooldown`
+
+- 类型：`integer`；必填：否；默认值：`30`
+- 单位：秒
+- 作用：限制同一个 stale 缓存键在刷新失败后的重试频率。
+- 运行影响：
+  - 上游错误、超时、SERVFAIL/不可缓存响应等刷新失败后，为当前 stale entry 设置失败冷却。
+  - 冷却期间继续返回 stale 响应，但不启动新的后台 refresh。
+  - 被失败冷却跳过的刷新计入 `cache_lazy_refresh_total{result="skipped_cooldown"}`。
+  - 成功刷新会发布新的 cache entry，新 entry 不继承旧 entry 的失败冷却。
+  - 默认 30 秒与 RFC 8767 的 failure recheck 建议一致。
+
 #### `dump_file`
 
 - 类型：`string`；必填：否；默认值：无
@@ -393,7 +464,11 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`integer`；必填：否；默认值：`600`
 - 单位：秒
-- 作用：定义缓存定期落盘周期。
+- 作用：定义自动周期 dump 的最小检查间隔。
+- 行为：
+  - 自动周期 dump 不会以短于该配置值的间隔执行。
+  - 内部 dirty-age 策略可以延后低变更量缓存的 dump，但不会缩短 `dump_interval`。
+  - shutdown 时的最终 dump 和显式 API 手动 dump 不受该间隔限制。
 
 #### `short_circuit`
 
@@ -437,6 +512,9 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`boolean`；必填：否；默认值：`false`
 - 作用：控制 ECS scope 是否参与缓存键计算。
+- `false`：客户端请求中的 ECS 仍会原样传递给后续上游插件，但缓存键忽略 ECS。上游响应中的 ECS 会在 cache 返回响应和写入缓存前剥离，因此带不同 ECS 或不带 ECS 的客户端共享同一个普通缓存项。该模式属于 first-writer-wins：首次成功写入的 ECS 调度结果可能被其它 ECS 客户端复用。
+- `true`：ECS 参与 scope-aware 缓存键与查找，按 RFC 7871 的 FAMILY、SOURCE PREFIX-LENGTH、ADDRESS 与响应 SCOPE PREFIX-LENGTH 隔离和复用缓存结果。
+- 无论取值为何，非法请求 ECS（例如非零 SCOPE PREFIX-LENGTH 或超出地址族范围的前缀）不会进入缓存，而是旁路 cache 继续执行后续链路。
 
 ### quick setup
 
@@ -460,8 +538,8 @@ import Admonition from "@theme/Admonition";
 ### 插件 API
 
 - `GET /plugins/<tag>/entries`
-  - 分页读取缓存项；支持 `limit`、`cursor` 和 `qname` 查询参数，其中 `qname` 按缓存键域名做大小写不敏感的包含筛选。
-- `GET /plugins/<tag>/flush`
+  - 分页读取缓存项；支持 `limit`、`cursor`、`qname` 和 `ip` 查询参数。`qname` 按缓存键域名做大小写不敏感的包含筛选；`ip` 精确匹配响应 Answer 区中的 IPv4 / IPv6 地址，返回对应缓存键域名。两项筛选可组合，且在分页前执行；不是 PTR 查询，不匹配胶水地址或 ECS 网段。WebUI 缓存详情提供对应输入框。
+- `POST /plugins/<tag>/flush`
   - 清空缓存。
 - `GET /plugins/<tag>/dump`
   - 导出缓存内容。

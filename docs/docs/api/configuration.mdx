@@ -82,6 +82,10 @@ title: 配置接口
 * UTF-8 YAML 文本且非空；或
 * JSON：`{"format":"yaml","content":"...yaml..."}`
 
+`forward` 的 `on_error: fail | continue` 与其它插件参数一样通过完整 YAML 配置传递。`POST /api/config/validate` 会校验该字段，`PUT /api/config` 默认在写盘前执行相同校验；API 不会重写或丢弃该字段。
+
+例如，`on_error: continue` 可用于让一个全部 upstream 均失败的主 `forward` 正常返回到 sequence，由后续 matcher / `fallback` executor 接管；该 forward 的失败 metrics 仍会正常记录。
+
 适用场景：
 
 * 控制平面先验校验配置，再决定是否落盘。

@@ -42,6 +42,9 @@ import Admonition from "@theme/Admonition";
   - 域名表达式（支持 `full:`、`domain:`、`keyword:`、`regexp:`，无前缀时按 `domain:` 处理）
   - 具备域名匹配能力的 provider 引用，例如 `domain_set`、`geosite`
   - 文件引用
+- 文件引用说明：
+  - `&/path/to/file` 会在 matcher 构建时读取，不会加入 provider 文件自动 watcher。
+  - 如果需要运行时自动感知文件变化，请使用 `domain_set.files` 等文件型 provider，并在 matcher 中通过 `"$tag"` 引用。
 - 运行影响：
   - 当前请求中的任意问题域名命中任一规则时，matcher 返回 `true`。
 
