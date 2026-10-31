@@ -516,6 +516,11 @@ export const zhCNWebui = {
     flushTitle: "清空缓存项？",
     flushDesc: '将清空插件 "{tag}" 当前保存的所有缓存项。此操作无法撤销。',
     qnameFilterLabel: "QNAME 包含",
+    ipFilterLabel: "答案 IP 等于",
+    ipFilterPlaceholder: "IPv4 或 IPv6 地址",
+    ipFilterHelp:
+      "精确匹配答案区 A/AAAA 记录中的 IPv4/IPv6 地址，包括含 CNAME 的响应。与 QNAME 条件同时满足才匹配。不匹配附加区、胶水记录或 ECS，不执行 PTR 反向查询。",
+    invalidIp: "请输入有效的 IPv4 或 IPv6 地址。",
     filterButton: "筛选",
     clearFilter: "清除",
     cacheKey: "缓存键",

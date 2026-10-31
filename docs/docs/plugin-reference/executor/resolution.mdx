@@ -538,7 +538,7 @@ import Admonition from "@theme/Admonition";
 ### 插件 API
 
 - `GET /plugins/<tag>/entries`
-  - 分页读取缓存项；支持 `limit`、`cursor` 和 `qname` 查询参数，其中 `qname` 按缓存键域名做大小写不敏感的包含筛选。
+  - 分页读取缓存项；支持 `limit`、`cursor`、`qname` 和 `ip` 查询参数。`qname` 按缓存键域名做大小写不敏感的包含筛选；`ip` 精确匹配响应 Answer 区中的 IPv4 / IPv6 地址，返回对应缓存键域名。两项筛选可组合，且在分页前执行；不是 PTR 查询，不匹配胶水地址或 ECS 网段。WebUI 缓存详情提供对应输入框。
 - `POST /plugins/<tag>/flush`
   - 清空缓存。
 - `GET /plugins/<tag>/dump`

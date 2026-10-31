@@ -482,7 +482,7 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 ### Plugin API
 
 - `GET /plugins/<cache_tag>/entries`
-  - Reads cache entries with pagination. Supports `limit`, `cursor`, and `qname`; `qname` is a case-insensitive substring filter over the cache-key domain.
+  - Reads cache entries with pagination. Supports `limit`, `cursor`, `qname`, and `ip`. `qname` is a case-insensitive substring filter over the cache-key domain; `ip` exactly matches IPv4 / IPv6 addresses in the response's Answer section and returns the matching cache-key domains. Both filters can be combined and are applied before pagination. This does not perform PTR queries or match glue addresses or ECS networks. The WebUI cache detail page provides corresponding filter inputs.
 - `POST /plugins/<cache_tag>/flush`
 - `GET /plugins/<cache_tag>/dump`
 - `POST /plugins/<cache_tag>/load_dump`
