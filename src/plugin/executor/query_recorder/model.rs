@@ -3,12 +3,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use oxidns_proto::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::context::ExecutionPath;
+use crate::core::context::ExecutionPathEvent;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct QueryRecorderConfig {
     pub(super) path: String,
@@ -127,14 +129,15 @@ pub(super) struct RecordDetail {
     pub(super) steps: Vec<StepJson>,
 }
 
+pub(super) type SharedRecordDetail = Arc<RecordDetail>;
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingRecord {
     pub(super) request: Message,
     pub(super) response: Option<Message>,
     pub(super) created_at_ms: i64,
     pub(super) elapsed_ms: u64,
-    pub(super) exec_path: ExecutionPath,
-    pub(super) step_start_index: usize,
+    pub(super) execution_events: Vec<Arc<ExecutionPathEvent>>,
     pub(super) client_ip: SocketAddr,
     pub(super) error: Option<String>,
 }

@@ -3,17 +3,22 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params, params_from_iter};
 use tokio::sync::broadcast;
+use tracing::{info, warn};
 
 use super::backend::{
-    CleanupResult, ClearHistoryResult, DatabaseCoordinator, RecorderBackend, SpaceReclaimResult,
-    SpaceStats, WriterCommand, WriterThreadContext,
+    CleanupResult, ClearHistoryResult, DatabaseCoordinator, MANAGEMENT_OPERATION_TIMEOUT,
+    MANAGEMENT_START_CLAIMED, MANAGEMENT_START_PENDING, NO_PERIODIC_CLEANUP, RecorderBackend,
+    RecorderLifecycle, SpaceReclaimResult, SpaceStats, WriterCommand, WriterInterrupt,
+    WriterThreadContext,
 };
 #[cfg(test)]
 use super::model::StepJson;
@@ -21,8 +26,8 @@ use super::model::{
     DistributionQuery, DistributionResponse, DistributionRow, LatencyHistogramBucket, LatencyQuery,
     LatencySlowRow, LatencySummary, ListCursor, ListQuery, PendingRecord, PluginStatsKind,
     PluginStatsRow, PluginsStatsQuery, QueryRecordFilter, QueryRecordStatus, RecordDetail,
-    RecordRow, TableNames, TimeseriesPoint, TimeseriesQuery, TimeseriesResponse, TopBucketRow,
-    TopBucketsResponse, TopQuery,
+    RecordRow, SharedRecordDetail, TableNames, TimeseriesPoint, TimeseriesQuery,
+    TimeseriesResponse, TopBucketRow, TopBucketsResponse, TopQuery,
 };
 use super::persistence::{
     PreparedRecord, RECORD_COLUMNS, StoredRecord, assemble_records, insert_batch, load_steps,
@@ -35,8 +40,140 @@ const SCHEMA_VERSION: &str = "v2";
 const CLEANUP_BATCH_SIZE: usize = 1_000;
 const VACUUM_BATCH_PAGES: u64 = 1_000;
 const PLUGIN_STATS_SAMPLE_LIMIT: usize = 10_000;
+const WRITER_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const WRITER_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(30);
+const WRITER_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NON_STORAGE_FAILURE_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const NON_STORAGE_FAILURE_MAX_DELAY: Duration = Duration::from_secs(1);
+const NON_STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+const PERIODIC_CLEANUP_ACCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const PERIODIC_CLEANUP_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const PERIODIC_CLEANUP_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct PeriodicCleanupRetry {
+    retry_at: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for PeriodicCleanupRetry {
+    fn default() -> Self {
+        Self {
+            retry_at: None,
+            delay: PERIODIC_CLEANUP_RETRY_INITIAL_DELAY,
+        }
+    }
+}
+
+impl PeriodicCleanupRetry {
+    fn ready(&mut self, now: Instant) -> bool {
+        match self.retry_at {
+            Some(deadline) if now < deadline => false,
+            Some(_) => {
+                self.retry_at = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn recv_timeout(&self, now: Instant, fallback: Duration) -> Duration {
+        self.retry_at
+            .map(|deadline| fallback.min(deadline.saturating_duration_since(now)))
+            .unwrap_or(fallback)
+    }
+
+    fn schedule(&mut self, now: Instant) -> Duration {
+        let delay = self.delay;
+        self.retry_at = Some(now + delay);
+        self.delay = self
+            .delay
+            .saturating_mul(2)
+            .min(PERIODIC_CLEANUP_RETRY_MAX_DELAY);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.retry_at = None;
+        self.delay = PERIODIC_CLEANUP_RETRY_INITIAL_DELAY;
+    }
+}
+
+#[derive(Debug)]
+struct NonStorageFailureBackoff {
+    delay: Duration,
+    last_warn: Option<Instant>,
+}
+
+impl Default for NonStorageFailureBackoff {
+    fn default() -> Self {
+        Self {
+            delay: NON_STORAGE_FAILURE_INITIAL_DELAY,
+            last_warn: None,
+        }
+    }
+}
+
+impl NonStorageFailureBackoff {
+    fn reset(&mut self) {
+        self.delay = NON_STORAGE_FAILURE_INITIAL_DELAY;
+        self.last_warn = None;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.delay;
+        self.delay = self
+            .delay
+            .saturating_mul(2)
+            .min(NON_STORAGE_FAILURE_MAX_DELAY);
+        delay
+    }
+
+    fn should_warn(&mut self, now: Instant) -> bool {
+        let should_warn = match self.last_warn {
+            Some(last_warn) => {
+                now.saturating_duration_since(last_warn) >= NON_STORAGE_FAILURE_WARN_INTERVAL
+            }
+            None => true,
+        };
+        if should_warn {
+            self.last_warn = Some(now);
+        }
+        should_warn
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShutdownWriteFailure {
+    dropped_records: u64,
+    first_error: Option<String>,
+}
+
+impl ShutdownWriteFailure {
+    fn record(&mut self, record_count: usize, error: &DnsError) {
+        self.dropped_records = self.dropped_records.saturating_add(record_count as u64);
+        if self.first_error.is_none() {
+            self.first_error = Some(error.to_string());
+        }
+    }
+
+    fn message(&self) -> Option<String> {
+        let first_error = self.first_error.as_deref()?;
+        Some(format!(
+            "query_recorder graceful shutdown dropped {} record(s) before final flush; first write failure: {}",
+            self.dropped_records, first_error
+        ))
+    }
+}
+
 pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    configure_writer_database(&conn)?;
+    Ok(conn)
+}
+
+fn configure_writer_database(conn: &Connection) -> rusqlite::Result<()> {
     // Tuned for the dedicated writer thread. Keep WAL and incremental vacuum
     // behavior, but avoid giving the single writer the same large read cache
     // and mmap footprint that used to be applied to every reader.
@@ -54,6 +191,32 @@ pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> 
          PRAGMA cache_size=-4096;
          PRAGMA mmap_size=0;",
     )?;
+    Ok(())
+}
+
+fn open_writer_database_for_recovery(
+    path: &Path,
+    stop_requested: &AtomicBool,
+    writer_interrupt: &WriterInterrupt,
+) -> Result<Connection> {
+    // Connection::open itself is a filesystem operation and cannot be
+    // interrupted through SQLite. Install the handle immediately afterwards
+    // so all PRAGMA/schema work that follows is interruptible during shutdown.
+    let conn = Connection::open(path)?;
+    writer_interrupt.install(&conn);
+
+    if stop_requested.load(Ordering::Acquire) {
+        writer_interrupt.interrupt();
+        return Err(writer_stopping());
+    }
+    configure_writer_database(&conn)?;
+
+    // Shutdown may have been requested while the PRAGMA configuration above
+    // was running. Check again before returning the recovered connection.
+    if stop_requested.load(Ordering::Acquire) {
+        writer_interrupt.interrupt();
+        return Err(writer_stopping());
+    }
     Ok(conn)
 }
 
@@ -132,68 +295,290 @@ pub(super) fn run_writer_thread(
     let WriterThreadContext {
         path,
         tables,
-        stop_requested,
+        lifecycle,
         tail,
         memory_tail,
         broadcaster,
         batch_size,
         flush_interval,
         database_coordinator,
+        dropped_total,
+        writer_interrupt,
+        writer_recovering,
+        management_inflight,
     } = context;
+    let stop_requested = &lifecycle.stop_requested;
+    let shutdown_requested = &lifecycle.shutdown_requested;
 
     let mut pending = Vec::with_capacity(batch_size);
+    let mut recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+    let mut non_storage_failure_backoff = NonStorageFailureBackoff::default();
+    let mut shutdown_write_failure = ShutdownWriteFailure::default();
+    let mut periodic_cleanup_retry = PeriodicCleanupRetry::default();
     loop {
-        match rx.recv_timeout(flush_interval) {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        if !run_periodic_cleanup_if_requested(
+            &mut conn,
+            &path,
+            &tables,
+            &lifecycle,
+            &mut pending,
+            &tail,
+            memory_tail,
+            &broadcaster,
+            &database_coordinator,
+            &dropped_total,
+            &writer_interrupt,
+            &mut recovery_delay,
+            &writer_recovering,
+            &management_inflight,
+            &mut periodic_cleanup_retry,
+        ) {
+            break;
+        }
+        let receive_timeout = periodic_cleanup_retry.recv_timeout(Instant::now(), flush_interval);
+        match rx.recv_timeout(receive_timeout) {
             Ok(WriterCommand::Insert(record)) => {
                 pending.push(*record);
-                if pending.len() >= batch_size {
-                    flush_pending_coordinated(
+                if pending.len() >= batch_size
+                    && !flush_pending_resilient(
                         &mut conn,
+                        &path,
                         &tables,
                         &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
                         &database_coordinator,
-                    )?;
+                        stop_requested,
+                        shutdown_requested,
+                        &dropped_total,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                        &mut non_storage_failure_backoff,
+                        &mut shutdown_write_failure,
+                        &writer_recovering,
+                    )
+                {
+                    break;
                 }
             }
+            Ok(WriterCommand::WakePeriodicCleanup) => {}
+            #[cfg(test)]
             Ok(WriterCommand::Cleanup {
                 cutoff_ms,
+                started_tx,
+                start_state,
                 reply_tx,
+                cancelled,
             }) => {
-                let result = (|| {
-                    let prepared = prepare_pending(&mut pending)?;
-                    let _access = database_coordinator.write_access()?;
-                    flush_prepared(
+                if start_state
+                    .compare_exchange(
+                        MANAGEMENT_START_PENDING,
+                        MANAGEMENT_START_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = started_tx.send(());
+                    management_inflight.store(false, Ordering::Release);
+                    let _ = reply_tx.send(Err(
+                        "query_recorder management request expired before start".to_string(),
+                    ));
+                    continue;
+                }
+                let management_interrupt_guard =
+                    match writer_interrupt.claim_management(cancelled.clone()) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            cancelled.store(true, Ordering::Release);
+                            let _ = started_tx.send(());
+                            management_inflight.store(false, Ordering::Release);
+                            let _ = reply_tx.send(Err(err.to_string()));
+                            continue;
+                        }
+                    };
+                let _ = started_tx.send(());
+                let result: Result<CleanupResult> = (|| {
+                    let Some(_access) = database_coordinator
+                        .write_access_until_stop_or_cancel(stop_requested, &cancelled)?
+                    else {
+                        return Err(writer_stopping());
+                    };
+                    ensure_maintenance_running(stop_requested, &cancelled)?;
+                    flush_pending_for_management(
                         &mut conn,
                         &tables,
-                        prepared,
+                        &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
+                        &dropped_total,
                     )?;
-                    run_cleanup(&mut conn, &path, &tables, cutoff_ms)
-                })()
-                .map_err(|err: DnsError| err.to_string());
-                let _ = reply_tx.send(result);
+                    run_cleanup_cancellable(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        cutoff_ms,
+                        stop_requested,
+                        &cancelled,
+                    )
+                })();
+                drop(management_interrupt_guard);
+                let recover_storage = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(storage_error_requires_reopen)
+                    && !cancelled.load(Ordering::Acquire)
+                    && !stop_requested.load(Ordering::Acquire);
+                // Publish recovery before releasing the management single-flight
+                // owner. Otherwise a new cleanup/clear request can slip through
+                // begin_management() before writer_recovering becomes visible.
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                }
+                management_inflight.store(false, Ordering::Release);
+                let _ = reply_tx.send(result.map_err(|err| err.to_string()));
+                if recover_storage {
+                    let recovered = recover_writer_connection(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &database_coordinator,
+                        stop_requested,
+                        shutdown_requested,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                    );
+                    if recovered {
+                        writer_recovering.store(false, Ordering::Release);
+                    } else {
+                        break;
+                    }
+                }
             }
-            Ok(WriterCommand::ClearHistory { reply_tx }) => {
-                let result = (|| {
-                    let prepared = prepare_pending(&mut pending)?;
-                    let _access = database_coordinator.write_access()?;
-                    flush_prepared(
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                start_state,
+                reply_tx,
+                cancelled,
+            }) => {
+                if start_state
+                    .compare_exchange(
+                        MANAGEMENT_START_PENDING,
+                        MANAGEMENT_START_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    cancelled.store(true, Ordering::Release);
+                    let _ = started_tx.send(());
+                    management_inflight.store(false, Ordering::Release);
+                    let _ = reply_tx.send(Err(
+                        "query_recorder management request expired before start".to_string(),
+                    ));
+                    continue;
+                }
+                let management_interrupt_guard =
+                    match writer_interrupt.claim_management(cancelled.clone()) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            cancelled.store(true, Ordering::Release);
+                            let _ = started_tx.send(());
+                            management_inflight.store(false, Ordering::Release);
+                            let _ = reply_tx.send(Err(err.to_string()));
+                            continue;
+                        }
+                    };
+                let _ = started_tx.send(());
+                let result: Result<ClearHistoryResult> = (|| {
+                    let Some(_access) = database_coordinator
+                        .write_access_until_stop_or_cancel(stop_requested, &cancelled)?
+                    else {
+                        return Err(writer_stopping());
+                    };
+                    ensure_maintenance_running(stop_requested, &cancelled)?;
+                    flush_pending_for_management(
                         &mut conn,
                         &tables,
-                        prepared,
+                        &mut pending,
                         &tail,
                         memory_tail,
                         &broadcaster,
+                        &dropped_total,
                     )?;
-                    run_clear_history(&mut conn, &path, &tables, &tail)
-                })()
-                .map_err(|err: DnsError| err.to_string());
+                    run_clear_history_cancellable(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &tail,
+                        stop_requested,
+                        &cancelled,
+                    )
+                })();
+                drop(management_interrupt_guard);
+                let recover_storage = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(storage_error_requires_reopen)
+                    && !cancelled.load(Ordering::Acquire)
+                    && !stop_requested.load(Ordering::Acquire);
+                // See the cleanup path above: recovery must become visible
+                // before management_inflight is released.
+                if recover_storage {
+                    writer_recovering.store(true, Ordering::Release);
+                }
+                management_inflight.store(false, Ordering::Release);
+                let _ = reply_tx.send(result.map_err(|err| err.to_string()));
+                if recover_storage {
+                    let recovered = recover_writer_connection(
+                        &mut conn,
+                        &path,
+                        &tables,
+                        &database_coordinator,
+                        stop_requested,
+                        shutdown_requested,
+                        &writer_interrupt,
+                        &mut recovery_delay,
+                    );
+                    if recovered {
+                        writer_recovering.store(false, Ordering::Release);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
+                drain_writer_queue_for_graceful_shutdown(&rx, &mut pending, &management_inflight);
+                let record_count = pending.len();
+                let final_result = flush_pending_coordinated(
+                    &mut conn,
+                    &tables,
+                    &mut pending,
+                    &tail,
+                    memory_tail,
+                    &broadcaster,
+                    &database_coordinator,
+                    stop_requested,
+                )
+                .map_err(|err| err.to_string());
+                if final_result.is_err() && record_count != 0 {
+                    dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+                }
+                let result = match (final_result, shutdown_write_failure.message()) {
+                    (Ok(()), Some(prior_error)) => Err(prior_error),
+                    (Err(final_error), Some(prior_error)) => {
+                        Err(format!("{prior_error}; final flush failed: {final_error}"))
+                    }
+                    (result, None) => result,
+                };
                 let _ = reply_tx.send(result);
+                break;
             }
             #[cfg(test)]
             Ok(WriterCommand::Flush { reply_tx }) => {
@@ -205,54 +590,737 @@ pub(super) fn run_writer_thread(
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
+                    stop_requested,
                 )
                 .map_err(|err| err.to_string());
                 let _ = reply_tx.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_pending_coordinated(
+                if !flush_pending_resilient(
                     &mut conn,
+                    &path,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                )?;
-                if stop_requested.load(Ordering::Relaxed) {
+                    stop_requested,
+                    shutdown_requested,
+                    &dropped_total,
+                    &writer_interrupt,
+                    &mut recovery_delay,
+                    &mut non_storage_failure_backoff,
+                    &mut shutdown_write_failure,
+                    &writer_recovering,
+                ) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                flush_pending_coordinated(
+                let _ = flush_pending_resilient(
                     &mut conn,
+                    &path,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
                     &database_coordinator,
-                )?;
+                    stop_requested,
+                    shutdown_requested,
+                    &dropped_total,
+                    &writer_interrupt,
+                    &mut recovery_delay,
+                    &mut non_storage_failure_backoff,
+                    &mut shutdown_write_failure,
+                    &writer_recovering,
+                );
                 break;
             }
         }
     }
 
+    if stop_requested.load(Ordering::Acquire) {
+        drain_writer_queue_on_stop(&rx, &mut pending, &dropped_total, &management_inflight);
+    }
+    writer_interrupt.clear();
     Ok(())
 }
 
+fn spawn_periodic_cleanup_watchdog(
+    writer_interrupt: Arc<WriterInterrupt>,
+    owner: Arc<AtomicBool>,
+    timeout: Duration,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, thread::JoinHandle<bool>)> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = thread::Builder::new()
+        .name("query-recorder-periodic-cleanup-timeout".to_string())
+        .spawn(move || match done_rx.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {
+                owner.store(true, Ordering::Release);
+                writer_interrupt.interrupt_management(&owner);
+                true
+            }
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+        })?;
+    Ok((done_tx, handle))
+}
+
+fn schedule_periodic_cleanup_retry(
+    lifecycle: &RecorderLifecycle,
+    cutoff_ms: i64,
+    retry: &mut PeriodicCleanupRetry,
+) -> Duration {
+    lifecycle
+        .periodic_cleanup_cutoff_ms
+        .fetch_max(cutoff_ms, Ordering::AcqRel);
+    retry.schedule(Instant::now())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_periodic_cleanup_if_requested(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    lifecycle: &RecorderLifecycle,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
+    database_coordinator: &DatabaseCoordinator,
+    dropped_total: &AtomicU64,
+    writer_interrupt: &Arc<WriterInterrupt>,
+    recovery_delay: &mut Duration,
+    writer_recovering: &AtomicBool,
+    management_inflight: &AtomicBool,
+    retry: &mut PeriodicCleanupRetry,
+) -> bool {
+    let stop_requested = &lifecycle.stop_requested;
+    let shutdown_requested = &lifecycle.shutdown_requested;
+    if stop_requested.load(Ordering::Acquire) {
+        return false;
+    }
+    if shutdown_requested.load(Ordering::Acquire) {
+        return true;
+    }
+    if !retry.ready(Instant::now()) {
+        return true;
+    }
+
+    let cutoff_ms = lifecycle
+        .periodic_cleanup_cutoff_ms
+        .swap(NO_PERIODIC_CLEANUP, Ordering::AcqRel);
+    if cutoff_ms == NO_PERIODIC_CLEANUP {
+        return true;
+    }
+
+    if management_inflight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        lifecycle
+            .periodic_cleanup_cutoff_ms
+            .fetch_max(cutoff_ms, Ordering::AcqRel);
+        return true;
+    }
+
+    if stop_requested.load(Ordering::Acquire) || shutdown_requested.load(Ordering::Acquire) {
+        management_inflight.store(false, Ordering::Release);
+        return !stop_requested.load(Ordering::Acquire);
+    }
+
+    let started = Instant::now();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let access_deadline = Instant::now() + PERIODIC_CLEANUP_ACCESS_TIMEOUT;
+    let _access = match database_coordinator.write_access_until_stop_or_cancel_until(
+        stop_requested,
+        &cancelled,
+        access_deadline,
+    ) {
+        Ok(Some(access)) => access,
+        Ok(None) => {
+            management_inflight.store(false, Ordering::Release);
+            return false;
+        }
+        Err(err) => {
+            if !stop_requested.load(Ordering::Acquire)
+                && !shutdown_requested.load(Ordering::Acquire)
+            {
+                let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+                warn!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    retry_ms = retry_delay.as_millis(),
+                    error = %err,
+                    "query_recorder periodic cleanup could not acquire database access; retry scheduled"
+                );
+            }
+            management_inflight.store(false, Ordering::Release);
+            return !stop_requested.load(Ordering::Acquire);
+        }
+    };
+
+    let management_interrupt_guard = match writer_interrupt.claim_management(cancelled.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            if !stop_requested.load(Ordering::Acquire)
+                && !shutdown_requested.load(Ordering::Acquire)
+            {
+                let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+                warn!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    retry_ms = retry_delay.as_millis(),
+                    error = %err,
+                    "query_recorder periodic cleanup could not claim interrupt ownership; retry scheduled"
+                );
+            }
+            drop(_access);
+            management_inflight.store(false, Ordering::Release);
+            return !stop_requested.load(Ordering::Acquire);
+        }
+    };
+
+    let (watchdog_done_tx, watchdog_handle) = match spawn_periodic_cleanup_watchdog(
+        writer_interrupt.clone(),
+        cancelled.clone(),
+        MANAGEMENT_OPERATION_TIMEOUT,
+    ) {
+        Ok(watchdog) => watchdog,
+        Err(err) => {
+            drop(management_interrupt_guard);
+            if !stop_requested.load(Ordering::Acquire)
+                && !shutdown_requested.load(Ordering::Acquire)
+            {
+                let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+                warn!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    retry_ms = retry_delay.as_millis(),
+                    error = %err,
+                    "query_recorder periodic cleanup watchdog could not start; retry scheduled"
+                );
+            }
+            drop(_access);
+            management_inflight.store(false, Ordering::Release);
+            return !stop_requested.load(Ordering::Acquire);
+        }
+    };
+
+    let result: Result<CleanupResult> = (|| {
+        ensure_maintenance_running(stop_requested, &cancelled)?;
+        flush_pending_for_management(
+            conn,
+            tables,
+            pending,
+            tail,
+            memory_tail,
+            broadcaster,
+            dropped_total,
+        )?;
+        run_cleanup_cancellable(conn, path, tables, cutoff_ms, stop_requested, &cancelled)
+    })();
+
+    let _ = watchdog_done_tx.send(());
+    let timed_out = match watchdog_handle.join() {
+        Ok(timed_out) => timed_out,
+        Err(_) => {
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                "query_recorder periodic cleanup watchdog panicked"
+            );
+            false
+        }
+    };
+    drop(management_interrupt_guard);
+    drop(_access);
+
+    let recover_storage = result
+        .as_ref()
+        .err()
+        .is_some_and(storage_error_requires_reopen)
+        && !timed_out
+        && !stop_requested.load(Ordering::Acquire);
+    if recover_storage {
+        writer_recovering.store(true, Ordering::Release);
+    }
+    management_inflight.store(false, Ordering::Release);
+
+    if recover_storage {
+        let recovered = recover_writer_connection(
+            conn,
+            path,
+            tables,
+            database_coordinator,
+            stop_requested,
+            shutdown_requested,
+            writer_interrupt,
+            recovery_delay,
+        );
+        if recovered {
+            writer_recovering.store(false, Ordering::Release);
+        }
+        if recovered
+            && !stop_requested.load(Ordering::Acquire)
+            && !shutdown_requested.load(Ordering::Acquire)
+        {
+            let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+            if let Some(err) = result.as_ref().err() {
+                warn!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    retry_ms = retry_delay.as_millis(),
+                    error = %err,
+                    "query_recorder periodic cleanup failed after a storage error; retry scheduled"
+                );
+            }
+        }
+        return recovered;
+    }
+
+    if timed_out {
+        if !stop_requested.load(Ordering::Acquire) && !shutdown_requested.load(Ordering::Acquire) {
+            let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+            warn!(
+                path = %path.display(),
+                cutoff_ms,
+                retry_ms = retry_delay.as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "query_recorder periodic cleanup timed out; retry scheduled"
+            );
+        }
+    } else {
+        match &result {
+            Ok(result) => {
+                retry.reset();
+                info!(
+                    path = %path.display(),
+                    cutoff_ms,
+                    deleted_records = result.deleted_records,
+                    reclaimed_bytes = result.space.reclaimed_bytes(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "query_recorder periodic cleanup completed"
+                );
+            }
+            Err(err) => {
+                if !stop_requested.load(Ordering::Acquire)
+                    && !shutdown_requested.load(Ordering::Acquire)
+                {
+                    let retry_delay = schedule_periodic_cleanup_retry(lifecycle, cutoff_ms, retry);
+                    warn!(
+                        path = %path.display(),
+                        cutoff_ms,
+                        retry_ms = retry_delay.as_millis(),
+                        error = %err,
+                        "query_recorder periodic cleanup failed; retry scheduled"
+                    );
+                }
+            }
+        }
+    }
+
+    !stop_requested.load(Ordering::Acquire)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_resilient(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
+    database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
+    dropped_total: &AtomicU64,
+    writer_interrupt: &WriterInterrupt,
+    recovery_delay: &mut Duration,
+    non_storage_failure_backoff: &mut NonStorageFailureBackoff,
+    shutdown_write_failure: &mut ShutdownWriteFailure,
+    writer_recovering: &AtomicBool,
+) -> bool {
+    if pending.is_empty() {
+        return !stop_requested.load(Ordering::Acquire);
+    }
+
+    let record_count = pending.len();
+    match flush_pending_coordinated(
+        conn,
+        tables,
+        pending,
+        tail,
+        memory_tail,
+        broadcaster,
+        database_coordinator,
+        stop_requested,
+    ) {
+        Ok(()) => {
+            *recovery_delay = WRITER_RECOVERY_INITIAL_DELAY;
+            non_storage_failure_backoff.reset();
+            writer_recovering.store(false, Ordering::Release);
+            true
+        }
+        Err(err) => {
+            if shutdown_requested.load(Ordering::Acquire) {
+                shutdown_write_failure.record(record_count, &err);
+            }
+            dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+            if stop_requested.load(Ordering::Acquire) {
+                return false;
+            }
+            if storage_error_requires_reopen(&err) {
+                non_storage_failure_backoff.reset();
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return true;
+                }
+                warn!(
+                    dropped_records = record_count,
+                    error = %err,
+                    "query_recorder writer flush failed; dropping batch and reopening storage"
+                );
+                writer_recovering.store(true, Ordering::Release);
+                let keep_running = recover_writer_connection(
+                    conn,
+                    path,
+                    tables,
+                    database_coordinator,
+                    stop_requested,
+                    shutdown_requested,
+                    writer_interrupt,
+                    recovery_delay,
+                );
+                if keep_running {
+                    writer_recovering.store(false, Ordering::Release);
+                }
+                keep_running
+            } else {
+                let retry_delay = non_storage_failure_backoff.next_delay();
+                if non_storage_failure_backoff.should_warn(Instant::now()) {
+                    warn!(
+                        dropped_records = record_count,
+                        retry_ms = retry_delay.as_millis(),
+                        error = %err,
+                        "query_recorder writer flush failed; dropping batch and backing off"
+                    );
+                }
+                sleep_with_stop_or_shutdown(stop_requested, shutdown_requested, retry_delay)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_for_management(
+    conn: &mut Connection,
+    tables: &TableNames,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
+    dropped_total: &AtomicU64,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let record_count = pending.len();
+    let prepared = match prepare_pending(pending) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+            warn!(
+                dropped_records = record_count,
+                error = %err,
+                "query_recorder management preflush preparation failed; dropping pending batch"
+            );
+            return Err(err);
+        }
+    };
+    if let Err(err) = flush_prepared(conn, tables, prepared, tail, memory_tail, broadcaster) {
+        dropped_total.fetch_add(record_count as u64, Ordering::Relaxed);
+        warn!(
+            dropped_records = record_count,
+            error = %err,
+            "query_recorder management preflush failed; dropping pending batch"
+        );
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(super) fn storage_error_requires_reopen(error: &DnsError) -> bool {
+    match error {
+        DnsError::Io(_) => true,
+        DnsError::Rusqlite(error) => matches!(
+            error.sqlite_error_code(),
+            Some(
+                ErrorCode::PermissionDenied
+                    | ErrorCode::ReadOnly
+                    | ErrorCode::SystemIoFailure
+                    | ErrorCode::DatabaseCorrupt
+                    | ErrorCode::DiskFull
+                    | ErrorCode::CannotOpen
+                    | ErrorCode::FileLockingProtocolFailed
+                    | ErrorCode::NotADatabase
+            )
+        ),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_writer_connection(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
+    writer_interrupt: &WriterInterrupt,
+    recovery_delay: &mut Duration,
+) -> bool {
+    // `true` means the writer may return to its command loop. A graceful
+    // shutdown therefore skips further recovery work without stopping the
+    // writer, so it can consume the queued Shutdown command.
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        if !sleep_with_stop_or_shutdown(stop_requested, shutdown_requested, *recovery_delay) {
+            return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
+        }
+
+        if !path.exists() {
+            warn!(
+                path = %path.display(),
+                retry_ms = recovery_delay.as_millis(),
+                "query_recorder database path is unavailable; waiting for storage to return"
+            );
+            *recovery_delay = recovery_delay
+                .saturating_mul(2)
+                .min(WRITER_RECOVERY_MAX_DELAY);
+            continue;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let reopened = (|| -> Result<Connection> {
+            let Some(_access) = database_coordinator.write_access_until_stop(stop_requested)?
+            else {
+                return Err(writer_stopping());
+            };
+            let mut new_conn =
+                open_writer_database_for_recovery(path, stop_requested, writer_interrupt)?;
+            create_schema(&mut new_conn, tables)?;
+            verify_writer_database_writable(&mut new_conn, tables)?;
+            Ok(new_conn)
+        })();
+
+        match reopened {
+            Ok(new_conn) => {
+                *conn = new_conn;
+                // Reopening the file only proves that SQLite can open and
+                // initialize it. Keep increasing the retry delay until a real
+                // record flush commits successfully; that success path resets
+                // the delay back to WRITER_RECOVERY_INITIAL_DELAY.
+                *recovery_delay = recovery_delay
+                    .saturating_mul(2)
+                    .min(WRITER_RECOVERY_MAX_DELAY);
+                info!(
+                    path = %path.display(),
+                    "query_recorder writer database connection recovered"
+                );
+                return true;
+            }
+            Err(err) => {
+                if stop_requested.load(Ordering::Acquire) {
+                    return false;
+                }
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return true;
+                }
+                warn!(
+                    path = %path.display(),
+                    retry_ms = recovery_delay.as_millis(),
+                    error = %err,
+                    "query_recorder database reopen failed"
+                );
+                *recovery_delay = recovery_delay
+                    .saturating_mul(2)
+                    .min(WRITER_RECOVERY_MAX_DELAY);
+            }
+        }
+    }
+}
+
+fn sleep_with_stop_or_shutdown(
+    stop_requested: &AtomicBool,
+    shutdown_requested: &AtomicBool,
+    duration: Duration,
+) -> bool {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            // Graceful shutdown only wakes the backoff. The writer must stay
+            // alive so it can consume the queued Shutdown command.
+            return true;
+        }
+        let sleep_for = remaining.min(WRITER_RECOVERY_POLL_INTERVAL);
+        thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
+    !stop_requested.load(Ordering::Acquire)
+}
+
+fn verify_writer_database_writable(conn: &mut Connection, tables: &TableNames) -> Result<()> {
+    // Reopening and reading the schema does not prove that the storage can
+    // still commit writes. Touch a recorder-internal probe key and remove it
+    // in the same transaction so the logical database contents are unchanged
+    // while WAL/write/commit failures are still exercised.
+    const PROBE_KEY: &str = "__oxidns_writer_health_probe__";
+    let tx = conn.transaction()?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {} (key,value) VALUES (?1,'1') \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            tables.meta
+        ),
+        [PROBE_KEY],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM {} WHERE key=?1", tables.meta),
+        [PROBE_KEY],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn drain_writer_queue_for_graceful_shutdown(
+    rx: &Receiver<WriterCommand>,
+    pending: &mut Vec<PendingRecord>,
+    management_inflight: &AtomicBool,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(WriterCommand::Insert(record)) => pending.push(*record),
+            Ok(WriterCommand::WakePeriodicCleanup) => {}
+            #[cfg(test)]
+            Ok(WriterCommand::Cleanup {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is already stopping".to_string()));
+            }
+            #[cfg(test)]
+            Ok(WriterCommand::Flush { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn drain_writer_queue_on_stop(
+    rx: &Receiver<WriterCommand>,
+    pending: &mut Vec<PendingRecord>,
+    dropped_total: &AtomicU64,
+    management_inflight: &AtomicBool,
+) {
+    let mut dropped = pending.len() as u64;
+    pending.clear();
+
+    loop {
+        match rx.try_recv() {
+            Ok(WriterCommand::Insert(_)) => {
+                dropped = dropped.saturating_add(1);
+            }
+            Ok(WriterCommand::WakePeriodicCleanup) => {}
+            #[cfg(test)]
+            Ok(WriterCommand::Cleanup {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::ClearHistory {
+                started_tx,
+                reply_tx,
+                ..
+            }) => {
+                let _ = started_tx.send(());
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+                management_inflight.store(false, Ordering::Release);
+            }
+            Ok(WriterCommand::Shutdown { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            #[cfg(test)]
+            Ok(WriterCommand::Flush { reply_tx }) => {
+                let _ = reply_tx.send(Err("query_recorder writer is stopping".to_string()));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+
+    if dropped != 0 {
+        dropped_total.fetch_add(dropped, Ordering::Relaxed);
+    }
+}
+
+fn writer_stopping() -> DnsError {
+    DnsError::runtime("query_recorder writer is stopping")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flush_pending_coordinated(
     conn: &mut Connection,
     tables: &TableNames,
     pending: &mut Vec<PendingRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
     database_coordinator: &DatabaseCoordinator,
+    stop_requested: &AtomicBool,
 ) -> Result<()> {
     let prepared = prepare_pending(pending)?;
-    let _access = database_coordinator.read_access()?;
-    let _writer = database_coordinator.writer()?;
+    let Some(_access) = database_coordinator.read_access_until_stop(stop_requested)? else {
+        return Err(writer_stopping());
+    };
+    let Some(_writer) = database_coordinator.writer_until_stop(stop_requested)? else {
+        return Err(writer_stopping());
+    };
     flush_prepared(conn, tables, prepared, tail, memory_tail, broadcaster)
 }
 
@@ -260,9 +1328,9 @@ fn flush_prepared(
     conn: &mut Connection,
     tables: &TableNames,
     prepared: Vec<PreparedRecord>,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     memory_tail: usize,
-    broadcaster: &broadcast::Sender<RecordDetail>,
+    broadcaster: &broadcast::Sender<SharedRecordDetail>,
 ) -> Result<()> {
     if prepared.is_empty() {
         return Ok(());
@@ -277,10 +1345,11 @@ fn flush_prepared(
     for (prepared, id) in prepared.into_iter().zip(ids) {
         let mut detail = prepared.detail;
         detail.record.id = id;
+        let detail = Arc::new(detail);
         if tail_guard.len() >= memory_tail {
             tail_guard.pop_front();
         }
-        tail_guard.push_back(detail.clone());
+        tail_guard.push_back(Arc::clone(&detail));
         let _ = broadcaster.send(detail);
     }
     Ok(())
@@ -358,17 +1427,34 @@ fn delete_batch(
     Ok(selected.len())
 }
 
+#[cfg(test)]
 fn run_cleanup(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
     cutoff_ms: i64,
 ) -> Result<CleanupResult> {
+    let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+    run_cleanup_cancellable(conn, path, tables, cutoff_ms, &stop_requested, &cancelled)
+}
+
+fn run_cleanup_cancellable(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    cutoff_ms: i64,
+    stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<CleanupResult> {
+    ensure_maintenance_running(stop_requested, cancelled)?;
     checkpoint_wal(conn)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let before = read_space_stats(conn, path)?;
     let mut deleted_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let deleted = delete_batch(conn, tables, Some(cutoff_ms))?;
         if deleted == 0 {
             break;
@@ -377,65 +1463,129 @@ fn run_cleanup(
         observe_wal_size(path, &mut peak_wal_bytes)?;
         checkpoint_wal(conn)?;
     }
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let reclaimable = read_space_stats(conn, path)?;
-    let space = reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes)?;
+    let space = reclaim_database_space_cancellable(
+        conn,
+        path,
+        before,
+        reclaimable,
+        peak_wal_bytes,
+        stop_requested,
+        cancelled,
+    )?;
     Ok(CleanupResult {
         deleted_records,
         space,
     })
 }
 
+#[cfg(test)]
 fn run_clear_history(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
-    run_clear_history_with_checkpoint(conn, path, tables, tail, &mut checkpoint_wal)
+    let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+    run_clear_history_cancellable(conn, path, tables, tail, &stop_requested, &cancelled)
 }
 
+fn run_clear_history_cancellable(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<ClearHistoryResult> {
+    run_clear_history_with_checkpoint_and_stop(
+        conn,
+        path,
+        tables,
+        tail,
+        stop_requested,
+        cancelled,
+        &mut checkpoint_wal,
+    )
+}
+
+#[cfg(test)]
 fn run_clear_history_with_checkpoint<F>(
     conn: &mut Connection,
     path: &Path,
     tables: &TableNames,
-    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
     checkpoint: &mut F,
 ) -> Result<ClearHistoryResult>
 where
     F: FnMut(&Connection) -> Result<()>,
 {
+    let stop_requested = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+    run_clear_history_with_checkpoint_and_stop(
+        conn,
+        path,
+        tables,
+        tail,
+        &stop_requested,
+        &cancelled,
+        checkpoint,
+    )
+}
+
+fn run_clear_history_with_checkpoint_and_stop<F>(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>,
+    stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
+    checkpoint: &mut F,
+) -> Result<ClearHistoryResult>
+where
+    F: FnMut(&Connection) -> Result<()>,
+{
+    ensure_maintenance_running(stop_requested, cancelled)?;
     // Start from an empty WAL and keep it bounded throughout the operation.
     // A single DELETE transaction for a large recorder can otherwise grow the
     // WAL close to the amount of history being removed before the final
     // checkpoint gets a chance to truncate it.
     checkpoint(conn)?;
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let before = read_space_stats(conn, path)?;
     let mut cleared_records = 0usize;
     let mut peak_wal_bytes = 0;
     loop {
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let deleted = delete_batch(conn, tables, None)?;
         if deleted == 0 {
             break;
         }
         cleared_records = cleared_records.saturating_add(deleted);
-        // Deletes and dictionary reclamation commit per batch. Clear the
-        // in-memory replay buffer before the next fallible checkpoint
-        // so a partial clear can never advertise rows that no longer
-        // exist in SQLite.
         clear_tail(tail);
         observe_wal_size(path, &mut peak_wal_bytes)?;
         checkpoint(conn)?;
     }
 
     clear_tail(tail);
-
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let reclaimable = read_space_stats(conn, path)?;
-    let space =
-        reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes).map_err(|err| {
-            DnsError::runtime(format!(
-                "query history cleared ({cleared_records} records), but space reclaim failed: {err}"
-            ))
-        })?;
+    let space = reclaim_database_space_cancellable(
+        conn,
+        path,
+        before,
+        reclaimable,
+        peak_wal_bytes,
+        stop_requested,
+        cancelled,
+    )
+    .map_err(|err| {
+        DnsError::runtime(format!(
+            "query history cleared ({cleared_records} records), but space reclaim failed: {err}"
+        ))
+    })?;
 
     Ok(ClearHistoryResult {
         cleared_records,
@@ -443,26 +1593,36 @@ where
     })
 }
 
-fn clear_tail(tail: &Arc<Mutex<VecDeque<RecordDetail>>>) {
+fn clear_tail(tail: &Arc<Mutex<VecDeque<SharedRecordDetail>>>) {
     let mut tail_guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     tail_guard.clear();
 }
 
-fn reclaim_database_space(
+fn reclaim_database_space_cancellable(
     conn: &Connection,
     path: &Path,
     before: SpaceStats,
     reclaimable: SpaceStats,
     mut peak_wal_bytes: u64,
+    stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Result<SpaceReclaimResult> {
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let migrated = match reclaimable.auto_vacuum {
         0 => {
             conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+            ensure_maintenance_running(stop_requested, cancelled)?;
             true
         }
         1 => false,
         2 => {
-            run_incremental_vacuum(conn, path, &mut peak_wal_bytes)?;
+            run_incremental_vacuum_cancellable(
+                conn,
+                path,
+                &mut peak_wal_bytes,
+                stop_requested,
+                cancelled,
+            )?;
             false
         }
         mode => {
@@ -475,6 +1635,7 @@ fn reclaim_database_space(
     observe_wal_size(path, &mut peak_wal_bytes)?;
     checkpoint_wal(conn)?;
 
+    ensure_maintenance_running(stop_requested, cancelled)?;
     let after = read_space_stats(conn, path)?;
     if migrated && after.auto_vacuum != 2 {
         return Err(DnsError::runtime(format!(
@@ -504,13 +1665,20 @@ fn reclaim_database_space(
     })
 }
 
-fn run_incremental_vacuum(conn: &Connection, path: &Path, peak_wal_bytes: &mut u64) -> Result<()> {
+fn run_incremental_vacuum_cancellable(
+    conn: &Connection,
+    path: &Path,
+    peak_wal_bytes: &mut u64,
+    stop_requested: &AtomicBool,
+    cancelled: &AtomicBool,
+) -> Result<()> {
     // `PRAGMA incremental_vacuum` is a multi-step statement that yields one
     // zero-column row per reclaimed page. `Connection::execute_batch` only
     // steps a result-producing statement once. Reclaim a bounded number of
     // pages per statement and truncate the WAL between batches so a manual
     // clear cannot trade a smaller main file for an unbounded WAL peak.
     loop {
+        ensure_maintenance_running(stop_requested, cancelled)?;
         let before = pragma_u64(conn, "PRAGMA freelist_count")?;
         if before == 0 {
             return Ok(());
@@ -532,6 +1700,18 @@ fn run_incremental_vacuum(conn: &Connection, path: &Path, peak_wal_bytes: &mut u
             )));
         }
     }
+}
+
+fn ensure_maintenance_running(stop_requested: &AtomicBool, cancelled: &AtomicBool) -> Result<()> {
+    if stop_requested.load(Ordering::Acquire) {
+        return Err(writer_stopping());
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(DnsError::runtime(
+            "query_recorder management operation cancelled",
+        ));
+    }
+    Ok(())
 }
 
 fn checkpoint_wal(conn: &Connection) -> Result<()> {
@@ -1454,6 +2634,183 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_periodic_cleanup_watchdog_reports_timeout_after_owner_release() {
+        let writer_interrupt = Arc::new(WriterInterrupt::default());
+        let conn = Connection::open_in_memory().unwrap();
+        writer_interrupt.install(&conn);
+
+        let owner = Arc::new(AtomicBool::new(false));
+        let guard = writer_interrupt.claim_management(owner.clone()).unwrap();
+        let (_done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            owner.clone(),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+
+        assert!(handle.join().unwrap());
+        assert!(owner.load(Ordering::Acquire));
+        drop(guard);
+
+        let stale_owner = Arc::new(AtomicBool::new(false));
+        let stale_guard = writer_interrupt
+            .claim_management(stale_owner.clone())
+            .unwrap();
+        drop(stale_guard);
+        let (_done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            stale_owner.clone(),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+
+        assert!(handle.join().unwrap());
+        assert!(stale_owner.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_periodic_cleanup_watchdog_can_be_disarmed() {
+        let writer_interrupt = Arc::new(WriterInterrupt::default());
+        let conn = Connection::open_in_memory().unwrap();
+        writer_interrupt.install(&conn);
+
+        let owner = Arc::new(AtomicBool::new(false));
+        let guard = writer_interrupt.claim_management(owner.clone()).unwrap();
+        let (done_tx, handle) = spawn_periodic_cleanup_watchdog(
+            writer_interrupt.clone(),
+            owner.clone(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        done_tx.send(()).unwrap();
+        assert!(!handle.join().unwrap());
+        assert!(!owner.load(Ordering::Acquire));
+        drop(guard);
+    }
+
+    #[test]
+    fn test_periodic_cleanup_retry_is_bounded_and_resettable() {
+        let mut retry = PeriodicCleanupRetry::default();
+        let lifecycle = RecorderLifecycle::default();
+        let now = Instant::now();
+
+        assert!(retry.ready(now));
+        assert_eq!(
+            schedule_periodic_cleanup_retry(&lifecycle, 10, &mut retry),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            lifecycle.periodic_cleanup_cutoff_ms.load(Ordering::Acquire),
+            10
+        );
+        assert!(!retry.ready(now));
+        let remaining = retry.recv_timeout(Instant::now(), Duration::from_secs(60));
+        assert!(
+            remaining <= Duration::from_secs(1),
+            "retry deadline should be at most one second away, got {remaining:?}"
+        );
+
+        lifecycle
+            .periodic_cleanup_cutoff_ms
+            .store(20, Ordering::Release);
+        for step in 1..=12 {
+            let current = now + Duration::from_secs(step * 600);
+            let scheduled = retry.schedule(current);
+            assert!(scheduled <= PERIODIC_CLEANUP_RETRY_MAX_DELAY);
+        }
+        assert_eq!(retry.delay, PERIODIC_CLEANUP_RETRY_MAX_DELAY);
+        assert_eq!(
+            lifecycle.periodic_cleanup_cutoff_ms.load(Ordering::Acquire),
+            20
+        );
+
+        retry.reset();
+        assert!(retry.ready(now));
+        assert_eq!(retry.delay, PERIODIC_CLEANUP_RETRY_INITIAL_DELAY);
+    }
+
+    #[test]
+    fn test_non_storage_failure_backoff_is_bounded_and_resettable() {
+        let mut backoff = NonStorageFailureBackoff::default();
+        let delays = (0..8).map(|_| backoff.next_delay()).collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
+
+        let now = Instant::now();
+        assert!(backoff.should_warn(now));
+        assert!(!backoff.should_warn(now + Duration::from_secs(4)));
+        assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), NON_STORAGE_FAILURE_INITIAL_DELAY);
+        assert!(backoff.should_warn(now + NON_STORAGE_FAILURE_WARN_INTERVAL));
+    }
+
+    #[test]
+    fn test_writer_recovery_yields_to_graceful_shutdown_before_reopen() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tables = table_names("recovery_shutdown");
+        let coordinator = DatabaseCoordinator::default();
+        let stop_requested = AtomicBool::new(false);
+        let shutdown_requested = AtomicBool::new(true);
+        let writer_interrupt = WriterInterrupt::default();
+        let mut recovery_delay = Duration::ZERO;
+
+        assert!(recover_writer_connection(
+            &mut conn,
+            temp.path(),
+            &tables,
+            &coordinator,
+            &stop_requested,
+            &shutdown_requested,
+            &writer_interrupt,
+            &mut recovery_delay,
+        ));
+
+        let probe = Connection::open(temp.path()).unwrap();
+        let table_count: i64 = probe
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![&tables.records],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn test_non_storage_backoff_distinguishes_graceful_and_hard_stop() {
+        let stop_requested = AtomicBool::new(false);
+        let shutdown_requested = AtomicBool::new(true);
+
+        assert!(sleep_with_stop_or_shutdown(
+            &stop_requested,
+            &shutdown_requested,
+            Duration::from_secs(1),
+        ));
+
+        stop_requested.store(true, Ordering::Release);
+        assert!(!sleep_with_stop_or_shutdown(
+            &stop_requested,
+            &shutdown_requested,
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
     fn test_read_record_row_matches_insert_and_select_column_order() {
         let mut conn = Connection::open_in_memory().unwrap();
         let tables = TableNames {
@@ -1528,7 +2885,9 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let tail = Arc::new(Mutex::new(VecDeque::from([first_detail.unwrap()])));
+        let tail = Arc::new(Mutex::new(VecDeque::from([Arc::new(
+            first_detail.unwrap(),
+        )])));
         let checkpoint_calls = Cell::new(0);
         let mut checkpoint = |_: &Connection| {
             let calls = checkpoint_calls.get() + 1;
