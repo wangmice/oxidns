@@ -442,3 +442,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# Keep release optimizations and debug symbols for Callgrind attribution.
+[profile.hotpath]
+inherits = "release"
+debug = true
+strip = false
