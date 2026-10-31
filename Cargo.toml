@@ -94,7 +94,7 @@ sha2 = "0.11"
 wincode = { version = "0.6", features = ["derive"] }
 oxidns-proto = { version = "0.1.6", path = "crates/proto" }
 oxidns-macros = { version = "0.1.0", path = "crates/macros" }
-hotpath = "0.28"
+hotpath = "0.30.1"
 
 # Optional upgrade dependencies and response snapshot compression.
 semver = { version = "1.0", optional = true }
@@ -304,8 +304,6 @@ plugin-query-recorder = ["api", "_sequence-step-recording", "dep:rusqlite", "dep
 # `ipset` + `nftset` executors (Linux netlink-backed firewall set sync).
 plugin-ipset = ["dep:ripset"]
 
-# `cron` executor (cron-expression scheduled triggers).
-_task-cron = ["dep:cronexpr"]
 plugin-cron = ["_task-cron"]
 
 # `dynamic_domain_set` provider + `learn_domain` executor (runtime-writable
@@ -338,7 +336,6 @@ plugin-upgrade = [
     "dep:zip",
     "dep:fs2",
 ]
-
 # `download` executor (fetch remote files into the working directory).
 # Needs the HTTP client.
 plugin-download = ["_http-client"]
@@ -359,6 +356,8 @@ provider-adguard-rule = []
 # --- Private aggregator features -------------------------------------------
 # These are pulled in by the public features above and should not be
 # enabled directly. They exist so each crate group is declared once.
+
+_task-cron = ["dep:cronexpr"]
 
 _tls-base = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 _tls-client = ["_tls-base", "dep:webpki-roots"]
@@ -393,9 +392,13 @@ _dns-client-doh3 = ["_dns-client-doh", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 # --- Profiling -------------------------------------------------------------
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-cloud = ["hotpath/hotpath-cloud"]
+hotpath-callgrind = ["hotpath/hotpath-callgrind"]
 
 [dev-dependencies]
 criterion = "0.8.2"
+# Keep the Criterion adapter out of production builds.
+hotpath = { version = "0.30.1", features = ["criterion-0-8"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 # Integration tests use hyper to spin up mock HTTP servers regardless of

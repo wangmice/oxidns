@@ -5,6 +5,7 @@
 [![license](https://img.shields.io/github/license/svenshi/oxidns)](LICENSE)
 [![Rust CI](https://github.com/svenshi/oxidns/actions/workflows/rust-ci.yml/badge.svg?branch=main)](https://github.com/svenshi/oxidns/actions/workflows/rust-ci.yml)
 [![WebUI CI](https://github.com/svenshi/oxidns/actions/workflows/webui-ci.yml/badge.svg)](https://github.com/svenshi/oxidns/actions/workflows/webui-ci.yml)
+[![hotpath-cloud](https://img.shields.io/endpoint?url=https://hotpath.rs/badge-cloud.json)](https://hotpath.rs/app/repos/svenshi/oxidns)
 
 [中文](README.md) | [English](README_EN.md) · [文档](https://oxidns.org/) · [快速开始](https://oxidns.org/quickstart) · [插件参考](https://oxidns.org/plugin-reference/overview)
 # 与上游相比主要更改
@@ -162,11 +163,9 @@ OxiDNS 仍在持续开发，适合高级家庭网络、软路由、Homelab 和�
 
 OxiDNS 主要由 [Sven Shi](https://github.com/svenshi) 创建和维护。
 
-我目前正在关注新的职业机会，方向包括 **后端工程、基础设施、网络系统**，
-以及涉及 **Rust** 的工程岗位。
+项目基于 Rust 开发，涉及 **DNS、异步网络编程、系统架构与基础设施工程**，持续关注性能优化、工程质量及实际应用场景。
 
-如果你所在的团队正在解决类似 OxiDNS 所涉及的系统、网络或基础设施问题，
-并认为我的经验可能适合，欢迎通过 [Email](mailto:isvenshi@gmail.com) 与我联系。
+欢迎交流相关技术问题、分享使用经验或探讨技术合作。如果你对这些领域感兴趣，欢迎通过 [Email](mailto:isvenshi@gmail.com) 与我联系。
 
 ---
 
