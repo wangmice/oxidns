@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap as StdHashMap;
+use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,6 +12,7 @@ use super::*;
 #[cfg(feature = "api")]
 use crate::api::{clear_global_api, global_api_test_guard};
 use crate::config::types::{Config, PluginConfig};
+use crate::infra::network::outbound::TestGlobalGuard;
 use crate::plugin::dependency::{
     DependencyGraphEdge, DependencyGraphNode, DependencyGraphReport, DependencySpec,
 };
@@ -68,6 +70,7 @@ async fn matcher_runtime_control_is_not_attached_when_api_is_not_running() {
 
 #[tokio::test]
 async fn test_init_runtime_failure_leaves_runtime_stopped() {
+    let _outbound_guard = TestGlobalGuard::clean();
     let manager = Arc::new(PluginRuntimeManager::new());
     manager
         .init_runtime(test_config(Vec::new()))
@@ -91,6 +94,7 @@ async fn test_init_runtime_failure_leaves_runtime_stopped() {
 
 #[tokio::test]
 async fn test_runtime_manager_recovers_poisoned_current_lock() {
+    let _outbound_guard = TestGlobalGuard::clean();
     let manager = Arc::new(PluginRuntimeManager::new());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = manager
@@ -116,6 +120,56 @@ async fn test_runtime_manager_recovers_poisoned_current_lock() {
 struct CaptureProvider {
     tag: String,
     rules: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WatchedProvider {
+    tag: String,
+    path: PathBuf,
+}
+
+#[async_trait]
+impl Plugin for WatchedProvider {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+#[async_trait]
+impl Provider for WatchedProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn reload(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn reload_watch_paths(&self) -> Vec<PathBuf> {
+        vec![self.path.clone()]
+    }
+
+    fn supports_domain_matching(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct WatchedProviderFactory {
+    path: PathBuf,
+}
+
+impl PluginFactory for WatchedProviderFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> Result<UninitializedPlugin> {
+        Ok(UninitializedPlugin::Provider(Box::new(WatchedProvider {
+            tag: plugin_config.tag.clone(),
+            path: self.path.clone(),
+        })))
+    }
 }
 
 #[derive(Debug)]
@@ -152,6 +206,51 @@ impl Provider for DrainingProvider {
 
     fn supports_domain_matching(&self) -> bool {
         true
+    }
+}
+
+#[tokio::test]
+async fn provider_file_auto_reload_runtime_switch_controls_watcher_creation() {
+    for enabled in [false, true] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("rules.txt");
+        std::fs::write(&path, "example.com\n").expect("rules");
+
+        let mut registry = PluginRegistry::new();
+        registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+        registry.register_factory(
+            "watched_provider",
+            DependencyKind::Provider,
+            Box::new(WatchedProviderFactory { path }),
+        );
+        let registry = Arc::new(registry);
+        registry
+            .clone()
+            .init_plugins_with_runtime_options(
+                vec![
+                    PluginConfig {
+                        tag: "watched".to_string(),
+                        plugin_type: "watched_provider".to_string(),
+                        args: None,
+                    },
+                    PluginConfig {
+                        tag: "match_qname".to_string(),
+                        plugin_type: "qname".to_string(),
+                        args: Some(serde_yaml_ng::from_str("- '$watched'").unwrap()),
+                    },
+                ],
+                false,
+                enabled,
+            )
+            .await
+            .expect("plugin init should succeed");
+
+        assert_eq!(
+            lock_mutex(&registry.file_reload).is_some(),
+            enabled,
+            "watcher state should follow runtime.provider_file_auto_reload"
+        );
+        registry.destroy().await;
     }
 }
 

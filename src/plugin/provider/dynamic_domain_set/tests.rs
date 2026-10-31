@@ -5,6 +5,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -29,6 +30,11 @@ fn test_name(raw: &str) -> Name {
 
 fn test_question(raw: &str) -> Question {
     Question::new(test_name(raw), RecordType::A, DNSClass::IN)
+}
+
+fn test_tag() -> String {
+    static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
+    format!("learned-test-{}", NEXT_TAG.fetch_add(1, Ordering::Relaxed))
 }
 
 fn test_config(path: PathBuf) -> DynamicDomainSetConfig {
@@ -91,7 +97,7 @@ async fn dynamic_domain_set_appends_and_matches() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("learned.txt");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -120,7 +126,7 @@ async fn dynamic_domain_set_append_preserves_unterminated_tail_rule() {
     let path = dir.path().join("learned.txt");
     fs::write(&path, "full:one.example").expect("write unterminated rule");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -163,7 +169,7 @@ async fn dynamic_domain_set_invalid_regexp_append_does_not_poison_file() {
     let path = dir.path().join("learned.txt");
     fs::write(&path, "full:stable.example\n").expect("write initial");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -196,7 +202,7 @@ async fn dynamic_domain_set_async_append_is_ordered_before_clear() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("learned.txt");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config_with_flush(path.clone(), 64, 60_000),
     ));
     backend.start().await.expect("backend should start");
@@ -224,7 +230,7 @@ async fn dynamic_domain_set_sync_append_flushes_without_batch_or_tick() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("learned.txt");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config_with_flush(path.clone(), 64, 60_000),
     ));
     backend.start().await.expect("backend should start");
@@ -259,7 +265,7 @@ async fn dynamic_domain_set_remove_clear_and_reload() {
     let path = dir.path().join("learned.txt");
     fs::write(&path, "full:one.example\n").expect("write initial");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -291,7 +297,7 @@ async fn dynamic_domain_set_remove_failure_keeps_state_and_snapshot() {
     let path = dir.path().join("learned.txt");
     fs::write(&path, "full:one.example\nfull:two.example\n").expect("write initial");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -325,7 +331,7 @@ async fn dynamic_domain_set_clear_failure_keeps_state_and_snapshot() {
     let path = dir.path().join("learned.txt");
     fs::write(&path, "full:one.example\n").expect("write initial");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -351,7 +357,7 @@ async fn dynamic_domain_set_rule_api_adds_removes_and_clears() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("learned.txt");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(path.clone()),
     ));
     backend.start().await.expect("backend should start");
@@ -429,12 +435,12 @@ fn contains_question_uses_name_matching() {
         .expect("rule");
     matcher.finalize().expect("finalize");
     let backend = Arc::new(DynamicDomainSetBackend::new(
-        "learned".to_string(),
+        test_tag(),
         test_config(PathBuf::from("unused")),
     ));
     backend.store_snapshot_for_test(DynamicDomainSetSnapshot { matcher });
     let provider = DynamicDomainSet {
-        tag: "learned".to_string(),
+        tag: test_tag(),
         backend,
     };
     assert!(provider.contains_question(&test_question("www.example.com.")));

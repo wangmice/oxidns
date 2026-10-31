@@ -19,7 +19,7 @@ use crate::plugin::executor::Executor;
 #[cfg(feature = "api")]
 use crate::plugin::matcher::MatcherRuntimeControl;
 use crate::plugin::matcher::{Matcher, MatcherRef};
-use crate::plugin::provider::{Provider, ProviderRuntimeControl};
+use crate::plugin::provider::{Provider, ProviderFileReloadService, ProviderRuntimeControl};
 use crate::plugin::runtime_control::PluginRuntimeControl;
 use crate::plugin::{PluginCreateContext, PluginFactory, PluginHolder, PluginInfo, PluginType};
 
@@ -98,6 +98,9 @@ pub struct PluginRegistry {
     /// Initialization order of plugins (for deterministic shutdown)
     init_order: Mutex<Vec<String>>,
 
+    /// Runtime-generation-scoped watcher for provider-owned rule sources.
+    file_reload: Mutex<Option<ProviderFileReloadService>>,
+
     #[cfg(debug_assertions)]
     test_runtime_guard: Mutex<Option<TestRuntimeGuard>>,
 }
@@ -111,6 +114,7 @@ impl PluginRegistry {
             factory_kinds: HashMap::new(),
             plugins: DashMap::new(),
             init_order: Mutex::new(Vec::new()),
+            file_reload: Mutex::new(None),
             #[cfg(debug_assertions)]
             test_runtime_guard: Mutex::new(None),
         }
@@ -188,6 +192,16 @@ impl PluginRegistry {
         self: Arc<Self>,
         configs: Vec<PluginConfig>,
         matcher_runtime_controls_enabled: bool,
+    ) -> Result<()> {
+        self.init_plugins_with_runtime_options(configs, matcher_runtime_controls_enabled, false)
+            .await
+    }
+
+    pub(crate) async fn init_plugins_with_runtime_options(
+        self: Arc<Self>,
+        configs: Vec<PluginConfig>,
+        matcher_runtime_controls_enabled: bool,
+        provider_file_auto_reload_enabled: bool,
     ) -> Result<()> {
         use crate::plugin::dependency;
 
@@ -339,6 +353,30 @@ impl PluginRegistry {
                 )));
             }
             lock_mutex(&self.init_order).push(plugin_config.tag.clone());
+        }
+
+        if provider_file_auto_reload_enabled {
+            let file_reload_entries = self
+                .plugins
+                .iter()
+                .filter_map(|entry| {
+                    if entry.plugin_type != PluginType::Provider {
+                        return None;
+                    }
+                    let paths = entry.provider().reload_watch_paths();
+                    if paths.is_empty() {
+                        return None;
+                    }
+                    let Some(PluginRuntimeControl::Provider(control)) = entry.runtime_control()
+                    else {
+                        return None;
+                    };
+                    Some((entry.tag.clone(), control, paths))
+                })
+                .collect::<Vec<_>>();
+            *lock_mutex(&self.file_reload) = ProviderFileReloadService::start(file_reload_entries)?;
+        } else {
+            debug!("provider file auto-reload disabled by runtime configuration");
         }
 
         info!("All plugins initialized successfully");
@@ -630,6 +668,11 @@ impl PluginRegistry {
 
     /// Destroy all initialized plugins in reverse init order
     pub async fn destroy(&self) {
+        let file_reload = lock_mutex(&self.file_reload).take();
+        if let Some(file_reload) = file_reload {
+            file_reload.shutdown().await;
+        }
+
         let order = lock_mutex(&self.init_order).clone();
 
         if order.is_empty() {

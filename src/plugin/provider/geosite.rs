@@ -179,6 +179,10 @@ impl Provider for GeoSiteProvider {
         Ok(())
     }
 
+    fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        vec![std::path::PathBuf::from(&self.args.file)]
+    }
+
     fn supports_domain_matching(&self) -> bool {
         true
     }

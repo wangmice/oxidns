@@ -88,11 +88,13 @@ impl PluginRuntimeManager {
 
             let matcher_runtime_controls_enabled =
                 cfg!(feature = "api") && config.api.http.is_some();
+            let provider_file_auto_reload_enabled = config.runtime.provider_file_auto_reload;
             if let Err(err) = candidate
                 .clone()
-                .init_plugins_with_runtime_controls(
+                .init_plugins_with_runtime_options(
                     config.plugins,
                     matcher_runtime_controls_enabled,
+                    provider_file_auto_reload_enabled,
                 )
                 .await
             {

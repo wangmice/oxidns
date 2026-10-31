@@ -143,6 +143,15 @@ impl Provider for AdGuardRule {
         true
     }
 
+    fn reload_watch_paths(&self) -> Vec<std::path::PathBuf> {
+        self.cfg
+            .files
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
     #[hotpath::measure]
     fn contains_name(&self, name: &Name) -> bool {
         self.contains_name_only(name)
