@@ -2,11 +2,10 @@
 name = "oxidns-proto"
 version = "0.1.6"
 edition = "2024"
-authors = ["Sven Shi <isvenshi@gmail.com>"]
+# authors = ["Sven Shi <isvenshi@gmail.com>"]
 description = "DNS message model and wire codec primitives used by OxiDNS"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/svenshi/oxidns"
-readme = "README.md"
 keywords = ["dns", "protocol", "codec", "wire"]
 categories = ["network-programming", "parser-implementations"]
 
@@ -16,9 +15,9 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-ahash = "0.8.12"
-hotpath = "0.30.1"
-smallvec = "1.15.1"
+ahash = "0.8"
+hotpath = "0.30"
+smallvec = "1.16"
 thiserror = "2.0"
 
 [features]
