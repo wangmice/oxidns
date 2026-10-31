@@ -82,6 +82,15 @@ impl WindowsMemorySampler {
         }
     }
 
+    #[cfg(windows)]
+    fn metric_kind(self) -> ProcessMemoryKind {
+        match self {
+            Self::PrivateWorkingSet => ProcessMemoryKind::PrivateWorkingSet,
+            Self::PrivateCommit => ProcessMemoryKind::PrivateCommit,
+            Self::WorkingSet => ProcessMemoryKind::WorkingSet,
+        }
+    }
+
     fn select(
         self,
         private_working_set_bytes: Option<u64>,
@@ -170,7 +179,7 @@ pub struct AppController {
     config_path: PathBuf,
     state: Mutex<ControlState>,
     command_tx: mpsc::UnboundedSender<ControlCommand>,
-    sysinfo: Mutex<System>,
+    sysinfo: Mutex<Option<System>>,
     #[cfg(windows)]
     windows_memory_sampler: WindowsMemorySampler,
 }
@@ -234,10 +243,11 @@ impl AppController {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let pid = Pid::from_u32(std::process::id());
         let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-        let mut sys =
-            System::new_with_specifics(RefreshKind::nothing().with_processes(refresh_kind));
-        // Prime the CPU baseline so the first real sample isn't always 0%.
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, refresh_kind);
+        let sys = prepare_sysinfo(
+            System::new_with_specifics(RefreshKind::nothing().with_processes(refresh_kind)),
+            pid,
+            refresh_kind,
+        );
         (
             Arc::new(Self {
                 started_at_ms: AppClock::elapsed_millis(),
@@ -255,7 +265,19 @@ impl AppController {
     pub fn sample_process_metrics(&self) -> ProcessMetrics {
         let pid = Pid::from_u32(std::process::id());
         let (cpu_percent, working_set_bytes, system_memory_total_mb) = {
-            let mut sys = self.sysinfo.lock().expect("sysinfo poisoned");
+            let mut sysinfo = self.sysinfo.lock().expect("sysinfo poisoned");
+            let Some(sys) = sysinfo.as_mut() else {
+                #[cfg(windows)]
+                let memory_kind = self.windows_memory_sampler.metric_kind();
+                #[cfg(not(windows))]
+                let memory_kind = ProcessMemoryKind::Rss;
+                return ProcessMetrics {
+                    cpu_percent: 0.0,
+                    memory_mb: 0,
+                    memory_kind,
+                    system_memory_total_mb: 0,
+                };
+            };
             sys.refresh_memory();
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&[pid]),
@@ -412,6 +434,23 @@ impl ControlState {
     }
 }
 
+fn prepare_sysinfo(
+    result: std::result::Result<System, sysinfo::Error>,
+    pid: Pid,
+    refresh_kind: ProcessRefreshKind,
+) -> Option<System> {
+    let mut system = match result {
+        Ok(system) => system,
+        Err(error) => {
+            tracing::warn!(%error, "Process metrics unavailable; continuing without sysinfo");
+            return None;
+        }
+    };
+    // Prime the CPU baseline so the first real sample isn't always 0%.
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, refresh_kind);
+    Some(system)
+}
+
 /// SHA256 of an in-memory config string. Stable across processes, so the API
 /// can compare the on-disk and running versions to tell "in-sync" from
 /// "needs reload."
@@ -432,6 +471,30 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    #[test]
+    fn sysinfo_initialization_failure_is_ignored() {
+        let pid = Pid::from_u32(std::process::id());
+        let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+        assert!(prepare_sysinfo(Err(sysinfo::Error::Unsupported), pid, refresh_kind).is_none());
+    }
+
+    #[test]
+    fn unavailable_sysinfo_produces_zero_process_metrics() {
+        AppClock::start();
+        let (controller, receiver) = AppController::new(PathBuf::from("config.yaml"));
+        drop(receiver);
+        #[cfg(windows)]
+        let expected_kind = controller.windows_memory_sampler.metric_kind();
+        #[cfg(not(windows))]
+        let expected_kind = ProcessMemoryKind::Rss;
+        *controller.sysinfo.lock().expect("sysinfo poisoned") = None;
+        let metrics = controller.sample_process_metrics();
+        assert_eq!(metrics.cpu_percent, 0.0);
+        assert_eq!(metrics.memory_mb, 0);
+        assert_eq!(metrics.system_memory_total_mb, 0);
+        assert_eq!(metrics.memory_kind, expected_kind);
+    }
 
     #[test]
     fn reload_snapshot_tracks_state_transitions() {
