@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::cmp::Ordering;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -39,6 +40,7 @@ use crate::register_plugin_api;
 
 const MAX_CACHE_DUMP_BODY: usize = 16 * 1024 * 1024;
 const CACHE_ENTRIES_SNAPSHOT_TTL_MS: u64 = 120_000;
+const INVALID_CACHE_IP: &str = "ip must be a valid IPv4 or IPv6 address";
 
 #[inline]
 fn cache_load_error_code(message: &str) -> &'static str {
@@ -398,6 +400,7 @@ struct CacheEntriesSnapshot {
     created_at_ms: u64,
     state_id: u64,
     qname: Option<String>,
+    ip: Option<IpAddr>,
     keys: Box<[CacheKey]>,
 }
 
@@ -509,6 +512,7 @@ fn reusable_cache_entries_snapshot(
     let current = guard.as_ref()?;
     if current.state_id != state_id
         || current.qname != query.qname
+        || current.ip != query.ip
         || now.saturating_sub(current.created_at_ms) > CACHE_ENTRIES_SNAPSHOT_TTL_MS
     {
         return None;
@@ -522,7 +526,7 @@ fn build_cache_entries_snapshot(
     query: &CacheEntriesQuery,
     now: u64,
 ) -> Arc<CacheEntriesSnapshot> {
-    let mut keys = if query.qname.is_none() {
+    let mut keys = if query.qname.is_none() && query.ip.is_none() {
         Vec::with_capacity(store.cache_map().entry_count())
     } else {
         Vec::new()
@@ -536,6 +540,15 @@ fn build_cache_entries_snapshot(
         .visit_key_expiry_cloned_by_shard(|entries| {
             for (key, expire_at_ms) in entries {
                 if expire_at_ms > now && cache_entry_matches_query(&key, query) {
+                    if let Some(ip) = query.ip {
+                        let Some(entry) = store.cache_map().get_retained_handle(&key, now, 0)
+                        else {
+                            continue;
+                        };
+                        if !cache_entry_matches_ip(entry.value(), ip) {
+                            continue;
+                        }
+                    }
                     keys.push(key);
                 }
             }
@@ -548,6 +561,7 @@ fn build_cache_entries_snapshot(
         created_at_ms: now,
         state_id,
         qname: query.qname.clone(),
+        ip: query.ip,
         keys: keys.into_boxed_slice(),
     })
 }
@@ -578,7 +592,12 @@ impl ApiHandler for CacheEntriesListHandler {
             Ok(query) => query,
 
             Err(err) => {
-                return json_error(StatusCode::BAD_REQUEST, "invalid_query", err);
+                let code = if err == INVALID_CACHE_IP {
+                    "invalid_cache_ip"
+                } else {
+                    "invalid_query"
+                };
+                return json_error(StatusCode::BAD_REQUEST, code, err);
             }
         };
 
@@ -601,6 +620,13 @@ impl ApiHandler for CacheEntriesListHandler {
                 let Some(entry) = store.cache_map().get_retained_handle(key, now, 0) else {
                     continue;
                 };
+                // A refresh can replace the answer after the key snapshot was built.
+                if query
+                    .ip
+                    .is_some_and(|ip| !cache_entry_matches_ip(entry.value(), ip))
+                {
+                    continue;
+                }
 
                 entries.push(CacheEntryPageCandidate {
                     key: key.clone(),
@@ -718,6 +744,7 @@ struct CacheEntriesQuery {
     /// returned by the previous page.
     cursor: Option<CacheKey>,
     qname: Option<String>,
+    ip: Option<IpAddr>,
 }
 
 fn parse_cache_entries_query(
@@ -726,6 +753,7 @@ fn parse_cache_entries_query(
     let mut limit = 100usize;
     let mut cursor = None;
     let mut qname = None;
+    let mut ip = None;
 
     visit_query_params(query, |key, value| {
         match key {
@@ -748,6 +776,16 @@ fn parse_cache_entries_query(
                 qname = optional_text(value).map(|value| normalize_domain_key(value.as_str()));
             }
 
+            "ip" => {
+                ip = optional_text(value)
+                    .map(|value| {
+                        value
+                            .parse::<IpAddr>()
+                            .map_err(|_| INVALID_CACHE_IP.to_string())
+                    })
+                    .transpose()?;
+            }
+
             _ => {}
         }
 
@@ -758,6 +796,7 @@ fn parse_cache_entries_query(
         limit,
         cursor,
         qname,
+        ip,
     })
 }
 
@@ -817,6 +856,13 @@ fn cache_entry_matches_query(key: &CacheKey, query: &CacheEntriesQuery) -> bool 
         .qname
         .as_deref()
         .is_none_or(|qname| contains_ascii_case_insensitive(key.domain.as_ref(), qname))
+}
+
+fn cache_entry_matches_ip(item: &CacheItem, ip: IpAddr) -> bool {
+    item.resp
+        .answers()
+        .iter()
+        .any(|record| record.ip_addr() == Some(ip))
 }
 
 fn cache_entry_row(
@@ -1018,6 +1064,224 @@ mod tests {
         }
     }
 
+    fn insert_address_entry(cache: &CacheMap, domain: &str, ip: &str, additional: bool) {
+        use crate::proto::{Message, Name, RData, rdata};
+
+        let mut response = Message::new();
+        let data = match ip.parse::<std::net::IpAddr>().unwrap() {
+            std::net::IpAddr::V4(ip) => RData::A(rdata::A(ip)),
+            std::net::IpAddr::V6(ip) => RData::AAAA(rdata::AAAA(ip)),
+        };
+        let record = Record::from_rdata(Name::from_ascii(domain).unwrap(), 60, data);
+        if additional {
+            response.add_additional(record);
+        } else {
+            response.add_answer(record);
+        }
+        let now = AppClock::elapsed_millis();
+        cache.insert_or_update(
+            test_cache_key(domain),
+            CacheItem::new(response, 60, now + 60_000),
+            now,
+            now + 60_000,
+        );
+    }
+
+    async fn list_entries(handler: &CacheEntriesListHandler, query: &str) -> Value {
+        use http_body_util::BodyExt;
+
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri(format!("/entries?{query}"))
+                    .body(Bytes::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cache_entries_ip_filter_matches_answers_before_pagination() {
+        AppClock::start();
+        let cache = CacheMap::with_capacity(5);
+        insert_address_entry(&cache, "a.example.com", "192.0.2.10", false);
+        insert_address_entry(&cache, "b.example.com", "192.0.2.1", false);
+        insert_address_entry(&cache, "c.example.com", "192.0.2.1", false);
+        insert_address_entry(&cache, "d.example.com", "192.0.2.1", true);
+        insert_address_entry(&cache, "e.other.test", "192.0.2.1", false);
+        let handler = CacheEntriesListHandler {
+            store: test_store(cache, 5),
+            snapshot: Arc::new(StdMutex::new(None)),
+        };
+        let first = list_entries(&handler, "limit=1&qname=example.com&ip=192.0.2.1").await;
+        assert_eq!(first["total_entries"], 2);
+        assert_eq!(first["entries"][0]["domain"], "b.example.com");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let second = list_entries(
+            &handler,
+            &format!("limit=1&qname=example.com&ip=192.0.2.1&cursor={cursor}"),
+        )
+        .await;
+        assert_eq!(second["entries"][0]["domain"], "c.example.com");
+        assert!(second["next_cursor"].is_null());
+        let changed = list_entries(&handler, "ip=192.0.2.10").await;
+        assert_eq!(changed["total_entries"], 1);
+        assert_eq!(changed["entries"][0]["domain"], "a.example.com");
+    }
+
+    #[test]
+    fn parse_cache_entries_query_validates_and_normalizes_ip() {
+        for (raw, expected) in [
+            ("ip=%20192.0.2.1%20", Some("192.0.2.1")),
+            ("ip=2001%3Adb8%3A%3A1", Some("2001:db8::1")),
+            (
+                "ip=2001:0DB8:0000:0000:0000:0000:0000:0001",
+                Some("2001:db8::1"),
+            ),
+            ("ip=%20%20", None),
+            ("qname=example.com", None),
+        ] {
+            let query = parse_cache_entries_query(Some(raw)).unwrap();
+            assert_eq!(query.ip, expected.map(|ip| ip.parse::<IpAddr>().unwrap()));
+        }
+        for raw in [
+            "ip=example.com",
+            "ip=192.0.2",
+            "ip=192.0.2.1/24",
+            "ip=192.0.2.1:53",
+            "ip=%5B2001:db8::1%5D",
+            "ip=2001:db8::gg",
+        ] {
+            assert_eq!(
+                parse_cache_entries_query(Some(raw)).unwrap_err(),
+                INVALID_CACHE_IP
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_entries_invalid_ip_returns_localizable_bad_request() {
+        use http_body_util::BodyExt;
+
+        let handler = CacheEntriesListHandler {
+            store: test_store(CacheMap::with_capacity(1), 1),
+            snapshot: Arc::new(StdMutex::new(None)),
+        };
+        let response = handler
+            .handle(
+                Request::builder()
+                    .uri("/entries?ip=not-an-ip")
+                    .body(Bytes::new())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "invalid_cache_ip");
+    }
+
+    #[tokio::test]
+    async fn cache_entries_ip_filter_handles_ipv6_cname_and_retention() {
+        use crate::proto::{Message, Name, RData, rdata};
+
+        AppClock::start();
+        let cache = CacheMap::with_capacity(5);
+        insert_address_entry(&cache, "ipv6.example.com", "2001:db8::1", false);
+        insert_address_entry(&cache, "other.example.com", "2001:db8::10", false);
+        let mut response = Message::new();
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("alias.example.com").unwrap(),
+            60,
+            RData::CNAME(rdata::CNAME(Name::from_ascii("ipv6.example.com").unwrap())),
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("ipv6.example.com").unwrap(),
+            60,
+            RData::AAAA(rdata::AAAA("2001:db8::1".parse().unwrap())),
+        ));
+        let now = AppClock::elapsed_millis();
+        cache.insert_or_update(
+            test_cache_key("alias.example.com"),
+            CacheItem::new(response.clone(), 60, now + 60_000),
+            now,
+            now + 60_000,
+        );
+        cache.insert_or_update(
+            test_cache_key("expired.example.com"),
+            CacheItem::new(response.clone(), 60, 0),
+            0,
+            0,
+        );
+        cache.insert_or_update(
+            test_cache_key("stale.example.com"),
+            CacheItem::new(response, 60, 0),
+            0,
+            now + 60_000,
+        );
+        let handler = CacheEntriesListHandler {
+            store: test_store(cache.clone(), 5),
+            snapshot: Arc::new(StdMutex::new(None)),
+        };
+        let last_access_before = cache
+            .get_retained_handle(&test_cache_key("ipv6.example.com"), now, 0)
+            .unwrap()
+            .last_access_ms();
+        // Cross a clock tick so an accidental API access-time update is observable.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let page = list_entries(&handler, "ip=2001:0DB8:0:0:0:0:0:1").await;
+        let domains = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["domain"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            domains,
+            ["alias.example.com", "ipv6.example.com", "stale.example.com"]
+        );
+        assert_eq!(page["entries"][2]["stale"], true);
+        assert_eq!(
+            cache
+                .get_retained_handle(&test_cache_key("ipv6.example.com"), now, 0)
+                .unwrap()
+                .last_access_ms(),
+            last_access_before
+        );
+        let all = list_entries(&handler, "ip=%20").await;
+        assert_eq!(all["total_entries"], 4);
+        let missing = list_entries(&handler, "ip=2001:db8::2").await;
+        assert_eq!(missing["total_entries"], 0);
+        assert!(missing["entries"].as_array().unwrap().is_empty());
+        assert!(missing["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn cache_entries_ip_filter_rechecks_replaced_answers_on_followup_pages() {
+        AppClock::start();
+        let cache = CacheMap::with_capacity(3);
+        for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+            insert_address_entry(&cache, domain, "192.0.2.1", false);
+        }
+        let handler = CacheEntriesListHandler {
+            store: test_store(cache.clone(), 3),
+            snapshot: Arc::new(StdMutex::new(None)),
+        };
+        let first = list_entries(&handler, "limit=1&ip=192.0.2.1").await;
+        let cursor = first["next_cursor"].as_str().unwrap();
+        insert_address_entry(&cache, "b.example.com", "192.0.2.2", false);
+        let second = list_entries(&handler, &format!("limit=1&ip=192.0.2.1&cursor={cursor}")).await;
+        assert_eq!(second["entries"][0]["domain"], "c.example.com");
+        assert!(second["next_cursor"].is_null());
+        let changed_filter =
+            list_entries(&handler, &format!("limit=1&ip=192.0.2.2&cursor={cursor}")).await;
+        assert_eq!(changed_filter["total_entries"], 1);
+        assert_eq!(changed_filter["entries"][0]["domain"], "b.example.com");
+    }
+
     #[test]
     fn parse_cache_entries_query_accepts_keyset_cursor_and_qname_filter() {
         let cursor_key = test_cache_key("cursor.example.com");
@@ -1049,6 +1313,7 @@ mod tests {
             limit: 100,
             cursor: None,
             qname: Some("example.com".to_string()),
+            ip: None,
         };
 
         assert!(cache_entry_matches_query(
@@ -1354,6 +1619,7 @@ mod tests {
             limit: 100,
             cursor: None,
             qname: Some("example.com".to_string()),
+            ip: None,
         };
         let snapshot = build_cache_entries_snapshot(&store, &query, 1_000);
 
@@ -1370,6 +1636,7 @@ mod tests {
             created_at_ms: 1_000,
             state_id: 7,
             qname: Some("example.com".to_string()),
+            ip: None,
             keys: vec![test_cache_key("a.example.com")].into_boxed_slice(),
         });
         let slot = StdMutex::new(Some(cached.clone()));
@@ -1378,6 +1645,7 @@ mod tests {
             limit: 100,
             cursor: Some(test_cache_key("a.example.com")),
             qname: Some("example.com".to_string()),
+            ip: None,
         };
         assert!(Arc::ptr_eq(
             &reusable_cache_entries_snapshot(&slot, &followup, 1_001, 7).unwrap(),

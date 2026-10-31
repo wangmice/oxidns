@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   DatabaseZap,
   Download,
@@ -63,6 +63,10 @@ import {
 import { usePluginAppliedStatus } from "@/hooks/use-plugin-applied";
 import { useI18n } from "@/lib/i18n/provider";
 import { WEBUI } from "@/lib/i18n/keys";
+import {
+  cacheEntryError,
+  normalizeCacheFilters,
+} from "@/components/plugins/kinds/cache-filters";
 
 function CachePluginCard({
   plugin,
@@ -124,52 +128,69 @@ function CacheEntriesPanel({ tag }: { tag: string }) {
   if (appliedStatus === "not-applied") {
     return <PluginNotAppliedPlaceholder />;
   }
-  return <CacheEntriesPanelInner tag={tag} />;
+  return <CacheEntriesPanelInner key={tag} tag={tag} />;
 }
 
 function CacheEntriesPanelInner({ tag }: { tag: string }) {
   const { locale, t } = useI18n();
+  const ipHelpId = useId();
   const [entries, setEntries] = useState<CacheEntryRow[]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [total, setTotal] = useState(0);
   const [selected, setSelected] = useState<CacheEntryRow | null>(null);
   const [qnameInput, setQnameInput] = useState("");
-  const [appliedQname, setAppliedQname] = useState("");
+  const [ipInput, setIpInput] = useState("");
+  const [filters, setFilters] = useState({ qname: "", ip: "" });
+  const requestSequence = useRef(0);
+  const invalidateRequests = useCallback(() => {
+    ++requestSequence.current;
+  }, []);
   const [loading, setLoading] = useState(false);
   const [flushLoading, setFlushLoading] = useState(false);
   const [flushResult, setFlushResult] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(
-    async (cursor?: string, qname = "") => {
+    async (cursor?: string) => {
+      const sequence = ++requestSequence.current;
       setLoading(true);
       setError(null);
+      if (!cursor) {
+        setEntries([]);
+        setNextCursor(undefined);
+        setTotal(0);
+        setSelected(null);
+      }
       try {
         const response = await fetchCacheEntries(tag, {
           limit: 100,
           cursor,
-          qname: qname || undefined,
+          qname: filters.qname || undefined,
+          ip: filters.ip || undefined,
         });
+        if (sequence !== requestSequence.current) return;
         setEntries((current) =>
           cursor ? [...current, ...response.entries] : response.entries,
         );
         setNextCursor(response.next_cursor);
         setTotal(response.total_entries);
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : t(WEBUI.cache.readEntriesFailed),
-        );
+        if (sequence !== requestSequence.current) return;
+        setError(cacheEntryError(err, t));
       } finally {
-        setLoading(false);
+        if (sequence === requestSequence.current) setLoading(false);
       }
     },
-    [tag, t],
+    [tag, t, filters],
   );
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
-  }, [load]);
+    return () => {
+      window.clearTimeout(timer);
+      invalidateRequests();
+    };
+  }, [load, invalidateRequests]);
 
   const handleDelete = async (entry: CacheEntryRow) => {
     setError(null);
@@ -205,16 +226,16 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
     }
   };
 
-  const applyQnameFilter = () => {
-    const nextQname = qnameInput.trim();
-    setAppliedQname(nextQname);
-    void load(undefined, nextQname);
+  const applyFilters = () => {
+    invalidateRequests();
+    setFilters(normalizeCacheFilters(qnameInput, ipInput));
   };
 
-  const clearQnameFilter = () => {
+  const clearFilters = () => {
+    invalidateRequests();
     setQnameInput("");
-    setAppliedQname("");
-    void load(undefined, "");
+    setIpInput("");
+    setFilters(normalizeCacheFilters("", ""));
   };
 
   return (
@@ -227,7 +248,7 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
             </CardTitle>
             <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
               <span className="rounded-full border bg-muted/30 px-2 py-0.5">
-                {appliedQname
+                {filters.qname || filters.ip
                   ? t(WEBUI.cache.matchCount, { total })
                   : t(WEBUI.cache.totalCount, { total })}
               </span>
@@ -249,7 +270,7 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
               variant="outline"
               size="sm"
               disabled={loading || flushLoading}
-              onClick={() => load(undefined, appliedQname)}
+              onClick={() => load()}
             >
               <RefreshCw className="h-4 w-4" />
               {t(WEBUI.common.refresh)}
@@ -305,10 +326,10 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
             </div>
           )}
           <form
-            className="mb-3 flex flex-col gap-2 rounded-md border bg-muted/20 p-3 sm:flex-row sm:items-end"
+            className="mb-3 grid min-w-0 gap-2 rounded-md border bg-muted/20 p-3 sm:grid-cols-2"
             onSubmit={(event) => {
               event.preventDefault();
-              applyQnameFilter();
+              applyFilters();
             }}
           >
             <label className="grid min-w-0 flex-1 gap-1 text-xs text-muted-foreground">
@@ -320,7 +341,20 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
                 className="h-8 font-mono text-sm"
               />
             </label>
-            <div className="flex gap-2">
+            <label className="grid min-w-0 gap-1 text-xs text-muted-foreground">
+              {t(WEBUI.cache.ipFilterLabel)}
+              <Input
+                value={ipInput}
+                onChange={(event) => setIpInput(event.target.value)}
+                placeholder={t(WEBUI.cache.ipFilterPlaceholder)}
+                aria-describedby={ipHelpId}
+                className="h-8 min-w-0 font-mono text-sm"
+              />
+            </label>
+            <p id={ipHelpId} className="text-xs text-muted-foreground sm:col-span-2">
+              {t(WEBUI.cache.ipFilterHelp)}
+            </p>
+            <div className="flex flex-wrap gap-2 sm:col-span-2">
               <Button
                 type="submit"
                 variant="outline"
@@ -330,13 +364,13 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
                 <Search className="h-4 w-4" />
                 {t(WEBUI.cache.filterButton)}
               </Button>
-              {appliedQname && (
+              {(filters.qname || filters.ip || qnameInput || ipInput) && (
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
                   disabled={loading}
-                  onClick={clearQnameFilter}
+                  onClick={clearFilters}
                 >
                   <X className="h-4 w-4" />
                   {t(WEBUI.cache.clearFilter)}
@@ -537,7 +571,7 @@ function CacheEntriesPanelInner({ tag }: { tag: string }) {
               size="sm"
               className="mt-3"
               disabled={loading}
-              onClick={() => load(nextCursor, appliedQname)}
+              onClick={() => load(nextCursor)}
             >
               {t(WEBUI.common.loadMore)}
             </Button>

@@ -31,6 +31,13 @@ Query parameters:
 * `limit`: Page size. Defaults to `100`, maximum `500`.
 * `cursor`: Pagination cursor.
 * `qname`: Case-insensitive substring filter for the query domain in the cache key.
+* `ip`: Exact address filter over `A` / `AAAA` records in the cached response's Answer section. Supports IPv4 and IPv6, including equivalent IPv6 spellings. When combined with `qname`, both filters must match. Filtering happens before pagination.
+
+The WebUI cache detail page lists the matching cache-key domains, including addresses in CNAME responses. This does not perform PTR queries or match Authority/Additional glue addresses or ECS networks. An empty IP disables the filter; an invalid non-empty IP returns `400 invalid_cache_ip`. CIDR prefixes, ports, and brackets are not accepted.
+
+Keep the same filters when following a pagination cursor. Fresh and stale entries still within their retention period are included. `total_entries` is the matching count in the pagination snapshot; refreshes or deletions may reduce the entries available on later pages. Refreshing the list scans the current cache again.
+
+Example: `GET /api/plugins/cache_main/entries?ip=192.0.2.1`.
 
 #### `POST /api/plugins/<cache_tag>/flush`
 

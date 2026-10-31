@@ -537,6 +537,11 @@ export const enUSWebui = {
     flushDesc:
       'This will flush all cache entries currently saved by plugin "{tag}". This action cannot be undone.',
     qnameFilterLabel: "QNAME contains",
+    ipFilterLabel: "Answer IP equals",
+    ipFilterPlaceholder: "IPv4 or IPv6 address",
+    ipFilterHelp:
+      "Exact IPv4/IPv6 match in answer A/AAAA records, including answers with CNAMEs. Combined with QNAME using AND. Excludes additional/glue records and ECS; no PTR lookup is performed.",
+    invalidIp: "Enter a valid IPv4 or IPv6 address.",
     filterButton: "Filter",
     clearFilter: "Clear",
     cacheKey: "Cache key",
