@@ -28,8 +28,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME_DOCKERHUB: svenshi/oxidns
-  IMAGE_NAME_GHCR: ghcr.io/svenshi/oxidns
+  IMAGE_NAME_DOCKERHUB: ${{ vars.DOCKERHUB_IMAGE }}
+  IMAGE_NAME_GHCR: ghcr.io/${{ github.repository }}
   RUNTIME_DOCKERFILE: ./packaging/docker/Dockerfile.runtime
 
 jobs:
@@ -49,18 +49,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            PUSH=false
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            if [[ "${{ inputs.PUSH }}" == "true" ]]; then
-              PUSH=true
-            else
-              PUSH=false
-            fi
-          else
+          if [[ "${{ github.event_name }}" != "pull_request" && "${{ inputs.PUSH }}" == "true" ]]; then
             PUSH=true
+          else
+            PUSH=false
           fi
           echo "push=${PUSH}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${PUSH}" == "true" ]]; then
+            : "${IMAGE_NAME_DOCKERHUB:?Set the DOCKERHUB_IMAGE repository variable to your Docker Hub namespace/image}"
+          fi
 
           VERSION="${{ inputs.OXIDNS_VERSION }}"
           if [[ -z "${VERSION}" ]]; then

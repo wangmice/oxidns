@@ -8,7 +8,12 @@ WORKDIR /etc/oxidns
 
 COPY .docker-dist/config.yaml /etc/oxidns/config.yaml
 
-RUN sed -i 's/:5335/:53/' /etc/oxidns/config.yaml || true
+# Match complete listen values; a prefix replacement corrupts :53353 into :533.
+RUN sed -i \
+    -e 's/listen: ":53353"/listen: ":53"/g' \
+    -e 's/listen: ":5335"/listen: ":53"/g' \
+    -e 's/listen: ":9198"/listen: ":9199"/g' \
+    /etc/oxidns/config.yaml
 
 FROM busybox:musl
 

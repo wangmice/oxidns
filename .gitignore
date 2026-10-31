@@ -90,6 +90,7 @@ Desktop.ini
 atlassian-ide-plugin.xml
 
 # Tooling output
+/.hermes/
 /.codex/
 **/__pycache__/
 *.py[cod]

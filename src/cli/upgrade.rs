@@ -484,10 +484,12 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command};
+    use crate::infra::network::outbound::TestGlobalGuard;
     use crate::infra::upgrade::UpgradeBundle;
 
     #[test]
     fn config_from_options_maps_webui_fields() {
+        let _outbound_guard = TestGlobalGuard::clean();
         #[cfg(windows)]
         let webui_dir_arg = r"C:\tmp\oxidns-webui";
         #[cfg(not(windows))]
@@ -513,6 +515,7 @@ mod tests {
 
     #[test]
     fn config_from_options_maps_github_token() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let cli = Cli::parse_from(["oxidns", "upgrade", "check", "--github-token", "ghp_test"]);
         let Command::Upgrade(opts) = cli.command else {
             panic!("expected upgrade command");
@@ -525,6 +528,7 @@ mod tests {
 
     #[test]
     fn config_from_options_maps_bundle() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let cli = Cli::parse_from(["oxidns", "upgrade", "check", "--bundle", "minimal"]);
         let Command::Upgrade(opts) = cli.command else {
             panic!("expected upgrade command");
@@ -537,6 +541,7 @@ mod tests {
 
     #[test]
     fn config_from_options_maps_no_restart_flag() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let cli = Cli::parse_from(["oxidns", "upgrade", "apply", "--no-restart"]);
         let Command::Upgrade(opts) = cli.command else {
             panic!("expected upgrade command");
@@ -549,6 +554,7 @@ mod tests {
 
     #[test]
     fn config_from_options_resolves_webui_root_against_explicit_working_dir() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
         fs::write(
@@ -588,6 +594,7 @@ api:
 
     #[test]
     fn config_from_options_uses_service_config_and_working_dir_when_no_local_config_exists() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let tmp = tempfile::TempDir::new().unwrap();
         let current_dir = tmp.path().join("home");
         let service_working_dir = tmp.path().join("var/lib/oxidns");
@@ -624,6 +631,7 @@ api:
     #[cfg(feature = "_http-client")]
     #[test]
     fn config_from_options_validates_outbound_before_upgrade_install() {
+        let _outbound_guard = TestGlobalGuard::clean();
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
         fs::write(
