@@ -62,7 +62,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 
 # Configuration, CLI, and observability
 jiff = "0.2"
@@ -74,7 +74,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 # Core data structures and utility crates
 ahash = "0.8"
@@ -94,7 +94,7 @@ sha2 = "0.11"
 wincode = { version = "0.6", features = ["derive"] }
 oxidns-proto = { version = "0.1.6", path = "crates/proto" }
 oxidns-macros = { version = "0.1.0", path = "crates/macros" }
-hotpath = "0.30.1"
+hotpath = "0.30.2"
 
 # Optional upgrade dependencies and response snapshot compression.
 semver = { version = "1.0", optional = true }
@@ -112,7 +112,7 @@ h2 = { version = "0.4", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"], optional = true }
 h3 = { version = "0.0", optional = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = { version = "0.0", optional = true }
-rustls = { version = "0.23.45", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
 webpki-roots = { version = "1.0", optional = true }
@@ -138,8 +138,8 @@ regex = "1.13"
 # Executor plugin dependencies, each gated by its own feature.
 cronexpr = { version = "1.7", optional = true }
 fast-socks5 = "1.0"
-mikrotik-rs = { version = "0.9", optional = true }
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+mikrotik-rs = { version = "0.10", optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/zoneparser", optional = true }
 
 # Service management
@@ -398,7 +398,7 @@ hotpath-callgrind = ["hotpath/hotpath-callgrind"]
 [dev-dependencies]
 criterion = "0.8.2"
 # Keep the Criterion adapter out of production builds.
-hotpath = { version = "0.30.1", features = ["criterion-0-8"] }
+hotpath = { version = "0.30.2", features = ["criterion-0-8"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 # Integration tests use hyper to spin up mock HTTP servers regardless of
