@@ -23,6 +23,10 @@ use crate::infra::network::deadline::QueryDeadline;
 use crate::infra::network::dial::{
     QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
 };
+#[cfg(feature = "resolver-doh3")]
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+#[cfg(feature = "resolver-doh3")]
+use crate::infra::network::upstream::validate_doh_content_type;
 use crate::proto::Message;
 
 #[derive(Debug)]
@@ -58,10 +62,16 @@ async fn query_doh3_config(
     request: Message,
     deadline: QueryDeadline,
 ) -> Result<Message> {
-    let socket = connect_udp(UdpDialOptions::new(
-        config.target(),
-        SocketOptions::default(),
-    ))?;
+    let socket = match deadline
+        .run(connect_udp(UdpDialOptions::new(
+            config.target(),
+            SocketOptions::default(),
+        )))
+        .await
+    {
+        DeadlineOutcome::Completed(result) => result?,
+        DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+    };
     let quic_conn = connect_quic(
         socket,
         QuicDialOptions::new(
@@ -95,6 +105,9 @@ async fn query_doh3_config(
         body_bytes.as_slice(),
         Version::HTTP_3,
     );
+    // The DNS payload has been encoded into the request URI, so return the
+    // pooled wire buffer before waiting on the HTTP/3 transport.
+    drop(body_bytes);
     let mut stream = match deadline.run(send_request.send_request(http_request)).await {
         DeadlineOutcome::Completed(Ok(value)) => value,
         DeadlineOutcome::Completed(Err(err)) => {
@@ -115,6 +128,11 @@ async fn query_doh3_config(
         }
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
+    let status_code = response.status();
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers())?;
+    }
+
     let mut response_bytes = response_buffer(&response);
     loop {
         let data = match deadline.run(stream.recv_data()).await {
@@ -129,13 +147,14 @@ async fn query_doh3_config(
         };
         append_response_chunk(&mut response_bytes, partial_bytes)?;
     }
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         return Err(DnsError::protocol(format!(
             "http unsuccessful code: {}",
-            response.status()
+            status_code
         )));
     }
     let mut message = Message::from_bytes(&response_bytes)?;
+    validate_dns_response(&request, &message, DnsResponseIdPolicy::Exact(0))?;
     message.set_id(raw_id);
     Ok(message)
 }

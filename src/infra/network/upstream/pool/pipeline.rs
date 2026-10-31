@@ -2,17 +2,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
+use futures::FutureExt;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::infra::clock::AppClock;
-use crate::infra::error::Result;
+use crate::infra::error::{DnsError, Result};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::config::ConnectionInfo;
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
@@ -22,10 +26,67 @@ use crate::infra::task as task_center;
 use crate::proto::Message;
 
 const POOL_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS: u64 = 50;
+const MULTIPLEXED_MAX_CONCURRENT_BUILDS: usize = 2;
+const MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS: u64 = 100;
+const MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS: u64 = 2_000;
+const MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT: u64 = 20;
 
-const SLOT_ACTIVE: u8 = 0;
-const SLOT_RETIRING: u8 = 1;
-const SLOT_CLOSED: u8 = 2;
+#[derive(Debug, Clone, Copy)]
+struct PacedExpansionPolicy;
+
+#[inline]
+fn jittered_connect_backoff_ms(base_ms: u64, key: u64) -> u64 {
+    let jitter = base_ms.saturating_mul(MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT) / 100;
+    if jitter == 0 {
+        return base_ms.min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+    }
+
+    let low = base_ms.saturating_sub(jitter).max(1);
+    let high = base_ms
+        .saturating_add(jitter)
+        .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+    let span = high.saturating_sub(low).saturating_add(1);
+
+    // SplitMix64 finalizer: cheap deterministic diffusion for pointer/streak
+    // inputs. This is scheduling jitter, not cryptographic randomness.
+    let mut mixed = key.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+
+    low.saturating_add(mixed % span)
+}
+
+#[derive(Debug, Clone)]
+struct ConnectFailureObservation {
+    at_ms: u64,
+    message: String,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Active = 0,
+    Retiring = 1,
+    Closed = 2,
+    /// Reserved packed bit pattern. Normal state transitions never write it,
+    /// but representing all two-bit values keeps decoding safe and preserves
+    /// the previous fail-closed handling if the packed word is ever corrupted.
+    Invalid = 3,
+}
+
+impl SlotState {
+    #[inline]
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Active,
+            1 => Self::Retiring,
+            2 => Self::Closed,
+            _ => Self::Invalid,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PipelinePool<C: Connection> {
@@ -45,17 +106,52 @@ pub struct PipelinePool<C: Connection> {
     /// Maximum allowed idle time before a connection is dropped.
     max_idle: Duration,
     /// Factory to create new connections.
-    connection_builder: Box<dyn ConnectionBuilder<C>>,
+    connection_builder: Arc<dyn ConnectionBuilder<C>>,
     /// Per-query timeout policy for acquired slots.
     timeout_policy: QueryTimeoutPolicy,
     /// Timeout used only by background prefill/maintenance expansion.
     connect_timeout: Duration,
     /// Monotonic connection id source.
     next_id: AtomicU16,
-    /// Notify waiters when a slot is released, inserted, retired, or closed.
-    release_notified: Notify,
+    /// Notify query waiters when stream capacity changes.
+    release_notified: Arc<Notify>,
+    /// Notify the paced expansion worker when a whole pool slot becomes
+    /// reservable again. Kept separate from query wakeups to avoid a waiter
+    /// stampede when a retiring slot finally drains.
+    expansion_capacity_notified: Arc<Notify>,
     /// Background maintenance task registered in task center.
     maintenance_task_handle: Mutex<Option<task_center::ManagedTaskHandle>>,
+    /// Multiplexed pools use a background paced expansion controller.
+    paced_expansion: Option<PacedExpansionPolicy>,
+    /// Cancels detached multiplexed connection builds when this pool is dropped.
+    /// Build tasks intentionally do not retain `Arc<PipelinePool<_>>`, so a
+    /// reload or pool swap can end the old generation immediately.
+    paced_build_shutdown: CancellationToken,
+    /// Weak self-reference used to spawn expansion workers without retaining the pool forever.
+    self_weak: Weak<PipelinePool<C>>,
+    /// A pressure change arrived while the expansion worker was running or exiting.
+    expansion_requested: AtomicBool,
+    /// Ensures at most one paced expansion worker exists for this pool.
+    expansion_worker_running: AtomicBool,
+    /// Queries currently waiting because no slot had usable capacity.
+    acquire_waiters: AtomicUsize,
+    /// Suppress redundant controller wakeups while every pool slot is occupied
+    /// by a healthy active connection and `max_size` prevents further growth.
+    expansion_quiescent_at_capacity: AtomicBool,
+    /// Gate for level-triggered soft-pressure probes. The gate is re-armed by
+    /// a detached timer so high-QPS acquisitions do not read the monotonic
+    /// clock on every hit above the soft threshold.
+    soft_probe_ready: AtomicBool,
+    /// Monotonic start time of the most recent connection build.
+    last_expand_start_ms: AtomicU64,
+    /// Earliest time another build may start after connection-creation failures.
+    next_expand_at_ms: AtomicU64,
+    /// Consecutive background connection-creation failures.
+    connect_failure_streak: AtomicU32,
+    /// Most recent background connection failure. Writes are rare; foreground
+    /// pool-acquire timeouts take a lock-free snapshot so failure storms do not
+    /// serialize on a shared mutex.
+    last_connect_failure: ArcSwapOption<ConnectFailureObservation>,
 }
 
 #[async_trait]
@@ -74,12 +170,13 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 result
             }
             DeadlineOutcome::Expired => {
+                let timeout_error = deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo);
                 match self.timeout_policy {
                     QueryTimeoutPolicy::Reuse => {}
                     QueryTimeoutPolicy::Retire => lease.retire(),
                     QueryTimeoutPolicy::Close => lease.close(),
                 }
-                Err(deadline.timeout_error())
+                Err(timeout_error)
             }
         }
     }
@@ -90,7 +187,15 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         if slots.is_empty() {
             drop(slots);
             if self.min_size > 0 {
-                let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+                if self.paced_expansion.is_some() {
+                    self.expansion_quiescent_at_capacity
+                        .store(false, Ordering::Release);
+                    self.request_paced_expansion();
+                } else {
+                    let _ = self
+                        .expand(QueryDeadline::background(self.connect_timeout))
+                        .await;
+                }
             }
             return;
         }
@@ -100,16 +205,15 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
         let mut close_after_swap = Vec::new();
 
         for slot in slots.iter() {
-            let state = slot.state();
-            let inflight = slot.inflight();
-            if state == SLOT_ACTIVE && slot.connection().available() {
+            let (state, inflight) = slot.snapshot();
+            if state == SlotState::Active && slot.connection().available() {
                 let idle = now.saturating_sub(slot.connection().last_used());
                 if inflight == 0 && idle >= self.max_idle.as_millis() as u64 {
                     idle_candidates.push(slot.clone());
                 } else {
                     keep.push(slot.clone());
                 }
-            } else if state == SLOT_RETIRING && inflight > 0 {
+            } else if state == SlotState::Retiring && inflight > 0 {
                 keep.push(slot.clone());
             } else if inflight > 0 {
                 slot.close();
@@ -139,7 +243,7 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
             for slot in close_after_swap {
                 slot.close();
             }
-            self.release_notified.notify_waiters();
+            self.notify_removed_pool_slot();
             return;
         }
 
@@ -157,11 +261,17 @@ impl<C: Connection> ConnectionPool<C> for PipelinePool<C> {
                 active_slots = new_len,
                 "Pipeline pool maintenance removed connections"
             );
-            self.release_notified.notify_waiters();
+            self.notify_removed_pool_slot();
         }
 
         if new_len < self.min_size {
-            let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+            if self.paced_expansion.is_some() {
+                self.request_paced_expansion();
+            } else {
+                let _ = self
+                    .expand(QueryDeadline::background(self.connect_timeout))
+                    .await;
+            }
         }
     }
 
@@ -181,6 +291,54 @@ impl<C: Connection> PipelinePool<C> {
         timeout_policy: QueryTimeoutPolicy,
         connect_timeout: Duration,
     ) -> Arc<PipelinePool<C>> {
+        Self::new_inner(
+            connection_info,
+            size,
+            max_load,
+            idle_time,
+            connection_builder,
+            timeout_policy,
+            connect_timeout,
+            None,
+        )
+    }
+
+    /// Build a pool for multiplexed transports (H2/H3/DoQ). Connection
+    /// creation is detached from query lifetimes and paced by one background
+    /// worker so bursts cannot create a handshake storm.
+    #[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
+    pub fn new_multiplexed(
+        connection_info: Arc<ConnectionInfo>,
+        size: PoolSize,
+        max_load: u16,
+        idle_time: Duration,
+        connection_builder: Box<dyn ConnectionBuilder<C>>,
+        timeout_policy: QueryTimeoutPolicy,
+        connect_timeout: Duration,
+    ) -> Arc<PipelinePool<C>> {
+        Self::new_inner(
+            connection_info,
+            size,
+            max_load,
+            idle_time,
+            connection_builder,
+            timeout_policy,
+            connect_timeout,
+            Some(PacedExpansionPolicy),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        connection_info: Arc<ConnectionInfo>,
+        size: PoolSize,
+        max_load: u16,
+        idle_time: Duration,
+        connection_builder: Box<dyn ConnectionBuilder<C>>,
+        timeout_policy: QueryTimeoutPolicy,
+        connect_timeout: Duration,
+        paced_expansion: Option<PacedExpansionPolicy>,
+    ) -> Arc<PipelinePool<C>> {
         let PoolSize {
             min: min_size,
             max: max_size,
@@ -194,7 +352,7 @@ impl<C: Connection> PipelinePool<C> {
             max_size,
             "Creating PipelinePool"
         );
-        let pool = Arc::new(Self {
+        let pool = Arc::new_cyclic(|weak| Self {
             connection_info,
             index: AtomicUsize::new(0),
             slots: ArcSwap::from_pointee(Vec::new()),
@@ -203,26 +361,53 @@ impl<C: Connection> PipelinePool<C> {
             min_size,
             max_load: max_load.max(1),
             max_idle: idle_time,
-            connection_builder,
+            connection_builder: Arc::from(connection_builder),
             timeout_policy,
             connect_timeout,
             next_id: AtomicU16::new(1),
-            release_notified: Notify::new(),
+            release_notified: Arc::new(Notify::new()),
+            expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
+            paced_expansion,
+            paced_build_shutdown: CancellationToken::new(),
+            self_weak: weak.clone(),
+            expansion_requested: AtomicBool::new(false),
+            expansion_worker_running: AtomicBool::new(false),
+            acquire_waiters: AtomicUsize::new(0),
+            expansion_quiescent_at_capacity: AtomicBool::new(false),
+            soft_probe_ready: AtomicBool::new(true),
+            last_expand_start_ms: AtomicU64::new(u64::MAX),
+            next_expand_at_ms: AtomicU64::new(0),
+            connect_failure_streak: AtomicU32::new(0),
+            last_connect_failure: ArcSwapOption::empty(),
         });
         start_maintenance(&pool);
         if min_size > 0 {
-            let arc = pool.clone();
-            tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::new(arc.connect_timeout)).await {
-                    warn!("Failed to prefill PipelinePool: {:?}", e);
-                }
-            });
+            if pool.paced_expansion.is_some() {
+                pool.request_paced_expansion();
+            } else {
+                let arc = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = arc
+                        .expand(QueryDeadline::background(arc.connect_timeout))
+                        .await
+                    {
+                        warn!("Failed to prefill PipelinePool: {:?}", e);
+                    }
+                });
+            }
         }
         pool
     }
 
     async fn acquire(&self, deadline: QueryDeadline) -> Result<PipelineLease<'_, C>> {
+        if self.paced_expansion.is_some() {
+            return self.acquire_paced(deadline).await;
+        }
+        self.acquire_legacy(deadline).await
+    }
+
+    async fn acquire_legacy(&self, deadline: QueryDeadline) -> Result<PipelineLease<'_, C>> {
         loop {
             if let Some(slot) = self.try_acquire_existing() {
                 return Ok(PipelineLease::new(slot, &self.release_notified));
@@ -241,7 +426,7 @@ impl<C: Connection> PipelinePool<C> {
                     }
                     Err(e) => {
                         if deadline.remaining().is_none() {
-                            return Err(deadline.timeout_error());
+                            return Err(e);
                         }
                         debug!("Failed to create pipeline-pool connection: {:?}", e);
                         self.wait_backoff(deadline).await?;
@@ -273,7 +458,7 @@ impl<C: Connection> PipelinePool<C> {
                         }
                         Err(e) => {
                             if deadline.remaining().is_none() {
-                                return Err(deadline.timeout_error());
+                                return Err(e);
                             }
                             debug!("Failed to create pipeline-pool connection: {:?}", e);
                             self.wait_backoff(deadline).await?;
@@ -283,7 +468,9 @@ impl<C: Connection> PipelinePool<C> {
                 }
                 match deadline.run(notified.as_mut()).await {
                     DeadlineOutcome::Completed(()) => {}
-                    DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+                    DeadlineOutcome::Expired => {
+                        return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                    }
                 }
             }
         }
@@ -306,6 +493,672 @@ impl<C: Connection> PipelinePool<C> {
         }
 
         None
+    }
+
+    fn try_acquire_existing_observed(&self) -> Option<AcquiredSlot<C>> {
+        let slots = self.slots.load();
+        let len = slots.len();
+        if len == 0 {
+            self.expansion_quiescent_at_capacity
+                .store(false, Ordering::Release);
+            return None;
+        }
+
+        let start_idx = self.index.fetch_add(1, Ordering::Relaxed) % len;
+        let mut saw_replacement_candidate = false;
+        for offset in 0..len {
+            let idx = (start_idx + offset) % len;
+            let slot = &slots[idx];
+            if let Some(load) = slot.try_acquire_observed(self.max_load) {
+                if saw_replacement_candidate {
+                    self.expansion_quiescent_at_capacity
+                        .store(false, Ordering::Release);
+                    self.request_paced_expansion();
+                }
+                return Some(AcquiredSlot {
+                    slot: slot.clone(),
+                    inflight: load.inflight,
+                    capacity: load.capacity,
+                });
+            }
+            saw_replacement_candidate |= slot.needs_replacement();
+        }
+
+        if saw_replacement_candidate {
+            // An internally closed/retiring multiplexed connection can become
+            // replaceable without going through the pool controller. A failed
+            // foreground scan already touched every slot, so use that
+            // observation to lift hard-cap quiescence without another scan.
+            self.expansion_quiescent_at_capacity
+                .store(false, Ordering::Release);
+        }
+        None
+    }
+
+    async fn acquire_paced(&self, deadline: QueryDeadline) -> Result<PipelineLease<'_, C>> {
+        if let Some(acquired) = self.try_acquire_existing_observed() {
+            self.maybe_request_soft_expansion(acquired.inflight, acquired.capacity);
+            return Ok(PipelineLease::new_paced(
+                acquired.slot,
+                self.release_notified.as_ref(),
+                self.expansion_capacity_notified.as_ref(),
+                &self.expansion_quiescent_at_capacity,
+            ));
+        }
+
+        let mut waiter = PoolAcquireWaiter::new(self);
+        self.request_paced_expansion();
+
+        loop {
+            // Register before the final capacity check so a release/insert in
+            // the check-to-sleep window cannot be lost.
+            let notified = self.release_notified.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(acquired) = self.try_acquire_existing_observed() {
+                // Stop advertising hard pressure before soft-pressure
+                // accounting; otherwise the worker can briefly count a query
+                // that has already obtained capacity as still waiting.
+                waiter.leave();
+                self.maybe_request_soft_expansion(acquired.inflight, acquired.capacity);
+                return Ok(PipelineLease::new_paced(
+                    acquired.slot,
+                    self.release_notified.as_ref(),
+                    self.expansion_capacity_notified.as_ref(),
+                    &self.expansion_quiescent_at_capacity,
+                ));
+            }
+
+            self.request_paced_expansion();
+            match deadline.run(notified.as_mut()).await {
+                DeadlineOutcome::Completed(()) => {}
+                DeadlineOutcome::Expired => {
+                    return Err(self.paced_pool_acquire_timeout_error(deadline));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn maybe_request_soft_expansion(&self, inflight: u16, capacity: u16) {
+        if capacity <= 1 {
+            return;
+        }
+        let soft_threshold = capacity.div_ceil(2);
+        if inflight < soft_threshold
+            || self.expansion_quiescent_at_capacity.load(Ordering::Relaxed)
+            || self.expansion_worker_running.load(Ordering::Relaxed)
+            || !self.soft_probe_ready.load(Ordering::Relaxed)
+        {
+            return;
+        }
+
+        // Level-triggered probes preserve aggregate-pressure and dynamic peer
+        // capacity handling without paying an Instant read on every hot-path
+        // acquisition. Only one query per interval closes the gate; a detached
+        // weak timer re-arms it without retaining or polling the pool.
+        if self
+            .soft_probe_ready
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.request_paced_expansion();
+        let weak = self.self_weak.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS)).await;
+            if let Some(pool) = weak.upgrade() {
+                pool.soft_probe_ready.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    fn request_paced_expansion(&self) {
+        if self.paced_expansion.is_none()
+            || self.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        self.expansion_requested.store(true, Ordering::Release);
+        if self
+            .expansion_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let weak = self.self_weak.clone();
+        let shutdown = self.paced_build_shutdown.clone();
+        tokio::spawn(async move {
+            Self::supervise_paced_expansion_worker(weak, shutdown).await;
+        });
+    }
+
+    async fn supervise_paced_expansion_worker(weak: Weak<Self>, shutdown: CancellationToken) {
+        let mut lifecycle = PacedExpansionWorkerLifecycle::new(weak.clone());
+        loop {
+            let outcome = AssertUnwindSafe(Self::run_paced_expansion_worker(
+                weak.clone(),
+                shutdown.clone(),
+            ))
+            .catch_unwind()
+            .await;
+            match outcome {
+                Ok(()) => {
+                    lifecycle.disarm();
+                    return;
+                }
+                Err(_) => {
+                    let Some(pool) = weak.upgrade() else {
+                        lifecycle.disarm();
+                        return;
+                    };
+
+                    // A panic must not leave `expansion_worker_running=true`
+                    // with no live worker. Keep ownership of the running flag
+                    // in this supervisor, re-arm demand, and reuse the same
+                    // bounded connection-failure backoff before retrying. This
+                    // also prevents a deterministic builder panic from turning
+                    // into a tight respawn loop.
+                    pool.expansion_requested.store(true, Ordering::Release);
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    warn!(
+                        delay_ms,
+                        "Multiplexed pipeline expansion worker panicked; retrying after backoff"
+                    );
+                    drop(pool);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            lifecycle.disarm();
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_paced_expansion_worker(weak: Weak<Self>, shutdown: CancellationToken) {
+        loop {
+            let Some(pool) = weak.upgrade() else {
+                return;
+            };
+
+            // Consume all requests observed up to this point. Any request that
+            // arrives after the swap leaves the flag set for the next
+            // iteration or the exit handshake below.
+            pool.expansion_requested.swap(false, Ordering::AcqRel);
+
+            let snapshot = pool.paced_expansion_snapshot();
+            match snapshot.state {
+                PacedExpansionState::Idle => {
+                    // Publish the idle state before the final request check. A
+                    // concurrent requester either observes `running=true` and
+                    // leaves `requested=true` for us, or observes `running=false`
+                    // and starts the replacement worker itself.
+                    pool.expansion_worker_running
+                        .store(false, Ordering::Release);
+                    if !pool.expansion_requested.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    if pool
+                        .expansion_worker_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                PacedExpansionState::Saturated => {
+                    // `max_size` is occupied entirely by healthy active
+                    // connections. Further hard-pressure requests cannot make
+                    // expansion possible, so suppress their controller wakeups
+                    // until a slot actually becomes replaceable. Revalidate
+                    // after publishing the flag to close a capacity-change race.
+                    pool.expansion_quiescent_at_capacity
+                        .store(true, Ordering::Release);
+                    if pool.paced_expansion_state() != PacedExpansionState::Saturated {
+                        pool.expansion_quiescent_at_capacity
+                            .store(false, Ordering::Release);
+                        continue;
+                    }
+
+                    // Requests that raced before quiescence was visible are
+                    // redundant at the hard cap. Capacity-changing paths clear
+                    // the quiescent flag; if that happens during this exit
+                    // handshake, explicitly restart the controller.
+                    pool.expansion_requested.store(false, Ordering::Release);
+                    pool.expansion_worker_running
+                        .store(false, Ordering::Release);
+                    if !pool.expansion_quiescent_at_capacity.load(Ordering::Acquire) {
+                        pool.request_paced_expansion();
+                    }
+                    return;
+                }
+                PacedExpansionState::ExpandSoft | PacedExpansionState::ExpandHard => {}
+            }
+
+            let delay = pool.paced_expansion_delay();
+            if !delay.is_zero() {
+                drop(pool);
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+
+            let build_limit = match pool.paced_build_limit(&snapshot) {
+                Some(limit) => limit,
+                None => continue,
+            };
+
+            if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
+                // The controller remains unique, but connection handshakes are
+                // detached and may overlap. Wait for one build reservation to
+                // finish instead of spinning while the bounded build window is
+                // full.
+                let capacity_changed = pool.expansion_capacity_notified.clone();
+                let notified = capacity_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if pool.reserved_slots.load(Ordering::Acquire) >= build_limit {
+                    drop(pool);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notified.as_mut() => {}
+                    }
+                    continue;
+                }
+            }
+
+            let mut reservation = pool.try_reserve_paced_slot();
+            if reservation.is_none() {
+                // A retiring/in-flight slot or an already-running connection
+                // build can temporarily occupy max_size even though no new
+                // build may start. Register before the final re-check to close
+                // the notify-before-sleep race.
+                let capacity_changed = pool.expansion_capacity_notified.clone();
+                let notified = capacity_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                reservation = pool.try_reserve_paced_slot();
+                if reservation.is_none() {
+                    // A successful concurrent build may have filled max_size
+                    // between the pressure check and reservation attempt. Let
+                    // the top of the loop publish hard-cap quiescence instead
+                    // of waiting for an event that may never arrive.
+                    if matches!(
+                        pool.paced_expansion_state(),
+                        PacedExpansionState::Idle | PacedExpansionState::Saturated
+                    ) {
+                        continue;
+                    }
+
+                    drop(reservation);
+                    drop(pool);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notified.as_mut() => {}
+                    }
+                    continue;
+                }
+            }
+            let Some(reservation) = reservation else {
+                unreachable!("pipeline reservation was checked above");
+            };
+
+            // Revalidate both state and current demand after reserving. This
+            // closes the race where another detached build publishes capacity
+            // after the controller snapshot but before this reservation; a
+            // stale high build target must not cause an unnecessary handshake.
+            let current_snapshot = pool.paced_expansion_snapshot();
+            let current_limit = pool.paced_build_limit(&current_snapshot);
+            let reserved = pool.reserved_slots.load(Ordering::Acquire);
+            if !current_limit.is_some_and(|limit| reserved <= limit) {
+                drop(reservation);
+                continue;
+            }
+
+            pool.last_expand_start_ms
+                .store(AppClock::elapsed_millis(), Ordering::Release);
+            Self::spawn_paced_build(pool.clone(), reservation);
+        }
+    }
+
+    fn spawn_paced_build(pool: Arc<Self>, reservation: PacedSlotReservation<C>) {
+        // Extract everything the network handshake needs before spawning it.
+        // In particular, the detached task must not retain `Arc<PipelinePool>`:
+        // otherwise an old pool generation survives reload/pool swap until the
+        // connection timeout and may continue satisfying its old `min_size`.
+        let weak = pool.self_weak.clone();
+        let builder = pool.connection_builder.clone();
+        let connection_info = pool.connection_info.clone();
+        let shutdown = pool.paced_build_shutdown.clone();
+        let connect_timeout = pool.connect_timeout;
+        let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
+        drop(pool);
+
+        tokio::spawn(async move {
+            let deadline = QueryDeadline::background_connection(connect_timeout);
+            let build = AssertUnwindSafe(deadline.run(builder.create_connection(
+                id,
+                deadline,
+                connection_info,
+            )))
+            .catch_unwind();
+            tokio::pin!(build);
+
+            let outcome = tokio::select! {
+                biased;
+                outcome = build.as_mut() => outcome,
+                _ = shutdown.cancelled() => {
+                    // Dropping the builder future cancels the in-flight
+                    // handshake. The reservation only holds a weak pool
+                    // reference, so this cannot keep an obsolete pool alive.
+                    drop(reservation);
+                    return;
+                }
+            };
+
+            let Some(pool) = weak.upgrade() else {
+                // The pool disappeared after the build completed but before
+                // publication. Never leak a successfully created connection
+                // from an obsolete generation.
+                if let Ok(DeadlineOutcome::Completed(Ok(conn))) = outcome {
+                    conn.close();
+                }
+                drop(reservation);
+                return;
+            };
+
+            match outcome {
+                Ok(DeadlineOutcome::Completed(Ok(conn))) => {
+                    match pool.publish_paced_connection(reservation, conn) {
+                        PacedPublishOutcome::Published | PacedPublishOutcome::Rejected => {
+                            pool.connect_failure_streak.store(0, Ordering::Release);
+                            pool.next_expand_at_ms.store(0, Ordering::Release);
+                            pool.clear_connect_failure();
+                        }
+                        PacedPublishOutcome::Unavailable => {
+                            let message =
+                                "new multiplexed connection became unavailable before publication";
+                            pool.record_connect_failure_message(message.to_string());
+                            let delay_ms = pool.record_connect_failure_backoff();
+                            debug!(
+                                delay_ms,
+                                "Multiplexed connection became unavailable before publication; backing off"
+                            );
+                        }
+                    }
+                }
+                Ok(DeadlineOutcome::Completed(Err(e))) => {
+                    drop(reservation);
+                    pool.record_connect_failure(&e);
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    debug!(
+                        delay_ms,
+                        error = ?e,
+                        "Multiplexed pipeline expansion failed; backing off"
+                    );
+                }
+                Ok(DeadlineOutcome::Expired) => {
+                    drop(reservation);
+                    let e = deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate);
+                    pool.record_connect_failure(&e);
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    debug!(
+                        delay_ms,
+                        error = ?e,
+                        "Multiplexed pipeline expansion timed out; backing off"
+                    );
+                }
+                Err(_) => {
+                    drop(reservation);
+                    pool.record_connect_failure_message(
+                        "multiplexed connection builder panicked".to_string(),
+                    );
+                    let delay_ms = pool.record_connect_failure_backoff();
+                    warn!(
+                        delay_ms,
+                        "Multiplexed pipeline connection build panicked; backing off"
+                    );
+                }
+            }
+
+            // The reservation has released its build slot by here and already
+            // notified a controller waiting on the bounded build window.
+            // Re-evaluate level-triggered pressure after the outcome is recorded.
+            pool.request_paced_expansion();
+        });
+    }
+
+    fn publish_paced_connection(
+        &self,
+        reservation: PacedSlotReservation<C>,
+        conn: Arc<C>,
+    ) -> PacedPublishOutcome {
+        self.register_connection_pool_notifications(&conn);
+        // A protocol driver can fail immediately after the builder returns. Do
+        // not publish a connection that is already known dead; registration
+        // above closes the failure-notification race for drivers that fail just
+        // before this check.
+        if !conn.available() {
+            conn.close();
+            return PacedPublishOutcome::Unavailable;
+        }
+
+        let slot = Arc::new(PipelineSlot::new(conn));
+        if !self.insert_slot(slot.clone()) {
+            slot.close();
+            return PacedPublishOutcome::Rejected;
+        }
+
+        // Re-check after the ArcSwap insertion but before committing the build
+        // reservation or advertising stream capacity. If the connection died
+        // during insertion, remove it immediately and keep query waiters asleep.
+        if !slot.connection().available() {
+            slot.close();
+            let _ = self.usable_or_inflight_slot_count();
+            return PacedPublishOutcome::Unavailable;
+        }
+
+        reservation.commit();
+        debug!(
+            "Pipeline pool expanded: total={}/{}",
+            self.slots.load().len(),
+            self.max_size
+        );
+        self.notify_inserted_query_capacity(&slot);
+        PacedPublishOutcome::Published
+    }
+
+    fn paced_expansion_snapshot(&self) -> PacedExpansionSnapshot {
+        let pressure = self.pool_pressure();
+        let waiters = self.acquire_waiters.load(Ordering::Acquire);
+        let state = if pressure.active_connections < self.min_size {
+            if pressure.active_connections < self.max_size {
+                PacedExpansionState::ExpandHard
+            } else {
+                PacedExpansionState::Saturated
+            }
+        } else if pressure.active_connections >= self.max_size {
+            PacedExpansionState::Saturated
+        } else if waiters > pressure.free_capacity {
+            PacedExpansionState::ExpandHard
+        } else if pressure.total_capacity > 0
+            && pressure.total_inflight.saturating_mul(2) >= pressure.total_capacity
+        {
+            PacedExpansionState::ExpandSoft
+        } else {
+            PacedExpansionState::Idle
+        };
+
+        PacedExpansionSnapshot {
+            state,
+            pressure,
+            waiters,
+        }
+    }
+
+    fn paced_expansion_state(&self) -> PacedExpansionState {
+        self.paced_expansion_snapshot().state
+    }
+
+    /// Return the total number of concurrent connection builds justified by
+    /// one pressure snapshot. Reusing the controller's state snapshot avoids a
+    /// second full pool scan immediately before reservation; state is still
+    /// revalidated after reserving a slot to preserve race safety. Existing
+    /// reservations consume this budget; the value is a target, while
+    /// `MULTIPLEXED_MAX_CONCURRENT_BUILDS` is only a ceiling.
+    fn paced_build_limit(&self, snapshot: &PacedExpansionSnapshot) -> Option<usize> {
+        match snapshot.state {
+            PacedExpansionState::Idle | PacedExpansionState::Saturated => None,
+            PacedExpansionState::ExpandSoft => Some(1),
+            PacedExpansionState::ExpandHard => {
+                let pressure = &snapshot.pressure;
+                let min_size_builds = self.min_size.saturating_sub(pressure.active_connections);
+                let waiter_deficit = snapshot.waiters.saturating_sub(pressure.free_capacity);
+                // Once the peer has published real multiplexing limits, size
+                // burst expansion from observed capacity instead of the
+                // configured ceiling. Using the smallest active connection
+                // capacity is intentionally conservative: it prevents a low
+                // H2 SETTINGS_MAX_CONCURRENT_STREAMS value from serializing
+                // connection recovery behind one handshake at a time. Cold
+                // start still falls back to the configured max_load until an
+                // observation exists.
+                let per_connection = if pressure.active_connections == 0 {
+                    usize::from(self.max_load.max(1))
+                } else {
+                    pressure.min_connection_capacity.max(1)
+                };
+                let waiter_builds = waiter_deficit.div_ceil(per_connection);
+                let available_pool_slots =
+                    self.max_size.saturating_sub(pressure.active_connections);
+                let justified = min_size_builds
+                    .max(waiter_builds)
+                    .min(available_pool_slots)
+                    .min(MULTIPLEXED_MAX_CONCURRENT_BUILDS);
+
+                (justified > 0).then_some(justified)
+            }
+        }
+    }
+
+    fn notify_expansion_capacity_change(&self) {
+        self.expansion_quiescent_at_capacity
+            .store(false, Ordering::Release);
+        self.expansion_capacity_notified.notify_waiters();
+    }
+
+    /// Removing a whole pool slot creates room for a replacement connection,
+    /// but does not itself create usable DNS stream capacity. Multiplexed
+    /// query waiters stay asleep until a replacement is inserted; legacy
+    /// pools keep their historical wake-all behavior because foreground
+    /// acquirers may compete directly for expansion reservations.
+    fn notify_removed_pool_slot(&self) {
+        if self.paced_expansion.is_some() {
+            self.notify_expansion_capacity_change();
+        } else {
+            self.release_notified.notify_waiters();
+        }
+    }
+
+    fn pool_pressure(&self) -> PoolPressure {
+        let slots = self.slots.load();
+        let mut pressure = PoolPressure::default();
+        for slot in slots.iter() {
+            let (state, inflight) = slot.snapshot();
+            if state != SlotState::Active || !slot.connection().available() {
+                continue;
+            }
+            let capacity_u16 = slot.effective_max_load(self.max_load);
+            let capacity = usize::from(capacity_u16);
+            if pressure.active_connections == 0 {
+                pressure.min_connection_capacity = capacity;
+            } else {
+                pressure.min_connection_capacity = pressure.min_connection_capacity.min(capacity);
+            }
+            pressure.active_connections += 1;
+            pressure.total_inflight += usize::from(inflight.min(capacity_u16));
+            pressure.total_capacity += capacity;
+            pressure.free_capacity += capacity.saturating_sub(usize::from(inflight));
+        }
+        pressure
+    }
+
+    fn paced_expansion_delay(&self) -> Duration {
+        let now = AppClock::elapsed_millis();
+        let last_start = self.last_expand_start_ms.load(Ordering::Acquire);
+        let paced_at = if last_start == u64::MAX {
+            0
+        } else {
+            last_start.saturating_add(MULTIPLEXED_EXPANSION_MIN_INTERVAL_MS)
+        };
+        let retry_at = self.next_expand_at_ms.load(Ordering::Acquire);
+        let allowed_at = paced_at.max(retry_at);
+        Duration::from_millis(allowed_at.saturating_sub(now))
+    }
+
+    fn record_connect_failure(&self, error: &DnsError) {
+        self.record_connect_failure_message(error.to_string());
+    }
+
+    fn record_connect_failure_message(&self, message: String) {
+        self.last_connect_failure
+            .store(Some(Arc::new(ConnectFailureObservation {
+                at_ms: AppClock::elapsed_millis(),
+                message,
+            })));
+    }
+
+    fn clear_connect_failure(&self) {
+        self.last_connect_failure.store(None);
+    }
+
+    fn paced_pool_acquire_timeout_error(&self, deadline: QueryDeadline) -> DnsError {
+        let failure = self.last_connect_failure.load_full();
+        if let Some(failure) = failure.filter(|failure| failure.at_ms >= deadline.started_at_ms) {
+            let detail = format!(
+                "last upstream connection attempt failed: {}",
+                failure.message
+            );
+            deadline.timeout_error_for_with_detail(UpstreamTimeoutStage::PoolAcquire, &detail)
+        } else {
+            deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire)
+        }
+    }
+
+    fn record_connect_failure_backoff(&self) -> u64 {
+        let failure = self
+            .connect_failure_streak
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let shift = failure.saturating_sub(1).min(31);
+        let base_delay_ms = MULTIPLEXED_EXPANSION_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << shift)
+            .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+        // Mix the pool identity with the failure streak to decorrelate retry
+        // schedules across upstreams without putting an RNG on this failure
+        // path. The resulting delay stays within a bounded +/-20% window
+        // (clamped by the configured maximum), so retry storms are dispersed
+        // while preserving the existing exponential-backoff envelope.
+        let pool_salt = self as *const Self as usize as u64;
+        let jitter_key = pool_salt ^ u64::from(failure).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let delay_ms = jittered_connect_backoff_ms(base_delay_ms, jitter_key);
+        self.next_expand_at_ms.store(
+            AppClock::elapsed_millis().saturating_add(delay_ms),
+            Ordering::Release,
+        );
+        delay_ms
     }
 
     async fn expand(&self, deadline: QueryDeadline) -> Result<()> {
@@ -336,6 +1189,17 @@ impl<C: Connection> PipelinePool<C> {
         reservation: SlotReservation<'_, C>,
         deadline: QueryDeadline,
     ) -> Result<Option<Arc<PipelineSlot<C>>>> {
+        let result = self.create_and_insert_slot(deadline).await;
+        if matches!(&result, Ok(Some(_))) {
+            reservation.commit();
+        }
+        result
+    }
+
+    async fn create_and_insert_slot(
+        &self,
+        deadline: QueryDeadline,
+    ) -> Result<Option<Arc<PipelineSlot<C>>>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         match deadline
             .run(self.connection_builder.create_connection(
@@ -346,15 +1210,17 @@ impl<C: Connection> PipelinePool<C> {
             .await
         {
             DeadlineOutcome::Completed(Ok(conn)) => {
+                if self.paced_expansion.is_some() {
+                    self.register_connection_pool_notifications(&conn);
+                }
                 let slot = Arc::new(PipelineSlot::new(conn));
                 if self.insert_slot(slot.clone()) {
-                    reservation.commit();
                     debug!(
                         "Pipeline pool expanded: total={}/{}",
                         self.slots.load().len(),
                         self.max_size
                     );
-                    self.release_notified.notify_waiters();
+                    self.notify_inserted_query_capacity(&slot);
                     Ok(Some(slot))
                 } else {
                     slot.close();
@@ -362,7 +1228,59 @@ impl<C: Connection> PipelinePool<C> {
                 }
             }
             DeadlineOutcome::Completed(Err(e)) => Err(e),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
+            }
+        }
+    }
+
+    fn register_connection_pool_notifications(&self, conn: &Arc<C>) {
+        let weak = self.self_weak.clone();
+        conn.register_unavailable_notify(Arc::new(move || {
+            let Some(pool) = weak.upgrade() else {
+                return;
+            };
+            // Connection loss creates potential whole-slot replacement
+            // capacity, not usable DNS stream capacity. Re-arm the controller
+            // directly and leave foreground waiters asleep until a real stream
+            // is released or a replacement connection is published.
+            pool.notify_expansion_capacity_change();
+            pool.request_paced_expansion();
+        }));
+
+        let weak = self.self_weak.clone();
+        conn.register_capacity_increase_notify(Arc::new(move |previous, current| {
+            let Some(pool) = weak.upgrade() else {
+                return;
+            };
+            let previous = usize::from(previous.min(pool.max_load));
+            let current = usize::from(current.min(pool.max_load));
+            let added_capacity = current.saturating_sub(previous);
+            if added_capacity == 0 {
+                return;
+            }
+
+            // SETTINGS growth creates real stream capacity on an already
+            // published connection. Wake only the newly serviceable portion of
+            // the backlog instead of broadcasting every pool waiter.
+            let waiters = pool.acquire_waiters.load(Ordering::Acquire);
+            for _ in 0..waiters.min(added_capacity) {
+                pool.release_notified.notify_one();
+            }
+        }));
+    }
+
+    fn notify_inserted_query_capacity(&self, slot: &PipelineSlot<C>) {
+        if self.paced_expansion.is_none() {
+            self.release_notified.notify_waiters();
+            return;
+        }
+
+        let waiters = self.acquire_waiters.load(Ordering::Acquire);
+        let capacity = usize::from(slot.effective_max_load(self.max_load));
+        let wake_count = waiters.min(capacity.max(1));
+        for _ in 0..wake_count {
+            self.release_notified.notify_one();
         }
     }
 
@@ -370,12 +1288,13 @@ impl<C: Connection> PipelinePool<C> {
         let inserted = AtomicBool::new(false);
         self.slots.rcu(|old_slots| {
             let mut new_slots = Vec::with_capacity(old_slots.len() + 1);
-            new_slots.extend(
-                old_slots
-                    .iter()
-                    .filter(|slot| !slot.is_drained_unusable())
-                    .cloned(),
-            );
+            for existing in old_slots.iter() {
+                if existing.is_drained_unusable() {
+                    existing.close();
+                } else {
+                    new_slots.push(existing.clone());
+                }
+            }
             let current_len = new_slots.len();
             if current_len >= self.max_size {
                 inserted.store(false, Ordering::Relaxed);
@@ -411,13 +1330,40 @@ impl<C: Connection> PipelinePool<C> {
         }
     }
 
+    fn try_reserve_paced_slot(&self) -> Option<PacedSlotReservation<C>> {
+        loop {
+            let reserved = self.reserved_slots.load(Ordering::Acquire);
+            let active = self.usable_or_inflight_slot_count();
+            if active.saturating_add(reserved) >= self.max_size {
+                return None;
+            }
+            match self.reserved_slots.compare_exchange_weak(
+                reserved,
+                reserved + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(PacedSlotReservation::new(self.self_weak.clone()));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     fn usable_or_inflight_slot_count(&self) -> usize {
         let slots = self.slots.load();
-        let active = slots
-            .iter()
-            .filter(|slot| !slot.is_drained_unusable())
-            .count();
-        if active == slots.len() {
+        let mut active = 0usize;
+        let mut has_drained = false;
+        for slot in slots.iter() {
+            if slot.is_drained_unusable() {
+                slot.close();
+                has_drained = true;
+            } else {
+                active += 1;
+            }
+        }
+        if !has_drained {
             return active;
         }
 
@@ -433,7 +1379,7 @@ impl<C: Connection> PipelinePool<C> {
             &slots,
             &self.slots.compare_and_swap(&slots, Arc::new(pruned)),
         ) {
-            self.release_notified.notify_waiters();
+            self.notify_removed_pool_slot();
             pruned_len
         } else {
             self.slots
@@ -446,29 +1392,94 @@ impl<C: Connection> PipelinePool<C> {
 
     async fn wait_backoff(&self, deadline: QueryDeadline) -> Result<()> {
         let Some(remaining) = deadline.remaining() else {
-            return Err(deadline.timeout_error());
+            return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
         };
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {
             DeadlineOutcome::Completed(()) => Ok(()),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire))
+            }
         }
     }
 }
 
 #[derive(Debug)]
+struct AcquiredSlot<C: Connection> {
+    slot: Arc<PipelineSlot<C>>,
+    inflight: u16,
+    capacity: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcquiredLoad {
+    inflight: u16,
+    capacity: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacedExpansionState {
+    Idle,
+    Saturated,
+    ExpandSoft,
+    ExpandHard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacedPublishOutcome {
+    Published,
+    Rejected,
+    Unavailable,
+}
+
+#[derive(Debug)]
+struct PacedExpansionSnapshot {
+    state: PacedExpansionState,
+    pressure: PoolPressure,
+    waiters: usize,
+}
+
+#[derive(Debug, Default)]
+struct PoolPressure {
+    active_connections: usize,
+    total_inflight: usize,
+    total_capacity: usize,
+    free_capacity: usize,
+    min_connection_capacity: usize,
+}
+
+#[derive(Debug)]
 struct PipelineSlot<C: Connection> {
     conn: Arc<C>,
-    inflight: AtomicU16,
-    state: AtomicU8,
+    /// Slot lifecycle state and in-flight borrow count share one atomic word so
+    /// idle retirement and new borrows cannot observe or publish split state.
+    /// Low 16 bits hold the in-flight count; bits 16..=17 hold the state.
+    state_and_inflight: AtomicU32,
+}
+
+const SLOT_INFLIGHT_MASK: u32 = u16::MAX as u32;
+const SLOT_STATE_SHIFT: u32 = 16;
+
+#[inline]
+const fn pack_slot_state(state: SlotState, inflight: u16) -> u32 {
+    ((state as u32) << SLOT_STATE_SHIFT) | inflight as u32
+}
+
+#[inline]
+const fn unpack_slot_state(word: u32) -> SlotState {
+    SlotState::from_bits(((word >> SLOT_STATE_SHIFT) & 0b11) as u8)
+}
+
+#[inline]
+const fn unpack_slot_inflight(word: u32) -> u16 {
+    (word & SLOT_INFLIGHT_MASK) as u16
 }
 
 impl<C: Connection> PipelineSlot<C> {
     fn new(conn: Arc<C>) -> Self {
         Self {
             conn,
-            inflight: AtomicU16::new(0),
-            state: AtomicU8::new(SLOT_ACTIVE),
+            state_and_inflight: AtomicU32::new(pack_slot_state(SlotState::Active, 0)),
         }
     }
 
@@ -476,90 +1487,213 @@ impl<C: Connection> PipelineSlot<C> {
         &self.conn
     }
 
-    fn inflight(&self) -> u16 {
-        self.inflight.load(Ordering::Acquire)
+    #[inline]
+    fn snapshot(&self) -> (SlotState, u16) {
+        let word = self.state_and_inflight.load(Ordering::Acquire);
+        (unpack_slot_state(word), unpack_slot_inflight(word))
     }
 
-    fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+    #[cfg(test)]
+    fn inflight(&self) -> u16 {
+        self.snapshot().1
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> SlotState {
+        self.snapshot().0
+    }
+
+    #[inline]
+    fn effective_max_load(&self, max_load: u16) -> u16 {
+        max_load.min(self.conn.max_concurrent_queries())
     }
 
     fn try_acquire(&self, max_load: u16) -> bool {
-        if self.state() != SLOT_ACTIVE || !self.conn.available() {
+        if !self.conn.available() {
             return false;
         }
 
-        let mut current = self.inflight.load(Ordering::Acquire);
+        let effective_max_load = self.effective_max_load(max_load);
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
         loop {
-            if current >= max_load {
+            if unpack_slot_state(current) != SlotState::Active {
                 return false;
             }
-            match self.inflight.compare_exchange_weak(
+
+            let inflight = unpack_slot_inflight(current);
+            if inflight >= effective_max_load {
+                return false;
+            }
+
+            let next = pack_slot_state(SlotState::Active, inflight + 1);
+            match self.state_and_inflight.compare_exchange_weak(
                 current,
-                current + 1,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if self.state() == SLOT_ACTIVE && self.conn.available() {
+                    if self.conn.available() {
                         return true;
                     }
                     self.release_without_notify();
                     return false;
                 }
-                Err(next) => current = next,
+                Err(observed) => current = observed,
             }
         }
     }
 
-    fn release(&self, notify: &Notify) {
-        let previous = self.inflight.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "pipeline slot inflight underflow");
-        if previous == 1 && self.state() != SLOT_ACTIVE {
-            self.close();
+    fn try_acquire_observed(&self, max_load: u16) -> Option<AcquiredLoad> {
+        if !self.conn.available() {
+            return None;
         }
-        // Releasing one in-flight query frees exactly one unit of load on this
-        // slot, so wake a single waiter instead of stampeding all of them.
-        // `Notify` stores one permit if no waiter is currently parked, and the
-        // freed capacity is in any case visible to other acquirers via
-        // `try_acquire_existing`, so this cannot strand a waiter.
+
+        let effective_max_load = self.effective_max_load(max_load);
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            if unpack_slot_state(current) != SlotState::Active {
+                return None;
+            }
+
+            let inflight = unpack_slot_inflight(current);
+            if inflight >= effective_max_load {
+                return None;
+            }
+
+            let next_inflight = inflight + 1;
+            let next = pack_slot_state(SlotState::Active, next_inflight);
+            match self.state_and_inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if self.conn.available() {
+                        return Some(AcquiredLoad {
+                            inflight: next_inflight,
+                            capacity: effective_max_load,
+                        });
+                    }
+                    self.release_without_notify();
+                    return None;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(&self, notify: &Notify) -> bool {
+        let drained_unusable = self.release_inner();
+        // Releasing one in-flight query frees exactly one unit of stream load,
+        // so wake a single query waiter. Whole-slot capacity changes are sent
+        // through the dedicated expansion notifier by PipelineLease::drop.
         notify.notify_one();
+        drained_unusable
     }
 
     fn release_without_notify(&self) {
-        let previous = self.inflight.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "pipeline slot inflight underflow");
-        if previous == 1 && self.state() != SLOT_ACTIVE {
-            self.close();
+        let _ = self.release_inner();
+    }
+
+    /// Returns true when this release drains a non-active slot completely.
+    fn release_inner(&self) -> bool {
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            let state = unpack_slot_state(current);
+            let inflight = unpack_slot_inflight(current);
+            debug_assert!(inflight > 0, "pipeline slot inflight underflow");
+            if inflight == 0 {
+                return false;
+            }
+
+            let next = pack_slot_state(state, inflight - 1);
+            match self.state_and_inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // An asynchronously failed multiplexed connection can keep
+                    // the slot state ACTIVE until its final lease drains. Treat
+                    // that transition as whole-slot capacity becoming reusable.
+                    let drained_unusable =
+                        inflight == 1 && (state != SlotState::Active || !self.conn.available());
+                    if drained_unusable {
+                        self.close();
+                    }
+                    return drained_unusable;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
     fn retire(&self) {
-        let _ = self.state.compare_exchange(
-            SLOT_ACTIVE,
-            SLOT_RETIRING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if self.inflight() == 0 {
-            self.close();
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            match unpack_slot_state(current) {
+                SlotState::Active => {
+                    let inflight = unpack_slot_inflight(current);
+                    let next = pack_slot_state(SlotState::Retiring, inflight);
+                    match self.state_and_inflight.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            if inflight == 0 {
+                                self.close();
+                            }
+                            return;
+                        }
+                        Err(observed) => current = observed,
+                    }
+                }
+                SlotState::Retiring => {
+                    if unpack_slot_inflight(current) == 0 {
+                        self.close();
+                    }
+                    return;
+                }
+                SlotState::Closed | SlotState::Invalid => return,
+            }
         }
     }
 
     fn close(&self) {
-        if self.state.swap(SLOT_CLOSED, Ordering::AcqRel) != SLOT_CLOSED {
-            self.conn.close();
+        let mut current = self.state_and_inflight.load(Ordering::Acquire);
+        loop {
+            if unpack_slot_state(current) == SlotState::Closed {
+                return;
+            }
+            let next = pack_slot_state(SlotState::Closed, unpack_slot_inflight(current));
+            match self.state_and_inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.conn.close();
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
     fn close_if_idle(&self) -> bool {
-        if self.inflight() != 0 {
-            return false;
-        }
-
-        match self.state.compare_exchange(
-            SLOT_ACTIVE,
-            SLOT_CLOSED,
+        // Idle close competes with borrow on the exact same atomic word. If a
+        // borrower changes ACTIVE/0 -> ACTIVE/1 first, this CAS fails and the
+        // healthy connection stays reusable. If maintenance wins, no later
+        // borrower can enter a CLOSED slot.
+        match self.state_and_inflight.compare_exchange(
+            pack_slot_state(SlotState::Active, 0),
+            pack_slot_state(SlotState::Closed, 0),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -567,27 +1701,53 @@ impl<C: Connection> PipelineSlot<C> {
                 self.conn.close();
                 true
             }
-            Err(SLOT_RETIRING | SLOT_CLOSED) if self.inflight() == 0 => {
-                self.close();
-                true
+            Err(current) => {
+                unpack_slot_state(current) == SlotState::Closed
+                    && unpack_slot_inflight(current) == 0
             }
-            Err(_) => false,
         }
     }
 
+    fn needs_replacement(&self) -> bool {
+        let state = unpack_slot_state(self.state_and_inflight.load(Ordering::Acquire));
+        state != SlotState::Active || !self.conn.available()
+    }
+
     fn is_drained_unusable(&self) -> bool {
-        self.state() != SLOT_ACTIVE && self.inflight() == 0
+        let (state, inflight) = self.snapshot();
+        inflight == 0 && (state != SlotState::Active || !self.conn.available())
     }
 }
 
 struct PipelineLease<'a, C: Connection> {
     slot: Arc<PipelineSlot<C>>,
     notify: &'a Notify,
+    expansion_capacity_notify: Option<&'a Notify>,
+    expansion_quiescent_at_capacity: Option<&'a AtomicBool>,
 }
 
 impl<'a, C: Connection> PipelineLease<'a, C> {
     fn new(slot: Arc<PipelineSlot<C>>, notify: &'a Notify) -> Self {
-        Self { slot, notify }
+        Self {
+            slot,
+            notify,
+            expansion_capacity_notify: None,
+            expansion_quiescent_at_capacity: None,
+        }
+    }
+
+    fn new_paced(
+        slot: Arc<PipelineSlot<C>>,
+        notify: &'a Notify,
+        expansion_capacity_notify: &'a Notify,
+        expansion_quiescent_at_capacity: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            slot,
+            notify,
+            expansion_capacity_notify: Some(expansion_capacity_notify),
+            expansion_quiescent_at_capacity: Some(expansion_quiescent_at_capacity),
+        }
     }
 
     fn connection(&self) -> &C {
@@ -596,18 +1756,100 @@ impl<'a, C: Connection> PipelineLease<'a, C> {
 
     fn retire(&self) {
         self.slot.retire();
-        self.notify.notify_waiters();
+        if self.expansion_capacity_notify.is_some() {
+            // Retiring a multiplexed slot removes capacity; it does not create
+            // stream capacity for blocked queries. Re-arm expansion directly
+            // and let a replacement insertion perform bounded query wakeups.
+            self.notify_paced_capacity_change();
+        } else {
+            self.notify.notify_waiters();
+        }
     }
 
     fn close(&self) {
         self.slot.close();
-        self.notify.notify_waiters();
+        if self.expansion_capacity_notify.is_some() {
+            self.notify_paced_capacity_change();
+        } else {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn notify_paced_capacity_change(&self) {
+        if let Some(quiescent) = self.expansion_quiescent_at_capacity {
+            quiescent.store(false, Ordering::Release);
+        }
+        if let Some(notify) = self.expansion_capacity_notify {
+            notify.notify_waiters();
+        }
     }
 }
 
 impl<C: Connection> Drop for PipelineLease<'_, C> {
     fn drop(&mut self) {
-        self.slot.release(self.notify);
+        if self.slot.release(self.notify) {
+            self.notify_paced_capacity_change();
+        }
+    }
+}
+
+struct PacedExpansionWorkerLifecycle<C: Connection> {
+    pool: Weak<PipelinePool<C>>,
+    armed: bool,
+}
+
+impl<C: Connection> PacedExpansionWorkerLifecycle<C> {
+    fn new(pool: Weak<PipelinePool<C>>) -> Self {
+        Self { pool, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<C: Connection> Drop for PacedExpansionWorkerLifecycle<C> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(pool) = self.pool.upgrade() else {
+            return;
+        };
+
+        // Task abortion/cancellation cannot be caught with `catch_unwind`.
+        // Publish the worker as absent and re-arm demand. Waking query waiters
+        // gives a live cold-pool request an immediate chance to restart the
+        // controller; min-conns pools are also recovered by maintenance.
+        pool.expansion_requested.store(true, Ordering::Release);
+        pool.expansion_worker_running
+            .store(false, Ordering::Release);
+        pool.release_notified.notify_waiters();
+    }
+}
+
+struct PoolAcquireWaiter<'a, C: Connection> {
+    pool: &'a PipelinePool<C>,
+    active: bool,
+}
+
+impl<'a, C: Connection> PoolAcquireWaiter<'a, C> {
+    fn new(pool: &'a PipelinePool<C>) -> Self {
+        pool.acquire_waiters.fetch_add(1, Ordering::AcqRel);
+        Self { pool, active: true }
+    }
+
+    fn leave(&mut self) {
+        if self.active {
+            self.active = false;
+            self.pool.acquire_waiters.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl<C: Connection> Drop for PoolAcquireWaiter<'_, C> {
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 
@@ -631,7 +1873,48 @@ impl<C: Connection> Drop for SlotReservation<'_, C> {
     fn drop(&mut self) {
         if self.active {
             self.pool.reserved_slots.fetch_sub(1, Ordering::Release);
-            self.pool.release_notified.notify_waiters();
+            if self.pool.paced_expansion.is_some() {
+                // Releasing a failed/cancelled paced build frees only a pool
+                // reservation; it does not create DNS stream capacity. Wake
+                // the expansion controller, but leave query waiters asleep
+                // until a real slot is published or an active stream releases.
+                self.pool.notify_expansion_capacity_change();
+            } else {
+                // Legacy pools let foreground acquirers compete for expansion
+                // reservations, so releasing one must wake those waiters.
+                self.pool.release_notified.notify_waiters();
+            }
+        }
+    }
+}
+
+struct PacedSlotReservation<C: Connection> {
+    pool: Weak<PipelinePool<C>>,
+    active: bool,
+}
+
+impl<C: Connection> PacedSlotReservation<C> {
+    fn new(pool: Weak<PipelinePool<C>>) -> Self {
+        Self { pool, active: true }
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+        if let Some(pool) = self.pool.upgrade() {
+            pool.reserved_slots.fetch_sub(1, Ordering::Release);
+            pool.notify_expansion_capacity_change();
+        }
+    }
+}
+
+impl<C: Connection> Drop for PacedSlotReservation<C> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(pool) = self.pool.upgrade() {
+            pool.reserved_slots.fetch_sub(1, Ordering::Release);
+            pool.notify_expansion_capacity_change();
         }
     }
 }
@@ -648,6 +1931,8 @@ impl<C: Connection> ManagedMaintenanceTask for PipelinePool<C> {
 
 impl<C: Connection> Drop for PipelinePool<C> {
     fn drop(&mut self) {
+        self.paced_build_shutdown.cancel();
+
         let task_handle = self
             .maintenance_task_handle
             .lock()
@@ -656,6 +1941,11 @@ impl<C: Connection> Drop for PipelinePool<C> {
         if let Some(handle) = task_handle {
             handle.stop_detached();
         }
+
+        let slots = self.slots.load();
+        for slot in slots.iter() {
+            slot.close();
+        }
     }
 }
 
@@ -663,30 +1953,37 @@ impl<C: Connection> Drop for PipelinePool<C> {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize};
 
     use async_trait::async_trait;
 
     use super::*;
     use crate::infra::error::{DnsError, Result};
+    use crate::infra::network::upstream::conn::{PoolCapacityNotify, PoolUnavailableNotify};
 
     #[derive(Debug)]
     struct MockConnection {
         available: AtomicBool,
-        using_count: AtomicU16,
+        using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
+        max_concurrent_queries: AtomicU16,
         query_delay: Duration,
+        pool_unavailable_notify: PoolUnavailableNotify,
+        pool_capacity_notify: PoolCapacityNotify,
     }
 
     impl MockConnection {
-        fn new(available: bool, using_count: u16, last_used: u64) -> Self {
+        fn new(available: bool, using_count: u32, last_used: u64) -> Self {
             Self {
                 available: AtomicBool::new(available),
-                using_count: AtomicU16::new(using_count),
+                using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
+                max_concurrent_queries: AtomicU16::new(u16::MAX),
                 query_delay: Duration::ZERO,
+                pool_unavailable_notify: PoolUnavailableNotify::default(),
+                pool_capacity_notify: PoolCapacityNotify::default(),
             }
         }
 
@@ -698,13 +1995,30 @@ mod tests {
         fn close_calls(&self) -> usize {
             self.close_calls.load(Ordering::Relaxed)
         }
+
+        fn set_max_concurrent_queries(&self, max: u16) {
+            self.max_concurrent_queries.store(max, Ordering::Release);
+        }
+
+        fn increase_max_concurrent_queries(&self, max: u16) {
+            let previous = self.max_concurrent_queries.swap(max, Ordering::AcqRel);
+            if max > previous {
+                self.pool_capacity_notify.notify_pool(previous, max);
+            }
+        }
+
+        fn mark_unavailable(&self) {
+            if self.available.swap(false, Ordering::AcqRel) {
+                self.pool_unavailable_notify.notify_pool();
+            }
+        }
     }
 
     #[async_trait]
     impl Connection for MockConnection {
         fn close(&self) {
             self.close_calls.fetch_add(1, Ordering::Relaxed);
-            self.available.store(false, Ordering::Relaxed);
+            self.mark_unavailable();
         }
 
         async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
@@ -716,12 +2030,27 @@ mod tests {
             Ok(request)
         }
 
-        fn using_count(&self) -> u16 {
+        fn using_count(&self) -> u32 {
             self.using_count.load(Ordering::Relaxed)
         }
 
         fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed)
+        }
+
+        fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+            self.pool_unavailable_notify.register(notify);
+            if !self.available.load(Ordering::Acquire) {
+                self.pool_unavailable_notify.notify_pool();
+            }
+        }
+
+        fn register_capacity_increase_notify(&self, notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {
+            self.pool_capacity_notify.register(notify);
+        }
+
+        fn max_concurrent_queries(&self) -> u16 {
+            self.max_concurrent_queries.load(Ordering::Acquire)
         }
 
         fn last_used(&self) -> u64 {
@@ -758,6 +2087,143 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AlwaysFailBuilder {
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for AlwaysFailBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
+        ) -> Result<Arc<MockConnection>> {
+            Err(DnsError::runtime(self.message))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicOnceBuilder {
+        calls: Arc<AtomicUsize>,
+        connection: Arc<MockConnection>,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for PanicOnceBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
+        ) -> Result<Arc<MockConnection>> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                panic!("planned multiplexed connection-builder panic");
+            }
+            Ok(self.connection.clone())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BuilderStats {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct TrackingBuilder {
+        stats: Arc<BuilderStats>,
+        build_delay: Duration,
+        query_delay: Duration,
+    }
+
+    #[derive(Debug, Default)]
+    struct LifecycleBuilderStats {
+        calls: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    struct LifecycleBuildGuard(Arc<LifecycleBuilderStats>);
+
+    impl Drop for LifecycleBuildGuard {
+        fn drop(&mut self) {
+            self.0.cancelled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug)]
+    struct LifecycleBlockingBuilder {
+        stats: Arc<LifecycleBuilderStats>,
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for LifecycleBlockingBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
+        ) -> Result<Arc<MockConnection>> {
+            self.stats.calls.fetch_add(1, Ordering::AcqRel);
+            let _guard = LifecycleBuildGuard(self.stats.clone());
+            std::future::pending::<()>().await;
+            unreachable!("lifecycle test builder must be cancelled")
+        }
+    }
+
+    impl TrackingBuilder {
+        fn new(stats: Arc<BuilderStats>, build_delay: Duration, query_delay: Duration) -> Self {
+            Self {
+                stats,
+                build_delay,
+                query_delay,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionBuilder<MockConnection> for TrackingBuilder {
+        async fn create_connection(
+            &self,
+            _conn_id: u16,
+            _deadline: QueryDeadline,
+            _connection_info: Arc<ConnectionInfo>,
+        ) -> Result<Arc<MockConnection>> {
+            self.stats.calls.fetch_add(1, Ordering::AcqRel);
+            let active = self.stats.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.stats.max_active.fetch_max(active, Ordering::AcqRel);
+            if !self.build_delay.is_zero() {
+                tokio::time::sleep(self.build_delay).await;
+            }
+            self.stats.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(Arc::new(
+                MockConnection::new(true, 0, AppClock::elapsed_millis())
+                    .with_query_delay(self.query_delay),
+            ))
+        }
+    }
+
+    fn make_paced_pool(
+        min_size: usize,
+        max_size: usize,
+        max_load: u16,
+        builder: TrackingBuilder,
+    ) -> Arc<PipelinePool<MockConnection>> {
+        AppClock::start();
+        PipelinePool::new_multiplexed(
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(min_size, max_size),
+            max_load,
+            Duration::from_secs(30),
+            Box::new(builder),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        )
+    }
+
     fn make_pool(
         min_size: usize,
         max_size: usize,
@@ -765,6 +2231,26 @@ mod tests {
         idle_secs: u64,
         builder: MockBuilder,
         initial_connections: Vec<Arc<MockConnection>>,
+    ) -> PipelinePool<MockConnection> {
+        make_pool_with_timeout_policy(
+            min_size,
+            max_size,
+            max_load,
+            idle_secs,
+            builder,
+            initial_connections,
+            QueryTimeoutPolicy::Retire,
+        )
+    }
+
+    fn make_pool_with_timeout_policy(
+        min_size: usize,
+        max_size: usize,
+        max_load: u16,
+        idle_secs: u64,
+        builder: MockBuilder,
+        initial_connections: Vec<Arc<MockConnection>>,
+        timeout_policy: QueryTimeoutPolicy,
     ) -> PipelinePool<MockConnection> {
         AppClock::start();
         let slots = initial_connections
@@ -780,12 +2266,25 @@ mod tests {
             min_size,
             max_load: max_load.max(1),
             max_idle: Duration::from_secs(idle_secs),
-            connection_builder: Box::new(builder),
-            timeout_policy: QueryTimeoutPolicy::Retire,
+            connection_builder: Arc::new(builder),
+            timeout_policy,
             connect_timeout: Duration::from_secs(5),
             next_id: AtomicU16::new(1),
-            release_notified: Notify::new(),
+            release_notified: Arc::new(Notify::new()),
+            expansion_capacity_notified: Arc::new(Notify::new()),
             maintenance_task_handle: Mutex::new(None),
+            paced_expansion: None,
+            paced_build_shutdown: CancellationToken::new(),
+            self_weak: Weak::new(),
+            expansion_requested: AtomicBool::new(false),
+            expansion_worker_running: AtomicBool::new(false),
+            acquire_waiters: AtomicUsize::new(0),
+            expansion_quiescent_at_capacity: AtomicBool::new(false),
+            soft_probe_ready: AtomicBool::new(true),
+            last_expand_start_ms: AtomicU64::new(u64::MAX),
+            next_expand_at_ms: AtomicU64::new(0),
+            connect_failure_streak: AtomicU32::new(0),
+            last_connect_failure: ArcSwapOption::empty(),
         }
     }
 
@@ -960,9 +2459,44 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(conn.close_calls(), 0);
-        assert_eq!(pool.slots.load()[0].state(), SLOT_RETIRING);
+        assert_eq!(pool.slots.load()[0].state(), SlotState::Retiring);
         drop(fast_lease);
         assert_eq!(conn.close_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_timeout_reuse_keeps_available_slot_active() {
+        AppClock::start();
+        let conn = Arc::new(
+            MockConnection::new(true, 0, AppClock::elapsed_millis())
+                .with_query_delay(Duration::from_secs(60)),
+        );
+        let pool = make_pool_with_timeout_policy(
+            0,
+            1,
+            2,
+            10,
+            MockBuilder::new(vec![]),
+            vec![conn.clone()],
+            QueryTimeoutPolicy::Reuse,
+        );
+
+        let result = pool
+            .query(
+                Message::new(),
+                QueryDeadline::new(Duration::from_millis(10)),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(conn.close_calls(), 0);
+        assert_eq!(pool.slots.load()[0].state(), SlotState::Active);
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("available connection should remain reusable after a stream-local timeout");
+        assert!(Arc::ptr_eq(&lease.slot.conn, &conn));
     }
 
     #[tokio::test]
@@ -1055,7 +2589,7 @@ mod tests {
 
         pool.maintain().await;
 
-        assert_eq!(slot.state(), SLOT_CLOSED);
+        assert_eq!(slot.state(), SlotState::Closed);
         assert!(!slot.try_acquire(1));
         assert_eq!(conn.close_calls(), 1);
         assert!(pool.slots.load().is_empty());
@@ -1073,6 +2607,52 @@ mod tests {
         assert_eq!(pool.slots.load().len(), 1);
     }
 
+    #[test]
+    fn test_close_if_idle_preserves_connection_when_borrower_wins_race() {
+        AppClock::start();
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        let slot = PipelineSlot::new(conn.clone());
+
+        // Model the real race: maintenance selected an apparently idle slot,
+        // but a borrower atomically claimed it before maintenance committed
+        // the idle close. The borrower wins, so maintenance must leave this
+        // healthy connection active instead of retiring it after it became
+        // useful again.
+        assert!(slot.try_acquire(4));
+
+        assert!(
+            !slot.close_if_idle(),
+            "idle close must lose when a borrower already owns the slot"
+        );
+        assert_eq!(
+            slot.state(),
+            SlotState::Active,
+            "a racing successful borrow must keep the connection reusable"
+        );
+        assert_eq!(conn.close_calls(), 0);
+
+        slot.release_without_notify();
+        assert_eq!(slot.state(), SlotState::Active);
+        assert_eq!(conn.close_calls(), 0);
+        assert!(
+            slot.try_acquire(4),
+            "the healthy connection should remain reusable after the racing lease drains"
+        );
+        slot.release_without_notify();
+    }
+
+    #[test]
+    fn test_close_if_idle_winner_blocks_late_borrower() {
+        AppClock::start();
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        let slot = PipelineSlot::new(conn.clone());
+
+        assert!(slot.close_if_idle());
+        assert_eq!(slot.state(), SlotState::Closed);
+        assert!(!slot.try_acquire(4));
+        assert_eq!(conn.close_calls(), 1);
+    }
+
     #[tokio::test]
     async fn test_maintain_keeps_idle_connection_with_inflight_queries() {
         AppClock::start();
@@ -1088,5 +2668,1207 @@ mod tests {
         assert_eq!(conn.close_calls(), 0);
         assert_eq!(pool.slots.load().len(), 1);
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_replaces_unavailable_idle_active_slot_at_capacity() {
+        AppClock::start();
+        let stale = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        let replacement = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        let pool = make_pool(
+            0,
+            1,
+            1,
+            10,
+            MockBuilder::new(vec![Ok(replacement.clone())]),
+            vec![stale.clone()],
+        );
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_millis(100)))
+            .await
+            .expect("unavailable idle slot should be replaced immediately");
+
+        assert!(Arc::ptr_eq(&lease.slot.conn, &replacement));
+        assert_eq!(stale.close_calls(), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[test]
+    fn test_drop_closes_all_pipeline_connections() {
+        let first = Arc::new(MockConnection::new(true, 0, 0));
+        let second = Arc::new(MockConnection::new(true, 0, 0));
+        let pool = make_pool(
+            0,
+            2,
+            1,
+            10,
+            MockBuilder::new(vec![]),
+            vec![first.clone(), second.clone()],
+        );
+
+        drop(pool);
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(second.close_calls(), 1);
+    }
+    #[test]
+    fn test_pipeline_slot_tracks_dynamic_connection_load_limit() {
+        let conn = Arc::new(MockConnection::new(true, 0, 0));
+        conn.set_max_concurrent_queries(2);
+        let slot = PipelineSlot::new(conn.clone());
+
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        conn.set_max_concurrent_queries(4);
+        assert!(slot.try_acquire(32));
+        assert!(slot.try_acquire(32));
+        assert!(!slot.try_acquire(32));
+
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
+        slot.release_without_notify();
+    }
+
+    #[tokio::test]
+    async fn test_paced_cold_start_bounds_parallel_connection_builds() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            4,
+            2,
+            TrackingBuilder::new(
+                stats.clone(),
+                Duration::from_millis(120),
+                Duration::from_millis(200),
+            ),
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.query(Message::new(), QueryDeadline::new(Duration::from_secs(2)))
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("query task should join")
+                .expect("query should complete");
+        }
+
+        assert_eq!(
+            stats.max_active.load(Ordering::Acquire),
+            MULTIPLEXED_MAX_CONCURRENT_BUILDS
+        );
+        assert!(stats.calls.load(Ordering::Acquire) >= 2);
+        assert!(pool.slots.load().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_paced_min_size_counts_inflight_build_reservations() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            1,
+            4,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::from_millis(120), Duration::ZERO),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(stats.max_active.load(Ordering::Acquire), 1);
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if pool.slots.load().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("min-size prefill should complete with one connection");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paced_build_limit_uses_observed_dynamic_stream_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            4,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let conn = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        conn.set_max_concurrent_queries(4);
+        let slot = Arc::new(PipelineSlot::new(conn));
+        for _ in 0..4 {
+            assert!(slot.try_acquire(32));
+        }
+        pool.slots.store(Arc::new(vec![slot.clone()]));
+        pool.acquire_waiters.store(8, Ordering::Release);
+
+        assert_eq!(
+            pool.paced_build_limit(&pool.paced_expansion_snapshot()),
+            Some(2)
+        );
+
+        for _ in 0..4 {
+            slot.release_without_notify();
+        }
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_paced_build_limit_cold_start_uses_configured_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            4,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(8, Ordering::Release);
+
+        assert_eq!(
+            pool.paced_build_limit(&pool.paced_expansion_snapshot()),
+            Some(1)
+        );
+
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_paced_controller_wait_is_cancelled_when_pool_drops() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(1, Ordering::Release);
+        // Pretend the only build window is already reserved so the controller
+        // must wait on expansion-capacity notification instead of starting a
+        // connection build.
+        pool.reserved_slots.store(1, Ordering::Release);
+        pool.request_paced_expansion();
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while Arc::strong_count(&pool.expansion_capacity_notified) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paced controller should start waiting for build capacity");
+
+        let capacity_notify = Arc::downgrade(&pool.expansion_capacity_notified);
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while capacity_notify.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the pool should cancel a controller waiting on capacity");
+    }
+
+    #[tokio::test]
+    async fn test_paced_build_does_not_retain_pool_after_drop() {
+        AppClock::start();
+        let stats = Arc::new(LifecycleBuilderStats::default());
+        let pool = PipelinePool::new_multiplexed(
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(1, 1),
+            32,
+            Duration::from_secs(30),
+            Box::new(LifecycleBlockingBuilder {
+                stats: stats.clone(),
+            }),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(30),
+        );
+        let weak = Arc::downgrade(&pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while stats.calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("paced connection build should start");
+
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if weak.upgrade().is_none() && stats.cancelled.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the pool should cancel the detached build without retaining the pool");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(stats.cancelled.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paced_hard_cap_quiesces_until_connection_becomes_replaceable() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            1,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+        pool.request_paced_expansion();
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                    && !pool.expansion_worker_running.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hard-cap controller should enter quiescence");
+
+        for _ in 0..1_000 {
+            pool.request_paced_expansion();
+        }
+        tokio::task::yield_now().await;
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(!pool.expansion_requested.load(Ordering::Acquire));
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        // Releasing ordinary stream capacity does not make another pool slot
+        // possible and should therefore keep hard-cap quiescence intact. Once
+        // the connection itself becomes unavailable, the next foreground scan
+        // observes that replacement is possible and re-arms the controller.
+        drop(lease);
+        assert!(pool.expansion_quiescent_at_capacity.load(Ordering::Acquire));
+        existing.close();
+
+        pool.query(Message::new(), QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("an unavailable hard-cap connection should be replaced");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paced_slot_close_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.register_connection_pool_notifications(&existing);
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(existing))]));
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        lease.close();
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        pool.acquire_waiters.store(0, Ordering::Release);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_replenishes_min_size_without_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            1,
+            2,
+            8,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.slots.load().len() == 1 && stats.calls.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial min-size prefill should complete");
+
+        let failed = pool.slots.load_full()[0].conn.clone();
+        failed.mark_unavailable();
+
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let slots = pool.slots.load();
+                if stats.calls.load(Ordering::Acquire) >= 2
+                    && slots.len() == 1
+                    && slots[0].connection().available()
+                    && !Arc::ptr_eq(&slots[0].conn, &failed)
+                {
+                    break;
+                }
+                drop(slots);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async loss should immediately replenish min_size without a foreground query");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 2);
+        assert_eq!(pool.acquire_waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::from_millis(200), Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.register_connection_pool_notifications(&existing);
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        existing.mark_unavailable();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_capacity_increase_wakes_only_added_stream_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            8,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        existing.set_max_concurrent_queries(2);
+        pool.register_connection_pool_notifications(&existing);
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        existing.increase_max_concurrent_queries(6);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 4);
+        pool.acquire_waiters.store(0, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_paced_pruning_dead_slot_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let dead = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(dead))]));
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        assert_eq!(pool.usable_or_inflight_slot_count(), 0);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+    }
+
+    #[tokio::test]
+    async fn test_paced_maintenance_removal_does_not_broadcast_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let dead = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(dead))]));
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            waiters.push(Box::pin(pool.release_notified.notified()));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        pool.maintain().await;
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 0);
+        assert!(pool.slots.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_async_unavailable_wakes_capacity_wait_without_fallback() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            1,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.register_connection_pool_notifications(&existing);
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let held = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("existing connection should be acquirable");
+
+        let waiter_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_pool
+                .acquire(QueryDeadline::new(Duration::from_millis(150)))
+                .await
+                .map(drop)
+        });
+
+        tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                if pool.acquire_waiters.load(Ordering::Acquire) == 1
+                    && pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second acquire should wait at the hard cap");
+
+        // Simulate an H2/H3/DoQ driver observing remote connection loss while
+        // one stream lease is still held. The unavailable callback re-arms the
+        // paced controller directly, but max_size remains occupied until
+        // `held` drains.
+        existing.mark_unavailable();
+        tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                if pool.expansion_worker_running.load(Ordering::Acquire)
+                    && !pool.expansion_requested.load(Ordering::Acquire)
+                    && !pool.expansion_quiescent_at_capacity.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller should observe asynchronous unavailability");
+
+        // Give the worker time to reach its capacity wait. The old 250 ms
+        // fallback path would then miss the final ACTIVE/unavailable drain and
+        // let the 150 ms foreground deadline expire.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(held);
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("replacement should not depend on a periodic fallback")
+            .expect("waiter task should join")
+            .expect("waiter should acquire the replacement connection");
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_inserted_multiplexed_capacity_wakes_only_matching_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            4,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.acquire_waiters.store(10, Ordering::Release);
+
+        let mut waiters = Vec::new();
+        for _ in 0..10 {
+            let notified = pool.release_notified.notified();
+            waiters.push(Box::pin(notified));
+        }
+        for waiter in &mut waiters {
+            waiter.as_mut().enable();
+        }
+
+        let slot = PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        )));
+        pool.notify_inserted_query_capacity(&slot);
+
+        let ready = waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.now_or_never())
+            .count();
+        assert_eq!(ready, 4);
+    }
+
+    #[tokio::test]
+    async fn test_paced_build_outlives_triggering_query_deadline() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::from_millis(80), Duration::ZERO),
+        );
+
+        let result = pool
+            .query(
+                Message::new(),
+                QueryDeadline::new(Duration::from_millis(20)),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "triggering query should exhaust its own deadline"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_threshold_does_not_block_foreground_acquire() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::from_millis(100), Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.slots
+            .store(Arc::new(vec![Arc::new(PipelineSlot::new(existing))]));
+
+        let mut leases = Vec::new();
+        for _ in 0..15 {
+            leases.push(
+                pool.acquire(QueryDeadline::new(Duration::from_secs(1)))
+                    .await
+                    .expect("pre-threshold acquire should succeed"),
+            );
+        }
+
+        let sixteenth = tokio::time::timeout(
+            Duration::from_millis(20),
+            pool.acquire(QueryDeadline::new(Duration::from_secs(1))),
+        )
+        .await
+        .expect("soft expansion must not delay the triggering acquire")
+        .expect("threshold acquire should succeed");
+        leases.push(sixteenth);
+
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        assert_eq!(pool.slots.load().len(), 2);
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn test_soft_expansion_uses_aggregate_pool_pressure() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            3,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let first = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        let second = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        for _ in 0..20 {
+            assert!(first.try_acquire(32));
+        }
+        for _ in 0..2 {
+            assert!(second.try_acquire(32));
+        }
+        pool.slots
+            .store(Arc::new(vec![first.clone(), second.clone()]));
+
+        pool.request_paced_expansion();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+        assert_eq!(pool.slots.load().len(), 2);
+        for _ in 0..20 {
+            first.release_without_notify();
+        }
+        for _ in 0..2 {
+            second.release_without_notify();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_level_triggered_soft_probe_handles_dynamic_capacity_reduction() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let existing = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.slots.store(Arc::new(vec![Arc::new(PipelineSlot::new(
+            existing.clone(),
+        ))]));
+
+        let mut leases = Vec::new();
+        for _ in 0..10 {
+            leases.push(
+                pool.acquire(QueryDeadline::new(Duration::from_secs(1)))
+                    .await
+                    .expect("initial acquire should succeed below the original soft threshold"),
+            );
+        }
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        // Simulate an H2 peer reducing SETTINGS_MAX_CONCURRENT_STREAMS from at
+        // least 32 to 16. The new soft threshold is 8, already below the
+        // current ten in-flight borrows, so no exact threshold edge remains.
+        existing.set_max_concurrent_queries(16);
+        leases.push(
+            pool.acquire(QueryDeadline::new(Duration::from_secs(1)))
+                .await
+                .expect("post-SETTINGS acquire should still use remaining capacity"),
+        );
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.slots.load().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("level-triggered probe should expand after dynamic capacity reduction");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+        drop(leases);
+    }
+
+    #[tokio::test]
+    async fn test_level_triggered_probe_preserves_aggregate_no_edge_expansion() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            3,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let first = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        let second = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        for _ in 0..20 {
+            assert!(first.try_acquire(32));
+        }
+
+        for _ in 0..11 {
+            assert!(second.try_acquire(32));
+        }
+        pool.slots
+            .store(Arc::new(vec![first.clone(), second.clone()]));
+        pool.index.store(0, Ordering::Relaxed);
+
+        // Aggregate starts at 31/64. The next round-robin acquire lands on
+        // conn1 and raises it from 20 to 21, so aggregate becomes 32/64 while
+        // neither connection crosses the exact local 16-stream edge.
+        let lease = pool
+            .acquire(QueryDeadline::new(Duration::from_secs(1)))
+            .await
+            .expect("level-triggered soft probe should not block foreground acquire");
+        assert!(Arc::ptr_eq(&lease.slot, &first));
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if pool.slots.load().len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregate fifty-percent pressure should expand without an exact local edge");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+
+        drop(lease);
+
+        for _ in 0..20 {
+            first.release_without_notify();
+        }
+        for _ in 0..11 {
+            second.release_without_notify();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_soft_probe_does_not_leave_background_polling_worker() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let first = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        let second = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        for _ in 0..20 {
+            assert!(first.try_acquire(32));
+        }
+        pool.slots.store(Arc::new(vec![first.clone(), second]));
+
+        // Local load is above 50%, but aggregate load is only 20/64. A soft
+        // probe should run once and then let the worker go idle instead of
+        // retaining the old 50ms Watch polling loop.
+        pool.maybe_request_soft_expansion(20, 32);
+        assert!(!pool.soft_probe_ready.load(Ordering::Acquire));
+        for _ in 0..1_000 {
+            pool.maybe_request_soft_expansion(20, 32);
+        }
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !pool.expansion_worker_running.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("soft probe worker should return to idle when aggregate load is low");
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(pool.soft_probe_ready.load(Ordering::Acquire));
+        assert_eq!(stats.calls.load(Ordering::Acquire), 0);
+
+        for _ in 0..20 {
+            first.release_without_notify();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_wakes_when_retiring_slot_frees_pool_capacity() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats.clone(), Duration::ZERO, Duration::ZERO),
+        );
+        let retiring = Arc::new(PipelineSlot::new(Arc::new(MockConnection::new(
+            true,
+            0,
+            AppClock::elapsed_millis(),
+        ))));
+        assert!(retiring.try_acquire(32));
+        retiring.retire();
+        pool.slots.store(Arc::new(vec![retiring.clone()]));
+
+        // Keep the retiring slot's final in-flight borrow alive so max_size is
+        // occupied but no connection can accept a new query.
+        let retiring_lease = PipelineLease::new_paced(
+            retiring,
+            pool.release_notified.as_ref(),
+            pool.expansion_capacity_notified.as_ref(),
+            &pool.expansion_quiescent_at_capacity,
+        );
+
+        let waiting_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            let lease = waiting_pool
+                .acquire(QueryDeadline::new(Duration::from_secs(1)))
+                .await?;
+            drop(lease);
+            Ok::<(), DnsError>(())
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            stats.calls.load(Ordering::Acquire),
+            0,
+            "replacement must wait while the retiring slot still occupies max_size"
+        );
+
+        // The final release broadcasts the dedicated pool-capacity event, so
+        // the replacement build can start immediately without polling.
+        drop(retiring_lease);
+        tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if stats.calls.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity notification should wake paced expansion immediately");
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiting acquire should complete")
+            .expect("waiting acquire task should join")
+            .expect("waiting acquire should succeed");
+        assert_eq!(stats.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paced_publish_rejects_connection_already_unavailable() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        let reservation = pool
+            .try_reserve_paced_slot()
+            .expect("test should reserve one paced slot");
+        let conn = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+
+        assert_eq!(
+            pool.publish_paced_connection(reservation, conn.clone()),
+            PacedPublishOutcome::Unavailable
+        );
+        assert!(pool.slots.load().is_empty());
+        assert_eq!(pool.reserved_slots.load(Ordering::Acquire), 0);
+        assert!(conn.close_calls() >= 1);
+    }
+
+    #[test]
+    fn test_paced_expansion_failure_backoff_is_jittered_and_bounded() {
+        let pool = make_pool(0, 1, 32, 30, MockBuilder::new(vec![]), vec![]);
+        let bases = [100_u64, 200, 400, 800, 1_600, 2_000, 2_000];
+
+        for base in bases {
+            let delay = pool.record_connect_failure_backoff();
+            let jitter = base * MULTIPLEXED_EXPANSION_BACKOFF_JITTER_PERCENT / 100;
+            let low = base.saturating_sub(jitter).max(1);
+            let high = base
+                .saturating_add(jitter)
+                .min(MULTIPLEXED_EXPANSION_BACKOFF_MAX_MS);
+            assert!(
+                (low..=high).contains(&delay),
+                "delay {delay} must stay inside jitter window {low}..={high}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connect_backoff_jitter_spreads_different_pool_keys() {
+        let base = 1_000;
+        let delays = (0_u64..16)
+            .map(|key| jittered_connect_backoff_ms(base, key))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            delays.len() > 1,
+            "different pool keys should disperse retries"
+        );
+        assert!(delays.iter().all(|delay| (800..=1_200).contains(delay)));
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_does_not_keep_pool_alive_during_backoff() {
+        AppClock::start();
+        let pool = PipelinePool::new_multiplexed(
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(1, 1),
+            32,
+            Duration::from_secs(30),
+            Box::new(MockBuilder::new(vec![Err(DnsError::runtime(
+                "planned connect failure",
+            ))])),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        );
+        let weak = Arc::downgrade(&pool);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(pool);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            weak.upgrade().is_none(),
+            "backoff worker must not self-retain the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paced_timeout_reports_recent_connection_failure() {
+        AppClock::start();
+        let pool = PipelinePool::new_multiplexed(
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(0, 1),
+            32,
+            Duration::from_secs(30),
+            Box::new(AlwaysFailBuilder {
+                message: "planned connect failure",
+            }),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        );
+
+        let deadline = QueryDeadline::new(Duration::from_secs(1));
+        let waiting_pool = pool.clone();
+        let query = tokio::spawn(async move { waiting_pool.query(Message::new(), deadline).await });
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if pool.last_connect_failure.load_full().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection failure should be recorded before the query deadline expires");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), query)
+            .await
+            .expect("query task should finish after its deadline")
+            .expect("query task should join")
+            .expect_err("query should expire while connection creation is backing off")
+            .to_string();
+        assert!(error.contains("DNS query timeout"));
+        assert!(error.contains("planned connect failure"));
+    }
+
+    #[tokio::test]
+    async fn test_paced_reservation_drop_does_not_wake_query_waiters() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            2,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+
+        let query_waiter = pool.release_notified.notified();
+        tokio::pin!(query_waiter);
+        query_waiter.as_mut().enable();
+        let expansion_waiter = pool.expansion_capacity_notified.notified();
+        tokio::pin!(expansion_waiter);
+        expansion_waiter.as_mut().enable();
+
+        let reservation = pool
+            .try_reserve_slot()
+            .expect("paced pool should reserve an expansion slot");
+        drop(reservation);
+
+        tokio::time::timeout(Duration::from_millis(50), expansion_waiter.as_mut())
+            .await
+            .expect("paced reservation release should wake the expansion controller");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), query_waiter.as_mut())
+                .await
+                .is_err(),
+            "paced reservation release must not wake DNS query waiters without new stream capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_reservation_drop_still_wakes_query_waiters() {
+        let pool = make_pool(0, 2, 32, 30, MockBuilder::new(vec![]), vec![]);
+        let query_waiter = pool.release_notified.notified();
+        tokio::pin!(query_waiter);
+        query_waiter.as_mut().enable();
+        let reservation = pool
+            .try_reserve_slot()
+            .expect("legacy pool should reserve an expansion slot");
+        drop(reservation);
+
+        tokio::time::timeout(Duration::from_millis(50), query_waiter.as_mut())
+            .await
+            .expect("legacy reservation release should preserve waiter wakeup semantics");
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_recovers_after_builder_panic() {
+        AppClock::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let connection = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        let pool = PipelinePool::new_multiplexed(
+            Arc::new(ConnectionInfo::with_addr("udp://127.0.0.1:53").unwrap()),
+            PoolSize::new(0, 1),
+            32,
+            Duration::from_secs(30),
+            Box::new(PanicOnceBuilder {
+                calls: calls.clone(),
+                connection: connection.clone(),
+            }),
+            QueryTimeoutPolicy::Reuse,
+            Duration::from_secs(1),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.query(Message::new(), QueryDeadline::new(Duration::from_secs(2))),
+        )
+        .await
+        .expect("supervisor should recover before the query timeout")
+        .expect("second connection attempt should succeed");
+        assert_eq!(response.id(), 0);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(pool.slots.load().len(), 1);
+        assert_eq!(pool.connect_failure_streak.load(Ordering::Acquire), 0);
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while pool.expansion_worker_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered worker should eventually publish the idle state");
+    }
+
+    #[tokio::test]
+    async fn test_paced_worker_lifecycle_drop_rearms_cancelled_worker() {
+        let stats = Arc::new(BuilderStats::default());
+        let pool = make_paced_pool(
+            0,
+            1,
+            32,
+            TrackingBuilder::new(stats, Duration::ZERO, Duration::ZERO),
+        );
+        pool.expansion_worker_running.store(true, Ordering::Release);
+        pool.expansion_requested.store(false, Ordering::Release);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let lifecycle = PacedExpansionWorkerLifecycle::new(Arc::downgrade(&pool));
+        drop(lifecycle);
+
+        assert!(!pool.expansion_worker_running.load(Ordering::Acquire));
+        assert!(pool.expansion_requested.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_millis(50), notified.as_mut())
+            .await
+            .expect("abnormal worker drop should wake cold-pool query waiters");
     }
 }

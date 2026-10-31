@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,7 +50,7 @@ impl Upstream for SlowUpstream {
 #[derive(Debug)]
 struct NoopConnection {
     available: AtomicBool,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     last_used: AtomicU64,
 }
 
@@ -64,7 +64,7 @@ impl Connection for NoopConnection {
         Ok(request)
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
@@ -90,7 +90,7 @@ impl ConnectionBuilder<NoopConnection> for NoopConnectionBuilder {
     ) -> Result<Arc<NoopConnection>> {
         Ok(Arc::new(NoopConnection {
             available: AtomicBool::new(true),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             last_used: AtomicU64::new(crate::infra::clock::AppClock::elapsed_millis()),
         }))
     }
@@ -131,12 +131,14 @@ fn make_upstream_config(addr: &str) -> UpstreamConfig {
         bootstrap_version: None,
         socks5: None,
         idle_timeout: None,
+        keepalive_interval: None,
         max_conns: None,
         min_conns: None,
         insecure_skip_verify: None,
         timeout: None,
         enable_pipeline: None,
         enable_http3: None,
+        use_post: false,
         so_mark: None,
         bind_to_device: None,
     }
@@ -275,6 +277,34 @@ fn test_helper_scheme_h3_forces_http3() {
 }
 
 #[test]
+fn test_use_post_is_enabled_only_for_doh() {
+    let mut doh = make_upstream_config("https://dns.example.test/dns-query");
+    doh.use_post = true;
+    let doh = clean_connection_info(doh, "DoH use_post should parse");
+    assert!(doh.use_post);
+
+    let mut doh3 = make_upstream_config("h3://dns.example.test/dns-query");
+    doh3.use_post = true;
+    let doh3 = clean_connection_info(doh3, "DoH3 use_post should parse");
+    assert!(doh3.use_post);
+    assert!(doh3.enable_http3);
+
+    let mut udp = make_upstream_config("udp://1.1.1.1:53");
+    udp.use_post = true;
+    let udp = clean_connection_info(udp, "UDP should ignore use_post");
+    assert!(!udp.use_post);
+}
+
+#[test]
+fn test_use_post_defaults_to_false() {
+    let doh = clean_connection_info(
+        make_upstream_config("https://dns.example.test/dns-query"),
+        "DoH default should parse",
+    );
+    assert!(!doh.use_post);
+}
+
+#[test]
 fn test_connection_info_defers_domain_resolution() {
     let info = ConnectionInfo::with_addr("tls://dns.example.invalid:853")
         .expect("domain upstream should parse without DNS resolution");
@@ -320,7 +350,7 @@ fn test_connection_info_dial_addr_takes_precedence_over_bootstrap() {
 fn test_connection_info_uses_outbound_resolver_for_domain() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -344,7 +374,7 @@ fn test_connection_info_uses_outbound_resolver_for_domain() {
 fn test_connection_info_without_default_outbound_keeps_domain_resolution_deferred() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     outbound::clear_global();
 
     let cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -359,7 +389,7 @@ fn test_connection_info_without_default_outbound_keeps_domain_resolution_deferre
 fn test_connection_info_uses_default_outbound_resolver_for_domain() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_resolver_only_config();
 
     let cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -382,7 +412,7 @@ fn test_connection_info_uses_default_outbound_resolver_for_domain() {
 async fn test_udp_upstream_with_outbound_resolver_keeps_truncated_fallback() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("udp://dns.example.invalid:53");
@@ -401,7 +431,7 @@ async fn test_udp_upstream_with_outbound_resolver_keeps_truncated_fallback() {
 fn test_connection_info_dial_addr_takes_precedence_over_outbound_resolver() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -421,7 +451,7 @@ fn test_connection_info_dial_addr_takes_precedence_over_outbound_resolver() {
 fn test_connection_info_uses_outbound_proxy_when_local_socks5_absent() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -443,7 +473,7 @@ fn test_connection_info_uses_outbound_proxy_when_local_socks5_absent() {
 fn test_connection_info_uses_default_outbound_proxy_when_local_socks5_absent() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -461,39 +491,70 @@ fn test_connection_info_uses_default_outbound_proxy_when_local_socks5_absent() {
 }
 
 #[test]
-fn test_connection_info_ignores_outbound_proxy_for_udp_upstream() {
+fn test_connection_info_preserves_local_socks5_for_udp_upstream() {
+    let mut cfg = make_upstream_config("udp://8.8.8.8:53");
+    cfg.socks5 = Some("127.0.0.1:1080".to_string());
+
+    let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
+
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("local proxy should be retained")
+            .socket_addr
+            .port(),
+        1080
+    );
+}
+
+#[test]
+fn test_connection_info_uses_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("8.8.8.8");
     cfg.outbound = Some("remote".to_string());
     let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
 
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
 }
 
 #[test]
-fn test_connection_info_ignores_default_outbound_proxy_for_udp_upstream() {
+fn test_connection_info_uses_default_outbound_proxy_for_udp_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let cfg = make_upstream_config("8.8.8.8");
     let info = ConnectionInfo::try_from(cfg).expect("UDP upstream should parse");
 
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("default outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
 }
 
 #[test]
-fn test_connection_info_ignores_outbound_proxy_for_doh3_upstream() {
+fn test_connection_info_uses_outbound_proxy_for_doh3_upstream() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("h3://dns.example/dns-query");
@@ -501,15 +562,40 @@ fn test_connection_info_ignores_outbound_proxy_for_doh3_upstream() {
     let info = ConnectionInfo::try_from(cfg).expect("DoH3 upstream should parse");
 
     assert!(info.enable_http3);
-    assert!(info.socks5.is_none());
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("outbound proxy should be injected")
+            .socket_addr
+            .port(),
+        1080
+    );
     outbound::clear_global();
+}
+
+#[test]
+fn test_connection_info_preserves_local_socks5_for_doq_upstream() {
+    let mut cfg = make_upstream_config("doq://dns.example:853");
+    cfg.socks5 = Some("127.0.0.1:1081".to_string());
+
+    let info = ConnectionInfo::try_from(cfg).expect("DoQ upstream should parse");
+
+    assert_eq!(info.connection_type, ConnectionType::DoQ);
+    assert_eq!(
+        info.socks5
+            .as_ref()
+            .expect("local proxy should be retained")
+            .socket_addr
+            .port(),
+        1081
+    );
 }
 
 #[test]
 fn test_connection_info_local_socks5_overrides_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -532,7 +618,7 @@ fn test_connection_info_local_socks5_overrides_outbound_proxy() {
 fn test_connection_info_local_socks5_overrides_default_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -554,7 +640,7 @@ fn test_connection_info_local_socks5_overrides_default_outbound_proxy() {
 fn test_connection_info_local_bootstrap_overrides_default_outbound_resolver() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_default_outbound_resolver_only_config();
 
     let mut cfg = make_upstream_config("tls://dns.example.invalid:853");
@@ -577,7 +663,7 @@ fn test_connection_info_local_bootstrap_overrides_default_outbound_resolver() {
 fn test_connection_info_rejects_invalid_local_socks5_with_outbound_proxy() {
     let _guard = outbound_test_lock()
         .lock()
-        .expect("outbound test lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_test_outbound_config();
 
     let mut cfg = make_upstream_config("tcp://1.1.1.1:53");
@@ -599,6 +685,160 @@ fn test_connection_info_rejects_invalid_bootstrap_version() {
 
     assert!(
         err.to_string().contains("bootstrap_version must be 4 or 6"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_is_preserved() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(5));
+
+    let info = clean_connection_info(cfg, "keepalive interval should be accepted");
+
+    assert_eq!(info.keepalive_interval, Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn test_doh2_rejects_idle_timeout_at_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let err = clean_connection_info_err(cfg, "DoH2 tick-range idle timeout should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("DoH2 idle_timeout must be less than 2^32 milliseconds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh2_accepts_idle_timeout_below_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS - 1,
+    ));
+
+    let info = clean_connection_info(cfg, "DoH2 idle timeout below tick range should parse");
+
+    assert_eq!(
+        info.idle_timeout,
+        Duration::from_millis(ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS - 1)
+    );
+}
+
+#[test]
+fn test_doh2_rejects_keepalive_at_u32_tick_range() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    // Zero bypasses the existing keepalive < idle_timeout relationship so
+    // this test isolates the H2 tick-range constraint itself.
+    cfg.idle_timeout = Some(Duration::ZERO);
+    cfg.keepalive_interval = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let err = clean_connection_info_err(cfg, "DoH2 tick-range keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("DoH2 keepalive_interval must be less than 2^32 milliseconds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh3_does_not_use_doh2_tick_range_limit() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.enable_http3 = Some(true);
+    cfg.idle_timeout = Some(Duration::from_millis(
+        ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS,
+    ));
+
+    let info = clean_connection_info(cfg, "DoH3 should not inherit the DoH2 tick limit");
+
+    assert!(info.enable_http3);
+    assert_eq!(
+        info.idle_timeout,
+        Duration::from_millis(ConnectionInfo::H2_LAST_USED_TICK_RANGE_MS)
+    );
+}
+
+#[test]
+fn test_keepalive_interval_rejects_zero() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.keepalive_interval = Some(Duration::ZERO);
+
+    let err = clean_connection_info_err(cfg, "zero keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be greater than 0"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_must_be_less_than_idle_timeout() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.idle_timeout = Some(Duration::from_secs(10));
+    cfg.keepalive_interval = Some(Duration::from_secs(10));
+
+    let err = clean_connection_info_err(cfg, "keepalive at idle timeout should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than idle_timeout"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_keepalive_interval_rejects_udp_upstream() {
+    let mut cfg = make_upstream_config("udp://8.8.8.8:53");
+    cfg.keepalive_interval = Some(Duration::from_secs(5));
+
+    let err = clean_connection_info_err(cfg, "UDP keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval is not supported for UDP upstreams"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doq_keepalive_must_precede_quic_idle_timeout() {
+    let mut cfg = make_upstream_config("doq://dns.example.com:853");
+    cfg.timeout = Some(Duration::from_secs(1));
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(3));
+
+    let err = clean_connection_info_err(cfg, "late DoQ keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than the QUIC idle timeout"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_doh3_keepalive_must_precede_quic_idle_timeout() {
+    let mut cfg = make_upstream_config("https://dns.example.com/dns-query");
+    cfg.enable_http3 = Some(true);
+    cfg.timeout = Some(Duration::from_secs(1));
+    cfg.idle_timeout = Some(Duration::from_secs(30));
+    cfg.keepalive_interval = Some(Duration::from_secs(3));
+
+    let err = clean_connection_info_err(cfg, "late DoH3 keepalive should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("keepalive_interval must be less than the QUIC idle timeout"),
         "{err}"
     );
 }

@@ -2,37 +2,100 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::select;
 use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
-use super::{UsingCountGuard, quic_idle_timeout};
+use super::{PoolUnavailableNotify, UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
+use crate::infra::network::deadline::DeadlineOutcome;
 use crate::infra::network::dial::{
-    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
+    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
+    connect_quic_abstract, connect_udp,
 };
-use crate::infra::network::transport::quic::QuicTransport;
+use crate::infra::network::metrics::UpstreamTimeoutStage;
+use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+use crate::infra::network::transport::quic::{
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
+};
+use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::pool::{ConnectionBuilder, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
+const DOQ_NO_ERROR: u32 = 0x0;
+const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
+
+struct DoqQueryStream {
+    reader: QuicTransportReader,
+    writer: QuicTransportWriter,
+    send_finished: bool,
+    completed: bool,
+}
+
+impl DoqQueryStream {
+    fn new(reader: QuicTransportReader, writer: QuicTransportWriter) -> Self {
+        Self {
+            reader,
+            writer,
+            send_finished: false,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for DoqQueryStream {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if !self.send_finished {
+            self.writer.reset(DOQ_REQUEST_CANCELLED);
+        }
+        self.reader.stop(DOQ_REQUEST_CANCELLED);
+    }
+}
+
 pub struct QuicConnection {
     connection_info: Arc<ConnectionInfo>,
     id: u16,
+    upstream: String,
     transport: QuicTransport,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     close_notify: Notify,
+    pool_unavailable_notify: PoolUnavailableNotify,
 }
 
 impl Debug for QuicConnection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str("QuicConnection")
+    }
+}
+
+impl QuicConnection {
+    fn mark_closed(&self) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.pool_unavailable_notify.notify_pool();
+        true
+    }
+
+    fn close_with_code(&self, code: u32, reason: &[u8]) -> bool {
+        if !self.mark_closed() {
+            return false;
+        }
+        self.transport.close_with_code(code, reason);
+        self.close_notify.notify_waiters();
+        true
     }
 }
 
@@ -43,20 +106,16 @@ impl Connection for QuicConnection {
     /// Sends QUIC CONNECTION_CLOSE frame to peer and notifies background tasks.
     /// This is idempotent - multiple calls are safe.
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return; // Already closed
-        }
-        debug!(
-            conn_id = self.id,
+        if self.close_with_code(DOQ_NO_ERROR, b"closing") {
+            debug!(
+                conn_id = self.id,
+            upstream = %self.upstream,
             upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
             upstream_host = %self.connection_info.server_name,
             upstream_port = self.connection_info.port,
-            "Closing QUIC connection, sending CONNECTION_CLOSE frame"
-        );
-        // Gracefully close the underlying QUIC connection with error code 0 (no
-        // error)
-        self.transport.close(b"closing");
-        self.close_notify.notify_waiters();
+                "Closing QUIC connection, sending CONNECTION_CLOSE frame"
+            );
+        }
     }
 
     /// Send a DNS query over QUIC (DoQ - DNS over QUIC, RFC 9250)
@@ -90,7 +149,7 @@ impl Connection for QuicConnection {
 
         // Open a new bidirectional stream (reader/writer) via connection
         // wrapper
-        let (mut reader, mut writer) = match self.transport.open_bi().await {
+        let (reader, writer) = match self.transport.open_bi().await {
             Ok((reader, writer)) => (reader, writer),
             Err(e) => {
                 self.close();
@@ -100,62 +159,131 @@ impl Connection for QuicConnection {
                 )));
             }
         };
+        let mut stream = DoqQueryStream::new(reader, writer);
 
         let raw_id = request.id();
-        if let Err(e) = writer.write_message(&request).await {
-            self.close();
-            return Err(DnsError::protocol(format!(
-                "Failed to write DNS query to QUIC stream: {}",
-                e
-            )));
+        if let Err(e) = stream.writer.write_message_doq(&request).await {
+            match e {
+                QuicWriteError::Stopped(code) => {
+                    self.close_with_code(DOQ_PROTOCOL_ERROR, b"peer sent STOP_SENDING");
+                    warn!(
+                                conn_id = self.id,
+                    upstream = %self.upstream,
+                                query_id = raw_id,
+                                %code,
+                                "DoQ peer sent forbidden STOP_SENDING"
+                            );
+                    return Err(DnsError::protocol(format!(
+                        "DoQ peer sent STOP_SENDING with code {code}"
+                    )));
+                }
+                QuicWriteError::ConnectionLost(error) => {
+                    self.close();
+                    return Err(DnsError::protocol(format!(
+                        "QUIC connection lost while writing DoQ query: {error}"
+                    )));
+                }
+                QuicWriteError::Stream(message) => {
+                    return Err(DnsError::protocol(format!(
+                        "Failed to write DNS query to QUIC stream: {message}"
+                    )));
+                }
+                QuicWriteError::Encode(message) => {
+                    return Err(DnsError::protocol(format!(
+                        "Failed to encode DNS query for QUIC stream: {message}"
+                    )));
+                }
+            }
         }
-        if let Err(e) = writer.finish() {
-            self.close();
-            warn!(
+        if let Err(e) = stream.writer.finish() {
+            debug!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 error = ?e,
-                "Failed to finish QUIC send stream (half-close)"
+                "Failed to finish DoQ send stream"
             );
             return Err(DnsError::protocol(format!(
                 "Failed to finish QUIC send stream: {}",
                 e
             )));
         }
+        stream.send_finished = true;
 
-        match reader.read_message().await {
+        match stream.reader.read_message_doq().await {
             Ok(mut resp) => {
+                stream.completed = true;
+                validate_dns_response(&request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
                 trace!(
-                    conn_id = self.id,
-                    query_id = raw_id,
-                    "Successfully received DNS response over QUIC"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        "Successfully received DNS response over QUIC"
+                    );
                 Ok(resp)
             }
-            Err(e) => {
+            Err(QuicReadError::StreamReset(code)) => {
+                warn!(
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        %code,
+                        "DoQ transaction reset by server"
+                    );
+                Err(DnsError::protocol(format!(
+                    "DoQ transaction reset by server with code {code}"
+                )))
+            }
+            Err(QuicReadError::Protocol(message)) => {
+                self.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
+                warn!(
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = %message,
+                        "Fatal DoQ protocol error"
+                    );
+                Err(DnsError::protocol(message))
+            }
+            Err(QuicReadError::ConnectionLost(e)) => {
                 self.close();
                 warn!(
-                    conn_id = self.id,
-                    query_id = raw_id,
-                    error = ?e,
-                    "Failed to read DNS response from QUIC stream"
-                );
-                Err(DnsError::protocol(format!(
-                    "Failed to read QUIC DNS response: {}",
-                    e
-                )))
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = ?e,
+                        "QUIC connection lost while reading DoQ response"
+                    );
+                Err(DnsError::protocol(format!("QUIC connection lost: {e}")))
+            }
+            Err(QuicReadError::Stream(message)) => {
+                debug!(
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = raw_id,
+                        error = %message,
+                        "DoQ stream read error"
+                    );
+                Err(DnsError::protocol(message))
             }
         }
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
     fn available(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+    }
+
+    fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.pool_unavailable_notify.register(notify);
+        if self.closed.load(Ordering::Acquire) {
+            self.pool_unavailable_notify.notify_pool();
+        }
     }
 
     fn last_used(&self) -> u64 {
@@ -167,14 +295,18 @@ impl Connection for QuicConnection {
 #[derive(Debug)]
 pub struct QuicConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl QuicConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -184,8 +316,10 @@ impl QuicConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -212,28 +346,51 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
         deadline: QueryDeadline,
         connection_info: Arc<ConnectionInfo>,
     ) -> Result<Arc<QuicConnection>> {
-        let socket = connect_udp(UdpDialOptions::new(
+        let dial_options = QuicDialOptions::new(
             self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
-
-        // Establish QUIC connection (includes TLS 1.3 handshake)
-        let quic_conn = connect_quic(
-            socket,
-            QuicDialOptions::new(
-                self.target.clone(),
-                self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
-                quic_idle_timeout(self.timeout),
-                vec![b"doq".to_vec()],
-            ),
+            self.insecure_skip_verify,
+            deadline.remaining().ok_or_else(|| {
+                deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+            })?,
+            quic_idle_timeout(self.timeout),
+            vec![b"doq".to_vec()],
         )
-        .await?;
+        .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake)
+        .with_keep_alive_interval(self.keepalive_interval);
+        let quic_conn = if let Some(socks5) = self.socks5.clone() {
+            let (socket, peer_addr) = match deadline
+                .run(Socks5QuicSocket::connect(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                    socks5,
+                ))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
+            connect_quic_abstract(socket, peer_addr, dial_options).await?
+        } else {
+            let socket = match deadline
+                .run(connect_udp(UdpDialOptions::new(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                )))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
+            connect_quic(socket, dial_options).await?
+        };
 
         debug!(
             conn_id,
+            upstream = %self.upstream,
             server_name = %self.target.host(),
             remote_addr = ?quic_conn.remote_address(),
             "Established QUIC connection for DoQ (DNS over QUIC)"
@@ -242,11 +399,13 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
         let quic_conn = Arc::new(QuicConnection {
             connection_info,
             id: conn_id,
+            upstream: self.upstream.clone(),
             transport: QuicTransport::new(quic_conn),
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
 
         // Spawn background task to monitor connection health
@@ -260,12 +419,14 @@ impl ConnectionBuilder<QuicConnection> for QuicConnectionBuilder {
                     _conn.close();
                     debug!(
                         conn_id,
+                        upstream = %_conn.upstream,
                         "QUIC connection closed by remote peer or network error"
                     );
                 }
                 _ = _conn.close_notify.notified() => {
                     debug!(
                         conn_id,
+                        upstream = %_conn.upstream,
                         "QUIC connection closed by local request"
                     );
                 }
@@ -291,6 +452,7 @@ mod tests {
         connection_info.insecure_skip_verify = true;
         connection_info.so_mark = Some(9);
         connection_info.bind_to_device = Some("wg0".to_string());
+        connection_info.keepalive_interval = Some(std::time::Duration::from_secs(4));
 
         let builder = QuicConnectionBuilder::new(&connection_info);
 
@@ -299,6 +461,10 @@ mod tests {
         assert_eq!(builder.target.host(), "dns.example.com");
         assert!(builder.insecure_skip_verify);
         assert_eq!(builder.timeout, std::time::Duration::from_secs(3));
+        assert_eq!(
+            builder.keepalive_interval,
+            Some(std::time::Duration::from_secs(4))
+        );
         assert_eq!(builder.socket_options.so_mark(), Some(9));
         assert_eq!(builder.socket_options.bind_to_device(), Some("wg0"));
     }

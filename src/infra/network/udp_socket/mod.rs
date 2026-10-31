@@ -16,6 +16,9 @@ use tokio::net::UdpSocket;
 
 use crate::infra::network::ip::normalize_ipv4_mapped_ip;
 
+const IPV4_MAX_UDP_PAYLOAD: u16 = 65_507;
+const IPV6_MAX_UDP_PAYLOAD: u16 = 65_527;
+
 #[cfg(any(
     target_os = "linux",
     target_os = "macos",
@@ -53,6 +56,16 @@ pub(crate) struct UdpReplyTarget {
 impl UdpReplyTarget {
     pub fn peer_addr(self) -> SocketAddr {
         self.peer
+    }
+
+    /// Standard non-jumbogram UDP application payload ceiling for the
+    /// normalized reply address family. Path or platform limits may be lower.
+    #[inline]
+    pub(crate) fn max_non_jumbo_udp_payload(self) -> u16 {
+        match self.local_ip {
+            IpAddr::V4(_) => IPV4_MAX_UDP_PAYLOAD,
+            IpAddr::V6(_) => IPV6_MAX_UDP_PAYLOAD,
+        }
     }
 
     fn new(peer: SocketAddr, local_ip: IpAddr, interface_index: u32) -> io::Result<Self> {

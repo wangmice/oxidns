@@ -25,6 +25,8 @@ use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, PoolSize, QueryTimeoutPolicy,
 };
 use crate::infra::network::upstream::pooled::{PooledUpstream, UdpTruncatedUpstream};
+#[cfg(feature = "upstream-doh")]
+use crate::infra::network::upstream::rate_limit::DohRateLimitedUpstream;
 use crate::infra::network::upstream::traits::Upstream;
 
 /// Builder for creating upstream instances
@@ -36,6 +38,7 @@ impl UpstreamBuilder {
             "Creating upstream: type={:?}, remote={:?}, port={}",
             connection_info.connection_type, connection_info.remote_ip, connection_info.port
         );
+        let rate_limit_doh = connection_info.connection_type == ConnectionType::DoH;
 
         if connection_info.bootstrap.is_none() {
             let upstream: Box<dyn Upstream> = match connection_info.connection_type {
@@ -124,7 +127,7 @@ impl UpstreamBuilder {
                 ConnectionType::DoQ => {
                     debug!("Creating QUIC upstream for {}", connection_info.raw_addr);
                     let builder = QuicConnectionBuilder::new(&connection_info);
-                    Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                    Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                 }
                 #[cfg(not(feature = "upstream-doq"))]
                 ConnectionType::DoQ => {
@@ -148,7 +151,7 @@ impl UpstreamBuilder {
                         #[cfg(feature = "upstream-doh3")]
                         {
                             let builder = H3ConnectionBuilder::new(&connection_info);
-                            Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                            Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                         }
                         #[cfg(not(feature = "upstream-doh3"))]
                         {
@@ -159,7 +162,7 @@ impl UpstreamBuilder {
                         }
                     } else {
                         let builder = H2ConnectionBuilder::new(&connection_info);
-                        Box::new(create_pipeline_pool(connection_info, Box::new(builder)))
+                        Box::new(create_multiplexed_pool(connection_info, Box::new(builder)))
                     }
                 }
                 #[cfg(not(feature = "upstream-doh"))]
@@ -170,7 +173,7 @@ impl UpstreamBuilder {
                     ));
                 }
             };
-            Ok(upstream)
+            Ok(wrap_doh_rate_limit(upstream, rate_limit_doh))
         } else {
             // Domain-based upstream: use bootstrap or system DNS for resolution
             let upstream: Box<dyn Upstream> = match &connection_info.connection_type {
@@ -238,7 +241,7 @@ impl UpstreamBuilder {
                     ));
                 }
             };
-            Ok(upstream)
+            Ok(wrap_doh_rate_limit(upstream, rate_limit_doh))
         }
     }
 
@@ -250,10 +253,29 @@ impl UpstreamBuilder {
     }
 }
 
+fn wrap_doh_rate_limit(upstream: Box<dyn Upstream>, enabled: bool) -> Box<dyn Upstream> {
+    #[cfg(feature = "upstream-doh")]
+    if enabled {
+        return Box::new(DohRateLimitedUpstream::new(upstream));
+    }
+
+    #[cfg(not(feature = "upstream-doh"))]
+    let _ = enabled;
+
+    upstream
+}
+
 #[inline]
 pub(crate) const fn pipeline_request_map_capacity() -> u16 {
     ConnectionInfo::DEFAULT_MAX_CONNS_LOAD
 }
+
+/// Maximum number of concurrent streams assigned to a single multiplexed
+/// transport connection (H2/H3/DoQ). Keep this below the generic DNS
+/// pipelining limit so one connection cannot become an oversized failure
+/// domain under bursty refresh traffic.
+#[cfg(any(test, feature = "upstream-doh", feature = "upstream-doq"))]
+pub(crate) const MULTIPLEXED_MAX_CONNS_LOAD: u16 = 32;
 
 #[inline]
 pub(crate) const fn reuse_request_map_capacity() -> u16 {
@@ -291,6 +313,32 @@ pub(crate) fn create_pipeline_pool<C: Connection>(
     }
 }
 
+/// Build a pool for transports where each DNS query has its own protocol
+/// stream (H2/H3/DoQ). A timeout is stream-local, so the underlying
+/// connection remains reusable unless the connection implementation marks
+/// itself unavailable because of a connection-level failure.
+#[cfg(any(feature = "upstream-doh", feature = "upstream-doq"))]
+pub(crate) fn create_multiplexed_pool<C: Connection>(
+    connection_info: ConnectionInfo,
+    builder: Box<dyn ConnectionBuilder<C>>,
+) -> PooledUpstream<C> {
+    let connection_info = Arc::new(connection_info);
+    let timeout = connection_info.timeout;
+    let min_size = main_pool_min_conns(&connection_info);
+    PooledUpstream::<C> {
+        pool: PipelinePool::new_multiplexed(
+            connection_info.clone(),
+            PoolSize::new(min_size, connection_info.max_conns_or_default()),
+            MULTIPLEXED_MAX_CONNS_LOAD,
+            connection_info.idle_timeout,
+            builder,
+            QueryTimeoutPolicy::Reuse,
+            timeout,
+        ),
+        connection_info,
+    }
+}
+
 pub(crate) fn create_reuse_pool<C: Connection>(
     connection_info: ConnectionInfo,
     builder: Box<dyn ConnectionBuilder<C>>,
@@ -309,5 +357,18 @@ pub(crate) fn create_reuse_pool<C: Connection>(
             timeout,
         ),
         connection_info,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiplexed_connection_load_is_lower_than_generic_pipeline_load() {
+        assert_eq!(MULTIPLEXED_MAX_CONNS_LOAD, 32);
+        const {
+            assert!(MULTIPLEXED_MAX_CONNS_LOAD < ConnectionInfo::DEFAULT_MAX_CONNS_LOAD);
+        }
     }
 }

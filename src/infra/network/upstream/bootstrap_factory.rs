@@ -5,6 +5,8 @@ use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+#[cfg(any(feature = "upstream-doh", feature = "upstream-doq"))]
+use crate::infra::network::upstream::builder::MULTIPLEXED_MAX_CONNS_LOAD;
 use crate::infra::network::upstream::builder::{
     main_pool_min_conns, pipeline_request_map_capacity, reuse_request_map_capacity,
 };
@@ -104,13 +106,13 @@ impl BootstrapPoolFactory<QuicConnection> for QuicBootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<QuicConnection>> {
         let info = Arc::new(connection_info_with_ip(connection_info, ip));
         let builder = QuicConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             info.clone(),
             PoolSize::new(main_pool_min_conns(&info), info.max_conns_or_default()),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }
@@ -129,13 +131,13 @@ impl BootstrapPoolFactory<H2Connection> for H2BootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<H2Connection>> {
         let info = Arc::new(connection_info_with_ip(connection_info, ip));
         let builder = H2ConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             info.clone(),
             PoolSize::new(main_pool_min_conns(&info), info.max_conns_or_default()),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }
@@ -154,13 +156,13 @@ impl BootstrapPoolFactory<H3Connection> for H3BootstrapPoolFactory {
     ) -> Arc<dyn ConnectionPool<H3Connection>> {
         let info = Arc::new(connection_info_with_ip(connection_info, ip));
         let builder = H3ConnectionBuilder::new(&info);
-        PipelinePool::new(
+        PipelinePool::new_multiplexed(
             info.clone(),
             PoolSize::new(main_pool_min_conns(&info), info.max_conns_or_default()),
-            ConnectionInfo::DEFAULT_MAX_CONNS_LOAD,
+            MULTIPLEXED_MAX_CONNS_LOAD,
             info.idle_timeout,
             Box::new(builder),
-            QueryTimeoutPolicy::Retire,
+            QueryTimeoutPolicy::Reuse,
             info.timeout,
         )
     }

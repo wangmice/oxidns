@@ -7,7 +7,7 @@ use tracing::info;
 
 use super::concurrent::ConcurrentForwarder;
 use super::config::{
-    MAX_CONCURRENT_QUERIES, make_default_upstream_config, parse_forward_config,
+    ForwardErrorPolicy, MAX_CONCURRENT_QUERIES, make_default_upstream_config, parse_forward_config,
     parse_quick_setup_param, resolve_active_concurrent, validate_upstream_addr,
 };
 use super::metrics::{ForwardMetrics, upstream_metric_names};
@@ -15,7 +15,9 @@ use super::selection::ResponseSelectionMode;
 use super::single::SingleDnsForwarder;
 use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::upstream::{ConnectionInfo, Upstream, UpstreamBuilder, UpstreamConfig};
+use crate::infra::network::upstream::{
+    ConnectionInfo, ConnectionType, Upstream, UpstreamBuilder, UpstreamConfig,
+};
 use crate::plugin::{PluginFactory, UninitializedPlugin};
 use crate::plugin_factory;
 
@@ -25,6 +27,10 @@ use crate::plugin_factory;
 pub struct ForwardFactory;
 
 impl PluginFactory for ForwardFactory {
+    fn validate_plugin_config(&self, plugin_config: &PluginConfig) -> Result<()> {
+        parse_forward_config(plugin_config).map(|_| ())
+    }
+
     fn create(
         &self,
         plugin_config: &PluginConfig,
@@ -33,6 +39,7 @@ impl PluginFactory for ForwardFactory {
         let forward_config = parse_forward_config(plugin_config)?;
         let short_circuit = forward_config.short_circuit;
         let response_selection = forward_config.response_selection;
+        let on_error = forward_config.on_error;
 
         if forward_config.upstreams.len() == 1 {
             // Single upstream configuration
@@ -50,6 +57,7 @@ impl PluginFactory for ForwardFactory {
                     tag: plugin_config.tag.clone(),
                     upstream,
                     short_circuit,
+                    on_error,
                     metrics: Arc::new(ForwardMetrics::new(plugin_config.tag.clone(), names)),
                 },
             )))
@@ -65,6 +73,10 @@ impl PluginFactory for ForwardFactory {
                 upstreams.push(build_upstream(upstream_config)?.into());
             }
 
+            let has_doh_upstream = upstreams.iter().any(|upstream: &Arc<dyn Upstream>| {
+                upstream.connection_type() == ConnectionType::DoH
+            });
+
             let infos: Vec<&ConnectionInfo> = upstreams
                 .iter()
                 .map(|u: &Arc<dyn Upstream>| u.connection_info())
@@ -76,8 +88,10 @@ impl PluginFactory for ForwardFactory {
                 ConcurrentForwarder {
                     tag: plugin_config.tag.clone(),
                     active_concurrent,
-                    upstreams,
+                    has_doh_upstream,
+                    upstreams: Arc::new(upstreams),
                     short_circuit,
+                    on_error,
                     response_selection,
                     metrics: Arc::new(ForwardMetrics::new(plugin_config.tag.clone(), names)),
                 },
@@ -108,6 +122,7 @@ impl PluginFactory for ForwardFactory {
                     tag: tag.to_string(),
                     upstream,
                     short_circuit,
+                    on_error: ForwardErrorPolicy::Fail,
                     metrics: Arc::new(ForwardMetrics::new(tag.to_string(), names)),
                 },
             )))
@@ -116,6 +131,9 @@ impl PluginFactory for ForwardFactory {
             for upstream_config in upstream_configs {
                 upstreams.push(build_upstream(upstream_config)?.into());
             }
+            let has_doh_upstream = upstreams.iter().any(|upstream: &Arc<dyn Upstream>| {
+                upstream.connection_type() == ConnectionType::DoH
+            });
             let infos: Vec<&ConnectionInfo> = upstreams
                 .iter()
                 .map(|u: &Arc<dyn Upstream>| u.connection_info())
@@ -128,8 +146,10 @@ impl PluginFactory for ForwardFactory {
                         Some(MAX_CONCURRENT_QUERIES),
                         upstreams.len(),
                     ),
-                    upstreams,
+                    has_doh_upstream,
+                    upstreams: Arc::new(upstreams),
                     short_circuit,
+                    on_error: ForwardErrorPolicy::Fail,
                     response_selection: ResponseSelectionMode::default(),
                     metrics: Arc::new(ForwardMetrics::new(tag.to_string(), names)),
                 },

@@ -51,6 +51,19 @@ pub enum DnsError {
     #[error("DNS protocol error: {0}")]
     Protocol(String),
 
+    /// HTTP 429 response returned by a DNS-over-HTTPS upstream.
+    #[error(
+        "DNS protocol error: http unsuccessful code: 429 Too Many Requests, message: {message}"
+    )]
+    DohRateLimited {
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
+
+    /// Query suppressed locally while a DoH upstream is cooling down after HTTP 429.
+    #[error("DoH upstream rate-limit cooldown active; retry in {retry_after_ms} ms")]
+    RateLimitCooldown { retry_after_ms: u64 },
+
     /// Quic connect error
     #[cfg(any(
         feature = "server-doq",
@@ -139,6 +152,27 @@ impl DnsError {
     /// Create a protocol error
     pub fn protocol<S: Into<String>>(msg: S) -> Self {
         DnsError::Protocol(msg.into())
+    }
+
+    /// Create a structured HTTP 429 error for DNS-over-HTTPS upstreams.
+    pub fn doh_rate_limited<M: Into<String>>(
+        retry_after: Option<std::time::Duration>,
+        message: M,
+    ) -> Self {
+        DnsError::DohRateLimited {
+            retry_after,
+            message: message.into(),
+        }
+    }
+
+    /// Create a local cooldown error without issuing an upstream query.
+    pub fn rate_limit_cooldown(retry_after_ms: u64) -> Self {
+        DnsError::RateLimitCooldown { retry_after_ms }
+    }
+
+    /// Whether this error represents a locally suppressed DoH request.
+    pub fn is_rate_limit_cooldown(&self) -> bool {
+        matches!(self, DnsError::RateLimitCooldown { .. })
     }
 }
 

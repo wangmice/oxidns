@@ -2,23 +2,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::select;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
-use super::wait_for_close;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::dial::TlsDialOptions;
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::dial::connect_tls;
-use crate::infra::network::dial::{DialTarget, SocketOptions};
+use crate::infra::network::dial::{DialTarget, SocketOptions, configure_tcp_keepalive};
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::proxy::{Socks5Opt, connect_tcp};
 #[cfg(feature = "upstream-dot")]
 use crate::infra::network::transport::tcp::TcpTransport;
@@ -38,10 +39,12 @@ pub struct TcpConnection {
     connection_info: Arc<ConnectionInfo>,
     /// Unique connection ID for logging/tracing.
     id: u16,
-    /// Sender for the unbounded outgoing TCP message channel.
-    sender: UnboundedSender<QueuedQuery>,
-    /// Notifier that signals connection closure to background tasks.
-    close_notify: Notify,
+    /// Stable upstream identity used to disambiguate per-pool connection IDs.
+    upstream: String,
+    /// Bounded sender for outbound TCP messages.
+    sender: Sender<QueuedQuery>,
+    /// Latched cancellation signal for background read/write tasks.
+    close_token: CancellationToken,
     /// Map of active DNS queries (query_id → response channel sender).
     request_map: RequestMap,
     /// Whether the connection is marked as closed.
@@ -55,10 +58,47 @@ pub struct TcpConnection {
 #[cfg(test)]
 const DEFAULT_REQUEST_MAP_CAPACITY: u16 = 64;
 
+const WRITE_STATE_QUEUED: u8 = 0;
+const WRITE_STATE_WRITING: u8 = 1;
+const WRITE_STATE_CANCELED: u8 = 2;
+
 #[derive(Debug)]
 struct QueuedQuery {
     message: Message,
     query_id: u16,
+    write_state: Arc<AtomicU8>,
+}
+
+#[derive(Debug)]
+struct QueuedWriteGuard {
+    write_state: Arc<AtomicU8>,
+}
+
+impl QueuedWriteGuard {
+    fn new() -> Self {
+        Self {
+            write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
+        }
+    }
+
+    fn state(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.write_state)
+    }
+}
+
+impl Drop for QueuedWriteGuard {
+    fn drop(&mut self) {
+        // Cancellation may suppress only work that has not started writing.
+        // Once the sender owns WRITING, the full DNS-over-TCP frame must be
+        // completed (or the connection closed) so a partial frame cannot
+        // corrupt subsequent messages on the byte stream.
+        let _ = self.write_state.compare_exchange(
+            WRITE_STATE_QUEUED,
+            WRITE_STATE_CANCELED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 #[async_trait]
@@ -78,13 +118,14 @@ impl Connection for TcpConnection {
         let cleared = self.request_map.clear();
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
             upstream_host = %self.connection_info.server_name,
             upstream_port = self.connection_info.port,
             canceled_queries = cleared,
             "Initiating TCP connection close sequence"
         );
-        self.close_notify.notify_waiters();
+        self.close_token.cancel();
     }
 
     /// Sends a DNS query and waits asynchronously for its corresponding
@@ -110,7 +151,7 @@ impl Connection for TcpConnection {
 
         // Register query and get unique ID for request/response matching
         let (tx, rx) = oneshot::channel();
-        let mut query_guard = self.request_map.store(tx)?;
+        let mut query_guard = self.request_map.store_for_request(tx, &request)?;
         let query_id = query_guard.query_id();
         if self.closed.load(Ordering::Acquire) {
             return Err(DnsError::protocol(format!(
@@ -121,6 +162,7 @@ impl Connection for TcpConnection {
 
         trace!(
             conn_id = self.id,
+            upstream = %self.upstream,
             query_id,
             active_queries = self.using_count(),
             "Sending DNS query over TCP"
@@ -128,16 +170,25 @@ impl Connection for TcpConnection {
 
         let raw_id = request.id();
 
-        // Queue Message for background sender task (TcpTransportWriter will
-        // frame it)
-        if let Err(e) = self.sender.send(QueuedQuery {
-            message: request,
-            query_id,
-        }) {
+        // Queue the message for the background sender task. The bounded
+        // channel applies backpressure if the socket writer falls behind. A
+        // per-query atomic state lets cancellation suppress queued work without
+        // relying on the reusable 16-bit DNS ID as a generation token.
+        let write_guard = QueuedWriteGuard::new();
+        if let Err(e) = self
+            .sender
+            .send(QueuedQuery {
+                message: request,
+                query_id,
+                write_state: write_guard.state(),
+            })
+            .await
+        {
             let _ = query_guard.remove();
             self.close();
             error!(
                 conn_id = self.id,
+            upstream = %self.upstream,
                 query_id,
                 error = ?e,
                 "Failed to queue DNS query Message (sender channel closed)"
@@ -156,23 +207,25 @@ impl Connection for TcpConnection {
                 query_guard.disarm();
                 res.set_id(raw_id); // Restore original query ID
                 trace!(
-                    conn_id = self.id,
-                    query_id, "Successfully received DNS response over TCP"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id, "Successfully received DNS response over TCP"
+                    );
                 Ok(res)
             }
             Err(_) => {
                 warn!(
-                    conn_id = self.id,
-                    query_id, "DNS query canceled (response channel dropped)"
-                );
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id, "DNS query canceled (response channel dropped)"
+                    );
                 Err(DnsError::protocol("request canceled"))
             }
         }
     }
 
-    fn using_count(&self) -> u16 {
-        self.request_map.size()
+    fn using_count(&self) -> u32 {
+        u32::from(self.request_map.size())
     }
 
     fn available(&self) -> bool {
@@ -189,10 +242,12 @@ impl TcpConnection {
     ///
     /// # Arguments
     /// * `conn_id` - Unique connection identifier for logging and debugging
-    /// * `sender` - Unbounded channel for queuing outbound DNS messages
+    /// * `upstream` - Stable upstream identity for connection diagnostics
+    /// * `sender` - Bounded channel for queuing outbound DNS messages
     fn new(
         conn_id: u16,
-        sender: UnboundedSender<QueuedQuery>,
+        upstream: String,
+        sender: Sender<QueuedQuery>,
         request_map_capacity: u16,
         connection_info: Arc<ConnectionInfo>,
     ) -> Self {
@@ -203,8 +258,9 @@ impl TcpConnection {
         Self {
             connection_info,
             id: conn_id,
+            upstream,
             sender,
-            close_notify: Notify::new(),
+            close_token: CancellationToken::new(),
             request_map: RequestMap::with_capacity(request_map_capacity),
             closed: AtomicBool::new(false),
             writeable: AtomicBool::new(true),
@@ -215,51 +271,86 @@ impl TcpConnection {
     /// Background task: sends queued DNS requests through the TCP writer
     ///
     /// Continuously drains the outbound message queue and writes to the TCP
-    /// stream. Terminates gracefully when close notification is received.
+    /// stream. Connection cancellation interrupts both queue waits and an
+    /// in-flight socket write.
     ///
     /// # Error Handling
     /// Write errors trigger connection closure and notify waiting queries
     async fn send_dns_request<S: AsyncWrite + Unpin>(
         self: Arc<Self>,
         mut writer: TcpTransportWriter<S>,
-        mut receiver: UnboundedReceiver<QueuedQuery>,
+        mut receiver: Receiver<QueuedQuery>,
     ) {
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             "TCP sender task started, ready to transmit queued messages"
         );
 
         loop {
-            select! {
+            let queued = select! {
                 biased;
-                _ = wait_for_close(&self.closed, &self.close_notify) => break,
-                queued = receiver.recv() => {
-                    let Some(queued) = queued else {
-                        self.close();
-                        break;
-                    };
-                    // Closing retires the stream, so abandoning a partial
-                    // frame is safe and must also interrupt blocked writes.
-                    let result = select! {
-                        biased;
-                        _ = wait_for_close(&self.closed, &self.close_notify) => break,
-                        result = writer.write_message_with_id(&queued.message, queued.query_id) => result,
-                    };
-                    if let Err(e) = result {
-                        error!(
-                            conn_id = self.id,
-                            error = ?e,
-                            "TCP write failed, marking connection as non-writable"
-                        );
-                        self.writeable.store(false, Ordering::Release);
-                        self.close();
-                        break;
-                    }
+                _ = self.close_token.cancelled() => {
+                    debug!(
+                        conn_id = self.id,
+            upstream = %self.upstream,
+                        "TCP sender observed connection cancellation"
+                    );
+                    break;
                 }
+                queued = receiver.recv() => match queued {
+                    Some(queued) => queued,
+                    None => break,
+                },
+            };
+
+            if queued
+                .write_state
+                .compare_exchange(
+                    WRITE_STATE_QUEUED,
+                    WRITE_STATE_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                trace!(
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        query_id = queued.query_id,
+                        "Skipping canceled queued TCP query"
+                    );
+                continue;
+            }
+
+            let write_result = select! {
+                biased;
+                _ = self.close_token.cancelled() => {
+                    debug!(
+                        conn_id = self.id,
+            upstream = %self.upstream,
+                        "TCP sender canceled an in-flight write during close"
+                    );
+                    break;
+                }
+                result = writer.write_message_with_id(&queued.message, queued.query_id) => result,
+            };
+
+            if let Err(e) = write_result {
+                error!(
+                        conn_id = self.id,
+                upstream = %self.upstream,
+                        error = ?e,
+                        "TCP write failed, marking connection as non-writable"
+                    );
+                self.writeable.store(false, Ordering::Release);
+                self.close();
+                break;
             }
         }
 
-        debug!(conn_id = self.id, "TCP sender task exiting");
+        debug!(conn_id = self.id,
+            upstream = %self.upstream, "TCP sender task exiting");
     }
 
     /// Background task: reads DNS responses from the upstream TCP connection
@@ -279,48 +370,62 @@ impl TcpConnection {
     ) {
         debug!(
             conn_id = self.id,
+            upstream = %self.upstream,
             "TCP listener task started, waiting for DNS responses"
         );
 
         loop {
-            select! {
+            let result = select! {
                 biased;
-                _ = wait_for_close(&self.closed, &self.close_notify) => break,
-                res = reader.read_message() => {
-                    match res {
-                        Ok(msg) => {
-                            let id = msg.id();
-                            if let Some(sender) = self.request_map.take(id) {
-                                let _ = sender.send(msg);
-                                self.last_used.store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                                trace!(
-                                    conn_id = self.id,
-                                    query_id = id,
-                                    "Matched and delivered DNS response to waiting query"
-                                );
-                            } else {
-                                trace!(
-                                    conn_id = self.id,
-                                    query_id = id,
-                                    "Discarded DNS response (no matching query or fingerprint mismatch)"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
+                _ = self.close_token.cancelled() => {
+                    debug!(
+                        conn_id = self.id,
+            upstream = %self.upstream,
+                        pending_queries = self.request_map.size(),
+                        "TCP listener observed connection cancellation"
+                    );
+                    break;
+                }
+                result = reader.read_message() => result,
+            };
+
+            match result {
+                Ok(msg) => {
+                    let id = msg.id();
+                    if let Some(sender) = self.request_map.take_for_response(id, &msg) {
+                        let _ = sender.send(msg);
+                        self.last_used
+                            .store(AppClock::elapsed_millis(), Ordering::Relaxed);
+                        trace!(
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id = id,
+                                        "Matched and delivered DNS response to waiting query"
+                                    );
+                    } else {
+                        trace!(
+                                        conn_id = self.id,
+                        upstream = %self.upstream,
+                                        query_id = id,
+                                        "Discarded DNS response (no matching query or fingerprint mismatch)"
+                                    );
+                    }
+                }
+                Err(e) => {
+                    debug!(
                                 conn_id = self.id,
+                    upstream = %self.upstream,
                                 error = ?e,
                                 "TCP read error or EOF, closing connection"
                             );
-                            self.close();
-                            break;
-                        }
-                    }
+                    self.close();
+                    break;
                 }
             }
         }
 
-        debug!(conn_id = self.id, "TCP listener task terminated");
+        debug!(conn_id = self.id,
+            upstream = %self.upstream, "TCP listener task terminated");
     }
 }
 
@@ -328,6 +433,7 @@ impl TcpConnection {
 #[derive(Debug)]
 pub struct TcpConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
     tls_enabled: bool,
     #[cfg_attr(not(feature = "upstream-dot"), allow(dead_code))]
@@ -335,6 +441,7 @@ pub struct TcpConnectionBuilder {
     connection_type: ConnectionType,
     request_map_capacity: u16,
     socks5: Option<Socks5Opt>,
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl TcpConnectionBuilder {
@@ -344,6 +451,7 @@ impl TcpConnectionBuilder {
         #[cfg(not(feature = "upstream-dot"))]
         let tls_enabled = false;
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -358,6 +466,7 @@ impl TcpConnectionBuilder {
             connection_type: connection_info.connection_type,
             request_map_capacity,
             socks5: connection_info.socks5.clone(),
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -388,20 +497,30 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
             .await
         {
             DeadlineOutcome::Completed(result) => result?,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+            }
         };
+
+        configure_tcp_keepalive(&stream, self.keepalive_interval)?;
 
         debug!(
             conn_id,
+            upstream = %self.upstream,
             connection_type = ?self.connection_type,
             remote = ?stream.peer_addr(),
             tls_enabled = self.tls_enabled,
             "Established TCP connection to DNS server"
         );
 
-        let (sender, receiver) = unbounded_channel();
-        let connection =
-            TcpConnection::new(conn_id, sender, self.request_map_capacity, connection_info);
+        let (sender, receiver) = channel(usize::from(self.request_map_capacity));
+        let connection = TcpConnection::new(
+            conn_id,
+            self.upstream.clone(),
+            sender,
+            self.request_map_capacity,
+            connection_info,
+        );
         let arc = Arc::new(connection);
 
         if self.tls_enabled {
@@ -412,11 +531,12 @@ impl ConnectionBuilder<TcpConnection> for TcpConnectionBuilder {
                     TlsDialOptions::new(
                         self.target.clone(),
                         self.insecure_skip_verify,
-                        deadline
-                            .remaining()
-                            .ok_or_else(|| deadline.timeout_error())?,
+                        deadline.remaining().ok_or_else(|| {
+                            deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+                        })?,
                         vec![b"dot".to_vec()],
-                    ),
+                    )
+                    .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake),
                 )
                 .await?;
 
@@ -469,8 +589,14 @@ mod tests {
     #[tokio::test]
     async fn test_sender_exits_and_releases_connection_after_write_failure() {
         AppClock::start();
-        let (sender, receiver) = unbounded_channel();
-        let connection = Arc::new(TcpConnection::new(1, sender, 1, test_connection_info()));
+        let (sender, receiver) = channel(1);
+        let connection = Arc::new(TcpConnection::new(
+            1,
+            "test".to_string(),
+            sender,
+            1,
+            test_connection_info(),
+        ));
         let weak = Arc::downgrade(&connection);
         let (stream, peer) = tokio::io::duplex(64);
         drop(peer);
@@ -479,7 +605,9 @@ mod tests {
             .send(QueuedQuery {
                 message: Message::new(),
                 query_id: 0,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
             })
+            .await
             .unwrap();
 
         tokio::time::timeout(
@@ -495,8 +623,14 @@ mod tests {
     async fn test_close_stops_tcp_tasks_before_start_and_while_idle() {
         AppClock::start();
         for start_tasks in [false, true] {
-            let (sender, receiver) = unbounded_channel();
-            let connection = Arc::new(TcpConnection::new(1, sender, 1, test_connection_info()));
+            let (sender, receiver) = channel(1);
+            let connection = Arc::new(TcpConnection::new(
+                1,
+                "test".to_string(),
+                sender,
+                1,
+                test_connection_info(),
+            ));
             let weak = Arc::downgrade(&connection);
             let (stream, _peer) = tokio::io::duplex(64);
             let (reader, writer) = tokio::io::split(stream);
@@ -526,8 +660,14 @@ mod tests {
     #[tokio::test]
     async fn test_close_interrupts_blocked_tcp_write() {
         AppClock::start();
-        let (sender, receiver) = unbounded_channel();
-        let connection = Arc::new(TcpConnection::new(1, sender, 1, test_connection_info()));
+        let (sender, receiver) = channel(1);
+        let connection = Arc::new(TcpConnection::new(
+            1,
+            "test".to_string(),
+            sender,
+            1,
+            test_connection_info(),
+        ));
         let weak = Arc::downgrade(&connection);
         // One byte of capacity forces the DNS frame write to remain pending.
         let (stream, _peer) = tokio::io::duplex(1);
@@ -536,7 +676,9 @@ mod tests {
             .send(QueuedQuery {
                 message: Message::new(),
                 query_id: 0,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
             })
+            .await
             .unwrap();
         let mut writer = Box::pin(
             connection
@@ -559,6 +701,7 @@ mod tests {
             .expect("connection info should parse");
         connection_info.timeout = Duration::from_secs(9);
         connection_info.insecure_skip_verify = true;
+        connection_info.keepalive_interval = Some(Duration::from_secs(5));
 
         let builder = TcpConnectionBuilder::new(&connection_info, DEFAULT_REQUEST_MAP_CAPACITY);
 
@@ -568,14 +711,16 @@ mod tests {
         assert_eq!(builder.request_map_capacity, DEFAULT_REQUEST_MAP_CAPACITY);
         assert_eq!(builder.target.host(), "dns.example.com");
         assert!(builder.insecure_skip_verify);
+        assert_eq!(builder.keepalive_interval, Some(Duration::from_secs(5)));
     }
 
     #[tokio::test]
     async fn test_query_returns_error_when_connection_is_closed() {
         AppClock::start();
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let connection = TcpConnection::new(
             7,
+            "test".to_string(),
             sender,
             DEFAULT_REQUEST_MAP_CAPACITY,
             test_connection_info(),
@@ -595,11 +740,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_close_before_listener_start_is_latched() {
+        AppClock::start();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
+        let connection = Arc::new(TcpConnection::new(
+            9,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+            test_connection_info(),
+        ));
+        connection.close();
+
+        let (client, _server) = tokio::io::duplex(64);
+        let reader = TcpTransportReader::new(client);
+        let task = tokio::spawn(TcpConnection::listen_dns_response(
+            Arc::clone(&connection),
+            reader,
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("latched close must stop a listener started after close")
+            .expect("listener task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_close_cancels_blocked_tcp_write() {
+        use tokio::io::AsyncReadExt;
+
+        AppClock::start();
+        let (sender, receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
+        let queue = sender.clone();
+        let connection = Arc::new(TcpConnection::new(
+            10,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+            test_connection_info(),
+        ));
+        let (client, mut server) = tokio::io::duplex(1);
+        let writer = TcpTransportWriter::new(client);
+        let task = tokio::spawn(TcpConnection::send_dns_request(
+            Arc::clone(&connection),
+            writer,
+            receiver,
+        ));
+
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 1,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
+            })
+            .await
+            .expect("sender task should still own the receiver");
+
+        // Observe one byte to prove write_all() has started. With a one-byte
+        // duplex buffer and no further reads, the remaining frame is blocked.
+        let mut first = [0u8; 1];
+        tokio::time::timeout(Duration::from_millis(100), server.read_exact(&mut first))
+            .await
+            .expect("writer should start writing")
+            .expect("first byte should be readable");
+
+        connection.close();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("close must cancel an in-flight blocked write")
+            .expect("sender task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_sender_skips_query_cancelled_before_write() {
+        AppClock::start();
+        let (sender, receiver) = channel(2);
+        let queue = sender.clone();
+        let connection = Arc::new(TcpConnection::new(
+            11,
+            "test".to_string(),
+            sender,
+            DEFAULT_REQUEST_MAP_CAPACITY,
+            test_connection_info(),
+        ));
+        let (client, server) = tokio::io::duplex(1024);
+        let writer = TcpTransportWriter::new(client);
+        let task = tokio::spawn(TcpConnection::send_dns_request(
+            Arc::clone(&connection),
+            writer,
+            receiver,
+        ));
+
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 1,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_CANCELED)),
+            })
+            .await
+            .expect("sender task should still own the receiver");
+        queue
+            .send(QueuedQuery {
+                message: Message::new(),
+                query_id: 2,
+                write_state: Arc::new(AtomicU8::new(WRITE_STATE_QUEUED)),
+            })
+            .await
+            .expect("sender task should still own the receiver");
+
+        let mut reader = TcpTransportReader::new(server);
+        let message = tokio::time::timeout(Duration::from_millis(100), reader.read_message())
+            .await
+            .expect("live queued query should be written")
+            .expect("live queued query should decode");
+        assert_eq!(message.id(), 2);
+
+        connection.close();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("close must stop sender task")
+            .expect("sender task should not panic");
+    }
+
+    #[tokio::test]
     async fn test_query_removes_request_when_cancelled() {
         AppClock::start();
-        let (sender, _receiver) = unbounded_channel();
+        let (sender, _receiver) = channel(usize::from(DEFAULT_REQUEST_MAP_CAPACITY));
         let connection = TcpConnection::new(
             8,
+            "test".to_string(),
             sender,
             DEFAULT_REQUEST_MAP_CAPACITY,
             test_connection_info(),

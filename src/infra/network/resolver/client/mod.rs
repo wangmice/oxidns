@@ -60,12 +60,7 @@ fn build_client(config: NameserverConfig) -> Result<Arc<dyn NameserverClient>> {
 }
 
 fn effective_deadline(deadline: QueryDeadline, timeout: Duration) -> QueryDeadline {
-    let timeout_deadline = QueryDeadline::new(timeout);
-    if timeout_deadline.expires_at_ms < deadline.expires_at_ms {
-        timeout_deadline
-    } else {
-        deadline
-    }
+    deadline.capped(timeout)
 }
 
 #[cfg(test)]

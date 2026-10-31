@@ -313,12 +313,12 @@ pub(super) fn cached_observation(
     // touch interval to keep cache hits cheap under heavy query volume.
     runtime
         .cache
-        .get_retained_cloned(
+        .get_retained_handle(
             key,
             AppClock::elapsed_millis(),
             LAST_ACCESS_TOUCH_INTERVAL_MS,
         )
-        .map(|entry| *entry.value)
+        .map(|entry| **entry.value())
 }
 
 fn store_probe_observation(runtime: &ProbeRuntime, key: ProbeKey, observation: ProbeObservation) {

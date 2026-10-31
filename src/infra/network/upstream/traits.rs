@@ -5,15 +5,16 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::debug;
 
 use crate::infra::error::Result;
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::config::{ConnectionInfo, ConnectionType};
 use crate::infra::network::upstream::pool::{DeadlineOutcome, QueryDeadline};
 use crate::proto::Message;
 
 #[async_trait]
-#[allow(unused)]
+// #[allow(unused)]
 pub trait Upstream: Send + Sync + Debug {
     /// **Internal API - Do not call directly!**
     ///
@@ -50,6 +51,16 @@ pub trait Upstream: Send + Sync + Debug {
         self.connection_info().connection_type
     }
 
+    /// Remaining local cooldown before this upstream should be attempted.
+    ///
+    /// `None` means the upstream is eligible for a query. Implementations may
+    /// return a small positive duration while a half-open probe is already in
+    /// flight. Healthy implementations should keep this method on a lock-free
+    /// fast path.
+    fn temporary_unavailable_for_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether `inner_query` owns deadline enforcement and timeout cleanup.
     ///
     /// Pool-backed implementations must return `true` so the pool can observe
@@ -66,11 +77,20 @@ pub trait Upstream: Send + Sync + Debug {
         deadline: QueryDeadline,
     ) -> Result<Message> {
         if deadline.remaining().is_none() {
-            warn!(
+            let info = self.connection_info();
+            debug!(
+                upstream = %info.raw_addr,
+                upstream_tag = info.tag.as_deref().unwrap_or(""),
+                protocol = ?info.connection_type,
                 timeout_secs = self.timeout().as_secs_f64(),
                 "Upstream DNS query timeout"
             );
-            return Err(deadline.timeout_error());
+            let stage = if self.handles_query_deadline() {
+                UpstreamTimeoutStage::PoolAcquire
+            } else {
+                UpstreamTimeoutStage::QueryIo
+            };
+            return Err(deadline.timeout_error_for(stage));
         }
         if self.handles_query_deadline() {
             return self.inner_query(message, deadline).await;
@@ -78,11 +98,15 @@ pub trait Upstream: Send + Sync + Debug {
         match deadline.run(self.inner_query(message, deadline)).await {
             DeadlineOutcome::Completed(result) => result,
             DeadlineOutcome::Expired => {
-                warn!(
+                let info = self.connection_info();
+                debug!(
+                    upstream = %info.raw_addr,
+                    upstream_tag = info.tag.as_deref().unwrap_or(""),
+                    protocol = ?info.connection_type,
                     timeout_secs = self.timeout().as_secs_f64(),
                     "Upstream DNS query timeout"
                 );
-                Err(deadline.timeout_error())
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo))
             }
         }
     }

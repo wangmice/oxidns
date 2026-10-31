@@ -45,10 +45,37 @@ fn reply_targets_preserve_peers_and_only_scope_link_local_replies() {
     assert_eq!(scoped_peer.outgoing_interface(), 7);
 }
 
+#[test]
+fn reply_targets_report_address_family_udp_payload_limits() {
+    let ipv4 = UdpReplyTarget::new(
+        "192.0.2.2:1234".parse().unwrap(),
+        "192.0.2.1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(ipv4.max_non_jumbo_udp_payload(), 65_507);
+
+    let ipv6 = UdpReplyTarget::new(
+        "[2001:db8::2]:1234".parse().unwrap(),
+        "2001:db8::1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(ipv6.max_non_jumbo_udp_payload(), 65_527);
+
+    let mapped = UdpReplyTarget::new(
+        "[::ffff:192.0.2.2]:1234".parse().unwrap(),
+        "::ffff:192.0.2.1".parse().unwrap(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(mapped.max_non_jumbo_udp_payload(), 65_507);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn reply_addresses_survive_reordered_concurrent_sends() {
-    let raw = listen::build_udp_socket("[::]:0".parse().unwrap(), |_| {}).unwrap();
+    let raw = listen::build_udp_socket("[::]:0".parse().unwrap(), |_| Ok(())).unwrap();
     let port = raw.local_addr().unwrap().port();
     let server = UdpReplySocket::new(UdpSocket::from_std(raw).unwrap()).unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -119,7 +146,7 @@ async fn udp_reply_socket_preserves_destination_and_rejects_truncation() {
         ("127.0.0.1:0", "127.0.0.1:0", "127.0.0.1"),
         ("[::1]:0", "[::1]:0", "::1"),
     ] {
-        let raw = listen::build_udp_socket(listen_addr.parse().unwrap(), |_| {}).unwrap();
+        let raw = listen::build_udp_socket(listen_addr.parse().unwrap(), |_| Ok(())).unwrap();
         let port = raw.local_addr().unwrap().port();
         let server = UdpReplySocket::new(UdpSocket::from_std(raw).unwrap()).unwrap();
         let destination = SocketAddr::new(destination.parse().unwrap(), port);
@@ -179,7 +206,7 @@ async fn closed_client_ports_do_not_interrupt_windows_listeners() {
         ("[::]:0", "[::1]:0", "::1"),
         ("[::]:0", "127.0.0.1:0", "127.0.0.1"),
     ] {
-        let raw = listen::build_udp_socket(listen.parse().unwrap(), |_| {}).unwrap();
+        let raw = listen::build_udp_socket(listen.parse().unwrap(), |_| Ok(())).unwrap();
         let destination = SocketAddr::new(
             destination.parse().unwrap(),
             raw.local_addr().unwrap().port(),

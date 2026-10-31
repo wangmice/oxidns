@@ -17,20 +17,17 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
     feature = "_dns-client-doh3"
 ))]
 use std::sync::Arc;
-#[cfg(any(
-    feature = "_tls-client",
-    feature = "_dns-client-doq",
-    feature = "_dns-client-doh3"
-))]
 use std::time::Duration;
 
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
 use quinn::crypto::rustls::QuicClientConfig;
 #[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
-use quinn::{ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt};
+use quinn::{
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, TokioRuntime, TransportConfig, VarInt,
+};
 #[cfg(feature = "_tls-client")]
 use rustls::pki_types::ServerName;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::net::TcpStream;
 #[cfg(any(
     feature = "_tls-client",
@@ -45,6 +42,18 @@ use tokio_rustls::client::TlsStream;
 use tracing::info;
 
 use crate::infra::error::{DnsError, Result};
+#[cfg(any(
+    feature = "_tls-client",
+    feature = "_dns-client-doq",
+    feature = "_dns-client-doh3"
+))]
+use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
+#[cfg(any(
+    feature = "_tls-client",
+    feature = "_dns-client-doq",
+    feature = "_dns-client-doh3"
+))]
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 #[cfg(feature = "_tls-client")]
 use crate::infra::network::tls_config::{insecure_client_config, secure_client_config};
 
@@ -85,21 +94,57 @@ impl DialTarget {
         self.port
     }
 
-    fn socket_addr(&self) -> Result<SocketAddr> {
-        let ip = match self.remote_ip {
-            Some(ip) => ip,
-            None => try_lookup_server_name(&self.host)?,
-        };
-        Ok(SocketAddr::new(ip, self.port))
+    async fn socket_addr_async(&self) -> Result<SocketAddr> {
+        if let Some(ip) = self.remote_ip {
+            return Ok(SocketAddr::new(ip, self.port));
+        }
+
+        let mut addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| {
+                DnsError::protocol(format!(
+                    "System DNS resolution failed for '{}': {}",
+                    self.host, e
+                ))
+            })?;
+        let addr = addrs.next().ok_or_else(|| {
+            DnsError::protocol(format!(
+                "System DNS returned no addresses for '{}'",
+                self.host
+            ))
+        })?;
+
+        info!(
+            server_name = %self.host,
+            resolved_ip = %addr.ip(),
+            ip_version = if addr.is_ipv4() { "IPv4" } else { "IPv6" },
+            "Resolved hostname using async system DNS"
+        );
+        Ok(addr)
     }
 
     #[cfg(any(
+        test,
         feature = "_tls-client",
         feature = "_dns-client-doq",
         feature = "_dns-client-doh3"
     ))]
     fn server_name(&self) -> &str {
-        self.host.as_str()
+        // Keep `host` unchanged for DNS resolution and HTTP authority formatting;
+        // TLS libraries require IPv6 identities without URI authority brackets.
+        let Some(unbracketed) = self
+            .host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return self.host.as_str();
+        };
+
+        if matches!(unbracketed.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            unbracketed
+        } else {
+            self.host.as_str()
+        }
     }
 }
 
@@ -169,6 +214,7 @@ pub(crate) struct TlsDialOptions {
     target: DialTarget,
     skip_cert: bool,
     handshake_timeout: Duration,
+    query_timeout: Option<(QueryDeadline, UpstreamTimeoutStage)>,
     alpn: Vec<Vec<u8>>,
 }
 
@@ -185,8 +231,23 @@ impl TlsDialOptions {
             target,
             skip_cert,
             handshake_timeout,
+            query_timeout: None,
             alpn,
         }
+    }
+
+    pub(crate) fn with_query_deadline(
+        mut self,
+        deadline: QueryDeadline,
+        stage: UpstreamTimeoutStage,
+    ) -> Self {
+        self.query_timeout = Some((deadline, stage));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
     }
 }
 
@@ -196,7 +257,9 @@ pub(crate) struct QuicDialOptions {
     target: DialTarget,
     skip_cert: bool,
     handshake_timeout: Duration,
+    query_timeout: Option<(QueryDeadline, UpstreamTimeoutStage)>,
     idle_timeout: Duration,
+    keep_alive_interval: Option<Duration>,
     alpn: Vec<Vec<u8>>,
 }
 
@@ -213,10 +276,73 @@ impl QuicDialOptions {
             target,
             skip_cert,
             handshake_timeout,
+            query_timeout: None,
             idle_timeout,
+            keep_alive_interval: None,
             alpn,
         }
     }
+
+    pub(crate) fn with_query_deadline(
+        mut self,
+        deadline: QueryDeadline,
+        stage: UpstreamTimeoutStage,
+    ) -> Self {
+        self.query_timeout = Some((deadline, stage));
+        self
+    }
+
+    pub(crate) fn with_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.keep_alive_interval = interval;
+        self
+    }
+}
+
+/// Enable TCP keepalive on an established stream.
+///
+/// The configured duration is used as the idle time before the first probe
+/// and, on targets supported by socket2, as the interval between later probes.
+/// Protocol-specific keepalive remains preferable when available (for example
+/// HTTP/2 PING), but DoT has no application-level keepalive frame.
+#[allow(dead_code)]
+pub(crate) fn configure_tcp_keepalive(
+    stream: &TcpStream,
+    interval: Option<Duration>,
+) -> Result<()> {
+    let Some(interval) = interval else {
+        return Ok(());
+    };
+    if interval.is_zero() {
+        return Err(DnsError::plugin(
+            "upstream keepalive_interval must be greater than 0",
+        ));
+    }
+
+    let keepalive = TcpKeepalive::new().with_time(interval);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        all(target_os = "wasi", not(target_env = "p1")),
+    ))]
+    let keepalive = keepalive.with_interval(interval);
+
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|error| DnsError::protocol(format!("failed to configure TCP keepalive: {error}")))
 }
 
 /// Establish a TLS client connection over an existing TCP stream.
@@ -253,14 +379,20 @@ pub(crate) async fn connect_tls(
     let dns_name = ServerName::try_from(options.target.server_name().to_string())
         .map_err(|_| DnsError::protocol("Invalid DNS server name"))?;
 
-    match timeout(
-        options.handshake_timeout,
-        connector.connect(dns_name, tcp_stream),
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(DnsError::protocol(format!("TLS connection error: {}", e))),
+    let connect = connector.connect(dns_name, tcp_stream);
+    if let Some((deadline, stage)) = options.query_timeout {
+        return match deadline.run(connect).await {
+            DeadlineOutcome::Completed(Ok(stream)) => Ok(stream),
+            DeadlineOutcome::Completed(Err(error)) => {
+                Err(DnsError::protocol(format!("TLS connection error: {error}")))
+            }
+            DeadlineOutcome::Expired => Err(deadline.timeout_error_for(stage)),
+        };
+    }
+
+    match timeout(options.handshake_timeout, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(DnsError::protocol(format!("TLS connection error: {error}"))),
         Err(_) => Err(DnsError::protocol("TLS handshake timeout")),
     }
 }
@@ -293,13 +425,38 @@ pub(crate) async fn connect_quic(
     options: QuicDialOptions,
 ) -> Result<quinn::Connection> {
     let remote_addr = udp_socket.peer_addr()?;
-    let mut endpoint = Endpoint::new(
+    let endpoint = Endpoint::new(
         EndpointConfig::default(),
         None,
         udp_socket,
         Arc::new(TokioRuntime),
     )?;
 
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+pub(crate) async fn connect_quic_abstract(
+    socket: Arc<dyn AsyncUdpSocket>,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
+    let endpoint = Endpoint::new_with_abstract_socket(
+        EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(TokioRuntime),
+    )?;
+
+    connect_quic_endpoint(endpoint, remote_addr, options).await
+}
+
+#[cfg(any(feature = "_dns-client-doq", feature = "_dns-client-doh3"))]
+async fn connect_quic_endpoint(
+    mut endpoint: Endpoint,
+    remote_addr: SocketAddr,
+    options: QuicDialOptions,
+) -> Result<quinn::Connection> {
     let mut client_config = if options.skip_cert {
         insecure_client_config()
     } else {
@@ -310,20 +467,29 @@ pub(crate) async fn connect_quic(
     let idle_ms = options.idle_timeout.as_millis().min(u32::MAX as u128) as u32;
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(VarInt::from_u32(idle_ms).into()));
+    transport.keep_alive_interval(options.keep_alive_interval);
 
     let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_config)?));
     client_config.transport_config(Arc::new(transport));
 
     endpoint.set_default_client_config(client_config);
 
-    match timeout(
-        options.handshake_timeout,
-        endpoint.connect(remote_addr, options.target.server_name())?,
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(DnsError::protocol(format!("QUIC connection error: {}", e))),
+    let connecting = endpoint.connect(remote_addr, options.target.server_name())?;
+    if let Some((deadline, stage)) = options.query_timeout {
+        return match deadline.run(connecting).await {
+            DeadlineOutcome::Completed(Ok(connection)) => Ok(connection),
+            DeadlineOutcome::Completed(Err(error)) => Err(DnsError::protocol(format!(
+                "QUIC connection error: {error}"
+            ))),
+            DeadlineOutcome::Expired => Err(deadline.timeout_error_for(stage)),
+        };
+    }
+
+    match timeout(options.handshake_timeout, connecting).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(DnsError::protocol(format!(
+            "QUIC connection error: {error}"
+        ))),
         Err(_) => Err(DnsError::protocol("QUIC handshake timeout")),
     }
 }
@@ -341,10 +507,11 @@ pub(crate) async fn connect_quic(
 /// - `Err(DnsError)` if resolution fails or returns no results
 ///
 /// # Notes
-/// - This is used at connection time when no literal IP, `dial_addr`, or
-///   bootstrap-resolved address is available
+/// - This is used by synchronous configuration/probe paths that explicitly need
+///   the system resolver
 /// - For dynamic resolution with TTL support, use Bootstrap instead
-/// - Blocks the current task - consider using bootstrap for async resolution
+/// - This function is synchronous; async connection paths use
+///   `tokio::net::lookup_host`
 /// - Returns the first address from the system resolver (maybe IPv4 or IPv6)
 ///
 /// # Platform Behavior
@@ -395,33 +562,32 @@ pub fn try_lookup_server_name(server_name: &str) -> Result<IpAddr> {
 ///
 /// # Notes
 /// - Socket is set to non-blocking mode for async I/O
-/// - SO_REUSEADDR is enabled to allow rapid reconnection
+/// - Address/port reuse is intentionally disabled for outbound UDP sockets so
+///   concurrent connections cannot acquire the same local 4-tuple
 /// - connect() is called to set the default destination (allows using send vs
 ///   send_to)
-pub(crate) fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
-    let socket_addr = options.target.socket_addr()?;
+pub(crate) async fn connect_udp(options: UdpDialOptions) -> Result<UdpSocket> {
+    let socket_addr = options.target.socket_addr_async().await?;
+    let socket = create_udp_socket(socket_addr, &options.socket)?;
+    socket.connect(&socket_addr.into())?;
+    Ok(socket.into())
+}
+
+pub(crate) fn bind_udp(bind_addr: SocketAddr, options: &SocketOptions) -> Result<UdpSocket> {
+    let socket = create_udp_socket(bind_addr, options)?;
+    socket.bind(&bind_addr.into())?;
+    Ok(socket.into())
+}
+
+fn create_udp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result<Socket> {
     let socket = Socket::new(
         Domain::for_address(socket_addr),
         Type::DGRAM,
         Some(Protocol::UDP),
     )?;
-
-    configure_common_socket(&socket, &options.socket)?;
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "solaris",
-            target_os = "illumos",
-            target_os = "cygwin",
-            target_os = "wasi"
-        ))
-    ))]
-    let _ = socket.set_reuse_port(true);
+    configure_common_socket(&socket, options)?;
     let _ = socket.set_recv_buffer_size(64 * 1024);
-
-    socket.connect(&socket_addr.into())?;
-
-    Ok(socket.into())
+    Ok(socket)
 }
 
 fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result<Socket> {
@@ -432,6 +598,7 @@ fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result
     )?;
 
     configure_common_socket(&socket, options)?;
+    let _ = socket.set_reuse_address(true);
     let _ = socket.set_tcp_nodelay(true);
     Ok(socket)
 }
@@ -439,7 +606,6 @@ fn create_tcp_socket(socket_addr: SocketAddr, options: &SocketOptions) -> Result
 fn configure_common_socket(socket: &Socket, options: &SocketOptions) -> Result<()> {
     let _ = options;
     let _ = socket.set_nonblocking(true);
-    let _ = socket.set_reuse_address(true);
 
     #[cfg(target_os = "linux")]
     if let Some(so_mark) = options.so_mark {
@@ -521,7 +687,94 @@ fn is_connect_in_progress(err: &std::io::Error) -> bool {
 /// TCP_NODELAY keeps small request frames from waiting for more data before
 /// being sent.
 pub(crate) async fn connect_tcp(options: TcpDialOptions) -> Result<TcpStream> {
-    let socket_addr = options.target.socket_addr()?;
+    let socket_addr = options.target.socket_addr_async().await?;
     let socket = create_tcp_socket(socket_addr, &options.socket)?;
     connect_tcp_socket(socket, socket_addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn dial_target_resolves_hostname_asynchronously() {
+        let target = DialTarget::new(None, "localhost".to_string(), 53);
+        let addr = target
+            .socket_addr_async()
+            .await
+            .expect("localhost should resolve through Tokio");
+
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn dial_target_uses_unbracketed_ipv6_for_tls_identity() {
+        let target = DialTarget::new(
+            Some("2001:db8::1".parse().expect("IPv6 should parse")),
+            "[2001:db8::1]".to_string(),
+            853,
+        );
+
+        assert_eq!(target.server_name(), "2001:db8::1");
+        assert_eq!(target.host(), "[2001:db8::1]");
+        #[cfg(feature = "_tls-client")]
+        assert!(
+            ServerName::try_from(target.server_name().to_string()).is_ok(),
+            "unbracketed IPv6 literal should be a valid TLS server identity"
+        );
+    }
+
+    #[test]
+    fn dial_target_preserves_dns_names_for_tls_identity() {
+        let target = DialTarget::new(None, "dns.example.test".to_string(), 853);
+
+        assert_eq!(target.server_name(), "dns.example.test");
+    }
+
+    #[test]
+    fn outbound_udp_socket_does_not_enable_address_or_port_reuse() {
+        let socket_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53));
+        let socket = create_udp_socket(socket_addr, &SocketOptions::default())
+            .expect("configured UDP socket should be created");
+
+        assert!(
+            !socket
+                .reuse_address()
+                .expect("SO_REUSEADDR should be readable"),
+            "outbound UDP sockets must not enable SO_REUSEADDR"
+        );
+
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "solaris",
+                target_os = "illumos",
+                target_os = "cygwin",
+                target_os = "wasi"
+            ))
+        ))]
+        assert!(
+            !socket
+                .reuse_port()
+                .expect("SO_REUSEPORT should be readable"),
+            "outbound UDP sockets must not enable SO_REUSEPORT"
+        );
+    }
+
+    #[test]
+    fn bind_udp_creates_bound_socket_with_common_options() {
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
+        let socket = bind_udp(bind_addr, &SocketOptions::default())
+            .expect("configured UDP socket should bind");
+
+        let local_addr = socket
+            .local_addr()
+            .expect("bound socket should have an address");
+        assert_eq!(local_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(local_addr.port(), 0);
+    }
 }

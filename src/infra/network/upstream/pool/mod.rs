@@ -94,12 +94,32 @@ pub trait Connection: Send + Sized + Debug + Sync + 'static {
     /// Get the number of queries currently in flight on this connection
     ///
     /// Used by pipeline pools to balance load across connections
-    fn using_count(&self) -> u16;
+    fn using_count(&self) -> u32;
+
+    /// Maximum concurrent queries accepted by this connection.
+    fn max_concurrent_queries(&self) -> u16 {
+        u16::MAX
+    }
 
     /// Check if the connection is available for use
     ///
     /// Returns false if the connection is closed or experiencing errors
     fn available(&self) -> bool;
+
+    /// Register a cold-path callback for connection-level unavailability.
+    ///
+    /// Multiplexed connections override this so an asynchronously closed
+    /// transport can re-arm its owning pool directly without waking every
+    /// foreground query waiter. Other connection types may ignore it.
+    fn register_unavailable_notify(&self, _notify: Arc<dyn Fn() + Send + Sync>) {}
+
+    /// Register a cold-path callback for increases in protocol-level query
+    /// capacity. The callback receives the previous and current peer limits.
+    ///
+    /// Dynamic-capacity transports override this so blocked pool waiters can be
+    /// woken when a peer raises its concurrent-stream limit. Static-capacity
+    /// connection types may ignore it.
+    fn register_capacity_increase_notify(&self, _notify: Arc<dyn Fn(u16, u16) + Send + Sync>) {}
 
     /// Get the timestamp of the last successful activity (in milliseconds)
     ///

@@ -6,12 +6,12 @@
 use async_trait::async_trait;
 
 use super::super::endpoint::NameserverConfig;
-use super::super::query::validate_response_id;
 use super::{NameserverClient, effective_deadline};
 use crate::infra::error::Result;
 use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
 use crate::infra::network::dial::SocketOptions;
 use crate::infra::network::proxy::connect_tcp as proxy_connect_tcp;
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
 use crate::infra::network::transport::tcp::{TcpTransportReader, TcpTransportWriter};
 use crate::proto::Message;
 
@@ -78,7 +78,6 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let query_id = request.id();
     match deadline.run(writer.write_message(&request)).await {
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
@@ -87,7 +86,7 @@ where
         DeadlineOutcome::Completed(result) => result?,
         DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
     };
-    validate_response_id(&response, query_id)?;
+    validate_dns_response(&request, &response, DnsResponseIdPolicy::MatchRequest)?;
     Ok(response)
 }
 
@@ -98,7 +97,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt, duplex, split};
 
     use super::*;
-    use crate::proto::{DNSClass, Name, Question, RecordType};
+    use crate::proto::{DNSClass, MessageType, Name, Question, RecordType};
 
     fn make_query(id: u16) -> Message {
         let mut message = Message::new();
@@ -146,5 +145,38 @@ mod tests {
         .expect_err("mismatched response ID should fail");
 
         assert!(err.to_string().contains("DNS response ID mismatch"));
+    }
+    #[tokio::test]
+    async fn test_query_framed_tcp_rejects_question_mismatch() {
+        let (client, mut server) = duplex(1024);
+        let (reader, writer) = split(client);
+        let request = make_query(7);
+        let mut response = Message::new();
+        response.set_id(7);
+        response.set_message_type(MessageType::Response);
+        response.add_question(Question::new(
+            Name::from_ascii("other.example.").expect("response name should parse"),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        let response_frame = encode_frame(&response);
+
+        tokio::spawn(async move {
+            server
+                .write_all(&response_frame)
+                .await
+                .expect("server side should write response");
+        });
+
+        let err = query_framed_tcp(
+            TcpTransportReader::new(reader),
+            TcpTransportWriter::new(writer),
+            request,
+            QueryDeadline::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("mismatched response question should fail");
+
+        assert!(err.to_string().contains("question does not match"));
     }
 }

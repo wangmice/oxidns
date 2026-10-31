@@ -12,7 +12,9 @@ use tracing::{debug, info};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::network::metrics::{self as network_metrics, NetworkProtocol, PoolRefreshReason};
+use crate::infra::network::metrics::{
+    self as network_metrics, NetworkProtocol, PoolRefreshReason, UpstreamTimeoutStage,
+};
 use crate::infra::network::resolver::{NameResolver, ResolvedIp};
 #[cfg(feature = "upstream-doh")]
 use crate::infra::network::upstream::bootstrap_factory::H2BootstrapPoolFactory;
@@ -191,7 +193,9 @@ impl<C: Connection> BootstrapUpstream<C> {
 
         let _update_guard = match deadline.run(self.pool_update_lock.lock()).await {
             DeadlineOutcome::Completed(guard) => guard,
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+            }
         };
         let state = self.pool.load();
         if state.is_valid() {
@@ -207,7 +211,12 @@ impl<C: Connection> BootstrapUpstream<C> {
             .await
         {
             Ok(value) => value,
-            Err(value) => return Err(value),
+            Err(value) => {
+                if deadline.remaining().is_none() {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                }
+                return Err(value);
+            }
         };
         let protocol = NetworkProtocol::from_connection_info(&self.connection_info);
 
@@ -295,15 +304,7 @@ impl BootstrapUpstream<H3Connection> {
 }
 
 fn bootstrap_deadline(deadline: QueryDeadline, timeout: Option<Duration>) -> QueryDeadline {
-    let Some(timeout) = timeout else {
-        return deadline;
-    };
-    let timeout_deadline = QueryDeadline::new(timeout);
-    if timeout_deadline.expires_at_ms < deadline.expires_at_ms {
-        timeout_deadline
-    } else {
-        deadline
-    }
+    timeout.map_or(deadline, |timeout| deadline.capped(timeout))
 }
 
 #[async_trait]
@@ -444,12 +445,14 @@ mod tests {
             bootstrap_version: Some(4),
             socks5: None,
             idle_timeout: None,
+            keepalive_interval: None,
             max_conns: None,
             min_conns: None,
             insecure_skip_verify: None,
             timeout: None,
             enable_pipeline: None,
             enable_http3: None,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
         };
@@ -482,8 +485,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bootstrap_upstream_pool_refresh_metrics_record_reasons() {
+    async fn assert_bootstrap_upstream_pool_refresh_metrics_record_reasons() {
         AppClock::start();
         let before = network_metrics::snapshot_for_profile_for_tests(OUTBOUND_PROFILE_LOCAL);
         let (bootstrap, _count) = spawn_bootstrap_server(vec![
@@ -532,6 +534,21 @@ mod tests {
                 ),
             "expected ip_changed pool refresh metric to increase: before={before:?}, after={after:?}"
         );
+    }
+
+    #[test]
+    fn bootstrap_upstream_pool_refresh_metrics_record_reasons() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("bootstrap metrics test runtime should build");
+        runtime.block_on(async {
+            tokio::spawn(assert_bootstrap_upstream_pool_refresh_metrics_record_reasons())
+                .await
+                .expect("bootstrap metrics test task should complete");
+        });
     }
 
     #[tokio::test]

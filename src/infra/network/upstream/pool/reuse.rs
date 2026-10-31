@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
+use crate::infra::network::metrics::UpstreamTimeoutStage;
 use crate::infra::network::upstream::config::{ConnectionInfo, ConnectionType};
 use crate::infra::network::upstream::pool::{
     Connection, ConnectionBuilder, ConnectionPool, DeadlineOutcome, ManagedMaintenanceTask,
@@ -86,6 +87,7 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
                 result
             }
             DeadlineOutcome::Expired => {
+                let timeout_error = deadline.timeout_error_for(UpstreamTimeoutStage::QueryIo);
                 match self.timeout_policy {
                     QueryTimeoutPolicy::Reuse if borrowed.connection().available() => {
                         borrowed.release();
@@ -96,7 +98,7 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
                         borrowed.close();
                     }
                 }
-                Err(deadline.timeout_error())
+                Err(timeout_error)
             }
         }
     }
@@ -113,7 +115,9 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         if check_count == 0 {
             if self.active_count.load(Ordering::Relaxed) < self.min_size {
                 debug!("Reuse pool expanding to maintain minimum size");
-                let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+                let _ = self
+                    .expand(QueryDeadline::background(self.connect_timeout))
+                    .await;
             }
             return;
         }
@@ -121,22 +125,27 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         for _ in 0..check_count {
             if let Some(conn) = self.connections.pop() {
                 if conn.available() {
-                    let idle = now - conn.last_used();
+                    let idle = now.saturating_sub(conn.last_used());
                     if idle < self.max_idle.as_millis() as u64 || conn.using_count() > 0 {
                         // still valid
                         if let Err(conn) = self.connections.push(conn) {
                             drop_vec.push(conn);
                             self.active_count.fetch_sub(1, Ordering::Relaxed);
+                            self.release_notified.notify_waiters();
+                        } else {
+                            self.release_notified.notify_one();
                         }
                     } else {
                         // idle timeout
                         drop_vec.push(conn);
                         self.active_count.fetch_sub(1, Ordering::Relaxed);
+                        self.release_notified.notify_waiters();
                     }
                 } else {
                     debug!("Dropping invalid connection");
                     invalid_vec.push(conn);
                     self.active_count.fetch_sub(1, Ordering::Relaxed);
+                    self.release_notified.notify_waiters();
                 }
             } else {
                 break;
@@ -145,16 +154,19 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
 
         // Maintain minimum connection count
         while self.active_count.load(Ordering::Relaxed) < self.min_size {
-            if !drop_vec.is_empty() {
-                if let Err(conn) = self.connections.push(drop_vec.pop().unwrap()) {
-                    drop_vec.push(conn);
-                    break;
-                } else {
-                    self.active_count.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
+            let Some(conn) = drop_vec.pop() else {
+                break;
+            };
+            let Some(reservation) = self.try_reserve_active() else {
+                drop_vec.push(conn);
+                break;
+            };
+            if let Err(conn) = self.connections.push(conn) {
+                drop_vec.push(conn);
                 break;
             }
+            reservation.commit();
+            self.release_notified.notify_one();
         }
 
         // Close dropped/invalid connections
@@ -174,7 +186,9 @@ impl<C: Connection> ConnectionPool<C> for ReusePool<C> {
         // Expand if below min_size
         if self.active_count.load(Ordering::Relaxed) < self.min_size {
             debug!("Reuse pool expanding to maintain minimum size");
-            let _ = self.expand(QueryDeadline::new(self.connect_timeout)).await;
+            let _ = self
+                .expand(QueryDeadline::background(self.connect_timeout))
+                .await;
         }
     }
 
@@ -231,7 +245,10 @@ impl<C: Connection> ReusePool<C> {
         if min_size > 0 {
             let arc = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = arc.expand(QueryDeadline::new(arc.connect_timeout)).await {
+                if let Err(e) = arc
+                    .expand(QueryDeadline::background(arc.connect_timeout))
+                    .await
+                {
                     warn!("Failed to prefill ReusePool: {:?}", e);
                 }
             });
@@ -258,7 +275,7 @@ impl<C: Connection> ReusePool<C> {
                     Ok(conn) => return Ok(BorrowedConnection::new(self, conn)),
                     Err(e) => {
                         if deadline.remaining().is_none() {
-                            return Err(deadline.timeout_error());
+                            return Err(e);
                         }
                         debug!("Failed to create reuse-pool connection: {:?}", e);
                         self.wait_backoff(deadline).await?;
@@ -288,7 +305,7 @@ impl<C: Connection> ReusePool<C> {
                         Ok(conn) => return Ok(BorrowedConnection::new(self, conn)),
                         Err(e) => {
                             if deadline.remaining().is_none() {
-                                return Err(deadline.timeout_error());
+                                return Err(e);
                             }
                             debug!("Failed to create reuse-pool connection: {:?}", e);
                             self.wait_backoff(deadline).await?;
@@ -298,7 +315,9 @@ impl<C: Connection> ReusePool<C> {
                 }
                 match deadline.run(notified.as_mut()).await {
                     DeadlineOutcome::Completed(()) => {}
-                    DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+                    DeadlineOutcome::Expired => {
+                        return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
+                    }
                 }
             }
         }
@@ -359,7 +378,7 @@ impl<C: Connection> ReusePool<C> {
                 Err(e) => {
                     debug!("Failed to create new connection: {:?}", e);
                     if deadline.remaining().is_none() {
-                        return Err(deadline.timeout_error());
+                        return Err(e);
                     }
                 }
             }
@@ -416,18 +435,22 @@ impl<C: Connection> ReusePool<C> {
                 Ok(conn)
             }
             DeadlineOutcome::Completed(Err(e)) => Err(e),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate))
+            }
         }
     }
 
     async fn wait_backoff(&self, deadline: QueryDeadline) -> Result<()> {
         let Some(remaining) = deadline.remaining() else {
-            return Err(deadline.timeout_error());
+            return Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire));
         };
         let delay = remaining.min(POOL_RETRY_BACKOFF);
         match deadline.run(tokio::time::sleep(delay)).await {
             DeadlineOutcome::Completed(()) => Ok(()),
-            DeadlineOutcome::Expired => Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                Err(deadline.timeout_error_for(UpstreamTimeoutStage::PoolAcquire))
+            }
         }
     }
 }
@@ -532,6 +555,10 @@ impl<C: Connection> Drop for ReusePool<C> {
         if let Some(handle) = task_handle {
             handle.stop_detached();
         }
+
+        while let Some(conn) = self.connections.pop() {
+            conn.close();
+        }
     }
 }
 
@@ -539,7 +566,7 @@ impl<C: Connection> Drop for ReusePool<C> {
 mod tests {
     use std::collections::VecDeque;
     use std::io;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::sync::{Arc, Mutex};
 
     use tracing::dispatcher::Dispatch;
@@ -552,7 +579,7 @@ mod tests {
     #[derive(Debug)]
     struct MockConnection {
         available: AtomicBool,
-        using_count: AtomicU16,
+        using_count: AtomicU32,
         last_used: AtomicU64,
         close_calls: AtomicUsize,
         query_calls: AtomicUsize,
@@ -560,10 +587,10 @@ mod tests {
     }
 
     impl MockConnection {
-        fn new(available: bool, using_count: u16, last_used: u64) -> Self {
+        fn new(available: bool, using_count: u32, last_used: u64) -> Self {
             Self {
                 available: AtomicBool::new(available),
-                using_count: AtomicU16::new(using_count),
+                using_count: AtomicU32::new(using_count),
                 last_used: AtomicU64::new(last_used),
                 close_calls: AtomicUsize::new(0),
                 query_calls: AtomicUsize::new(0),
@@ -600,7 +627,7 @@ mod tests {
             Ok(request)
         }
 
-        fn using_count(&self) -> u16 {
+        fn using_count(&self) -> u32 {
             self.using_count.load(Ordering::Relaxed)
         }
 
@@ -948,6 +975,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_maintain_saturates_idle_age_when_last_used_advances_past_snapshot() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let future_last_used = AppClock::elapsed_millis().saturating_add(1_000);
+        let conn = Arc::new(MockConnection::new(true, 0, future_last_used));
+        pool.connections
+            .push(conn.clone())
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        pool.maintain().await;
+
+        assert_eq!(conn.close_calls(), 0);
+        assert_eq!(pool.connections.len(), 1);
+        assert_eq!(pool.active_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_maintain_notifies_waiter_when_connection_is_requeued() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let conn = Arc::new(MockConnection::new(true, 0, AppClock::elapsed_millis()));
+        pool.connections
+            .push(conn)
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        pool.maintain().await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified.as_mut())
+            .await
+            .expect("maintenance should wake a waiter when a connection is requeued");
+    }
+
+    #[tokio::test]
+    async fn test_maintain_notifies_waiter_when_capacity_is_freed() {
+        AppClock::start();
+        let pool = make_pool(0, 1, 10, MockBuilder::new(vec![]));
+        let conn = Arc::new(MockConnection::new(false, 0, AppClock::elapsed_millis()));
+        pool.connections
+            .push(conn)
+            .expect("queue should accept connection");
+        pool.active_count.store(1, Ordering::Relaxed);
+
+        let notified = pool.release_notified.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        pool.maintain().await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified.as_mut())
+            .await
+            .expect("maintenance should wake waiters when connection capacity is freed");
+        assert_eq!(pool.active_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn test_get_rechecks_capacity_after_active_connection_closes() {
         let replacement = Arc::new(MockConnection::new(true, 0, 0));
         let pool = Arc::new(make_pool(
@@ -986,5 +1074,24 @@ mod tests {
 
         assert!(matched);
         assert_eq!(pool.active_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_drop_closes_all_idle_reuse_connections() {
+        let pool = make_pool(0, 2, 10, MockBuilder::new(vec![]));
+        let first = Arc::new(MockConnection::new(true, 0, 0));
+        let second = Arc::new(MockConnection::new(true, 0, 0));
+        pool.connections
+            .push(first.clone())
+            .expect("queue should accept first connection");
+        pool.connections
+            .push(second.clone())
+            .expect("queue should accept second connection");
+        pool.active_count.store(2, Ordering::Relaxed);
+
+        drop(pool);
+
+        assert_eq!(first.close_calls(), 1);
+        assert_eq!(second.close_calls(), 1);
     }
 }

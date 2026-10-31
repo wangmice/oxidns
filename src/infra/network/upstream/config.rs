@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::infra::error::{DnsError, Result};
@@ -49,12 +49,6 @@ impl ConnectionType {
             ConnectionType::DoH => vec!["doh", "https", "h3"],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProxySource {
-    Local,
-    Profile,
 }
 
 /// Configuration for building an upstream DNS server connection
@@ -175,6 +169,17 @@ pub struct UpstreamConfig {
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     pub idle_timeout: Option<Duration>,
 
+    /// Optional transport keepalive interval.
+    ///
+    /// Disabled by default to preserve existing upstream behavior. When set:
+    /// - DoH2 sends HTTP/2 PING frames while the connection is idle;
+    /// - DoH3 and DoQ enable QUIC transport keepalive;
+    /// - TCP and DoT enable TCP SO_KEEPALIVE with this idle probe time.
+    ///
+    /// A bare number is interpreted as seconds.
+    #[serde(default, deserialize_with = "deserialize_duration_option")]
+    pub keepalive_interval: Option<Duration>,
+
     /// Maximum number of connections in the pool
     ///
     /// Used as the pool size upper bound to limit per-upstream resource usage.
@@ -221,6 +226,14 @@ pub struct UpstreamConfig {
     /// When `true`, uses HTTP/3 (QUIC) instead of HTTP/2 for DoH.
     /// Requires the upstream server to support HTTP/3.
     pub enable_http3: Option<bool>,
+
+    /// Use HTTP POST for DNS-over-HTTPS requests.
+    ///
+    /// Defaults to `false`, which uses RFC 8484 GET requests. When enabled,
+    /// DoH over HTTP/2 and HTTP/3 send the DNS wire message as the request
+    /// body. This option is ignored for non-DoH upstream protocols.
+    #[serde(default)]
+    pub use_post: bool,
 
     /// Linux SO_MARK socket option for policy routing
     ///
@@ -275,6 +288,12 @@ pub struct ConnectionInfo {
     /// DoH request path (e.g., `/dns-query`), empty for non-HTTP protocols
     pub path: String,
 
+    /// Fixed query string from the configured DoH URL, without the leading
+    /// `?`. This is preserved separately from `path` so the per-request
+    /// RFC 8484 `dns` parameter can be appended without losing configured
+    /// parameters such as authentication tokens.
+    pub doh_query: Option<String>,
+
     /// Server hostname for TLS SNI and certificate validation
     pub server_name: String,
 
@@ -283,6 +302,9 @@ pub struct ConnectionInfo {
 
     /// Connection idle timeout in seconds
     pub idle_timeout: Duration,
+
+    /// Optional protocol/transport keepalive interval.
+    pub keepalive_interval: Option<Duration>,
 
     /// Maximum number of connections in the pool
     pub max_conns: Option<usize>,
@@ -299,6 +321,9 @@ pub struct ConnectionInfo {
     /// Use HTTP/3 (true) instead of HTTP/2 (false) for DoH
     pub enable_http3: bool,
 
+    /// Use HTTP POST instead of GET for DoH requests.
+    pub use_post: bool,
+
     /// Linux SO_MARK for packet marking (policy routing)
     pub so_mark: Option<u32>,
 
@@ -312,10 +337,13 @@ impl ConnectionInfo {
     pub(crate) const DEFAULT_MAX_CONNS_SIZE: usize = 64;
     pub(crate) const DEFAULT_MIN_CONNS_SIZE: usize = 0;
     pub(crate) const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+    /// H2 stores its last-used timestamp as a wrapping 32-bit millisecond tick.
+    /// Durations compared against that tick must stay below one complete wrap.
+    pub(crate) const H2_LAST_USED_TICK_RANGE_MS: u64 = 1u64 << 32;
     pub(crate) const MAX_CONFIGURED_CONNS_SIZE: usize = 4096;
 
     pub fn with_addr(addr: &str) -> Result<Self> {
-        let (connection_type, host, port, path, _) = detect_connection_type(addr)?;
+        let (connection_type, host, port, path, doh_query, _) = detect_connection_type(addr)?;
         let port = port.unwrap_or(connection_type.default_port());
 
         debug!(
@@ -334,13 +362,16 @@ impl ConnectionInfo {
             bootstrap: None,
             bootstrap_timeout: None,
             path,
+            doh_query,
             timeout: Self::DEFAULT_QUERY_TIMEOUT,
             server_name: host,
             insecure_skip_verify: false,
             idle_timeout: Self::DEFAULT_CONN_IDLE_TIME,
+            keepalive_interval: None,
             raw_addr: addr.to_string(),
             enable_pipeline: None,
             enable_http3: false,
+            use_post: false,
             so_mark: None,
             bind_to_device: None,
             max_conns: None,
@@ -375,16 +406,19 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             bootstrap_version,
             socks5,
             idle_timeout,
+            keepalive_interval,
             max_conns,
             min_conns,
             insecure_skip_verify,
             timeout,
             enable_pipeline,
             enable_http3,
+            use_post,
             so_mark,
             bind_to_device,
         } = upstream_config;
-        let (connection_type, host, port, path, helper_flags) = detect_connection_type(&addr)?;
+        let (connection_type, host, port, path, doh_query, helper_flags) =
+            detect_connection_type(&addr)?;
         let enable_pipeline = if helper_flags.force_pipeline {
             Some(true)
         } else {
@@ -395,9 +429,61 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
         } else {
             enable_http3.unwrap_or(false)
         };
+        let use_post = connection_type == ConnectionType::DoH && use_post;
         let port = config_port
             .or(port)
             .unwrap_or(connection_type.default_port());
+        let effective_idle_timeout = idle_timeout.unwrap_or(Self::DEFAULT_CONN_IDLE_TIME);
+        let effective_query_timeout = timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT);
+
+        if connection_type == ConnectionType::DoH && !enable_http3 {
+            let tick_range = Duration::from_millis(Self::H2_LAST_USED_TICK_RANGE_MS);
+            if effective_idle_timeout >= tick_range {
+                return Err(DnsError::plugin(
+                    "DoH2 idle_timeout must be less than 2^32 milliseconds (~49.7 days)",
+                ));
+            }
+            if keepalive_interval.is_some_and(|interval| interval >= tick_range) {
+                return Err(DnsError::plugin(
+                    "DoH2 keepalive_interval must be less than 2^32 milliseconds (~49.7 days)",
+                ));
+            }
+        }
+
+        if let Some(interval) = keepalive_interval {
+            if interval.is_zero() {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval must be greater than 0",
+                ));
+            }
+            if connection_type == ConnectionType::UDP {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval is not supported for UDP upstreams",
+                ));
+            }
+            if !effective_idle_timeout.is_zero() && interval >= effective_idle_timeout {
+                return Err(DnsError::plugin(
+                    "upstream keepalive_interval must be less than idle_timeout",
+                ));
+            }
+
+            // DoQ and DoH3 also have QUIC's transport-level idle timeout.
+            // Keepalive must fire before that deadline or it cannot keep the
+            // connection alive. Keep this calculation in sync with
+            // `conn::quic_idle_timeout`.
+            if connection_type == ConnectionType::DoQ
+                || (connection_type == ConnectionType::DoH && enable_http3)
+            {
+                let quic_idle_timeout = effective_query_timeout
+                    .checked_mul(3)
+                    .unwrap_or(Duration::MAX);
+                if interval >= quic_idle_timeout {
+                    return Err(DnsError::plugin(
+                        "upstream keepalive_interval must be less than the QUIC idle timeout (3x timeout)",
+                    ));
+                }
+            }
+        }
 
         if let Some(max_conns) = max_conns {
             if max_conns == 0 {
@@ -480,34 +566,12 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             (None, None)
         };
 
-        let raw_socks5 = if let Some(socks5_str) = socks5.as_deref() {
-            Some((
-                parse_socks5_opt(socks5_str).ok_or_else(|| {
-                    DnsError::plugin(format!("upstream has invalid socks5 proxy '{socks5_str}'"))
-                })?,
-                ProxySource::Local,
-            ))
+        let socks5 = if let Some(socks5_str) = socks5.as_deref() {
+            Some(parse_socks5_opt(socks5_str).ok_or_else(|| {
+                DnsError::plugin(format!("upstream has invalid socks5 proxy '{socks5_str}'"))
+            })?)
         } else {
-            outbound_policy
-                .as_ref()
-                .and_then(|policy| policy.proxy())
-                .map(|socks5| (socks5, ProxySource::Profile))
-        };
-        let socks5 = if let Some((socks5_opt, proxy_source)) = raw_socks5 {
-            match connection_type {
-                ConnectionType::TCP | ConnectionType::DoT => Some(socks5_opt),
-                ConnectionType::DoH if !enable_http3 => Some(socks5_opt),
-                _ => {
-                    info!(
-                        ?connection_type,
-                        ?proxy_source,
-                        "upstream protocol does not use SOCKS5 proxy; ignoring proxy"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
+            outbound_policy.as_ref().and_then(|policy| policy.proxy())
         };
 
         Ok(ConnectionInfo {
@@ -519,13 +583,16 @@ impl TryFrom<UpstreamConfig> for ConnectionInfo {
             bootstrap,
             bootstrap_timeout,
             path,
-            timeout: timeout.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT),
+            doh_query,
+            timeout: effective_query_timeout,
             server_name: host,
             insecure_skip_verify: insecure_skip_verify.unwrap_or(false),
-            idle_timeout: idle_timeout.unwrap_or(Self::DEFAULT_CONN_IDLE_TIME),
+            idle_timeout: effective_idle_timeout,
+            keepalive_interval,
             raw_addr: addr,
             enable_pipeline,
             enable_http3,
+            use_post,
             so_mark,
             bind_to_device,
             max_conns,
@@ -576,9 +643,16 @@ struct HelperFlags {
     force_http3: bool,
 }
 
-fn detect_connection_type(
-    addr: &str,
-) -> Result<(ConnectionType, String, Option<u16>, String, HelperFlags)> {
+type DetectedConnection = (
+    ConnectionType,
+    String,
+    Option<u16>,
+    String,
+    Option<String>,
+    HelperFlags,
+);
+
+fn detect_connection_type(addr: &str) -> Result<DetectedConnection> {
     if !addr.contains("//") {
         return detect_connection_type(&("udp://".to_owned() + addr));
     }
@@ -618,6 +692,20 @@ fn detect_connection_type(
         }
     };
 
+    let doh_query = if connection_type == ConnectionType::DoH {
+        if url.query_pairs().any(|(key, _)| key == "dns") {
+            return Err(DnsError::plugin(
+                "DoH upstream URL must not contain a preconfigured 'dns' query parameter",
+            ));
+        }
+
+        url.query()
+            .filter(|query| !query.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
     debug!(
         "Detected upstream: scheme={}, type={:?}, host={}, port={:?}, path={}",
         url.scheme(),
@@ -632,6 +720,7 @@ fn detect_connection_type(
         host,
         url.port(),
         url.path().to_string(),
+        doh_query,
         helper_flags,
     ))
 }

@@ -1,47 +1,87 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use futures::future::poll_fn;
 use h3::client::{RequestStream, SendRequest};
 use h3_quinn::{BidiStream, OpenStreams};
 use http::{Request, Version};
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
-use super::{UsingCountGuard, quic_idle_timeout};
+use super::{PoolUnavailableNotify, UsingCountGuard, quic_idle_timeout};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::buffer_pool::wire_buffer_pool;
 use crate::infra::network::dial::{
-    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic, connect_udp,
+    DialTarget, QuicDialOptions, SocketOptions, UdpDialOptions, connect_quic,
+    connect_quic_abstract, connect_udp,
 };
+use crate::infra::network::metrics::UpstreamTimeoutStage;
+use crate::infra::network::proxy::Socks5Opt;
+use crate::infra::network::response_validation::{DnsResponseIdPolicy, validate_dns_response};
+use crate::infra::network::transport::socks5_quic::Socks5QuicSocket;
 use crate::infra::network::upstream::conn::doh::{
-    build_dns_get_request, build_doh_request_uri, get_cap_buf_with_context_len,
+    MAX_DOH_DNS_BODY_SIZE, MAX_DOH_ERROR_BODY_SIZE, build_dns_get_request, build_dns_post_request,
+    build_doh_request_uri, get_cap_buf_with_context_len, parse_doh_retry_after,
+    validate_doh_content_type,
 };
 use crate::infra::network::upstream::pool::{ConnectionBuilder, DeadlineOutcome, QueryDeadline};
 use crate::infra::network::upstream::{Connection, ConnectionInfo};
 use crate::proto::Message;
 
+const H3_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn run_bounded_h3_shutdown<F, C>(timeout_duration: Duration, graceful: F, force_close: C)
+where
+    F: Future<Output = ()>,
+    C: FnOnce(),
+{
+    if timeout(timeout_duration, graceful).await.is_err() {
+        force_close();
+    }
+}
+
 enum H3RecvError {
-    Transport(DnsError),
+    Connection(DnsError),
+    Stream(DnsError),
     HttpStatus(DnsError),
+    InvalidResponse(DnsError),
+}
+
+fn classify_h3_stream_error(context: &str, error: h3::error::StreamError) -> H3RecvError {
+    let connection_scoped = matches!(
+        error,
+        h3::error::StreamError::ConnectionError(_) | h3::error::StreamError::RemoteClosing
+    );
+    let error = DnsError::protocol(format!("{context}: {error}"));
+    if connection_scoped {
+        H3RecvError::Connection(error)
+    } else {
+        H3RecvError::Stream(error)
+    }
 }
 
 pub struct H3Connection {
     connection_info: Arc<ConnectionInfo>,
     id: u16,
+    upstream: String,
     sender: SendRequest<OpenStreams, Bytes>,
-    using_count: AtomicU16,
+    using_count: AtomicU32,
     closed: AtomicBool,
     last_used: AtomicU64,
     request_uri: String,
+    use_post: bool,
     close_notify: Notify,
+    pool_unavailable_notify: PoolUnavailableNotify,
 }
 impl Debug for H3Connection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -52,17 +92,15 @@ impl Debug for H3Connection {
 #[async_trait]
 impl Connection for H3Connection {
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if !self.mark_closed() {
             return;
         }
-        debug!(
-            conn_id = self.id,
+        debug!(conn_id = self.id,
+            upstream = %self.upstream,
             upstream_tag = %self.connection_info.tag.as_deref().unwrap_or("<untagged>"),
             upstream_host = %self.connection_info.server_name,
-            upstream_port = self.connection_info.port,
-            "Closing H3 connection"
-        );
-        self.close_notify.notify_waiters();
+            upstream_port = self.connection_info.port, "Closing H3 connection");
+        self.close_notify.notify_one();
     }
 
     async fn query(&self, request: Message, _deadline: QueryDeadline) -> Result<Message> {
@@ -79,12 +117,19 @@ impl Connection for H3Connection {
         self.query_inner(request).await
     }
 
-    fn using_count(&self) -> u16 {
+    fn using_count(&self) -> u32 {
         self.using_count.load(Ordering::Relaxed)
     }
 
     fn available(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+    }
+
+    fn register_unavailable_notify(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.pool_unavailable_notify.register(notify);
+        if self.closed.load(Ordering::Acquire) {
+            self.pool_unavailable_notify.notify_pool();
+        }
     }
 
     fn last_used(&self) -> u64 {
@@ -93,51 +138,101 @@ impl Connection for H3Connection {
 }
 
 impl H3Connection {
+    fn mark_closed(&self) -> bool {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.pool_unavailable_notify.notify_pool();
+        true
+    }
+
     async fn query_inner(&self, request: Message) -> Result<Message> {
-        let raw_id = request.id();
         let mut body_bytes = wire_buffer_pool().acquire();
         request.append_to_with_id(0, &mut body_bytes)?;
 
-        let http_request = build_dns_get_request(
-            self.request_uri.clone(),
-            body_bytes.as_slice(),
-            Version::HTTP_3,
-        );
+        let (http_request, post_body) = if self.use_post {
+            (
+                build_dns_post_request(self.request_uri.as_str(), Version::HTTP_3)?,
+                Some(Bytes::copy_from_slice(body_bytes.as_slice())),
+            )
+        } else {
+            (
+                build_dns_get_request(
+                    self.request_uri.as_str(),
+                    body_bytes.as_slice(),
+                    Version::HTTP_3,
+                )?,
+                None,
+            )
+        };
+        drop(body_bytes);
 
-        self.do_request(http_request, raw_id).await
+        self.do_request(http_request, post_body, &request).await
     }
 
-    async fn do_request(&self, http_request: Request<()>, raw_id: u16) -> Result<Message> {
-        let mut request_stream = self
-            .sender
-            .clone()
-            .send_request(http_request)
-            .await
-            .map_err(|e| {
-                self.close();
-                DnsError::protocol(format!("H3 send_request error: {e}"))
-            })?;
+    async fn do_request(
+        &self,
+        http_request: Request<()>,
+        post_body: Option<Bytes>,
+        request: &Message,
+    ) -> Result<Message> {
+        let raw_id = request.id();
+        let mut request_stream = match self.sender.clone().send_request(http_request).await {
+            Ok(stream) => stream,
+            Err(error) => match classify_h3_stream_error("H3 send_request error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            },
+        };
 
-        request_stream.finish().await.map_err(|err| {
-            self.close();
-            DnsError::protocol(format!("H3 received a stream error: {err}"))
-        })?;
+        if let Some(post_body) = post_body
+            && let Err(error) = request_stream.send_data(post_body).await
+        {
+            match classify_h3_stream_error("H3 send_data error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            }
+        }
+
+        if let Err(error) = request_stream.finish().await {
+            match classify_h3_stream_error("H3 finish stream error", error) {
+                H3RecvError::Connection(error) => {
+                    self.close();
+                    return Err(error);
+                }
+                H3RecvError::Stream(error) => return Err(error),
+                H3RecvError::HttpStatus(_) | H3RecvError::InvalidResponse(_) => unreachable!(),
+            }
+        }
 
         match recv(request_stream).await {
             Ok(bytes) => {
                 let mut resp = Message::from_bytes(&bytes)?;
+                validate_dns_response(request, &resp, DnsResponseIdPolicy::Exact(0))?;
                 resp.set_id(raw_id);
                 self.last_used
                     .store(AppClock::elapsed_millis(), Ordering::Relaxed);
-                trace!(conn_id = self.id, raw_id, "Received H3 response");
+                trace!(conn_id = self.id,
+            upstream = %self.upstream, raw_id, "Received H3 response");
                 Ok(resp)
             }
-            Err(H3RecvError::Transport(e)) => {
+            Err(H3RecvError::Connection(e)) => {
                 self.close();
-                warn!(conn_id = self.id, raw_id, ?e, "H3 request error");
                 Err(e)
             }
-            Err(H3RecvError::HttpStatus(e)) => Err(e),
+            Err(
+                H3RecvError::Stream(e)
+                | H3RecvError::HttpStatus(e)
+                | H3RecvError::InvalidResponse(e),
+            ) => Err(e),
         }
     }
 }
@@ -146,15 +241,20 @@ impl H3Connection {
 #[derive(Debug)]
 pub struct H3ConnectionBuilder {
     target: DialTarget,
+    upstream: String,
     socket_options: SocketOptions,
+    socks5: Option<Socks5Opt>,
     request_uri: String,
+    use_post: bool,
     insecure_skip_verify: bool,
     timeout: std::time::Duration,
+    keepalive_interval: Option<std::time::Duration>,
 }
 
 impl H3ConnectionBuilder {
     pub fn new(connection_info: &ConnectionInfo) -> Self {
         Self {
+            upstream: connection_info.raw_addr.clone(),
             target: DialTarget::new(
                 connection_info.remote_ip,
                 connection_info.server_name.clone(),
@@ -164,9 +264,12 @@ impl H3ConnectionBuilder {
                 connection_info.so_mark,
                 connection_info.bind_to_device.clone(),
             ),
+            socks5: connection_info.socks5.clone(),
             request_uri: build_doh_request_uri(connection_info),
+            use_post: connection_info.use_post,
             insecure_skip_verify: connection_info.insecure_skip_verify,
             timeout: connection_info.timeout,
+            keepalive_interval: connection_info.keepalive_interval,
         }
     }
 }
@@ -179,25 +282,49 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         deadline: QueryDeadline,
         connection_info: Arc<ConnectionInfo>,
     ) -> Result<Arc<H3Connection>> {
-        let socket = connect_udp(UdpDialOptions::new(
+        let dial_options = QuicDialOptions::new(
             self.target.clone(),
-            self.socket_options.clone(),
-        ))?;
-
-        let quic_conn = connect_quic(
-            socket,
-            QuicDialOptions::new(
-                self.target.clone(),
-                self.insecure_skip_verify,
-                deadline
-                    .remaining()
-                    .ok_or_else(|| deadline.timeout_error())?,
-                quic_idle_timeout(self.timeout),
-                vec![b"h3".to_vec()],
-            ),
+            self.insecure_skip_verify,
+            deadline.remaining().ok_or_else(|| {
+                deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate)
+            })?,
+            quic_idle_timeout(self.timeout),
+            vec![b"h3".to_vec()],
         )
-        .await?;
+        .with_query_deadline(deadline, UpstreamTimeoutStage::ProtocolHandshake)
+        .with_keep_alive_interval(self.keepalive_interval);
+        let quic_conn = if let Some(socks5) = self.socks5.clone() {
+            let (socket, peer_addr) = match deadline
+                .run(Socks5QuicSocket::connect(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                    socks5,
+                ))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
+            connect_quic_abstract(socket, peer_addr, dial_options).await?
+        } else {
+            let socket = match deadline
+                .run(connect_udp(UdpDialOptions::new(
+                    self.target.clone(),
+                    self.socket_options.clone(),
+                )))
+                .await
+            {
+                DeadlineOutcome::Completed(result) => result?,
+                DeadlineOutcome::Expired => {
+                    return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ConnectionCreate));
+                }
+            };
+            connect_quic(socket, dial_options).await?
+        };
 
+        let force_close_conn = quic_conn.clone();
         let h3_conn = h3_quinn::Connection::new(quic_conn);
 
         let (mut driver, send_request) = match deadline.run(h3::client::new(h3_conn)).await {
@@ -205,18 +332,23 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
             DeadlineOutcome::Completed(Err(e)) => {
                 return Err(DnsError::protocol(format!("h3 connection failed: {e}")));
             }
-            DeadlineOutcome::Expired => return Err(deadline.timeout_error()),
+            DeadlineOutcome::Expired => {
+                return Err(deadline.timeout_error_for(UpstreamTimeoutStage::ProtocolHandshake));
+            }
         };
 
         let h3_conn = Arc::new(H3Connection {
             connection_info,
             id: conn_id,
+            upstream: self.upstream.clone(),
             sender: send_request,
             closed: AtomicBool::new(false),
             last_used: AtomicU64::new(AppClock::elapsed_millis()),
-            using_count: AtomicU16::new(0),
+            using_count: AtomicU32::new(0),
             request_uri: self.request_uri.clone(),
+            use_post: self.use_post,
             close_notify: Notify::new(),
+            pool_unavailable_notify: PoolUnavailableNotify::default(),
         });
 
         let _conn = h3_conn.clone();
@@ -224,14 +356,38 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
         let _driver_handle = tokio::spawn(async move {
             select! {
                 _ = poll_fn(|cx| driver.poll_close(cx)) => {
-                    _conn.close();
-                    debug!(conn_id, "H3 connection poll closed");
+                    _conn.mark_closed();
+                    debug!(conn_id, upstream = %_conn.upstream, "H3 connection poll closed");
                 }
-                _ = _conn.close_notify.notified()=>{
-                    debug!(conn_id, "H3 connection closed by notify");
+                _ = _conn.close_notify.notified() => {
+                    debug!(conn_id, upstream = %_conn.upstream, "H3 connection shutdown requested");
+                    let graceful_upstream = _conn.upstream.clone();
+                    let force_close_upstream = _conn.upstream.clone();
+                    run_bounded_h3_shutdown(
+                        H3_GRACEFUL_SHUTDOWN_TIMEOUT,
+                        async {
+                            if let Err(e) = driver.shutdown(0).await {
+                                warn!(conn_id, upstream = %graceful_upstream, error = ?e, "H3 graceful shutdown failed");
+                            }
+                            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+                        },
+                        move || {
+                            warn!(
+                                conn_id,
+                                upstream = %force_close_upstream,
+                                timeout_secs = H3_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                                "H3 graceful shutdown deadline exceeded; force closing QUIC transport"
+                            );
+                            force_close_conn.close(
+                                quinn::VarInt::from_u64(h3::error::Code::H3_NO_ERROR.value())
+                                    .expect("H3_NO_ERROR must fit in a QUIC varint"),
+                                b"h3 graceful shutdown deadline",
+                            );
+                        },
+                    )
+                    .await;
                 }
             }
-            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         Ok(h3_conn)
@@ -241,26 +397,57 @@ impl ConnectionBuilder<H3Connection> for H3ConnectionBuilder {
 async fn recv(
     mut request_stream: RequestStream<BidiStream<Bytes>, Bytes>,
 ) -> std::result::Result<Bytes, H3RecvError> {
-    let mut response = request_stream.recv_response().await.map_err(|e| {
-        H3RecvError::Transport(DnsError::protocol(format!("H3 response error: {}", e)))
-    })?;
+    let response = request_stream
+        .recv_response()
+        .await
+        .map_err(|e| classify_h3_stream_error("H3 response error", e))?;
 
-    let mut response_bytes = get_cap_buf_with_context_len(&mut response);
+    let status_code = response.status();
+    if status_code == http::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = parse_doh_retry_after(response.headers());
+        request_stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        return Err(H3RecvError::HttpStatus(DnsError::doh_rate_limited(
+            retry_after,
+            "response body skipped after rate-limit headers",
+        )));
+    }
 
-    while let Some(partial_bytes) = request_stream.recv_data().await.map_err(|e| {
-        H3RecvError::Transport(DnsError::protocol(format!("h3 recv_data error: {e}")))
-    })? {
+    if status_code.is_success() {
+        validate_doh_content_type(response.headers()).map_err(H3RecvError::InvalidResponse)?;
+    }
+    let body_limit = if status_code.is_success() {
+        MAX_DOH_DNS_BODY_SIZE
+    } else {
+        MAX_DOH_ERROR_BODY_SIZE
+    };
+    let mut response_bytes = get_cap_buf_with_context_len(&response, body_limit);
+    let mut truncated = false;
+
+    while let Some(partial_bytes) = request_stream
+        .recv_data()
+        .await
+        .map_err(|e| classify_h3_stream_error("H3 recv_data error", e))?
+    {
+        let remaining = body_limit.saturating_sub(response_bytes.len());
+        if partial_bytes.remaining() > remaining {
+            if status_code.is_success() {
+                return Err(H3RecvError::InvalidResponse(DnsError::protocol(
+                    "DoH response body exceeds the 65535-byte DNS message limit",
+                )));
+            }
+            response_bytes.put(partial_bytes.take(remaining));
+            truncated = true;
+            break;
+        }
         response_bytes.put(partial_bytes);
     }
 
-    // Was it a successful request?
-    if !response.status().is_success() {
+    if !status_code.is_success() {
         let error_string = String::from_utf8_lossy(response_bytes.as_ref());
-
+        let suffix = if truncated { " (truncated)" } else { "" };
         Err(H3RecvError::HttpStatus(DnsError::protocol(format!(
-            "http unsuccessful code: {}, message: {}",
-            response.status(),
-            error_string
+            "http unsuccessful code: {}, message: {}{}",
+            status_code, error_string, suffix
         ))))
     } else {
         Ok(response_bytes.freeze())
@@ -272,6 +459,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_remote_closing_as_connection_scoped() {
+        let error = classify_h3_stream_error(
+            "H3 send_request error",
+            h3::error::StreamError::RemoteClosing,
+        );
+        assert!(matches!(error, H3RecvError::Connection(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_h3_shutdown_forces_transport_close_after_deadline() {
+        let forced = Arc::new(AtomicBool::new(false));
+        let forced_for_close = forced.clone();
+
+        run_bounded_h3_shutdown(
+            Duration::from_secs(1),
+            std::future::pending::<()>(),
+            move || {
+                forced_for_close.store(true, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert!(
+            forced.load(Ordering::Acquire),
+            "stalled graceful shutdown must force-close the QUIC transport"
+        );
+    }
+
+    #[test]
     fn test_builder_new_uses_http3_request_uri_and_flags() {
         let mut connection_info = ConnectionInfo::with_addr("h3://dns.example.com/dns-query")
             .expect("connection info should parse");
@@ -279,6 +495,7 @@ mod tests {
         connection_info.insecure_skip_verify = true;
         connection_info.so_mark = Some(7);
         connection_info.bind_to_device = Some("utun1".to_string());
+        connection_info.keepalive_interval = Some(std::time::Duration::from_secs(5));
 
         let builder = H3ConnectionBuilder::new(&connection_info);
 
@@ -290,7 +507,41 @@ mod tests {
         );
         assert!(builder.insecure_skip_verify);
         assert_eq!(builder.timeout, std::time::Duration::from_secs(4));
+        assert_eq!(
+            builder.keepalive_interval,
+            Some(std::time::Duration::from_secs(5))
+        );
         assert_eq!(builder.socket_options.so_mark(), Some(7));
         assert_eq!(builder.socket_options.bind_to_device(), Some("utun1"));
+    }
+
+    #[test]
+    fn test_builder_new_uses_post_uri_without_dns_parameter() {
+        let mut connection_info =
+            ConnectionInfo::with_addr("h3://dns.example.com/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
+        connection_info.use_post = true;
+
+        let builder = H3ConnectionBuilder::new(&connection_info);
+
+        assert!(builder.use_post);
+        assert_eq!(
+            builder.request_uri,
+            "https://dns.example.com/dns-query?token=abc&profile=fast"
+        );
+    }
+
+    #[test]
+    fn test_builder_new_preserves_fixed_doh_query_parameters() {
+        let connection_info =
+            ConnectionInfo::with_addr("h3://dns.example.com/dns-query?token=abc&profile=fast")
+                .expect("connection info should parse");
+
+        let builder = H3ConnectionBuilder::new(&connection_info);
+
+        assert_eq!(
+            builder.request_uri,
+            "https://dns.example.com/dns-query?token=abc&profile=fast&dns="
+        );
     }
 }

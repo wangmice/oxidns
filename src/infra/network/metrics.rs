@@ -18,6 +18,8 @@ pub(crate) const OUTBOUND_PROFILE_LOCAL: &str = "__local";
 pub(crate) const OUTBOUND_PROFILE_SYSTEM: &str = "__system";
 const PROTOCOL_COUNT: usize = 6;
 const REASON_COUNT: usize = 3;
+const UPSTREAM_TIMEOUT_STAGE_COUNT: usize = 4;
+const KEEPALIVE_RESULT_COUNT: usize = 3;
 
 static NETWORK_METRICS: OnceLock<Arc<NetworkMetrics>> = OnceLock::new();
 static NETWORK_METRICS_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -75,6 +77,72 @@ impl NetworkProtocol {
             Self::Doq => "doq",
             Self::Doh2 => "doh2",
             Self::Doh3 => "doh3",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpstreamTimeoutStage {
+    PoolAcquire,
+    ConnectionCreate,
+    ProtocolHandshake,
+    QueryIo,
+}
+
+impl UpstreamTimeoutStage {
+    const ALL: [Self; UPSTREAM_TIMEOUT_STAGE_COUNT] = [
+        Self::PoolAcquire,
+        Self::ConnectionCreate,
+        Self::ProtocolHandshake,
+        Self::QueryIo,
+    ];
+
+    #[inline]
+    const fn as_index(self) -> usize {
+        match self {
+            Self::PoolAcquire => 0,
+            Self::ConnectionCreate => 1,
+            Self::ProtocolHandshake => 2,
+            Self::QueryIo => 3,
+        }
+    }
+
+    #[inline]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquire => "pool_acquire",
+            Self::ConnectionCreate => "connection_create",
+            Self::ProtocolHandshake => "protocol_handshake",
+            Self::QueryIo => "query_io",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeepaliveResult {
+    Success,
+    Failed,
+    Timeout,
+}
+
+impl KeepaliveResult {
+    const ALL: [Self; KEEPALIVE_RESULT_COUNT] = [Self::Success, Self::Failed, Self::Timeout];
+
+    #[inline]
+    const fn as_index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::Failed => 1,
+            Self::Timeout => 2,
+        }
+    }
+
+    #[inline]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -197,6 +265,8 @@ impl NetworkProfileMetrics {
 #[derive(Debug, Default)]
 pub(crate) struct NetworkMetrics {
     profiles: Mutex<Vec<Arc<NetworkProfileMetrics>>>,
+    upstream_timeout_total: [AtomicU64; UPSTREAM_TIMEOUT_STAGE_COUNT],
+    upstream_keepalive_total: [[AtomicU64; KEEPALIVE_RESULT_COUNT]; PROTOCOL_COUNT],
 }
 
 impl NetworkMetrics {
@@ -228,6 +298,32 @@ impl MetricSource for NetworkMetrics {
     }
 
     fn collect(&self, sink: &mut dyn MetricSink) {
+        for stage in UpstreamTimeoutStage::ALL {
+            let labels = [MetricLabel::new("stage", stage.as_str())];
+            sink.emit(MetricSample::counter(
+                "network_upstream_timeout_total",
+                "Total upstream operation deadline expirations by network stage.",
+                &labels,
+                self.upstream_timeout_total[stage.as_index()].load(Ordering::Relaxed),
+            ));
+        }
+
+        for protocol in NetworkProtocol::ALL {
+            for result in KeepaliveResult::ALL {
+                let labels = [
+                    MetricLabel::new("protocol", protocol.as_str()),
+                    MetricLabel::new("result", result.as_str()),
+                ];
+                sink.emit(MetricSample::counter(
+                    "network_upstream_keepalive_total",
+                    "Total observable upstream keepalive outcomes.",
+                    &labels,
+                    self.upstream_keepalive_total[protocol.as_index()][result.as_index()]
+                        .load(Ordering::Relaxed),
+                ));
+            }
+        }
+
         let profiles = self
             .profiles
             .lock()
@@ -331,6 +427,19 @@ pub(crate) fn resolver_error(profile: &NetworkProfileMetrics) {
 }
 
 #[inline]
+pub(crate) fn upstream_timeout(stage: UpstreamTimeoutStage) {
+    ensure_registered();
+    network_metrics().upstream_timeout_total[stage.as_index()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(any(feature = "upstream-doh", test))]
+#[inline]
+pub(crate) fn upstream_keepalive(protocol: NetworkProtocol, result: KeepaliveResult) {
+    ensure_registered();
+    network_metrics().upstream_keepalive_total[protocol.as_index()][result.as_index()]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn upstream_pool_refresh(
     profile: &NetworkProfileMetrics,
     protocol: NetworkProtocol,
@@ -375,6 +484,8 @@ pub(crate) struct NetworkMetricsSnapshot {
     pub(crate) resolver_refresh_total: u64,
     pub(crate) resolver_error_total: u64,
     upstream_pool_refresh_total: [[u64; REASON_COUNT]; PROTOCOL_COUNT],
+    upstream_timeout_total: [u64; UPSTREAM_TIMEOUT_STAGE_COUNT],
+    upstream_keepalive_total: [[u64; KEEPALIVE_RESULT_COUNT]; PROTOCOL_COUNT],
 }
 
 #[cfg(test)]
@@ -385,6 +496,18 @@ impl NetworkMetricsSnapshot {
         reason: PoolRefreshReason,
     ) -> u64 {
         self.upstream_pool_refresh_total[protocol.as_index()][reason.as_index()]
+    }
+
+    pub(crate) fn upstream_timeout_total(&self, stage: UpstreamTimeoutStage) -> u64 {
+        self.upstream_timeout_total[stage.as_index()]
+    }
+
+    pub(crate) fn upstream_keepalive_total(
+        &self,
+        protocol: NetworkProtocol,
+        result: KeepaliveResult,
+    ) -> u64 {
+        self.upstream_keepalive_total[protocol.as_index()][result.as_index()]
     }
 }
 
@@ -401,6 +524,14 @@ pub(crate) fn snapshot_for_profile_for_tests(outbound_profile: &str) -> NetworkM
                 profile.upstream_pool_refresh[protocol][reason]
                     .total
                     .load(Ordering::Relaxed)
+            })
+        }),
+        upstream_timeout_total: std::array::from_fn(|stage| {
+            network_metrics().upstream_timeout_total[stage].load(Ordering::Relaxed)
+        }),
+        upstream_keepalive_total: std::array::from_fn(|protocol| {
+            std::array::from_fn(|result| {
+                network_metrics().upstream_keepalive_total[protocol][result].load(Ordering::Relaxed)
             })
         }),
     }
@@ -432,6 +563,23 @@ mod tests {
             PoolRefreshReason::Init,
             started_at_ms,
         );
+        upstream_timeout(UpstreamTimeoutStage::PoolAcquire);
+        upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Success);
+        upstream_keepalive(NetworkProtocol::Doh2, KeepaliveResult::Timeout);
+
+        let snapshot = snapshot_for_profile_for_tests("remote");
+        assert_eq!(
+            snapshot.upstream_timeout_total(UpstreamTimeoutStage::PoolAcquire),
+            1
+        );
+        assert_eq!(
+            snapshot.upstream_keepalive_total(NetworkProtocol::Doh2, KeepaliveResult::Success),
+            1
+        );
+        assert_eq!(
+            snapshot.upstream_keepalive_total(NetworkProtocol::Doh2, KeepaliveResult::Timeout),
+            1
+        );
 
         let output = render_prometheus_metrics();
         assert!(output.contains("network_resolver_cache_hit_total"));
@@ -439,6 +587,11 @@ mod tests {
         assert!(output.contains("network_resolver_refresh_total"));
         assert!(output.contains("network_resolver_error_total"));
         assert!(output.contains("network_upstream_pool_refresh_total"));
+        assert!(output.contains("network_upstream_timeout_total"));
+        assert!(output.contains("network_upstream_keepalive_total"));
+        assert!(output.contains("stage=\"pool_acquire\""));
+        assert!(output.contains("protocol=\"doh2\",result=\"success\""));
+        assert!(output.contains("protocol=\"doh2\",result=\"timeout\""));
         assert!(output.contains("outbound_profile=\"remote\""));
         assert!(output.contains("outbound_profile=\"remote\",protocol=\"udp\",reason=\"init\""));
     }

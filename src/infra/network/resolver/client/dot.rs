@@ -16,7 +16,7 @@ use crate::infra::error::Result;
 use crate::infra::network::deadline::DeadlineOutcome;
 use crate::infra::network::deadline::QueryDeadline;
 #[cfg(feature = "resolver-dot")]
-use crate::infra::network::dial::{SocketOptions, TlsDialOptions, connect_tls};
+use crate::infra::network::dial::{DialTarget, SocketOptions, TlsDialOptions, connect_tls};
 #[cfg(feature = "resolver-dot")]
 use crate::infra::network::proxy::connect_tcp as proxy_connect_tcp;
 #[cfg(feature = "resolver-dot")]
@@ -51,6 +51,15 @@ impl NameserverClient for DotNameserverClient {
 }
 
 #[cfg(feature = "resolver-dot")]
+#[inline]
+fn dot_tls_dial_options(
+    target: DialTarget,
+    handshake_timeout: std::time::Duration,
+) -> TlsDialOptions {
+    TlsDialOptions::new(target, false, handshake_timeout, vec![b"dot".to_vec()])
+}
+
+#[cfg(feature = "resolver-dot")]
 async fn query_dot_config(
     config: &NameserverConfig,
     request: Message,
@@ -69,13 +78,11 @@ async fn query_dot_config(
     };
     let tls_stream = connect_tls(
         stream,
-        TlsDialOptions::new(
+        dot_tls_dial_options(
             config.target(),
-            false,
             deadline
                 .remaining()
                 .ok_or_else(|| deadline.timeout_error())?,
-            Vec::new(),
         ),
     )
     .await?;
@@ -93,4 +100,21 @@ async fn query_dot_config(
     Err(DnsError::plugin(
         "nameserver DoT is not compiled into this build; rebuild with --features resolver-dot",
     ))
+}
+
+#[cfg(all(test, feature = "resolver-dot"))]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn dot_tls_options_advertise_dot_alpn() {
+        let target =
+            DialTarget::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 853));
+        let options = dot_tls_dial_options(target, Duration::from_secs(1));
+
+        assert_eq!(options.alpn(), &[b"dot".to_vec()]);
+    }
 }

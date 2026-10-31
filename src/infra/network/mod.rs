@@ -41,6 +41,7 @@ pub(crate) mod metrics;
 pub(crate) mod outbound;
 pub mod proxy;
 pub(crate) mod resolver;
+pub(crate) mod response_validation;
 #[cfg(any(feature = "_tls-client", feature = "_tls-server"))]
 pub mod tls_config;
 pub mod transport;
