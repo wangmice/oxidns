@@ -321,7 +321,9 @@ fn bench_arbitrary(c: &mut Criterion) {
                     .block_on(executor.execute_with_next(&mut ctx, None))
                     .expect("arbitrary execute should succeed");
                 black_box(step);
-                black_box(ctx.response().expect("response should be present"));
+                // `arbitrary` matches the complete (qname, qtype, qclass)
+                // tuple, so an ANY query intentionally misses typed records.
+                black_box(ctx.response());
             })
         });
     }
