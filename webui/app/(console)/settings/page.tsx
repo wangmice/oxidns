@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { AppHeader } from "@/components/shell/app-header";
-import { useAppStore } from "@/lib/store";
+import { shouldPersistPluginMutation, useAppStore } from "@/lib/store";
 import { useAuthStore } from "@/lib/auth-store";
 import {
   useUpdateStore,
@@ -10,7 +10,7 @@ import {
   type UpgradeApplyPhase,
   type UpgradeBundle,
 } from "@/lib/update-store";
-import { stringifyOxiDnsConfig, type OxiDnsConfig } from "@/lib/oxidns-config";
+import type { OxiDnsConfig } from "@/lib/oxidns-config";
 import { applyProviderFileAutoReloadSetting } from "@/lib/runtime-settings";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -422,7 +422,7 @@ export default function SettingsPage() {
   const system = useAppStore((s) => s.system);
   const buildInfo = useAppStore((s) => s.buildInfo);
   const reloadStatus = useAppStore((s) => s.reloadStatus);
-  const setYamlConfig = useAppStore((s) => s.setYamlConfig);
+  const stageSettingsConfig = useAppStore((s) => s.stageSettingsConfig);
   const saveConfig = useAppStore((s) => s.saveConfig);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const outboundMetrics = useAppStore((s) => s.outboundMetrics);
@@ -709,8 +709,8 @@ export default function SettingsPage() {
   const handleSaveTopLevelConfig = async () => {
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig()));
-      await saveConfig();
+      const resolution = await stageSettingsConfig(buildTopLevelConfig());
+      if (shouldPersistPluginMutation(resolution)) await saveConfig();
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;
@@ -720,8 +720,8 @@ export default function SettingsPage() {
   const handleRestartTopLevelConfig = async () => {
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig()));
-      await restartApp();
+      const resolution = await stageSettingsConfig(buildTopLevelConfig());
+      if (shouldPersistPluginMutation(resolution)) await restartApp();
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;
@@ -737,7 +737,10 @@ export default function SettingsPage() {
     const override: AuthOverride = { enabled, username: uname, password: pwd };
     try {
       setSettingsError(null);
-      setYamlConfig(stringifyOxiDnsConfig(buildTopLevelConfig(override)));
+      const resolution = await stageSettingsConfig(
+        buildTopLevelConfig(override),
+      );
+      if (!shouldPersistPluginMutation(resolution)) return;
     } catch (error) {
       if (error instanceof Error) setSettingsError(error.message);
       throw error;

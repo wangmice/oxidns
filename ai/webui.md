@@ -74,6 +74,10 @@ Paths in this guide are relative to `webui/` unless stated otherwise.
   for review or explicit confirmation when only a localized reconstruction is
   possible. The full YAML editor remains authoritative for intentional raw
   text changes.
+- Structured settings edits (including save, restart, and authentication changes)
+  must use the same source-backed YAML patch/confirmation flow. Never serialize
+  the complete config model to apply a settings form. Unsafe alias or node-type
+  changes must stop for manual YAML review rather than silently rewriting source.
 
 ### Shared Toasts and asynchronous runtime actions
 

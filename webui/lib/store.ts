@@ -12,6 +12,7 @@ import {
   type OxiDnsConfig,
 } from "./oxidns-config";
 import {
+  patchConfigYaml,
   patchPluginsYaml,
   type PluginYamlPatchResult,
 } from "./oxidns-config-patch";
@@ -183,6 +184,9 @@ interface AppState {
   setEditorMode: (mode: boolean) => void;
   setHistoryOpen: (open: boolean) => void;
   setYamlConfig: (config: string) => void;
+  stageSettingsConfig: (
+    config: OxiDnsConfig,
+  ) => Promise<PluginMutationResolution>;
   resolveConfigPatchConfirmation: (
     choice: ConfigPatchConfirmationChoice,
   ) => void;
@@ -338,6 +342,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDetailOpen: (open) => set({ detailOpen: open }),
   setEditorMode: (mode) => set({ editorMode: mode }),
   setHistoryOpen: (open) => set({ historyOpen: open }),
+  stageSettingsConfig: (config) =>
+    stageConfigModelMutation(set, get, config, { patchSettings: true }),
   resolveConfigPatchConfirmation: (choice) => {
     const pending = pendingConfigPatch;
     if (!pending) return;
@@ -1429,6 +1435,7 @@ function applyConfigValidationResponse(
 }
 
 interface ConfigModelMutationOptions {
+  patchSettings?: boolean;
   plugins?: PluginInstance[];
   selectedTag?: string | null;
   renamedTags?: ReadonlyMap<string, string>;
@@ -1453,7 +1460,7 @@ async function stageConfigModelMutation(
 ): Promise<PluginMutationResolution> {
   if (pendingConfigPatch) return "cancelled";
   const state = get();
-  const result = patchPluginsYaml(
+  const result = (options.patchSettings ? patchConfigYaml : patchPluginsYaml)(
     state.configText,
     state.configModel,
     configModel,
