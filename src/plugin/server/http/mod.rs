@@ -34,11 +34,16 @@ use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::http::entry::HttpDnsEntry;
 use crate::plugin::server::http::http_dispatcher::HttpDispatcher;
-use crate::plugin::server::{RequestHandle, Server, ServerMetrics};
+use crate::plugin::server::{
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundRequestLimiter, RequestHandle, Server,
+    ServerMetrics,
+};
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
 
 mod entry;
+#[cfg(feature = "server-doh3")]
+mod http3_quinn;
 #[cfg(feature = "server-doh3")]
 mod http3_server;
 mod http_dispatcher;
@@ -231,6 +236,8 @@ impl HttpServer {
             "Spawning HTTP server tasks"
         );
 
+        let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
+
         task_handles.push(tokio::spawn(http_server::run_server(
             listen,
             self.dispatcher.clone(),
@@ -238,6 +245,7 @@ impl HttpServer {
             self.alt_svc.clone(),
             self.idle_timeout,
             self.src_ip_header.clone(),
+            request_limiter.clone(),
             self.shutdown_tx.subscribe(),
             http_startup_tx,
         )));
@@ -255,6 +263,7 @@ impl HttpServer {
                     cfg,
                     self.idle_timeout,
                     self.src_ip_header.clone(),
+                    request_limiter.clone(),
                     self.shutdown_tx.subscribe(),
                     h3_startup_tx,
                 )));

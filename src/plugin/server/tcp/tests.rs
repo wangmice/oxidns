@@ -26,7 +26,7 @@ fn test_tcp_factory_requires_args() {
 
 #[tokio::test]
 async fn test_build_tcp_listener_accepts_port_only_shorthand() {
-    let listener = build_tcp_listener(parse_listen_addr(":0").unwrap(), Duration::from_secs(5))
+    let listener = build_tcp_listener(parse_listen_addr(":0").unwrap())
         .expect("port-only shorthand should bind");
     let addr = listener
         .local_addr()
@@ -150,6 +150,8 @@ async fn connection_exit_preserves_accepted_requests_and_releases_writer() {
         });
         let requests = TaskTracker::new();
         let tracked = requests.clone();
+        let limiter = InboundRequestLimiter::new(1);
+        let stream_limiter = limiter.clone();
         let connection = AbortOnDropHandle::new(tokio::spawn(async move {
             handle_dns_stream(
                 stream,
@@ -157,6 +159,7 @@ async fn connection_exit_preserves_accepted_requests_and_releases_writer() {
                 handler,
                 None,
                 &tracked,
+                stream_limiter,
             )
             .await;
         }));
@@ -172,6 +175,10 @@ async fn connection_exit_preserves_accepted_requests_and_releases_writer() {
             .await
             .expect("connection should exit without waiting for the executor");
         assert_eq!(result.is_err(), cancel);
+        assert!(
+            limiter.try_acquire().is_none(),
+            "disconnected work must retain server capacity"
+        );
         // A detached writer would keep its half alive while the request holds
         // a sender. This must reach EOF before that request is released.
         let mut byte = [0];
@@ -252,6 +259,7 @@ async fn write_failure_closes_connection_while_reader_is_pending() {
             handler,
             None,
             &tracked,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         )
         .await;
     }));
@@ -313,6 +321,7 @@ async fn pipelined_requests_can_complete_out_of_order() {
             handler,
             None,
             &tracked,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         )
         .await;
     }));
@@ -364,6 +373,7 @@ async fn cancellation_releases_a_writer_blocked_mid_frame() {
             handler,
             None,
             &tracked,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
         )
         .await;
     }));
@@ -395,6 +405,110 @@ async fn cancellation_releases_a_writer_blocked_mid_frame() {
         .await
         .expect("connection cancellation must release a blocked writer")
         .unwrap();
+    requests.close();
+    tokio::time::timeout(Duration::from_secs(2), requests.wait())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pipelined_burst_keeps_writing_under_admission_pressure() {
+    use crate::infra::network::transport::tcp::TcpTransportReader;
+
+    let (client, stream) = tokio::io::duplex(64 * 1024);
+    let executor = GatedExecutor::new();
+    let handler = Arc::new(RequestHandle {
+        entry_executor: executor,
+        metrics: None,
+    });
+    let requests = TaskTracker::new();
+    let tracked = requests.clone();
+    let connection = AbortOnDropHandle::new(tokio::spawn(async move {
+        handle_dns_stream(
+            stream,
+            "127.0.0.1:335".parse().unwrap(),
+            handler,
+            None,
+            &tracked,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
+        )
+        .await;
+    }));
+    let (reader, writer) = tokio::io::split(client);
+    let mut reader = TcpTransportReader::new(reader);
+    let mut writer = TcpTransportWriter::new(writer);
+    let count = DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION * 4 + 3;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..count {
+            let mut message = request();
+            message.set_id(1000 + i as u16);
+            writer.write_message(&message).await.unwrap();
+        }
+        let mut received = std::collections::HashSet::new();
+        for _ in 0..count {
+            let response = reader.read_message().await.unwrap();
+            assert!(
+                received.insert(response.id()),
+                "responses must not be duplicated"
+            );
+        }
+        assert_eq!(received, (1000..1000 + count as u16).collect());
+    })
+    .await
+    .expect("admission backpressure must not starve the response writer");
+    drop(reader);
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(2), connection)
+        .await
+        .unwrap()
+        .unwrap();
+    requests.close();
+    tokio::time::timeout(Duration::from_secs(2), requests.wait())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn connection_limit_blocks_dispatch_until_a_request_finishes() {
+    let (mut client, stream) = tokio::io::duplex(64 * 1024);
+    let executor = GatedExecutor::new();
+    let handler = Arc::new(RequestHandle {
+        entry_executor: executor.clone(),
+        metrics: None,
+    });
+    let requests = TaskTracker::new();
+    let tracked = requests.clone();
+    let connection = AbortOnDropHandle::new(tokio::spawn(async move {
+        handle_dns_stream(
+            stream,
+            "127.0.0.1:335".parse().unwrap(),
+            handler,
+            None,
+            &tracked,
+            InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS),
+        )
+        .await;
+    }));
+    let mut writer = TcpTransportWriter::new(&mut client);
+    for _ in 0..=DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION {
+        writer.write_message(&request()).await.unwrap();
+    }
+    for _ in 0..DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION {
+        wait_for(&executor.started).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), executor.started.acquire())
+            .await
+            .is_err(),
+        "an extra request must wait before its executor is spawned"
+    );
+    executor.release.add_permits(1);
+    wait_for(&executor.started).await;
+    connection.abort();
+    assert!(connection.await.is_err());
+    executor
+        .release
+        .add_permits(DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION);
     requests.close();
     tokio::time::timeout(Duration::from_secs(2), requests.wait())
         .await

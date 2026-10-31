@@ -23,10 +23,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use socket2::{Socket, TcpKeepalive};
+use socket2::Socket;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 #[cfg(feature = "server-dot")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,9 @@ use crate::infra::observability::metrics::{register_metric_source, unregister_me
 use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
-    ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT, RequestHandle, RequestMeta, Server, ServerMetrics,
+    ActivityTrackedIo, ConnectionActivity, ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT,
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
+    InboundRequestLimiter, RequestHandle, RequestMeta, Server, ServerMetrics,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
@@ -85,8 +87,8 @@ pub struct TcpServerConfig {
 
     /// TCP connection idle timeout in seconds.
     ///
-    /// - Default: 10 seconds if omitted.
-    /// - Applied as TCP keepalive interval for long-lived connections.
+    /// - Default: 30 seconds if omitted.
+    /// - Closes a connection after this much transport inactivity.
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     idle_timeout: Option<Duration>,
 }
@@ -215,7 +217,7 @@ async fn run_server(
     startup_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
 ) {
     let mut startup_tx = startup_tx;
-    let listener = match build_tcp_listener(addr, idle_timeout) {
+    let listener = match build_tcp_listener(addr) {
         Ok(s) => s,
         Err(e) => {
             if let Some(tx) = startup_tx.take() {
@@ -237,6 +239,8 @@ async fn run_server(
         listen = %addr,
         idle_timeout_secs = idle_timeout.as_secs(),
         tls = %tls_mode,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        max_inflight_per_connection = DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
         "TCP server bound successfully"
     );
 
@@ -244,6 +248,7 @@ async fn run_server(
     let requests = TaskTracker::new();
     let shutdown_token = CancellationToken::new();
     let active_connections = Arc::new(AtomicU64::new(0));
+    let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
 
     loop {
         tokio::select! {
@@ -256,20 +261,31 @@ async fn run_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, src)) => {
+                        let activity = Arc::new(ConnectionActivity::new());
+                        let stream = ActivityTrackedIo::new(stream, activity.clone());
                         let handler = handler.clone();
                         #[cfg(feature = "server-dot")]
                         let tls_acceptor = tls_acceptor.clone();
                         let task_shutdown = shutdown_token.clone();
                         let requests = requests.clone();
                         let active_connections = active_connections.clone();
+                        let request_limiter = request_limiter.clone();
 
                         let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
                         debug!("New connection from {} (active: {})", src, active);
                         connections.spawn(async move {
                             let _connection_guard =
                                 ConnectionGuard::new(active_connections.clone(), src, "TCP");
+
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
+                                _ = activity.wait_until_idle(idle_timeout) => {
+                                    debug!(
+                                        client = %src,
+                                        idle_timeout_secs = idle_timeout.as_secs_f64(),
+                                        "Closing idle TCP connection"
+                                    );
+                                }
                                 _ = async move {
                                     #[cfg(feature = "server-dot")]
                                     {
@@ -283,7 +299,7 @@ async fn run_server(
                                                         .server_name()
                                                         .map(Arc::from);
                                                     debug!("TLS handshake completed for client {}", src);
-                                                    handle_dns_stream(tls_stream, src, handler, server_name, &requests)
+                                                    handle_dns_stream(tls_stream, src, handler, server_name, &requests, request_limiter)
                                                         .await;
                                                 }
                                                 Err(e) => {
@@ -293,14 +309,14 @@ async fn run_server(
                                         } else {
                                             // Plain TCP connection
                                             debug!("TCP server connected to client {}", src);
-                                            handle_dns_stream(stream, src, handler, None, &requests).await;
+                                            handle_dns_stream(stream, src, handler, None, &requests, request_limiter).await;
                                         }
                                     }
                                     #[cfg(not(feature = "server-dot"))]
                                     {
                                         // Plain TCP connection only (DoT requires --features server-dot).
                                         debug!("TCP server connected to client {}", src);
-                                        handle_dns_stream(stream, src, handler, None, &requests).await;
+                                        handle_dns_stream(stream, src, handler, None, &requests, request_limiter).await;
                                     }
                                 } => {}
                             }
@@ -319,7 +335,7 @@ async fn run_server(
     connections.close();
     connections.wait().await;
     // Connections can no longer dispatch work. Finish accepted requests before
-    // the registry destroys their executor dependencies, as for UDP servers.
+    // the registry destroys their executor dependencies.
     requests.close();
     requests.wait().await;
     info!(listen = %addr, "TCP server stopped");
@@ -333,59 +349,72 @@ async fn handle_dns_stream<S>(
     handler: Arc<RequestHandle>,
     server_name: Option<Arc<str>>,
     requests: &TaskTracker,
+    request_limiter: InboundRequestLimiter,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
     let transport = TcpTransport::new(stream);
     let (mut reader, writer) = transport.into_split();
 
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Message>(128);
+    let (sender, receiver) =
+        tokio::sync::mpsc::channel::<Message>(DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION);
 
-    // The writer is owned by the connection future, so EOF, write failure,
-    // and cancellation all drop the receiver and both stream halves together.
-    let write = write_tcp_responses(writer, receiver);
-    tokio::pin!(write);
-
-    loop {
-        let req_msg = tokio::select! {
-            result = &mut write => {
-                if let Err(error) = result {
-                    if is_peer_disconnect(&error) {
-                        debug!(%src, %error, "TCP peer closed the response stream");
-                    } else {
-                        warn!(%src, %error, "Failed to write TCP response");
-                    }
-                }
-                break;
-            }
-            result = reader.read_message() => match result {
+    let connection_limiter = Arc::new(Semaphore::new(DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION));
+    let read = async {
+        loop {
+            let req_msg = match reader.read_message().await {
                 Ok(message) => message,
                 Err(error) => {
                     debug!(%src, %error, "TCP client disconnected or read error");
                     break;
                 }
+            };
+            // Admit before spawning so both per-connection and server-wide
+            // handler counts remain bounded, including disconnected requests.
+            let connection_permit = connection_limiter
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("TCP connection request limiter is never closed");
+            let server_permit = request_limiter.acquire().await;
+            let handler = handler.clone();
+            let sender = sender.clone();
+            let server_name = server_name.clone();
+            // Accepted work belongs to the server and survives connection exit.
+            requests.spawn(async move {
+                let _connection_permit = connection_permit;
+                let _server_permit = server_permit;
+                let response = handler
+                    .handle_request(
+                        req_msg,
+                        src,
+                        RequestMeta {
+                            server_name,
+                            url_path: None,
+                        },
+                    )
+                    .await;
+                if sender.send(response.response).await.is_err() {
+                    debug!(%src, "Discarding TCP response after connection closed");
+                }
+            });
+        }
+    };
+
+    // Poll writes even while reads wait for admission capacity. Otherwise a
+    // full response queue can retain every permit and deadlock the connection.
+    // Both I/O futures are connection-owned and drop together on any exit.
+    tokio::select! {
+        _ = read => {}
+        result = write_tcp_responses(writer, receiver) => {
+            if let Err(error) = result {
+                if is_peer_disconnect(&error) {
+                    debug!(%src, %error, "TCP peer closed the response stream");
+                } else {
+                    warn!(%src, %error, "Failed to write TCP response");
+                }
             }
-        };
-        let handler = handler.clone();
-        let sender = sender.clone();
-        let server_name = server_name.clone();
-        // A client's connection lifetime does not cancel executor side effects.
-        // The server owns these tasks and waits for them during destruction.
-        requests.spawn(async move {
-            let response = handler
-                .handle_request(
-                    req_msg,
-                    src,
-                    RequestMeta {
-                        server_name,
-                        url_path: None,
-                    },
-                )
-                .await;
-            if sender.send(response.response).await.is_err() {
-                debug!(%src, "Discarding TCP response after connection closed");
-            }
-        });
+        }
     }
 }
 
@@ -416,14 +445,12 @@ where
 /// Build a TCP socket with reuse_address and reuse_port options when available
 ///
 /// Creates a socket optimized for DNS server workloads with port reuse enabled.
-pub fn build_tcp_listener(addr: SocketAddr, idle_timeout: Duration) -> Result<TcpListener> {
-    listen::build_tcp_listener(addr, 512, |sock| configure_tcp_socket(sock, idle_timeout))
+pub fn build_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    listen::build_tcp_listener(addr, 512, configure_tcp_socket)
 }
 
-fn configure_tcp_socket(sock: &Socket, idle_timeout: Duration) {
+fn configure_tcp_socket(sock: &Socket) {
     let _ = sock.set_tcp_nodelay(true);
-    let keepalive = TcpKeepalive::new().with_interval(idle_timeout);
-    let _ = sock.set_tcp_keepalive(&keepalive);
     #[cfg(all(
         unix,
         not(any(

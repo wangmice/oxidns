@@ -11,12 +11,25 @@ use std::time::Duration;
 
 use crate::plugin::Plugin;
 
+mod admission;
 mod connection;
 mod metrics;
 mod request;
 
-pub(crate) use connection::ConnectionGuard;
+#[cfg(feature = "server-doh")]
+pub(crate) use admission::DEFAULT_HTTP2_MAX_INFLIGHT_PER_CONNECTION;
+#[cfg(any(feature = "server-doq", feature = "server-doh3"))]
+pub(crate) use admission::DEFAULT_QUIC_MAX_BIDI_STREAMS;
+pub(crate) use admission::{
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, DEFAULT_TCP_MAX_INFLIGHT_PER_CONNECTION,
+    InboundRequestLimiter,
+};
+pub(crate) use connection::{ActivityTrackedIo, ConnectionActivity, ConnectionGuard};
 pub(crate) use metrics::ServerMetrics;
+pub(crate) use request::{
+    InboundDnsRequestDisposition, build_inbound_error_response_from_wire_header,
+    classify_inbound_dns_request_after_wire_header, classify_inbound_dns_wire_header,
+};
 pub use request::{RequestExit, RequestHandle, RequestMeta, RequestResult};
 
 #[cfg(feature = "server-doh")]

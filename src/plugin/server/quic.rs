@@ -25,17 +25,22 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::parse_listen_addr;
 use crate::infra::network::tls_config::load_tls_config;
 use crate::infra::network::transport::quic::{
-    QuicTransport, QuicTransportReader, QuicTransportWriter,
+    QuicReadError, QuicTransport, QuicTransportReader, QuicTransportWriter, QuicWriteError,
 };
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
 use crate::infra::system::deserialize_duration_option;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::server::{
-    ConnectionGuard, DEFAULT_SERVER_IDLE_TIMEOUT, RequestHandle, RequestMeta, Server,
-    ServerMetrics, quic_endpoint,
+    ConnectionGuard, DEFAULT_QUIC_MAX_BIDI_STREAMS, DEFAULT_SERVER_IDLE_TIMEOUT,
+    DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS, InboundRequestLimiter, RequestHandle, RequestMeta,
+    Server, ServerMetrics, quic_endpoint,
 };
 use crate::plugin::{Plugin, PluginFactory};
 use crate::plugin_factory;
+
+const DOQ_INTERNAL_ERROR: u32 = 0x1;
+const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
 
 /// QUIC server configuration
 #[derive(Deserialize)]
@@ -203,13 +208,19 @@ async fn run_server(
     if let Some(tx) = startup_tx.take() {
         let _ = tx.send(Ok(()));
     }
-    info!(listen = %addr, "QUIC server listening");
+    info!(
+        listen = %addr,
+        max_inflight_requests = DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS,
+        max_bidi_streams = DEFAULT_QUIC_MAX_BIDI_STREAMS,
+        "QUIC server listening"
+    );
     // QUIC endpoint created successfully; enter the accept loop.
     debug!("QUIC server event loop started on {}", addr);
 
     let tasks = TaskTracker::new();
     let shutdown_token = CancellationToken::new();
     let active_connections = Arc::new(AtomicU64::new(0));
+    let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
 
     // Accept QUIC connections and spawn a task per connection.
     loop {
@@ -226,13 +237,29 @@ async fn run_server(
                         let handler_clone = handler.clone();
                         let task_shutdown = shutdown_token.clone();
                         let active_connections = active_connections.clone();
+                        let request_limiter = request_limiter.clone();
                         tasks.spawn(async move {
                             let _connection_guard =
                                 ConnectionGuard::new(active_connections.clone(), connecting.remote_address(), "QUIC");
+                            let stream_tasks = TaskTracker::new();
+                            let stream_cancel = CancellationToken::new();
+                            let connection_stream_tasks = stream_tasks.clone();
+                            let connection_stream_cancel = stream_cancel.clone();
+
                             tokio::select! {
                                 _ = task_shutdown.cancelled() => {}
-                                _ = handle_quic_connection(connecting, handler_clone) => {}
+                                _ = handle_quic_connection(
+                                    connecting,
+                                    handler_clone,
+                                    request_limiter,
+                                    connection_stream_tasks,
+                                    connection_stream_cancel,
+                                ) => {}
                             }
+
+                            stream_cancel.cancel();
+                            stream_tasks.close();
+                            stream_tasks.wait().await;
                         });
                         debug!("New QUIC connection started (active: {})", active);
                     }
@@ -252,7 +279,13 @@ async fn run_server(
 /// QUIC). Each bi-directional stream represents a single DNS query/response
 /// exchange.
 #[hotpath::measure]
-async fn handle_quic_connection(connecting: quinn::Incoming, handler: Arc<RequestHandle>) {
+async fn handle_quic_connection(
+    connecting: quinn::Incoming,
+    handler: Arc<RequestHandle>,
+    request_limiter: InboundRequestLimiter,
+    stream_tasks: TaskTracker,
+    stream_cancel: CancellationToken,
+) {
     let remote_addr = connecting.remote_address();
     let connection = match connecting.await {
         Ok(c) => c,
@@ -270,62 +303,185 @@ async fn handle_quic_connection(connecting: quinn::Incoming, handler: Arc<Reques
     let server_name = server_name.map(Arc::from);
 
     loop {
-        match transport.accept_bi().await {
-            Ok((reader, writer)) => {
-                let handler = handler.clone();
-                let server_name = server_name.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_doq_bi_stream(
-                        reader,
-                        writer,
-                        handler.clone(),
-                        remote_addr,
-                        server_name,
-                    )
-                    .await
-                    {
+        let (reader, writer) = tokio::select! {
+            _ = stream_cancel.cancelled() => return,
+            result = transport.accept_bi() => match result {
+                Ok(streams) => streams,
+                Err(e) => {
+                    debug!("QUIC connection closed by {}: {}", remote_addr, e);
+                    return;
+                }
+            }
+        };
+
+        // Wait for server-wide capacity before creating a stream handler task.
+        // While saturated we stop accepting more streams from this connection,
+        // allowing QUIC's stream limit and flow control to provide backpressure.
+        let permit = tokio::select! {
+            _ = stream_cancel.cancelled() => return,
+            _ = transport.closed() => return,
+            permit = request_limiter.acquire() => permit,
+        };
+
+        let handler = handler.clone();
+        let server_name = server_name.clone();
+        let task_cancel = stream_cancel.clone();
+        let task_transport = transport.clone();
+        stream_tasks.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = task_cancel.cancelled() => {}
+                result = handle_doq_bi_stream(
+                    task_transport,
+                    reader,
+                    writer,
+                    handler,
+                    remote_addr,
+                    server_name,
+                ) => {
+                    if let Err(e) = result {
                         warn!("DoQ stream error ({}): {}", remote_addr, e);
                     }
-                });
+                }
             }
-            Err(e) => {
-                debug!("QUIC connection closed by {}: {}", remote_addr, e);
-                return;
-            }
-        }
+        });
     }
 }
 
 /// Handle a single DNS over QUIC (DoQ) bidirectional stream.
 /// Format: 2-byte big-endian length prefix followed by the DNS message payload.
 async fn handle_doq_bi_stream(
+    transport: QuicTransport,
     mut reader: QuicTransportReader,
     mut writer: QuicTransportWriter,
     handler: Arc<RequestHandle>,
     remote_addr: std::net::SocketAddr,
     server_name: Option<Arc<str>>,
 ) -> Result<()> {
-    match reader.read_message().await {
-        Ok(request_msg) => {
-            let response = handler
-                .handle_request(
-                    request_msg,
-                    remote_addr,
-                    RequestMeta {
-                        server_name,
-                        url_path: None,
-                    },
-                )
-                .await;
-            if let Err(e) = writer.write_message(&response.response).await {
-                warn!("Failed to send DoQ response to {}: {}", remote_addr, e);
-                return Ok(());
+    let request_msg = match reader.read_message_doq().await {
+        Ok(request_msg) => request_msg,
+        Err(QuicReadError::Protocol(message)) => {
+            warn!(
+                client = %remote_addr,
+                error = %message,
+                "Fatal DoQ protocol error while reading request"
+            );
+            transport.close_with_code(DOQ_PROTOCOL_ERROR, b"DoQ protocol error");
+            return Ok(());
+        }
+        Err(QuicReadError::StreamReset(code)) => {
+            debug!(
+                client = %remote_addr,
+                %code,
+                "DoQ request stream reset by client"
+            );
+            writer.reset(DOQ_REQUEST_CANCELLED);
+            return Ok(());
+        }
+        Err(QuicReadError::ConnectionLost(error)) => {
+            debug!(
+                client = %remote_addr,
+                error = ?error,
+                "QUIC connection lost while reading DoQ request"
+            );
+            return Ok(());
+        }
+        Err(QuicReadError::Stream(message)) => {
+            debug!(
+                client = %remote_addr,
+                error = %message,
+                "DoQ request stream read error"
+            );
+            writer.reset(DOQ_INTERNAL_ERROR);
+            return Ok(());
+        }
+    };
+
+    // A DoQ client can abandon the response direction with STOP_SENDING after
+    // it has already sent a complete request and FIN. Do not keep executing the
+    // DNS transaction (and holding the global inbound-request permit) until the
+    // eventual response write notices `WriteError::Stopped`.
+    //
+    // `SendStream::stopped()` is woken by STOP_SENDING. If this branch wins,
+    // dropping the `handle_request()` future propagates cancellation through
+    // the executor/upstream future chain. The surrounding stream task then
+    // returns and releases its `InboundRequestLimiter` permit.
+    let peer_stopped = writer.stopped();
+    tokio::pin!(peer_stopped);
+    let response = tokio::select! {
+        biased;
+
+        stopped = &mut peer_stopped => {
+            match stopped {
+                Ok(Some(code)) => {
+                    debug!(
+                        client = %remote_addr,
+                        %code,
+                        "Cancelling DoQ transaction after client STOP_SENDING"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        client = %remote_addr,
+                        "DoQ response send stream closed while request was executing"
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        client = %remote_addr,
+                        error = ?error,
+                        "QUIC connection lost while executing DoQ request"
+                    );
+                }
             }
-            let _ = writer.finish();
+            return Ok(());
         }
-        Err(e) => {
-            warn!("Failed to read DoQ request from {}: {}", remote_addr, e);
+
+        response = handler.handle_request(
+            request_msg,
+            remote_addr,
+            RequestMeta {
+                server_name,
+                url_path: None,
+            },
+        ) => response,
+    };
+
+    match writer.write_message_doq(&response.response).await {
+        Ok(()) => {}
+        Err(QuicWriteError::Stopped(code)) => {
+            debug!(
+                client = %remote_addr,
+                %code,
+                "DoQ transaction cancelled by client with STOP_SENDING"
+            );
+            return Ok(());
         }
+        Err(QuicWriteError::ConnectionLost(error)) => {
+            debug!(
+                client = %remote_addr,
+                error = ?error,
+                "QUIC connection lost while writing DoQ response"
+            );
+            return Ok(());
+        }
+        Err(QuicWriteError::Stream(message) | QuicWriteError::Encode(message)) => {
+            warn!(
+                client = %remote_addr,
+                error = %message,
+                "Failed to write DoQ response"
+            );
+            writer.reset(DOQ_INTERNAL_ERROR);
+            return Ok(());
+        }
+    }
+
+    if let Err(error) = writer.finish() {
+        debug!(
+            client = %remote_addr,
+            error = %error,
+            "Failed to finish DoQ response stream"
+        );
     }
     Ok(())
 }
