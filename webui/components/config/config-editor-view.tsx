@@ -26,6 +26,7 @@ import {
   ClipboardCheck,
   LogOut,
   PanelRightOpen,
+  X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/spinner";
@@ -46,6 +47,8 @@ export function ConfigEditorView() {
   const configEditorBaseline = useAppStore((s) => s.configEditorBaseline);
   const setYamlConfig = useAppStore((s) => s.setYamlConfig);
   const saveConfig = useAppStore((s) => s.saveConfig);
+  const cancelConfigEditing = useAppStore((s) => s.cancelConfigEditing);
+  const isApplying = useAppStore((s) => s.isApplying);
   const isConfigLoading = useAppStore((s) => s.isConfigLoading);
   const isConfigSaving = useAppStore((s) => s.isConfigSaving);
   const isRestarting = useAppStore((s) => s.isRestarting);
@@ -146,7 +149,7 @@ export function ConfigEditorView() {
     setIndexOpen(false);
   };
 
-  const busy = isConfigSaving || isRestarting;
+  const busy = isConfigSaving || isRestarting || isApplying;
 
   const shortcutsBlock = (
     <div className="border-t px-3 py-3 flex-shrink-0 space-y-2">
@@ -251,6 +254,15 @@ export function ConfigEditorView() {
           )}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => cancelConfigEditing(originalConfig)}
+            disabled={busy || isConfigLoading}
+          >
+            <X className="h-4 w-4 mr-1.5" />
+            {t(WEBUI.common.cancel)}
+          </Button>
           {isMobile && (
             <Button
               variant="outline"

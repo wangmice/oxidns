@@ -65,13 +65,14 @@ export function ConfigPatchConfirmationDialog() {
           >
             {t(WEBUI.configPatch.review)}
           </AlertDialogAction>
-          <AlertDialogAction
-            variant="warning"
-            disabled={!confirmation?.canForce}
-            onClick={() => resolve("force")}
-          >
-            {t(WEBUI.configPatch.force)}
-          </AlertDialogAction>
+          {confirmation?.canForce && (
+            <AlertDialogAction
+              variant="warning"
+              onClick={() => resolve("force")}
+            >
+              {t(WEBUI.configPatch.force)}
+            </AlertDialogAction>
+          )}
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

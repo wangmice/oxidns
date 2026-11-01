@@ -332,6 +332,141 @@ plugins: # keep
     expect(result.content).toContain("exec: $renamed # keep reference");
   });
 
+  it.each([
+    "{ mode: old, timeout: 2s }",
+    "{ mode: null, timeout: 2s }",
+    "{ mode:, timeout: 2s }",
+  ])(
+    "offers a complete bounded candidate for simultaneous changes from %s",
+    (args) => {
+      const prefix =
+        "\uFEFF---\r\nlog: { level: info } # keep\r\nplugins:\r\n  - tag: main\r\n    type: forward\r\n    x-extra: keep # extension\r\n    args: ";
+      const suffix =
+        " # args comment\r\n  - { tag: other, type: debug_print } # untouched\r\n...";
+      const source = prefix + args + suffix;
+      const before = configOf(source);
+      const after = structuredClone(before);
+      after.plugins[0].args = { mode: ["new"], timeout: "3s" };
+      const result = patchPluginsYaml(source, before, after);
+      expect(result.status).toBe("needs_confirmation");
+      if (result.status !== "needs_confirmation") return;
+      expect(result.candidate).toBeDefined();
+      expect(result.candidate?.affectedPath).toBe("plugins.main.args");
+      expect(result.candidate?.content.startsWith(prefix)).toBe(true);
+      expect(result.candidate?.content.endsWith(suffix)).toBe(true);
+      expect(configOf(result.candidate!.content)).toEqual(after);
+    },
+  );
+
+  it("falls back to one plugin when its type and null args both change", () => {
+    const prefix = "# header\nplugins:\n  - ";
+    const suffix =
+      "  - { tag: other, type: debug_print } # keep\nlog: { level: info }\n";
+    const source =
+      prefix +
+      "tag: main\n    type: forward\n    x-extra: { keep: true }\n    args:\n" +
+      suffix;
+    const before = configOf(source);
+    const after = structuredClone(before);
+    after.plugins[0].type = "qname";
+    after.plugins[0].args = ["new"];
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate?.affectedPath).toBe("plugins.main");
+    expect(result.candidate?.content.startsWith(prefix)).toBe(true);
+    expect(result.candidate?.content.endsWith(suffix)).toBe(true);
+    expect(result.candidate?.content).toContain("x-extra:\n      keep: true");
+    expect(configOf(result.candidate!.content)).toEqual(after);
+  });
+
+  it.each([false, true])(
+    "rejects stale source even on a no-op (%s)",
+    (noop) => {
+      const source =
+        "plugins: [{ tag: main, type: forward, args: { timeout: 2s } }]\nlog: { level: info }\n";
+      const before = configOf(source);
+      const after = structuredClone(before);
+      if (!noop) after.plugins[0].args = ["new"];
+      const result = patchPluginsYaml(
+        source.replace("info", "debug"),
+        before,
+        after,
+      );
+      expect(result.status).toBe("needs_confirmation");
+      if (result.status !== "needs_confirmation") return;
+      expect(result.candidate).toBeUndefined();
+    },
+  );
+
+  it("rejects a safe CST edit that would change an alias outside plugins", () => {
+    const source =
+      "plugins:\n  - tag: main\n    type: forward\n    args: &shared { timeout: 2s }\nshared: *shared\n";
+    const before = configOf(source);
+    const after = structuredClone(before);
+    after.plugins[0].args = { timeout: "3s" };
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate).toBeUndefined();
+  });
+
+  it("rejects silently dropped non-plugin changes", () => {
+    const source =
+      "plugins: [{ tag: main, type: forward, args: old }]\nlog: { level: info }\n";
+    const before = configOf(source);
+    const after = structuredClone(before);
+    after.plugins[0].args = ["new"];
+    after.log = { level: "debug" };
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate).toBeUndefined();
+  });
+
+  it("keeps the smallest failed node when it covers the complete edit", () => {
+    const source =
+      "plugins: [{ tag: main, type: forward, args: { mode: old, untouched: 'keep' } }] # tail\n";
+    const before = configOf(source);
+    const after = structuredClone(before);
+    (after.plugins[0].args as Record<string, unknown>).mode = ["new"];
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate?.affectedPath).toBe("plugins.main.args.mode");
+    expect(result.candidate?.content).toBe(
+      source.replace("mode: old", "mode: [ new ]"),
+    );
+  });
+
+  it("validates alias effects on schema-unknown plugin fields", () => {
+    const source =
+      "plugins:\n  - tag: main\n    type: forward\n    args: &shared { timeout: 2s }\n    x-shared: *shared\n";
+    const before = configOf(source);
+    const after = structuredClone(before);
+    after.plugins[0].args = { timeout: "3s" };
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate?.affectedPath).toBe("plugins.main");
+    expect(result.candidate?.content).toContain("x-shared:\n      timeout: 2s");
+    expect(configOf(result.candidate!.content)).toEqual(after);
+  });
+
+  it("refuses to widen a replacement to the complete plugins list", () => {
+    const source =
+      "plugins: [{ tag: one, type: forward, args: old }, { tag: two, type: forward, args: old }]\n";
+    const before = configOf(source);
+    const after = structuredClone(before);
+    after.plugins.forEach((plugin) => {
+      plugin.args = ["new"];
+    });
+    const result = patchPluginsYaml(source, before, after);
+    expect(result.status).toBe("needs_confirmation");
+    if (result.status !== "needs_confirmation") return;
+    expect(result.candidate).toBeUndefined();
+  });
+
   it("returns a reviewed local candidate instead of rewriting aliases", () => {
     const source = `shared: &shared { timeout: 2s }
 plugins:

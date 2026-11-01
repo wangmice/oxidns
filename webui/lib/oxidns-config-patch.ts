@@ -72,8 +72,44 @@ export function patchPluginsYaml(
   after: OxiDnsConfig,
   options: PluginYamlPatchOptions = {},
 ): PluginYamlPatchResult {
-  if (deepEqual(before.plugins, after.plugins)) {
+  const loaded = parseOxiDnsYaml(source);
+  if (!loaded.config || !deepEqual(loaded.config, before)) {
+    return confirmationResult(
+      "The YAML source no longer matches the loaded configuration; edit it manually",
+      "$",
+    );
+  }
+  if (deepEqual(before, after)) {
     return { status: "patched", content: source };
+  }
+  if (!deepEqual({ ...before, plugins: after.plugins }, after)) {
+    return confirmationResult(
+      "Plugin edits cannot change non-plugin configuration",
+      "$",
+    );
+  }
+  if (!source.endsWith("\n")) {
+    const eol = detectEol(source);
+    const result = patchPluginsYaml(source + eol, before, after, options);
+    const restoreEof = (content: string) =>
+      content.endsWith(eol) ? content.slice(0, -eol.length) : content;
+    if (result.status === "patched") {
+      const content = restoreEof(result.content);
+      return patchedConfigMatches(content, after)
+        ? { status: "patched", content }
+        : confirmationResult(
+            "Restoring the YAML EOF requires manual editing",
+            "plugins",
+          );
+    }
+    if (result.candidate) {
+      const content = restoreEof(result.candidate.content);
+      if (patchedConfigMatches(content, after)) {
+        return { ...result, candidate: { ...result.candidate, content } };
+      }
+      return confirmationResult(result.reason, result.affectedPath);
+    }
+    return result;
   }
   const eol = detectEol(source);
   let document;
@@ -102,6 +138,18 @@ export function patchPluginsYaml(
     }
 
     const pluginsNode = document.get("plugins", true);
+    const scalarPatch = deepEqual(
+      before.plugins.map((plugin) => plugin.tag),
+      after.plugins.map((plugin) => plugin.tag),
+    )
+      ? patchScalarValues(source, document.contents, before, after)
+      : undefined;
+    if (
+      scalarPatch !== undefined &&
+      unmanagedPluginKeysMatch(source, scalarPatch, before, after, options)
+    ) {
+      return { status: "patched", content: scalarPatch };
+    }
     let content: string;
     if (pluginsNode === undefined) {
       if (after.plugins.length === 0)
@@ -146,7 +194,10 @@ export function patchPluginsYaml(
       );
     }
 
-    if (!patchedPluginsMatch(content, after.plugins)) {
+    if (
+      !patchedConfigMatches(content, after) ||
+      !unmanagedPluginKeysMatch(source, content, before, after, options)
+    ) {
       throw new UnsafePluginYamlPatch(
         "The incremental YAML patch did not produce the requested plugin configuration",
         "plugins",
@@ -156,14 +207,14 @@ export function patchPluginsYaml(
     return { status: "patched", content };
   } catch (error) {
     if (error instanceof UnsafePluginYamlPatch) {
-      const candidate = createLocalizedCandidate(source, error, after.plugins);
-      return confirmationResult(
-        error.message,
-        error.path,
-        candidate
-          ? { content: candidate, affectedPath: error.path }
-          : undefined,
+      const candidate = createLocalizedCandidate(
+        source,
+        error,
+        before,
+        after,
+        options,
       );
+      return confirmationResult(error.message, error.path, candidate);
     }
     return confirmationResult(
       error instanceof Error ? error.message : "Unable to patch YAML source",
@@ -204,7 +255,12 @@ export function patchConfigYaml(
     const terminatedSource = source.endsWith("\n")
       ? source
       : source + detectEol(source);
-    const plugins = patchPluginsYaml(terminatedSource, before, after, options);
+    const plugins = patchPluginsYaml(
+      terminatedSource,
+      before,
+      { ...before, plugins: after.plugins },
+      options,
+    );
     if (plugins.status !== "patched") {
       return confirmationResult(plugins.reason, plugins.affectedPath);
     }
@@ -386,6 +442,90 @@ function reconcilePluginSequence(
   normalizeSequenceStarts(sequenceToken, eol);
 }
 
+// Value-only edits must never normalize their enclosing collections or trivia.
+function patchScalarValues(
+  source: string,
+  root: ParsedNode,
+  before: unknown,
+  after: OxiDnsConfig,
+): string | undefined {
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const collect = (
+    node: ParsedNode,
+    previous: unknown,
+    desired: unknown,
+  ): boolean => {
+    if (deepEqual(previous, desired)) return true;
+    if (
+      isScalar(node) &&
+      isScalarValue(desired) &&
+      node.srcToken &&
+      node.range &&
+      !node.anchor
+    ) {
+      const token = structuredClone(node.srcToken);
+      CST.setScalarValue(token, scalarSourceValue(desired), {
+        afterKey: true,
+        type: preferredScalarType(node, desired),
+      });
+      edits.push({
+        start: node.range[0],
+        end: node.range[2],
+        text: CST.stringify(token),
+      });
+      return true;
+    }
+    if (
+      isMap(node) &&
+      isPlainRecord(previous) &&
+      isPlainRecord(desired) &&
+      !node.anchor
+    ) {
+      const keys = Object.keys(previous).filter(
+        (key) => previous[key] !== undefined,
+      );
+      if (
+        !deepEqual(
+          [...keys].sort(),
+          Object.keys(desired)
+            .filter((key) => desired[key] !== undefined)
+            .sort(),
+        )
+      )
+        return false;
+      return node.items.every((pair) => {
+        const key = scalarMapKey(pair);
+        return (
+          key !== null &&
+          (deepEqual(previous[key], desired[key]) ||
+            (isParsedNode(pair.value) &&
+              collect(pair.value, previous[key], desired[key])))
+        );
+      });
+    }
+    if (
+      isSeq(node) &&
+      Array.isArray(previous) &&
+      Array.isArray(desired) &&
+      previous.length === desired.length &&
+      !node.anchor
+    ) {
+      return node.items.every(
+        (item, index) =>
+          isParsedNode(item) && collect(item, previous[index], desired[index]),
+      );
+    }
+    return false;
+  };
+  if (!collect(root, before, after) || edits.length === 0) return undefined;
+  let content = source;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) {
+    content =
+      content.slice(0, edit.start) + edit.text + content.slice(edit.end);
+  }
+  return patchedConfigMatches(content, after) ? content : undefined;
+}
+
 function reconcileNode(
   node: ParsedNode,
   before: unknown,
@@ -495,6 +635,10 @@ function reconcileMap(
 
     if (!desiredKeys.has(key)) return;
     seenKeys.add(key);
+    if (deepEqual(before[key], after[key])) {
+      nextItems.push(structuredClone(item));
+      return;
+    }
     if (!pair.value || !isParsedNode(pair.value)) {
       throw new UnsafePluginYamlPatch(
         "An empty YAML mapping value cannot be changed safely",
@@ -524,11 +668,17 @@ function reconcileMap(
     );
   });
 
+  const keysUnchanged =
+    map.items.length === nextItems.length &&
+    map.items.every((pair) => {
+      const key = scalarMapKey(pair);
+      return key !== null && desiredKeys.has(key);
+    });
   token.items = nextItems;
   if (nextItems.length === 0 && token.type === "block-map") {
     return createEmptyCollectionToken("map", context.eol);
   }
-  normalizeMapStarts(token, context.eol);
+  if (!keysUnchanged) normalizeMapStarts(token, context.eol);
   return token;
 }
 
@@ -718,24 +868,96 @@ function createSequenceItem(
 function createLocalizedCandidate(
   source: string,
   error: UnsafePluginYamlPatch,
-  expectedPlugins: OxiDnsPluginConfig[],
-): string | undefined {
-  const { node, desired } = error;
-  if (!node?.range || desired === undefined) return undefined;
+  before: OxiDnsConfig,
+  after: OxiDnsConfig,
+  options: PluginYamlPatchOptions,
+): PluginYamlPatchCandidate | undefined {
+  // Reparse pristine source: reconciliation may have mutated earlier CST nodes
+  // before failing. Never grow the replacement beyond a single plugin.
   try {
-    const replacement = stringify(cleanUndefined(desired), {
-      ...yamlStringifyOptions(true),
-    }).trimEnd();
-    const candidate =
-      source.slice(0, node.range[0]) +
-      replacement +
-      source.slice(node.range[1]);
-    return patchedPluginsMatch(candidate, expectedPlugins)
-      ? candidate
-      : undefined;
+    const document = parseDocument(source, { keepSourceTokens: true });
+    const plugins = document.get("plugins", true);
+    if (!isSeq(plugins) || plugins.items.length !== before.plugins.length) {
+      return undefined;
+    }
+    const replacements: Array<{
+      node: ParsedNode;
+      desired: unknown;
+      path: string;
+    }> = [];
+    const rawPlugins = document.toJSON().plugins;
+    before.plugins.forEach((plugin, index) => {
+      const node = plugins.items[index];
+      const tag = options.renamedTags?.get(plugin.tag) ?? plugin.tag;
+      const desired = after.plugins.find((entry) => entry.tag === tag);
+      if (!desired || deepEqual(plugin, desired) || !isMap(node)) return;
+      // The original failure may point at a parent collection (e.g. an empty
+      // value). Only trust its range if it is inside this changed plugin.
+      if (
+        error.node?.range &&
+        node.range &&
+        error.desired !== undefined &&
+        error.node.range[0] >= node.range[0] &&
+        error.node.range[1] <= node.range[1]
+      ) {
+        replacements.push({
+          node: error.node,
+          desired: error.desired,
+          path: error.path,
+        });
+      }
+      const args = node.get("args", true);
+      if (isParsedNode(args) && desired.args !== undefined) {
+        replacements.push({
+          node: args,
+          desired: desired.args,
+          path: `plugins.${plugin.tag}.args`,
+        });
+      }
+      // Preserve schema-unknown plugin keys, which the loaded model projects
+      // away. Complete raw validation below protects them as well.
+      const raw = rawPlugins[index];
+      const rest = { ...raw };
+      delete rest.args;
+      replacements.push({
+        node: node as YAMLMap.Parsed,
+        desired: { ...rest, ...(projectManagedPlugin(desired) as object) },
+        path: `plugins.${plugin.tag}`,
+      });
+    });
+    for (const { node, desired, path } of replacements) {
+      if (!node.range) continue;
+      const block =
+        node.srcToken?.type === "block-map" ||
+        node.srcToken?.type === "block-seq";
+      let replacement = stringify(
+        cleanUndefined(desired),
+        yamlStringifyOptions(!block),
+      ).trimEnd();
+      if (block) {
+        const lineStart = source.lastIndexOf("\n", node.range[0] - 1) + 1;
+        const column = node.range[0] - lineStart;
+        replacement = replacement.replaceAll(
+          "\n",
+          detectEol(source) + " ".repeat(column),
+        );
+      }
+      const content =
+        source.slice(0, node.range[0]) +
+        replacement +
+        source.slice(node.range[1]);
+      if (
+        patchedConfigMatches(content, after) &&
+        unmanagedPluginKeysMatch(source, content, before, after, options)
+      ) {
+        return { content, affectedPath: path };
+      }
+    }
   } catch {
-    return undefined;
+    // Unresolvable aliases, unsupported source ranges, or malformed candidates
+    // must remain manual-only rather than bypassing semantic verification.
   }
+  return undefined;
 }
 
 function createEmptyCollectionToken(
@@ -751,16 +973,34 @@ function createEmptyCollectionToken(
   return structuredClone(node.srcToken);
 }
 
-function patchedPluginsMatch(
-  content: string,
-  expectedPlugins: OxiDnsPluginConfig[],
-) {
+function patchedConfigMatches(content: string, expected: OxiDnsConfig) {
   const parsed = parseOxiDnsYaml(content);
-  if (!parsed.config) return false;
-  return deepEqual(
-    parsed.config.plugins.map(projectManagedPlugin),
-    expectedPlugins.map(projectManagedPlugin),
-  );
+  return Boolean(parsed.config && deepEqual(parsed.config, expected));
+}
+
+function unmanagedPluginKeysMatch(
+  source: string,
+  content: string,
+  before: OxiDnsConfig,
+  after: OxiDnsConfig,
+  options: PluginYamlPatchOptions,
+) {
+  const original = parseDocument(source).toJSON().plugins ?? [];
+  const candidate = parseDocument(content).toJSON().plugins ?? [];
+  const unmanaged = (plugin: Record<string, unknown>) =>
+    Object.fromEntries(
+      Object.entries(plugin).filter(
+        ([key]) => !["tag", "type", "args"].includes(key),
+      ),
+    );
+  return before.plugins.every((plugin, index) => {
+    const tag = options.renamedTags?.get(plugin.tag) ?? plugin.tag;
+    const next = after.plugins.findIndex((entry) => entry.tag === tag);
+    return (
+      next < 0 ||
+      deepEqual(unmanaged(original[index]), unmanaged(candidate[next]))
+    );
+  });
 }
 
 function projectManagedPlugin(plugin: OxiDnsPluginConfig) {

@@ -19,6 +19,67 @@ function loadStoreConfig(source: string) {
 }
 
 describe("config patch confirmation state", () => {
+  it("cancels reviewed candidates and returns to the source before review", async () => {
+    const source =
+      "shared: &shared { timeout: 2s }\nplugins:\n  - tag: main\n    type: forward\n    args: *shared\n";
+    loadStoreConfig(source);
+    const pending = useAppStore
+      .getState()
+      .updatePluginConfig("main", { timeout: "3s" });
+    useAppStore.getState().resolveConfigPatchConfirmation("review");
+    await expect(pending).resolves.toBe("review");
+    useAppStore.getState().setYamlConfig("invalid: [");
+    useAppStore.getState().cancelConfigEditing("wrong baseline");
+    expect(useAppStore.getState().configText).toBe(source);
+    expect(useAppStore.getState().configError).toBeNull();
+    expect(useAppStore.getState().editorMode).toBe(false);
+    expect(useAppStore.getState().configEditorBaseline).toBeNull();
+  });
+
+  it("cancels ordinary YAML edits without saving", () => {
+    const source = "plugins: []\n";
+    loadStoreConfig(source);
+    useAppStore.getState().setYamlConfig("plugins: []\nlog: {level: debug}\n");
+    useAppStore.getState().cancelConfigEditing(source);
+    expect(useAppStore.getState().configText).toBe(source);
+    expect(useAppStore.getState().editorMode).toBe(false);
+  });
+  it("offers force for a multi-field edit requiring a local rebuild", async () => {
+    const source =
+      "log: {level: info} # keep\nplugins:\n  - tag: main\n    type: forward\n    args: { upstream: old, timeout: 2s } # args\n";
+    loadStoreConfig(source);
+    const pending = useAppStore.getState().updatePluginConfig("main", {
+      upstream: ["new"],
+      timeout: "3s",
+    });
+    expect(useAppStore.getState().configPatchConfirmation).toMatchObject({
+      canForce: true,
+    });
+    useAppStore.getState().resolveConfigPatchConfirmation("force");
+    await expect(pending).resolves.toBe("forced");
+    expect(useAppStore.getState().configModel.plugins[0].args).toEqual({
+      upstream: ["new"],
+      timeout: "3s",
+    });
+    expect(useAppStore.getState().configText).toContain(
+      "log: {level: info} # keep\n",
+    );
+  });
+
+  it("does not overwrite newer source when an old confirmation is accepted", async () => {
+    const source =
+      "shared: &shared { timeout: 2s }\nplugins:\n  - tag: main\n    type: forward\n    args: *shared\n";
+    loadStoreConfig(source);
+    const pending = useAppStore
+      .getState()
+      .updatePluginConfig("main", { timeout: "3s" });
+    useAppStore.getState().setYamlConfig(source + "log: {level: debug}\n");
+    useAppStore.getState().resolveConfigPatchConfirmation("force");
+    await expect(pending).resolves.toBe("cancelled");
+    expect(useAppStore.getState().configText).toBe(
+      source + "log: {level: debug}\n",
+    );
+  });
   beforeEach(() => {
     useAppStore.getState().resolveConfigPatchConfirmation("cancel");
   });

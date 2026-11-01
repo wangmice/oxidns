@@ -184,6 +184,7 @@ interface AppState {
   setEditorMode: (mode: boolean) => void;
   setHistoryOpen: (open: boolean) => void;
   setYamlConfig: (config: string) => void;
+  cancelConfigEditing: (baseline: string) => void;
   stageSettingsConfig: (
     config: OxiDnsConfig,
   ) => Promise<PluginMutationResolution>;
@@ -342,6 +343,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDetailOpen: (open) => set({ detailOpen: open }),
   setEditorMode: (mode) => set({ editorMode: mode }),
   setHistoryOpen: (open) => set({ historyOpen: open }),
+  cancelConfigEditing: (baseline) => {
+    const state = get();
+    if (state.isConfigSaving || state.isRestarting || state.isApplying) return;
+    get().setYamlConfig(state.configEditorBaseline ?? baseline);
+    set({ configEditorBaseline: null, editorMode: false });
+  },
   stageSettingsConfig: (config) =>
     stageConfigModelMutation(set, get, config, { patchSettings: true }),
   resolveConfigPatchConfirmation: (choice) => {
@@ -350,6 +357,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     pendingConfigPatch = null;
     set({ configPatchConfirmation: null });
 
+    if (get().configText !== pending.source) {
+      pending.resolve("cancelled");
+      return;
+    }
+
     if (choice === "cancel") {
       pending.resolve("cancelled");
       return;
@@ -357,7 +369,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     const candidate = pending.result.candidate?.content;
     if (!candidate) {
-      if (choice === "review") set({ editorMode: true });
+      if (choice === "review")
+        set({ configEditorBaseline: pending.source, editorMode: true });
       pending.resolve(choice === "review" ? "review" : "cancelled");
       return;
     }
@@ -1488,7 +1501,7 @@ async function stageConfigModelMutation(
     set({
       configPatchConfirmation: {
         reason: result.reason,
-        affectedPath: result.affectedPath,
+        affectedPath: result.candidate?.affectedPath ?? result.affectedPath,
         canForce: Boolean(result.candidate),
       },
     });
