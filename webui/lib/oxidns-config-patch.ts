@@ -137,6 +137,18 @@ export function patchPluginsYaml(
       );
     }
 
+    const deletionPatch = patchDeletedValues(
+      source,
+      document.contents,
+      before,
+      after,
+    );
+    if (
+      deletionPatch !== undefined &&
+      unmanagedPluginKeysMatch(source, deletionPatch, before, after, options)
+    )
+      return { status: "patched", content: deletionPatch };
+
     const pluginsNode = document.get("plugins", true);
     const scalarPatch = deepEqual(
       before.plugins.map((plugin) => plugin.tag),
@@ -195,6 +207,21 @@ export function patchPluginsYaml(
     }
 
     if (
+      before.plugins.some(
+        (plugin) =>
+          !after.plugins.some(
+            (next) =>
+              next.tag === (options.renamedTags?.get(plugin.tag) ?? plugin.tag),
+          ),
+      ) &&
+      !standaloneTriviaRetained(source, content)
+    ) {
+      return confirmationResult(
+        "Preserving standalone comments and blank lines requires manual YAML editing",
+        "plugins",
+      );
+    }
+    if (
       !patchedConfigMatches(content, after) ||
       !unmanagedPluginKeysMatch(source, content, before, after, options)
     ) {
@@ -248,6 +275,17 @@ export function patchConfigYaml(
       );
     }
     assertSafeConfigChange(original.contents, before, after, "$");
+    const deletionPatch = patchDeletedValues(
+      source,
+      original.contents,
+      before,
+      after,
+    );
+    if (
+      deletionPatch !== undefined &&
+      unmanagedPluginKeysMatch(source, deletionPatch, before, after, options)
+    )
+      return { status: "patched", content: deletionPatch };
 
     // Plugins require tag-aware alignment, not generic positional reconciliation.
     // A newly appended block item needs a separator after an EOF scalar.
@@ -292,21 +330,18 @@ export function patchConfigYaml(
     }
     // Collection deletion/normalization can attach standalone trivia to a
     // removed item. Refuse instead of silently losing comments or whitespace.
-    const standaloneTrivia = (text: string) =>
-      text.match(/^[\t ]*(?:#[^\r\n]*)?(?:\r?\n|$)/gm)?.filter(Boolean) ?? [];
-    const originalTrivia = standaloneTrivia(source);
-    let triviaIndex = 0;
-    for (const line of standaloneTrivia(content)) {
-      if (line === originalTrivia[triviaIndex]) triviaIndex += 1;
-    }
-    if (triviaIndex !== originalTrivia.length) {
+    if (!standaloneTriviaRetained(source, content)) {
       return confirmationResult(
         "Preserving standalone comments and blank lines requires manual YAML editing",
         "$",
       );
     }
     const final = parseOxiDnsYaml(content);
-    if (!final.config || !deepEqual(final.config, after)) {
+    if (
+      !final.config ||
+      !deepEqual(final.config, after) ||
+      !unmanagedPluginKeysMatch(source, content, before, after, options)
+    ) {
       return confirmationResult(
         "The incremental YAML patch did not produce the requested complete configuration; edit it manually",
         "$",
@@ -440,6 +475,209 @@ function reconcilePluginSequence(
 
   sequenceToken.items = nextItems;
   normalizeSequenceStarts(sequenceToken, eol);
+}
+
+/** Delete block entries by original ranges, not by CST trivia ownership.
+ * The parser may store a sibling comment in the preceding subtree's last item.
+ * Only CST comment tokens at the deleted entry's indentation (or less) survive;
+ * hash-prefixed text inside a scalar is never classified as a comment.
+ */
+function patchDeletedValues(
+  source: string,
+  root: ParsedNode,
+  before: OxiDnsConfig,
+  after: OxiDnsConfig,
+): string | undefined {
+  let hasDeletion = false;
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const remove = (item: CstCollectionItem, indent: number): boolean => {
+    hasDeletion = true;
+    const head = item.key ?? item.start.find((p) => p.type === "seq-item-ind");
+    if (!head) return false;
+    const physicalStart = source.lastIndexOf("\n", head.offset - 1) + 1;
+    const start =
+      physicalStart === 0 && source.startsWith("\uFEFF") ? 1 : physicalStart;
+    // Compact mappings/sequences share a physical line with their parent.
+    if (!/^[ \t]*$/.test(source.slice(start, head.offset))) return false;
+    const comments = new Map<number, number>();
+    const scalars: Array<[number, number]> = [];
+    let end = head.offset;
+    const visit = (value: unknown) => {
+      if (!value || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      const token = value as {
+        type?: string;
+        offset?: number;
+        source?: string;
+        indent?: number;
+      };
+      if (
+        token.offset !== undefined &&
+        typeof token.source === "string" &&
+        token.type !== "block-scalar"
+      )
+        end = Math.max(end, token.offset + token.source.length);
+      if (token.type === "comment" && token.offset !== undefined)
+        comments.set(token.offset, token.indent ?? 0);
+      if (
+        token.type === "block-scalar" ||
+        token.type === "single-quoted-scalar" ||
+        token.type === "double-quoted-scalar" ||
+        token.type === "scalar"
+      ) {
+        const t = value as CstNodeToken;
+        end = Math.max(end, t.offset + CST.stringify(t).length);
+        scalars.push([t.offset, t.offset + CST.stringify(t).length]);
+      }
+      Object.values(value).forEach(visit);
+    };
+    visit(item);
+    let cursor = start;
+    while (cursor < end) {
+      const newline = source.indexOf("\n", cursor);
+      const lineEnd = newline < 0 ? source.length : newline + 1;
+      const line = source.slice(cursor, lineEnd);
+      const first = cursor + (line.match(/^[ \t]*/)?.[0].length ?? 0);
+      if (first >= end) break;
+      const literal = scalars.some(
+        ([left, right]) => cursor >= left && cursor < right && first < right,
+      );
+      const blank = /^[ \t]*(?:\r?\n)?$/.test(line);
+      const blockSubtree =
+        item.value?.type === "block-map" || item.value?.type === "block-seq";
+      const siblingComment =
+        comments.has(first) &&
+        (!blockSubtree || comments.get(first)! <= indent);
+      if (literal || (!blank && !siblingComment))
+        edits.push({ start: cursor, end: lineEnd, text: "" });
+      cursor = lineEnd;
+    }
+    return true;
+  };
+  const collect = (
+    node: ParsedNode,
+    previous: unknown,
+    desired: unknown,
+  ): boolean => {
+    if (deepEqual(previous, desired)) return true;
+    if (isAlias(node) || ("anchor" in node && node.anchor)) return false;
+    if (
+      isScalar(node) &&
+      isScalarValue(desired) &&
+      node.srcToken &&
+      node.range
+    ) {
+      const token = structuredClone(node.srcToken);
+      CST.setScalarValue(token, scalarSourceValue(desired), {
+        afterKey: true,
+        type: preferredScalarType(node, desired),
+      });
+      let text = CST.stringify(token);
+      if (detectEol(source) === "\r\n" && !/(?<!\r)\n/.test(source))
+        text = text.replace(/(?<!\r)\n/g, "\r\n");
+      edits.push({ start: node.range[0], end: node.range[2], text });
+      return true;
+    }
+    if (
+      isMap(node) &&
+      isPlainRecord(previous) &&
+      isPlainRecord(desired) &&
+      node.srcToken?.type === "block-map"
+    ) {
+      if (
+        Object.keys(desired).some(
+          (key) => desired[key] !== undefined && previous[key] === undefined,
+        )
+      )
+        return false;
+      let kept = 0;
+      for (let index = 0; index < node.items.length; index++) {
+        const pair = node.items[index];
+        const key = scalarMapKey(pair);
+        const item = node.srcToken.items[index];
+        if (key === null || !item) return false;
+        // Unmanaged plugin keys are absent from both projected models.
+        if (previous[key] === undefined && desired[key] === undefined) {
+          kept++;
+          continue;
+        }
+        if (desired[key] === undefined) {
+          if (!remove(item, node.srcToken.indent)) return false;
+        } else {
+          kept++;
+          if (
+            !deepEqual(previous[key], desired[key]) &&
+            (!isParsedNode(pair.value) ||
+              !collect(pair.value, previous[key], desired[key]))
+          )
+            return false;
+        }
+      }
+      if (kept === 0 && node.items.length) {
+        const offset = node.range![0];
+        const start = source.lastIndexOf("\n", offset - 1) + 1;
+        edits.push({
+          start,
+          end: start,
+          text: source.slice(start, offset) + "{}" + detectEol(source),
+        });
+      }
+      return true;
+    }
+    if (
+      isSeq(node) &&
+      Array.isArray(previous) &&
+      Array.isArray(desired) &&
+      node.srcToken?.type === "block-seq"
+    ) {
+      if (previous.length === desired.length) {
+        return node.items.every(
+          (item, index) =>
+            isParsedNode(item) &&
+            collect(item, previous[index], desired[index]),
+        );
+      }
+      // Deletion-only alignment is linear and retains the earliest equal duplicate.
+      let next = 0;
+      for (let index = 0; index < previous.length; index++) {
+        if (
+          next < desired.length &&
+          deepEqual(previous[index], desired[next])
+        ) {
+          next++;
+          continue;
+        }
+        const item = node.srcToken.items[index];
+        if (!item || !remove(item, node.srcToken.indent)) return false;
+      }
+      if (next !== desired.length) return false;
+      if (!desired.length && previous.length) {
+        const offset = node.range![0];
+        const start = source.lastIndexOf("\n", offset - 1) + 1;
+        edits.push({
+          start,
+          end: start,
+          text: source.slice(start, offset) + "[]" + detectEol(source),
+        });
+      }
+      return true;
+    }
+    return false;
+  };
+  if (!collect(root, before, after) || !hasDeletion || !edits.length)
+    return undefined;
+  let content = source;
+  // Apply removals before an insertion at the same original offset.
+  for (const edit of edits.sort((a, b) => b.start - a.start || b.end - a.end)) {
+    content =
+      content.slice(0, edit.start) + edit.text + content.slice(edit.end);
+  }
+  if (!source.endsWith("\n") && content.endsWith("\n"))
+    content = content.slice(0, -detectEol(content).length);
+  return patchedConfigMatches(content, after) ? content : undefined;
 }
 
 // Value-only edits must never normalize their enclosing collections or trivia.
@@ -971,6 +1209,15 @@ function createEmptyCollectionToken(
     throw new Error("Unable to create an empty YAML collection");
   }
   return structuredClone(node.srcToken);
+}
+
+function standaloneTriviaRetained(source: string, content: string) {
+  const lines = (text: string) =>
+    text.match(/^[\t ]*(?:#[^\r\n]*)?(?:\r?\n|$)/gm)?.filter(Boolean) ?? [];
+  const original = lines(source);
+  let index = 0;
+  for (const line of lines(content)) if (line === original[index]) index++;
+  return index === original.length;
 }
 
 function patchedConfigMatches(content: string, expected: OxiDnsConfig) {
