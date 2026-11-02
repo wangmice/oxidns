@@ -4,6 +4,7 @@
 //! Plugin dependency resolver interfaces and initialization context.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::infra::error::Result;
 use crate::plugin::executor::Executor;
@@ -67,6 +68,10 @@ impl<'a> PluginInitContext<'a> {
             tag: tag.into(),
             create_context,
         }
+    }
+
+    pub(crate) fn automatic_dump_enabled(&self) -> Arc<AtomicBool> {
+        self.registry.automatic_dump_enabled.clone()
     }
 
     pub fn tag(&self) -> &str {
