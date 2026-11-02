@@ -60,6 +60,22 @@ impl PluginRuntimeManager {
     }
 
     pub async fn init_runtime(self: &Arc<Self>, config: Config) -> Result<Arc<PluginRuntime>> {
+        self.init_runtime_with_dump_activation(config, true).await
+    }
+
+    /// Application assembly enables persistence after its API has started too.
+    pub(crate) async fn init_runtime_deferred(
+        self: &Arc<Self>,
+        config: Config,
+    ) -> Result<Arc<PluginRuntime>> {
+        self.init_runtime_with_dump_activation(config, false).await
+    }
+
+    async fn init_runtime_with_dump_activation(
+        self: &Arc<Self>,
+        config: Config,
+        enable_automatic_dump: bool,
+    ) -> Result<Arc<PluginRuntime>> {
         // Test serialization must not wait while holding the lifecycle lock.
         // A concurrently running test may need `destroy_runtime` to acquire
         // that lifecycle lock before it can drop the previous test guard.
@@ -103,6 +119,9 @@ impl PluginRuntimeManager {
                 return Err(err);
             }
 
+            if enable_automatic_dump {
+                candidate.enable_automatic_dump();
+            }
             write_rwlock(&manager.current).replace(candidate.clone());
             Ok(candidate)
         })

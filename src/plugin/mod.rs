@@ -367,8 +367,10 @@ pub trait Plugin: Debug + Send + Sync + 'static {
         let registry = std::sync::Arc::new(PluginRegistry::new());
         let create_context = PluginCreateContext::default();
         let init_context =
-            PluginInitContext::new(registry, self.tag().to_string(), &create_context);
-        self.init(&init_context).await
+            PluginInitContext::new(registry.clone(), self.tag().to_string(), &create_context);
+        self.init(&init_context).await?;
+        registry.enable_automatic_dump();
+        Ok(())
     }
 
     /// Clean up plugin resources (called during shutdown)

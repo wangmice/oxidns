@@ -410,6 +410,7 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 
 - Type: `string`; Required: no
 - Purpose: Persistence dump file path.
+- Automatic periodic and final shutdown dumps are enabled only after all plugins and the management API (when configured) have started successfully for the current generation. Failed startup or reload candidate cleanup does not overwrite the existing dump; normal shutdown after successful startup still writes the current snapshot, including an empty cache.
 
 #### `dump_interval`
 

@@ -459,6 +459,7 @@ import Admonition from "@theme/Admonition";
 
 - 类型：`string`；必填：否；默认值：无
 - 作用：指定缓存持久化文件路径。
+- 自动周期 dump 和 shutdown 最终 dump 仅在本轮插件与管理 API（如启用）全部启动成功后开启。启动或 reload 候选初始化失败时，清理不会覆盖已有 dump；成功运行后的正常关闭仍会写入当前快照，包括空缓存。
 
 #### `dump_interval`
 

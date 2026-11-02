@@ -962,6 +962,9 @@ pub struct Cache {
     /// Periodic dump task id, if dump persistence is enabled.
     dump_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
+    /// Shared with the owning runtime, including quick-setup cache instances.
+    automatic_dump_enabled: Arc<AtomicBool>,
+
     /// Periodic cleanup task id.
     cleanup_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
@@ -1032,6 +1035,7 @@ impl Cache {
         let (dump_interval, check_interval_ms, dirty_age_target_ms) =
             Self::dump_schedule(dump_interval);
         let ecs_in_key = self.ecs_in_key;
+        let automatic_dump_enabled = self.automatic_dump_enabled.clone();
         task_center::spawn_fixed(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
@@ -1039,27 +1043,47 @@ impl Cache {
             move |_| {
                 let store = store.clone();
                 let dump_path = dump_path.clone();
+                let automatic_dump_enabled = automatic_dump_enabled.clone();
                 async move {
-                    let Some(handoff) = store.begin_dump_if_due(
-                        AppClock::elapsed_millis(),
-                        MINIMUM_CHANGES_TO_DUMP,
+                    Self::dump_if_due(
+                        &store,
+                        &dump_path,
+                        ecs_in_key,
+                        &automatic_dump_enabled,
                         dirty_age_target_ms,
                         check_interval_ms,
-                    ) else {
-                        return;
-                    };
-
-                    if let Err(e) =
-                        dump_cache_to_file(store.cache_map(), &dump_path, ecs_in_key).await
-                    {
-                        handoff.abort();
-                        warn!("Failed to dump cache to {}: {}", dump_path, e);
-                    } else {
-                        let _ = handoff.complete();
-                    }
+                    )
+                    .await;
                 }
             },
         )
+    }
+
+    async fn dump_if_due(
+        store: &DnsCacheStore,
+        dump_path: &str,
+        ecs_in_key: bool,
+        automatic_dump_enabled: &AtomicBool,
+        dirty_age_target_ms: u64,
+        check_interval_ms: u64,
+    ) {
+        if !automatic_dump_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(handoff) = store.begin_dump_if_due(
+            AppClock::elapsed_millis(),
+            MINIMUM_CHANGES_TO_DUMP,
+            dirty_age_target_ms,
+            check_interval_ms,
+        ) else {
+            return;
+        };
+        if let Err(e) = dump_cache_to_file(store.cache_map(), dump_path, ecs_in_key).await {
+            handoff.abort();
+            warn!("Failed to dump cache to {}: {}", dump_path, e);
+        } else {
+            let _ = handoff.complete();
+        }
     }
 
     fn spawn_cleanup_task(&self, store: DnsCacheStore) -> Result<task_center::ManagedTaskHandle> {
@@ -1798,7 +1822,8 @@ impl Plugin for Cache {
         &self.tag
     }
 
-    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+    async fn init(&mut self, context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+        self.automatic_dump_enabled = context.automatic_dump_enabled();
         if let Some(dump_file) = &self.config.dump_file {
             if let Err(e) = load_cache_from_file(
                 self.store.cache_map(),
@@ -1952,7 +1977,8 @@ impl Plugin for Cache {
         // completed before shutdown and that no refresh can mutate afterward.
         self.lazy_refresh_tasks.wait().await;
 
-        if let Some(dump_file) = &self.config.dump_file
+        if self.automatic_dump_enabled.load(Ordering::Acquire)
+            && let Some(dump_file) = &self.config.dump_file
             && let Err(e) =
                 dump_cache_to_file(self.store.cache_map(), dump_file, self.ecs_in_key).await
         {
@@ -2499,6 +2525,7 @@ impl CacheFactory {
             ecs_in_key: cache_config.ecs_in_key.unwrap_or(false),
             config: cache_config,
             dump_task_id: Mutex::new(None),
+            automatic_dump_enabled: Arc::new(AtomicBool::new(false)),
             cleanup_task_id: Mutex::new(None),
             ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2623,6 +2650,7 @@ mod tests {
             ecs_in_key,
             config,
             dump_task_id: Mutex::new(None),
+            automatic_dump_enabled: Arc::new(AtomicBool::new(false)),
             cleanup_task_id: Mutex::new(None),
             ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2653,6 +2681,150 @@ mod tests {
             min_positive_ttl: None,
             ecs_in_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_preserves_cache_dump() {
+        let _outbound = crate::infra::network::outbound::TestGlobalGuard::clean();
+        #[cfg(feature = "api")]
+        let _api = crate::api::global_api_test_guard().await;
+        #[cfg(feature = "api")]
+        crate::api::clear_global_api();
+        AppClock::start();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.dump");
+        let seed = test_cache(default_test_config());
+        for domain in ["first.example.", "second.example."] {
+            let request = make_request_with_query(domain, false, false);
+            let mut response = request.clone();
+            response.set_message_type(MessageType::Response);
+            response.add_answer(Record::from_rdata(
+                Name::from_ascii(domain).unwrap(),
+                3600,
+                RData::A(crate::proto::rdata::A(Ipv4Addr::LOCALHOST)),
+            ));
+            let mut context = make_context(request);
+            let key = Cache::build_cache_key(&mut context, false).unwrap();
+            let now = AppClock::elapsed_millis();
+            assert!(seed.store.insert_or_update(
+                key,
+                CacheItem::new(response, 3600, now + 3_600_000),
+                now,
+                now + 3_600_000,
+                now,
+            ));
+        }
+        dump_cache_to_file(seed.store.cache_map(), path.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let original = tokio::fs::read(&path).await.unwrap();
+        let config: crate::config::types::Config = serde_yaml_ng::from_str(&format!(
+            "plugins:\n  - tag: cache\n    type: cache\n    args:\n      size: 1\n      dump_file: '{}'\n  - tag: main\n    type: sequence\n    args:\n      - exec: $cache\n  - tag: server\n    type: udp_server\n    args:\n      entry: main\n      listen: not-an-address\n",
+            path.display(),
+        )).unwrap();
+        let error = crate::plugin::init(config).await.unwrap_err();
+        assert!(error.to_string().contains("not-an-address"), "{error}");
+        assert!(crate::plugin::current_runtime().is_none());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+
+        #[cfg(feature = "api")]
+        {
+            let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let config: crate::config::types::Config = serde_yaml_ng::from_str(&format!(
+                "api:\n  http: '{}'\nplugins:\n  - tag: cache\n    type: cache\n    args:\n      size: 1\n      dump_file: '{}'\n",
+                occupied.local_addr().unwrap(),
+                path.display(),
+            )).unwrap();
+            assert!(
+                crate::app::bootstrap::assemble(&config, None)
+                    .await
+                    .is_err()
+            );
+            assert!(crate::plugin::current_runtime().is_none());
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        }
+
+        // Successful assembly without an API still enables the final dump,
+        // including an intentionally empty snapshot after policy filtering.
+        let config: crate::config::types::Config = serde_yaml_ng::from_str(&format!(
+            "plugins:\n  - tag: cache\n    type: cache\n    args:\n      min_positive_ttl: 7200\n      dump_file: '{}'\n",
+            path.display(),
+        )).unwrap();
+        let assembly = crate::app::bootstrap::assemble(&config, None)
+            .await
+            .unwrap();
+        crate::app::bootstrap::stop(&assembly).await;
+        let empty = tokio::fs::read(&path).await.unwrap();
+        assert_ne!(empty, original);
+        assert_eq!(u64::from_le_bytes(empty[20..28].try_into().unwrap()), 0);
+
+        // Standalone public initialization retains normal persistence semantics.
+        for global in [true, false] {
+            tokio::fs::write(&path, &original).await.unwrap();
+            let config: crate::config::types::Config = serde_yaml_ng::from_str(&format!(
+                "plugins:\n  - tag: cache\n    type: cache\n    args:\n      size: 1\n      dump_file: '{}'\n",
+                path.display(),
+            )).unwrap();
+            let manager = crate::plugin::global_manager();
+            if global {
+                crate::plugin::init(config).await.unwrap();
+            } else {
+                manager.init_runtime(config).await.unwrap();
+            }
+            manager.destroy_runtime().await;
+            let reduced = tokio::fs::read(&path).await.unwrap();
+            assert_ne!(reduced, original);
+            assert_eq!(u64::from_le_bytes(reduced[20..28].try_into().unwrap()), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_dump_waits_for_runtime_activation_without_losing_dirty_state() {
+        AppClock::start();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("periodic.dump");
+        let original = b"existing recovery snapshot";
+        tokio::fs::write(&path, original).await.unwrap();
+        let cache = test_cache(default_test_config());
+        let key = cache_key_for_domain("periodic.example.");
+        for _ in 0..MINIMUM_CHANGES_TO_DUMP {
+            let now = AppClock::elapsed_millis();
+            assert!(cache.store.insert_or_update(
+                key.clone(),
+                CacheItem::new(Message::new(), 3600, now + 3_600_000),
+                now,
+                now + 3_600_000,
+                now,
+            ));
+        }
+        Cache::dump_if_due(
+            &cache.store,
+            path.to_str().unwrap(),
+            false,
+            &cache.automatic_dump_enabled,
+            DIRTY_DUMP_TARGET_MS,
+            1000,
+        )
+        .await;
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        cache.automatic_dump_enabled.store(true, Ordering::Release);
+        Cache::dump_if_due(
+            &cache.store,
+            path.to_str().unwrap(),
+            false,
+            &cache.automatic_dump_enabled,
+            DIRTY_DUMP_TARGET_MS,
+            1000,
+        )
+        .await;
+        let enabled_dump = tokio::fs::read(&path).await.unwrap();
+        assert!(enabled_dump.starts_with(b"DSCACHE1"));
+        assert!(
+            cache
+                .store
+                .begin_dump_if_due(AppClock::elapsed_millis(), 1, 0, 0)
+                .is_none()
+        );
     }
 
     #[test]

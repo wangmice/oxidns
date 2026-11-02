@@ -54,7 +54,10 @@ pub async fn assemble(
         plugin::clear_app_controller();
     }
 
-    let runtime = match plugin::init(config.clone()).await {
+    let runtime = match plugin::global_manager()
+        .init_runtime_deferred(config.clone())
+        .await
+    {
         Ok(runtime) => runtime,
         Err(err) => {
             #[cfg(feature = "api")]
@@ -81,10 +84,7 @@ pub async fn assemble(
             return Err(err);
         }
     }
-    #[cfg(not(feature = "api"))]
-    {
-        let _ = runtime;
-    }
+    runtime.enable_automatic_dump();
 
     Ok(AppAssembly {
         #[cfg(feature = "api")]

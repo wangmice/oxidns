@@ -7,6 +7,7 @@
 //! enabling better testability and support for multiple server instances.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use dashmap::DashMap;
@@ -98,6 +99,9 @@ pub struct PluginRegistry {
     /// Initialization order of plugins (for deterministic shutdown)
     init_order: Mutex<Vec<String>>,
 
+    /// Automatic cache writes are permitted only after this generation starts.
+    automatic_dump_enabled: Arc<AtomicBool>,
+
     /// Runtime-generation-scoped watcher for provider-owned rule sources.
     file_reload: Mutex<Option<ProviderFileReloadService>>,
 
@@ -114,6 +118,7 @@ impl PluginRegistry {
             factory_kinds: HashMap::new(),
             plugins: DashMap::new(),
             init_order: Mutex::new(Vec::new()),
+            automatic_dump_enabled: Arc::new(AtomicBool::new(false)),
             file_reload: Mutex::new(None),
             #[cfg(debug_assertions)]
             test_runtime_guard: Mutex::new(None),
@@ -127,6 +132,10 @@ impl PluginRegistry {
         {
             *slot = Some(TestRuntimeGuard { _guard: guard });
         }
+    }
+
+    pub(crate) fn enable_automatic_dump(&self) {
+        self.automatic_dump_enabled.store(true, Ordering::Release);
     }
 
     /// Register a plugin factory
