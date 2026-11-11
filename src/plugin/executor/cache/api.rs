@@ -81,6 +81,8 @@ pub(super) fn register(tag: &str, store: DnsCacheStore, config: CacheApiConfig) 
         POST "/entries/delete" => CacheEntriesDeleteHandler {
             store: store.clone(),
             mutation_gate: mutation_gate.clone(),
+            #[cfg(test)]
+            after_shard_snapshot: None,
         },
         DELETE_PREFIX "/entries/" => CacheEntryDeleteHandler {
             store: store.clone(),
@@ -898,6 +900,27 @@ fn answer_ip_matches(item: &CacheItem, ip: Option<IpAddr>) -> bool {
 struct CacheEntriesDeleteHandler {
     store: DnsCacheStore,
     mutation_gate: Arc<Mutex<()>>,
+    #[cfg(test)]
+    after_shard_snapshot: Option<Arc<DeleteSnapshotBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DeleteSnapshotBarrier {
+    scanned: std::sync::mpsc::SyncSender<()>,
+    resume: StdMutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl DeleteSnapshotBarrier {
+    fn wait(&self) {
+        self.scanned.send(()).unwrap();
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("replacement must finish before deletion resumes");
+    }
 }
 
 #[derive(Deserialize)]
@@ -969,6 +992,8 @@ impl ApiHandler for CacheEntriesDeleteHandler {
         };
         let mutation_guard = self.mutation_gate.clone().lock_owned().await;
         let store = self.store.clone();
+        #[cfg(test)]
+        let after_shard_snapshot = self.after_shard_snapshot.clone();
         let deleted_entries = match tokio::task::spawn_blocking(move || {
             let _mutation_guard = mutation_guard;
             match selection {
@@ -976,26 +1001,27 @@ impl ApiHandler for CacheEntriesDeleteHandler {
                 DeleteSelection::Filter(query) => {
                     let now = AppClock::elapsed_millis();
                     let mut deleted = 0;
-                    store
-                        .cache_map()
-                        .visit_key_expiry_cloned_by_shard(|entries| {
-                            for (key, expire_at_ms) in entries {
-                                if expire_at_ms <= now || !cache_entry_matches_query(&key, &query) {
-                                    continue;
-                                }
-                                let Some(entry) =
-                                    store.cache_map().get_retained_handle(&key, now, 0)
-                                else {
-                                    continue;
-                                };
-                                if answer_ip_matches(entry.value(), query.ip)
-                                    && delete_filtered_entry(&store, &key, &entry)
-                                {
-                                    deleted += 1;
-                                }
+                    store.cache_map().visit_handles_cloned_by_shard(|entries| {
+                        #[cfg(test)]
+                        if let Some(barrier) = &after_shard_snapshot {
+                            barrier.wait();
+                        }
+                        // Preserve the enumerated identity: a refresh after
+                        // the shard snapshot must not become a delete target.
+                        for (key, entry) in entries {
+                            if entry.expire_at_ms() <= now
+                                || !cache_entry_matches_query(&key, &query)
+                            {
+                                continue;
                             }
-                            true
-                        });
+                            if answer_ip_matches(entry.value(), query.ip)
+                                && delete_filtered_entry(&store, &key, &entry)
+                            {
+                                deleted += 1;
+                            }
+                        }
+                        true
+                    });
                     deleted
                 }
             }
@@ -1948,6 +1974,7 @@ mod tests {
         let handler = CacheEntriesDeleteHandler {
             store: test_store(cache.clone(), 4),
             mutation_gate: Arc::new(Mutex::new(())),
+            after_shard_snapshot: None,
         };
         let id = encode_cache_entry_id(&key).unwrap();
         for body in [
@@ -1984,6 +2011,67 @@ mod tests {
         .await;
         assert_eq!(value["deleted_entries"], 1);
         assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_bulk_delete_preserves_same_ip_refresh_after_shard_snapshot() {
+        AppClock::start();
+        let cache = CacheMap::with_capacity(1);
+        let key = test_cache_key("alias.example");
+        seed(&cache, key.clone(), true, false);
+        let store = test_store(cache.clone(), 1);
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let handler = CacheEntriesDeleteHandler {
+            store: store.clone(),
+            mutation_gate: Arc::new(Mutex::new(())),
+            after_shard_snapshot: Some(Arc::new(DeleteSnapshotBarrier {
+                scanned: scanned_tx,
+                resume: StdMutex::new(resume_rx),
+            })),
+        };
+        let refresh_key = key.clone();
+        let refresh = std::thread::spawn(move || {
+            scanned_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("handler must enumerate A before refresh");
+            let now = AppClock::elapsed_millis();
+            let old = store
+                .cache_map()
+                .get_retained_handle(&refresh_key, now, 0)
+                .unwrap();
+            let mut response = old.value().resp.clone();
+            response.set_id(4242);
+            assert!(store.replace_handle(
+                refresh_key,
+                &old,
+                CacheItem::new(response, 60, now + 60_000),
+                now,
+                now + 120_000,
+                now,
+            ));
+            resume_tx.send(()).unwrap();
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            handler.handle(Request::new(Bytes::from_static(
+                br#"{"filter":{"qname":"alias.example","answer_ip":"192.0.2.1"}}"#,
+            ))),
+        )
+        .await
+        .expect("bulk delete must finish");
+        refresh.join().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json(response).await;
+        assert_eq!(value["deleted_entries"], 0, "must not delete refreshed B");
+        let replacement = cache
+            .get_retained_handle(&key, AppClock::elapsed_millis(), 0)
+            .expect("refreshed B must survive");
+        assert_eq!(replacement.value().resp.id(), 4242);
+        assert!(answer_ip_matches(
+            replacement.value(),
+            Some("192.0.2.1".parse().unwrap())
+        ));
     }
 
     #[test]
