@@ -142,6 +142,15 @@ impl Plugin for Sequence {
         Ok(())
     }
 
+    fn on_ready(&self) {
+        for executor in &self.quick_setup_executors {
+            executor.on_ready();
+        }
+        for matcher in &self.quick_setup_matchers {
+            matcher.on_ready();
+        }
+    }
+
     async fn destroy(&self) -> DnsResult<()> {
         let mut first_err: Option<DnsError> = None;
         for executor in &self.quick_setup_executors {
@@ -460,6 +469,58 @@ fn validate_control_flow_syntax(exec: &str) -> DnsResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct ReadyProbe(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Plugin for ReadyProbe {
+        fn tag(&self) -> &str {
+            "ready_probe"
+        }
+
+        fn on_ready(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl Executor for ReadyProbe {
+        async fn execute(&self, _context: &mut DnsContext) -> DnsResult<ExecStep> {
+            unreachable!("readiness must not execute the request pipeline")
+        }
+    }
+
+    impl crate::plugin::matcher::Matcher for ReadyProbe {
+        fn is_match(&self, _context: &mut DnsContext) -> bool {
+            unreachable!("readiness must not evaluate matchers")
+        }
+    }
+
+    #[test]
+    fn readiness_reaches_owned_quick_setup_children_recursively() {
+        let executor = Arc::new(ReadyProbe::default());
+        let matcher = Arc::new(ReadyProbe::default());
+        let child = Sequence {
+            tag: "child".into(),
+            program: OnceCell::new(),
+            rules: Vec::new(),
+            quick_setup_executors: vec![executor.clone()],
+            quick_setup_matchers: vec![matcher.clone()],
+        };
+        let parent = Sequence {
+            tag: "parent".into(),
+            program: OnceCell::new(),
+            rules: Vec::new(),
+            quick_setup_executors: vec![Arc::new(child)],
+            quick_setup_matchers: Vec::new(),
+        };
+        assert_eq!(executor.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(matcher.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        parent.on_ready();
+        assert_eq!(executor.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(matcher.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn test_parse_sequence_ref_and_control_flow_dependency() {

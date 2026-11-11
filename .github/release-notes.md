@@ -1,37 +1,31 @@
-# OxiDNS v1.6.3
+# OxiDNS v1.7.0
 
 ## 🚀 发布概览
 
-- v1.6.3 是面向网络稳定性的 Patch Release，重点修复 DoH HTTP/2 keepalive 与并发 DNS 查询的生命周期竞争。
-- 同时完善 IPv6 上游解析与 TLS identity、连接关闭资源回收及连接池诊断。
-- 没有新增配置字段或改变默认值；DoH2 超长时长配置需按下方限制调整。
+- v1.7.0 是功能版本，扩展策略编排、EDNS 过滤、域名学习、缓存管理和查询分析，并修复 ECS 来源选择、持久化回滚、DNS 协议处理与 RouterOS 联动。
 
 ## ✨ 主要亮点
 
-### DoH2 Keepalive 与并发查询
-
-- PING 失败或超时后回收失效空闲连接并通知连接池，不再仅停用 keepalive 后继续复用。
-- 统一查询准入与回收的原子状态，避免误杀与 PING 重叠的查询；没有成功响应时等待在途查询结束后回收。
-- 任一通过校验的成功 DNS 响应会立即取消回收并解除准入门控，无需等待其他慢查询。
-- 活动计数、成功响应 generation 和空闲时间采用 32 位原子；补充 tick 回绕与并发回收回归测试，正常查询路径不引入全局锁。
-
-### IPv6、资源回收与诊断
-
-- 正确识别 URL 中带方括号的 IPv6 地址，避免误走 bootstrap 域名解析；TLS identity 去除 IPv6 方括号，保留原始主机和 HTTP authority 格式。
-- 合入上游连接关闭资源释放修复，补充 UDP listener、TCP 收发任务、写入失败与阻塞写取消回归测试。
-- 连接池和关闭日志增加 upstream tag、主机、端口与传输信息；正常并发转发中的查询取消改为 debug 日志。
-- 更新 Rust 依赖；support crate 代码与版本保持不变。
+- 新增 `load_balance` 执行器，支持轮询、随机和加权随机；新增 `has_cname` matcher，两者均可用于 minimal bundle。
+- 新增 minimal 可用的 `edns_filter` 执行器，支持 `preserve`、`strip`、`strip_unknown` 策略及 option code 白名单/黑名单；默认在后续执行链退出或取消时恢复整个请求。补齐 EDNS 注册代码识别，未实现 payload 解析的选项仍保留原始数据，查询记录同步显示名称。
+- 修复 `ecs_handler` 删除客户端 ECS 后未继续应用 `preset`/`send` 的问题；非 IN 查询也遵循删除策略，但不生成 ECS。
+- `hosts.format: standard` 支持标准 hosts 文件与地址合并；`learn_domain.rule_kind: registrable_domain` 使用内置公共后缀表学习可注册域及其子域。
+- WebUI 查询分析增加统一时间条、自适应趋势桶、统计截断提示和记录下钻，支持精确域名、客户端 IP 与特殊响应分类筛选；补充 EDNS 过滤配置入口并修复 YAML 嵌套字段补全。
+- 缓存保留 `ip` 过滤及 keyset/snapshot 分页，新增 `answer_ip` 别名和批量删除；启动时等待恢复，失败的启动/reload 不再覆盖历史 dump，读取失败时保护原文件。
+- RouterOS 路由增加可选 `scope`、`target_scope`，修复地址列表重复插入恢复、地址表示及清理。
+- 修正 NOTIMP/BADVERS 响应、超大 TCP 帧、TCP keepalive 和 DoQ/DoH3 停机任务等待；支持 OpenWrt `/etc/TZ`，同步 zoneparser 修复。
+- 管理 API 限制请求体大小、改进 Basic Auth 凭据比较；配置原子保存保留 Unix 权限、属主、属组及符号链接。
+- Docker 新增 ARMv7 镜像；文档源码迁至 `website/`，补充社区 WebUI 推荐。`oxidns-proto` 与 `oxidns-macros` 改为 MIT/Apache-2.0 双许可证，主项目许可证不变。
 
 ## ⚠️ 升级说明
 
-- v1.6.2 常规 YAML 配置、缓存文件和 query recorder 数据库无需迁移。
-- **DoH2 时长限制**：未启用 HTTP/3 的 DoH 上游，其有效 `idle_timeout` 与启用的 `keepalive_interval` 必须小于 `2^32` 毫秒（约 49.7 天）。达到或超过该值的配置现在会被拒绝，需缩短后升级；其他传输及启用 HTTP/3 的 DoH 不受此新增限制影响。
-- `keepalive_interval` 仍默认关闭；启用时建议升级后观察 keepalive、连接回收与 upstream timeout 日志。
-- 建议升级前运行：
-  ```bash
-  oxidns check -c <配置文件>
-  ```
-- 根 crate 版本为 `1.6.3`，`oxidns-proto` 为 `0.1.6`，`oxidns-ripset` 为 `0.1.3`；tag 使用 `v1.6.3`。
+- **保留本地 DoH2 修复**：keepalive PING 失败回收失效连接，成功响应解除查询准入门控；保留 IPv6 TLS identity 与连接诊断修复。未启用 HTTP/3 的 DoH 上游，其有效 `idle_timeout` 与启用的 `keepalive_interval` 仍须小于 `2^32` 毫秒；`keepalive_interval` 默认关闭。
+- **统计 API 调用变更**：`query_recorder` 的 `/stats/*` 必须提供 `since_ms`、`until_ms`，开始时间早于结束时间，跨度最多 24 小时；旧的不带时间调用会返回 HTTP 400。统计最多使用区间内最近 10,000 条记录；列表、详情与 SSE 接口保持原有时间参数语义。
+- **回退行为变更**：显式 `fallback.threshold: 0` 现在立即启动备用分支；如需保留旧延迟，改为 `500`。省略字段仍默认 500 毫秒。
+- **ECS 行为修复**：IN 查询依次采用保留的客户端 ECS、`preset`、`send` 对应的客户端地址；`forward: false` 删除原 ECS 后仍可补发。非法 quick-setup IP 现在会导致配置加载失败；旧 `IP/mask` 写法仍忽略 mask，使用 IPv4 `/24`、IPv6 `/48`，自定义前缀请用完整配置。
+- 除上述行为修复和校验收紧外，现有 v1.6.1 YAML 配置可继续使用，新增字段均为可选。`edns_filter` 需要显式加入执行链，默认 `policy: preserve`、`restore_request: true`，白名单和黑名单默认留空。管理 API 请求体上限为 4 MiB，大型配置提交或缓存导入需核对大小；建议同步更新随包 WebUI。
+- 从 v1.6.1 升级无需迁移查询历史或重新安装 Windows 服务；更早版本仍须遵循 v1.6.0 的迁移说明。升级前备份配置和持久化数据，并运行 `oxidns check -c <配置文件>`。
+- 根 crate 为 `1.7.0`，tag 为 `v1.7.0`；辅助 crate 为 `oxidns-proto 0.1.7`、`oxidns-macros 0.1.1`、`oxidns-zoneparser 0.1.3`，`oxidns-ripset` 保持 `0.1.3`。
 
 ## 📦 下载与校验
 
@@ -40,5 +34,10 @@
 ## ✅ 验证
 
 - `just check`
-- 文档（中英文）：`cd docs && npm run build`
-- Telegram 发布消息：`python3 -m unittest discover -s .github/scripts -p '*_test.py'`
+- `just check-matrix`
+- EDNS 补充验证：`cargo test --locked -p oxidns-proto`、`cargo test --locked --no-default-features --features minimal edns_filter`。
+- WebUI：`pnpm typecheck`、`pnpm lint`、`pnpm test`、`pnpm build`
+- 双语文档：`cd website && npm run build`
+- Telegram 发布消息：`python3 -m unittest discover -s .github/scripts -p '*_test.py'`，渲染后无需截断。
+- full/minimal：`oxidns --version`、`oxidns build-info` 与对应的 `oxidns check -c config.yaml` / `oxidns check -c config.minimal.yaml`。
+- crates.io workspace dry-run：`cargo publish --locked --dry-run --allow-dirty --workspace`；实际发布由 Action 先发布辅助 crate，再验证和发布根包。

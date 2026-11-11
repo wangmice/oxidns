@@ -43,8 +43,7 @@ pub(super) fn unpack_zip(archive: &Path, out_dir: &Path) -> Result<()> {
         // silently skip files and leave the install in a half-applied state.
         let Some(rel_path) = entry.enclosed_name() else {
             return Err(DnsError::runtime(format!(
-                "refusing to extract zip entry with unsafe path: '{}'",
-                entry_name
+                "refusing to extract zip entry with unsafe path: '{entry_name}'"
             )));
         };
         let dest = out_dir_canon.join(&rel_path);

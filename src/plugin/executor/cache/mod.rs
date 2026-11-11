@@ -44,6 +44,12 @@ use crate::infra::observability::metrics::{
     unregister_metric_source,
 };
 use crate::infra::task as task_center;
+#[cfg(not(test))]
+use crate::infra::task::spawn_fixed as spawn_fixed_maintenance;
+// Unit tests each own a Tokio runtime; a process-global scheduler may otherwise
+// die with another test or be stopped by its application-reload cleanup.
+#[cfg(test)]
+use crate::infra::task::spawn_fixed_isolated as spawn_fixed_maintenance;
 use crate::plugin::executor::sequence::chain::ExecutorNextIdentity;
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
@@ -959,7 +965,7 @@ pub struct Cache {
     /// Whether to include ECS scope in cache key.
     ecs_in_key: bool,
 
-    /// Periodic dump task id, if dump persistence is enabled.
+    /// Periodic dump task created only after successful runtime readiness.
     dump_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
 
     /// Shared with the owning runtime, including quick-setup cache instances.
@@ -970,6 +976,15 @@ pub struct Cache {
 
     /// Periodic ECS lookup-index maintenance task id.
     ecs_index_task_id: Mutex<Option<task_center::ManagedTaskHandle>>,
+
+    /// Successful activation, also retained for the final shutdown dump. The
+    /// flag makes repeated notifications harmless even if scheduling fails.
+    persistence_ready: AtomicBool,
+
+    /// Set during init only after the dump is absent or completely restored
+    /// and pruned. I/O/decode failure protects the original file for this
+    /// instance's lifetime; readiness and API imports cannot lift protection.
+    persistence_writable: bool,
 
     /// Deduplicates background refreshes for stale lazy cache hits.
     lazy_refresh_inflight: Arc<DashSet<CacheKey>>,
@@ -1036,7 +1051,7 @@ impl Cache {
             Self::dump_schedule(dump_interval);
         let ecs_in_key = self.ecs_in_key;
         let automatic_dump_enabled = self.automatic_dump_enabled.clone();
-        task_center::spawn_fixed(
+        spawn_fixed_maintenance(
             format!("cache:{}:dump", self.tag),
             Duration::from_secs(dump_interval),
             task_center::TaskOptions::default(),
@@ -1090,7 +1105,7 @@ impl Cache {
         let cache_size = store.cache_size();
         let last_cleanup_ms = Arc::new(AtomicU64::new(0));
         let cleanup_in_progress = Arc::new(AtomicBool::new(false));
-        task_center::spawn_fixed(
+        spawn_fixed_maintenance(
             format!("cache:{}:cleanup", self.tag),
             Duration::from_secs(PRESSURE_CHECK_INTERVAL),
             task_center::TaskOptions::default(),
@@ -1825,6 +1840,7 @@ impl Plugin for Cache {
     async fn init(&mut self, context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
         self.automatic_dump_enabled = context.automatic_dump_enabled();
         if let Some(dump_file) = &self.config.dump_file {
+            self.persistence_writable = false;
             if let Err(e) = load_cache_from_file(
                 self.store.cache_map(),
                 dump_file,
@@ -1835,7 +1851,8 @@ impl Plugin for Cache {
             )
             .await
             {
-                warn!("Failed to load cache from {}: {}", dump_file, e);
+                warn!(plugin = %self.tag, file = %dump_file, error = %e,
+                    "Cache dump loading failed; automatic persistence disabled until reload or restart");
             } else {
                 let store_for_prune = self.store.clone();
                 let cache_size = self.store.cache_size();
@@ -1850,6 +1867,7 @@ impl Plugin for Cache {
                 .await
                 {
                     Ok((expired_removed, evicted, after_len)) => {
+                        self.persistence_writable = true;
                         let total_removed = expired_removed.saturating_add(evicted);
                         if total_removed > 0 {
                             let before_len = after_len.saturating_add(total_removed);
@@ -1883,13 +1901,6 @@ impl Plugin for Cache {
         register_metric_source(Arc::new(CacheMetricSource::new(self.store.clone())))?;
 
         let task_init: Result<()> = (|| {
-            if let Some(dump_file) = &self.config.dump_file {
-                let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
-                let task_id =
-                    self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval)?;
-                *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(task_id);
-            }
-
             let cleanup_task_id = self.spawn_cleanup_task(self.store.clone())?;
             *self
                 .cleanup_task_id
@@ -1933,6 +1944,29 @@ impl Plugin for Cache {
         Ok(())
     }
 
+    fn on_ready(&self) {
+        // Schedule writes only after the entire runtime has started. Keep a
+        // separate startup bit for the final dump, even if optional periodic
+        // task registration fails. Failed candidates never receive this hook.
+        if self.persistence_ready.swap(true, Ordering::AcqRel) || !self.persistence_writable {
+            return;
+        }
+        if let Some(dump_file) = &self.config.dump_file {
+            let dump_interval = self.config.dump_interval.unwrap_or(DEFAULT_DUMP_INTERVAL);
+            match self.spawn_dump_task(self.store.clone(), dump_file.clone(), dump_interval) {
+                Ok(handle) => {
+                    *self.dump_task_id.lock().expect("dump_task_id poisoned") = Some(handle);
+                }
+                Err(error) => {
+                    // Readiness cannot fail after the application has started.
+                    // DNS service and a valid final shutdown dump remain
+                    // usable.
+                    warn!(plugin = %self.tag, %error, "Failed to start periodic cache dump task");
+                }
+            }
+        }
+    }
+
     async fn destroy(&self) -> Result<()> {
         unregister_metric_source(&self.tag);
 
@@ -1962,8 +1996,10 @@ impl Plugin for Cache {
             .expect("ecs_index_task_id poisoned")
             .take();
 
-        if let Some(task_handle) = dump_task_id {
-            task_handle.stop().await;
+        // Stop scheduled work before the final snapshot so this instance's
+        // periodic writer cannot compete with the shutdown dump.
+        if let Some(handle) = dump_task_id {
+            handle.stop().await;
         }
         if let Some(task_handle) = cleanup_task_id {
             task_handle.stop().await;
@@ -1978,6 +2014,7 @@ impl Plugin for Cache {
         self.lazy_refresh_tasks.wait().await;
 
         if self.automatic_dump_enabled.load(Ordering::Acquire)
+            && self.persistence_writable
             && let Some(dump_file) = &self.config.dump_file
             && let Err(e) =
                 dump_cache_to_file(self.store.cache_map(), dump_file, self.ecs_in_key).await
@@ -2526,6 +2563,8 @@ impl CacheFactory {
             config: cache_config,
             dump_task_id: Mutex::new(None),
             automatic_dump_enabled: Arc::new(AtomicBool::new(false)),
+            persistence_ready: AtomicBool::new(false),
+            persistence_writable: false,
             cleanup_task_id: Mutex::new(None),
             ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2534,6 +2573,7 @@ impl CacheFactory {
             lazy_refresh_shutdown: CancellationToken::new(),
             lazy_refresh_accepting: Mutex::new(true),
             miss_coalescer: MissCoalescer::new(),
+
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
         })))
@@ -2584,6 +2624,57 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+pub(crate) fn persistence_test_dump() -> Vec<u8> {
+    use crate::proto::{DNSClass, Name, Question, RData, Record, RecordType};
+    let map = CacheMap::with_capacity(4);
+    let now = AppClock::elapsed_millis();
+    for idx in 0..4 {
+        let domain = format!("entry-{}.example", idx / 2);
+        let mut resp = crate::proto::Message::new();
+        resp.set_message_type(MessageType::Response);
+        let mut edns = Edns::new();
+        edns.insert(EdnsOption::Subnet(ClientSubnet::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(idx, 0, 0, 0)),
+            24,
+            24,
+        )));
+        resp.set_edns(edns);
+        resp.add_question(Question::new(
+            Name::from_ascii(&domain).unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        resp.add_answer(Record::from_rdata(
+            Name::from_ascii(&domain).unwrap(),
+            3600,
+            RData::A(crate::proto::rdata::A(std::net::Ipv4Addr::LOCALHOST)),
+        ));
+        let key = CacheKey {
+            domain: domain.into(),
+            record_type: RecordType::A,
+            dns_class: DNSClass::IN,
+            do_bit: false,
+            cd_bit: false,
+            ecs_scope: Some(key::EcsScopeDigest {
+                family: 1,
+                source_prefix: 24,
+                scope_prefix: 24,
+                network_len: 3,
+                network: [idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }),
+        };
+        map.insert_or_update_with_meta(
+            key,
+            CacheItem::new_validated(resp, 3600, now + 3_600_000),
+            now,
+            now + 3_600_000,
+            now,
+        );
+    }
+    persistence::dump_cache_to_bytes_for_mode(&map, true).unwrap()
 }
 
 #[cfg(test)]
@@ -2651,6 +2742,8 @@ mod tests {
             config,
             dump_task_id: Mutex::new(None),
             automatic_dump_enabled: Arc::new(AtomicBool::new(false)),
+            persistence_ready: AtomicBool::new(false),
+            persistence_writable: false,
             cleanup_task_id: Mutex::new(None),
             ecs_index_task_id: Mutex::new(None),
             lazy_refresh_inflight: Arc::new(DashSet::new()),
@@ -2659,6 +2752,7 @@ mod tests {
             lazy_refresh_shutdown: CancellationToken::new(),
             lazy_refresh_accepting: Mutex::new(true),
             miss_coalescer: MissCoalescer::new(),
+
             touch_interval_ms: AtomicU64::new(0),
             next_touch_interval_refresh_ms: AtomicU64::new(0),
         }
@@ -2685,9 +2779,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_candidate_preserves_cache_dump() {
-        let _outbound = crate::infra::network::outbound::TestGlobalGuard::clean();
         #[cfg(feature = "api")]
         let _api = crate::api::global_api_test_guard().await;
+        let _outbound = crate::infra::network::outbound::TestGlobalGuard::clean();
         #[cfg(feature = "api")]
         crate::api::clear_global_api();
         AppClock::start();
@@ -2736,7 +2830,7 @@ mod tests {
                 path.display(),
             )).unwrap();
             assert!(
-                crate::app::bootstrap::assemble(&config, None)
+                crate::app::bootstrap::start_application(&config, None)
                     .await
                     .is_err()
             );
@@ -2750,10 +2844,10 @@ mod tests {
             "plugins:\n  - tag: cache\n    type: cache\n    args:\n      min_positive_ttl: 7200\n      dump_file: '{}'\n",
             path.display(),
         )).unwrap();
-        let assembly = crate::app::bootstrap::assemble(&config, None)
+        let assembly = crate::app::bootstrap::start_application(&config, None)
             .await
             .unwrap();
-        crate::app::bootstrap::stop(&assembly).await;
+        crate::app::bootstrap::stop_application(&assembly).await;
         let empty = tokio::fs::read(&path).await.unwrap();
         assert_ne!(empty, original);
         assert_eq!(u64::from_le_bytes(empty[20..28].try_into().unwrap()), 0);
@@ -6927,5 +7021,205 @@ mod tests {
         cfg.max_positive_ttl = Some(10);
 
         assert!(validate_cache_config(&cfg).is_err());
+    }
+    #[tokio::test]
+    async fn persistence_readiness_and_load_failure_protection() {
+        #[cfg(feature = "api")]
+        let _guard = crate::api::global_api_test_guard().await;
+        AppClock::start();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache.dump");
+        let baseline = super::persistence_test_dump();
+        std::fs::write(&file, &baseline).unwrap();
+        let mut cfg = default_test_config();
+        cfg.dump_file = Some(file.to_string_lossy().into_owned());
+        cfg.ecs_in_key = Some(true);
+
+        // A fully restored candidate still cannot save pruned/filtered data
+        // until the owning startup operation finishes successfully.
+        // Disabling ECS drops scoped answers instead of merging them into a
+        // shared bucket, which could leak location-dependent answers.
+        for (size, ecs, expected) in [(1, true, 1), (128, false, 0)] {
+            let mut candidate_cfg = cfg.clone();
+            candidate_cfg.size = Some(size);
+            candidate_cfg.ecs_in_key = Some(ecs);
+            let mut cache = test_cache(candidate_cfg);
+            cache.init_for_test().await.unwrap();
+            assert_eq!(cache.store.cache_map().len(), expected);
+            assert!(cache.dump_task_id.lock().unwrap().is_none());
+            // Unlike standalone init_for_test, a real failed candidate never
+            // has its runtime activation gate enabled.
+            cache.automatic_dump_enabled.store(false, Ordering::Release);
+            cache.destroy().await.unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), baseline);
+        }
+
+        // Readiness after restoration creates the first periodic writer.
+        let mut cache = test_cache(cfg.clone());
+        cache.init_for_test().await.unwrap();
+        assert_eq!(cache.store.cache_map().len(), 4);
+        assert!(cache.dump_task_id.lock().unwrap().is_none());
+        cache.on_ready();
+        cache.on_ready(); // Repeated notifications must not spawn another task.
+        for idx in 0..2 {
+            for prefix in 0..2 {
+                let mut key = cache_key_for_domain(format!("entry-{idx}.example"));
+                key.ecs_scope = Some(key::EcsScopeDigest {
+                    family: 1,
+                    source_prefix: 24,
+                    scope_prefix: 24,
+                    network_len: 3,
+                    network: [
+                        idx * 2 + prefix,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                });
+                assert!(cache.store.remove(&key));
+            }
+        }
+        Cache::dump_if_due(
+            &cache.store,
+            file.to_str().unwrap(),
+            true,
+            &cache.automatic_dump_enabled,
+            0,
+            0,
+        )
+        .await;
+        assert_eq!(
+            u64::from_le_bytes(std::fs::read(&file).unwrap()[20..28].try_into().unwrap()),
+            0
+        );
+        cache.destroy().await.unwrap();
+        let empty_dump = std::fs::read(&file).unwrap();
+        assert_ne!(empty_dump, baseline);
+
+        // File load failure must block both periodic and final saves, even if
+        // startup succeeds and new in-memory updates reach the dump threshold.
+        for bytes in [Vec::new(), b"invalid dump".to_vec()] {
+            std::fs::write(&file, &bytes).unwrap();
+            let mut cache = test_cache(cfg.clone());
+            cache.init_for_test().await.unwrap();
+            assert!(!cache.persistence_writable);
+            assert!(cache.dump_task_id.lock().unwrap().is_none());
+            cache.on_ready();
+            assert!(cache.dump_task_id.lock().unwrap().is_none());
+            cache.destroy().await.unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        }
+
+        // A missing dump and a valid serialized empty cache are writable.
+        std::fs::remove_file(&file).unwrap();
+        for _ in 0..2 {
+            let mut cache = test_cache(cfg.clone());
+            cache.init_for_test().await.unwrap();
+            cache.on_ready();
+            cache.destroy().await.unwrap();
+            assert!(cache.persistence_writable);
+            assert_eq!(
+                u64::from_le_bytes(std::fs::read(&file).unwrap()[20..28].try_into().unwrap()),
+                0
+            );
+        }
+
+        // A periodic-registration failure is best effort after readiness; a
+        // valid final shutdown snapshot must remain possible.
+        let mut unschedulable = cfg.clone();
+        unschedulable.dump_interval = Some(u64::MAX);
+        let mut cache = test_cache(unschedulable);
+        cache.init_for_test().await.unwrap();
+        cache.on_ready();
+        assert!(cache.dump_task_id.lock().unwrap().is_none());
+        cache.destroy().await.unwrap();
+        assert!(cache.persistence_writable);
+        assert_eq!(
+            u64::from_le_bytes(std::fs::read(&file).unwrap()[20..28].try_into().unwrap()),
+            0
+        );
+
+        // A directory deterministically exercises read failure on all
+        // platforms.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let mut cache = test_cache(cfg);
+        cache.init_for_test().await.unwrap();
+        cache.on_ready();
+        cache.destroy().await.unwrap();
+        assert!(!cache.persistence_writable);
+        assert!(file.is_dir());
+    }
+
+    #[test]
+    fn persistence_init_waits_for_restore_or_io_timeout() {
+        AppClock::start();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("slow.dump");
+        let baseline = super::persistence_test_dump();
+        for timed_out in [false, true] {
+            std::fs::write(&file, &baseline).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(timed_out)
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            // Hold the only blocking worker to control metadata/read
+            // completion. Channel disconnection releases it if the assertions
+            // unwind.
+            let blocker = runtime.spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            runtime.block_on(async {
+                #[cfg(feature = "api")]
+                let _guard = crate::api::global_api_test_guard().await;
+                let mut cfg = default_test_config();
+                cfg.dump_file = Some(file.to_string_lossy().into_owned());
+                cfg.ecs_in_key = Some(true);
+                let mut cache = test_cache(cfg);
+                let mut init = Box::pin(cache.init_for_test());
+                assert!(futures::poll!(init.as_mut()).is_pending());
+                if timed_out {
+                    tokio::time::advance(persistence::LOAD_IO_TIMEOUT + Duration::from_secs(1))
+                        .await;
+                    init.await.unwrap();
+                    assert!(!cache.persistence_writable);
+                    assert_eq!(cache.store.cache_map().len(), 0);
+                    cache.on_ready();
+                    assert!(cache.dump_task_id.lock().unwrap().is_none());
+                    cache.destroy().await.unwrap();
+                    assert_eq!(std::fs::read(&file).unwrap(), baseline);
+                    release_tx.send(()).unwrap();
+                } else {
+                    release_tx.send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), init)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(cache.persistence_writable);
+                    assert_eq!(cache.store.cache_map().len(), 4);
+                    cache.on_ready();
+                    cache.destroy().await.unwrap();
+                }
+                blocker.await.unwrap();
+            });
+        }
     }
 }

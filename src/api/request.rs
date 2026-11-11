@@ -7,6 +7,7 @@ use bytes::Bytes;
 use http::{Request, StatusCode, Uri};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use tracing::warn;
 
 pub(crate) fn strip_api_prefix(path: &str) -> Option<String> {
     if path == "/api" {
@@ -40,6 +41,13 @@ pub(super) async fn read_hyper_request(
         let frame = frame_result.map_err(|_| StatusCode::BAD_REQUEST)?;
         if let Ok(data) = frame.into_data() {
             if data.len() > max_body_size.saturating_sub(collected.len()) {
+                warn!(
+                    path = parts.uri.path(),
+                    collected = collected.len(),
+                    chunk = data.len(),
+                    limit = max_body_size,
+                    "API request body exceeds limit"
+                );
                 return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
             collected.extend_from_slice(&data);

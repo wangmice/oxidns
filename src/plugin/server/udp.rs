@@ -340,6 +340,12 @@ async fn run_server(
                     Err(e) if is_client_port_unreachable(&e) => {
                         debug!(listen = %addr, error = %e, "UDP reply destination is no longer listening");
                     }
+                    // A malformed datagram only affects the attacker's own
+                    // packet; keep decode failures at debug level so a
+                    // garbage flood cannot drown the log at line rate.
+                    Err(crate::infra::error::DnsError::Protocol(e)) => {
+                        debug!(listen = %addr, error = %e, "Dropping malformed UDP datagram");
+                    }
                     Err(e) => {
                         consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
                         let backoff = udp_recv_error_backoff(consecutive_recv_errors);

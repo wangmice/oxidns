@@ -190,8 +190,10 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_control_api_controls_matcher_and_reloads_provider() -> DnsResult<()> {
-        let _outbound_guard = crate::infra::network::outbound::TestGlobalGuard::clean();
+        // Match application/cache tests: API -> outbound -> runtime lifecycle.
+        // Waiting for API while holding outbound would invert their lock order.
         let _guard = global_api_test_guard().await;
+        let _outbound_guard = crate::infra::network::outbound::TestGlobalGuard::clean();
         clear_global_api();
         plugin::reset_runtime_for_test().await;
         AppClock::start();

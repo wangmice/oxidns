@@ -270,6 +270,9 @@ pub async fn run_server(
 }
 
 /// Handle a single QUIC connection and all its HTTP/3 request streams
+///
+/// Each connection owns tracked request tasks and cancels and joins them on
+/// exit before the registry destroys executor dependencies.
 #[hotpath::measure]
 async fn handle_h3_connection(
     connecting: quinn::Incoming,

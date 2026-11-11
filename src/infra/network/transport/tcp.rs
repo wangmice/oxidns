@@ -66,10 +66,7 @@ where
 
         msg.append_to(&mut self.write_buf)?;
 
-        let body_len = self.write_buf.len() - 2;
-        let body_len = u16::try_from(body_len).map_err(|_| {
-            DnsError::protocol("DNS message exceeds the 65535-byte TCP framing limit")
-        })?;
+        let body_len = self.frame_len()?;
 
         self.write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
 
@@ -86,10 +83,7 @@ where
         msg.append_to_with_id(id, &mut self.write_buf)
             .map_err(|e| DnsError::protocol(format!("Failed to serialize DNS message: {}", e)))?;
 
-        let body_len = self.write_buf.len() - 2;
-        let body_len = u16::try_from(body_len).map_err(|_| {
-            DnsError::protocol("DNS message exceeds the 65535-byte TCP framing limit")
-        })?;
+        let body_len = self.frame_len()?;
 
         self.write_buf[..2].copy_from_slice(&body_len.to_be_bytes());
 
@@ -98,6 +92,14 @@ where
             .await
             .map_err(|e| DnsError::protocol(format!("Failed to write DNS frame: {}", e)))?;
         Ok(())
+    }
+
+    /// Validate the encoded body against the 2-byte length prefix; an
+    /// unchecked `as u16` would silently wrap and desynchronize the stream.
+    #[inline]
+    fn frame_len(&self) -> Result<u16> {
+        u16::try_from(self.write_buf.len() - 2)
+            .map_err(|_| DnsError::protocol("DNS message exceeds the TCP framing size limit"))
     }
 }
 
@@ -187,6 +189,15 @@ mod tests {
         frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[tokio::test]
+    async fn test_writer_frame_length_accepts_u16_max_and_rejects_overflow() {
+        let mut writer = TcpTransportWriter::new(tokio::io::sink());
+        writer.write_buf.resize(2 + usize::from(u16::MAX), 0);
+        assert_eq!(writer.frame_len().unwrap(), u16::MAX);
+        writer.write_buf.push(0);
+        assert!(writer.frame_len().is_err());
     }
 
     #[tokio::test]

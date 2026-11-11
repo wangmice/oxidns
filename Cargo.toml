@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "oxidns"
-version = "1.6.3"
+version = "1.7.0"
 edition = "2024"
 description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
 repository = "https://github.com/svenshi/oxidns"
@@ -19,9 +19,9 @@ keywords = ["dns", "rustdns", "pipeline", "flow", "dns-server"]
 categories = ["network-programming"]
 exclude = [
     ".github/**",
-    "ai/**",
     "benchmarks/**",
     "docs/**",
+    "website/**",
     "webui/**",
 ]
 
@@ -92,8 +92,8 @@ fs2 = { version = "0.4", optional = true }
 hex = "0.4"
 sha2 = "0.11"
 wincode = { version = "0.6", features = ["derive"] }
-oxidns-proto = { version = "0.1.6", path = "crates/proto" }
-oxidns-macros = { version = "0.1.0", path = "crates/macros" }
+oxidns-proto = { version = "0.1.7", path = "crates/proto" }
+oxidns-macros = { version = "0.1.1", path = "crates/macros" }
 hotpath = "0.30.2"
 
 # Optional upgrade dependencies and response snapshot compression.
@@ -133,6 +133,7 @@ tower-service = { version = "0.3", optional = true }
 # in addition to the `hosts` / `redirect` executors.
 aho-corasick = "1.1"
 prost = { version = "0.14", optional = true }
+psl = { version = "2.1", optional = true }
 regex = "1.13"
 
 # Executor plugin dependencies, each gated by its own feature.
@@ -140,7 +141,7 @@ cronexpr = { version = "1.7", optional = true }
 fast-socks5 = "1.0"
 mikrotik-rs = { version = "0.10", optional = true }
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }
-zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/zoneparser", optional = true }
+zoneparser = { package = "oxidns-zoneparser", version = "0.1.3", path = "crates/zoneparser", optional = true }
 
 # Service management
 service-manager = "0.11"
@@ -180,7 +181,7 @@ default = ["full"]
 # --- Bundles ---------------------------------------------------------------
 
 # Minimal core DNS forwarder: UDP + TCP listeners, UDP + TCP upstream,
-# sequence / forward / cache / fallback / hosts / redirect / dual_selector /
+# sequence / forward / cache / fallback / load_balance / hosts / redirect / dual_selector /
 # ecs_handler / ttl / drop_resp / black_hole / debug_print / reload, all matchers,
 # and the `domain_set` + `ip_set` providers.
 # Nothing else is compiled. No hyper / rustls / quinn / h2 / h3 / zoneparser.
@@ -308,7 +309,7 @@ plugin-cron = ["_task-cron"]
 
 # `dynamic_domain_set` provider + `learn_domain` executor (runtime-writable
 # domain rule set with background-flush persistence and pipeline learning).
-plugin-dynamic-domain = ["dep:fs2"]
+plugin-dynamic-domain = ["dep:fs2", "dep:psl"]
 
 # `ip_selector` executor (response IP scoring and selection via active probing).
 plugin-ip-selector = []
@@ -426,6 +427,11 @@ harness = false
 [[bench]]
 name = "response_classification"
 harness = false
+
+[[bench]]
+name = "request_pipeline"
+harness = false
+
 
 [[bin]]
 name = "oxidns"

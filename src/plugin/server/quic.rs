@@ -41,6 +41,8 @@ use crate::plugin_factory;
 const DOQ_INTERNAL_ERROR: u32 = 0x1;
 const DOQ_PROTOCOL_ERROR: u32 = 0x2;
 const DOQ_REQUEST_CANCELLED: u32 = 0x3;
+// Bound shutdown without imposing a new timeout on normal executor work.
+const DOQ_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// QUIC server configuration
 #[derive(Deserialize)]
@@ -219,6 +221,7 @@ async fn run_server(
 
     let tasks = TaskTracker::new();
     let shutdown_token = CancellationToken::new();
+    let drain_expired = CancellationToken::new();
     let active_connections = Arc::new(AtomicU64::new(0));
     let request_limiter = InboundRequestLimiter::new(DEFAULT_SERVER_MAX_INFLIGHT_REQUESTS);
 
@@ -236,6 +239,7 @@ async fn run_server(
                         let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
                         let handler_clone = handler.clone();
                         let task_shutdown = shutdown_token.clone();
+                        let task_drain_expired = drain_expired.clone();
                         let active_connections = active_connections.clone();
                         let request_limiter = request_limiter.clone();
                         tasks.spawn(async move {
@@ -254,6 +258,7 @@ async fn run_server(
                                     request_limiter,
                                     connection_stream_tasks,
                                     connection_stream_cancel,
+                                    task_drain_expired,
                                 ) => {}
                             }
 
@@ -270,7 +275,19 @@ async fn run_server(
     }
 
     shutdown_token.cancel();
+    // Stream tasks retain the connection while reading or writing. Close the
+    // transport to release those waits, then join connection-owned stream tasks.
+    endpoint.close(0u32.into(), b"server shutting down");
     tasks.close();
+    // All connections share one shutdown budget, including owners already
+    // draining after an ordinary peer close. Never restart it per connection.
+    if tokio::time::timeout(DOQ_SHUTDOWN_DRAIN_TIMEOUT, tasks.wait())
+        .await
+        .is_err()
+    {
+        warn!(listen = %addr, "DoQ shutdown drain budget exceeded; cancelling remaining streams");
+        drain_expired.cancel();
+    }
     tasks.wait().await;
     info!(listen = %addr, "QUIC server stopped");
 }
@@ -278,6 +295,10 @@ async fn run_server(
 /// Accept a QUIC connection and handle all bidirectional streams (DNS over
 /// QUIC). Each bi-directional stream represents a single DNS query/response
 /// exchange.
+///
+/// Each connection owns a bounded set of tracked stream tasks and joins them
+/// before the registry destroys executor dependencies. Accepted work survives
+/// connection loss, but is cancelled when the server-wide shutdown budget ends.
 #[hotpath::measure]
 async fn handle_quic_connection(
     connecting: quinn::Incoming,
@@ -285,6 +306,7 @@ async fn handle_quic_connection(
     request_limiter: InboundRequestLimiter,
     stream_tasks: TaskTracker,
     stream_cancel: CancellationToken,
+    drain_expired: CancellationToken,
 ) {
     let remote_addr = connecting.remote_address();
     let connection = match connecting.await {
@@ -325,24 +347,26 @@ async fn handle_quic_connection(
 
         let handler = handler.clone();
         let server_name = server_name.clone();
-        let task_cancel = stream_cancel.clone();
         let task_transport = transport.clone();
+        let task_drain_expired = drain_expired.clone();
         stream_tasks.spawn(async move {
             let _permit = permit;
-            tokio::select! {
-                _ = task_cancel.cancelled() => {}
+            // Endpoint closure releases incomplete reads and response writes.
+            // Preserve accepted work until the shared shutdown budget expires.
+            let result = tokio::select! {
+                biased;
+                _ = task_drain_expired.cancelled() => return,
                 result = handle_doq_bi_stream(
-                    task_transport,
-                    reader,
-                    writer,
-                    handler,
-                    remote_addr,
-                    server_name,
-                ) => {
-                    if let Err(e) = result {
-                        warn!("DoQ stream error ({}): {}", remote_addr, e);
-                    }
-                }
+                task_transport,
+                reader,
+                writer,
+                handler,
+                remote_addr,
+                server_name,
+                ) => result,
+            };
+            if let Err(e) = result {
+                warn!("DoQ stream error ({}): {}", remote_addr, e);
             }
         });
     }
@@ -408,6 +432,15 @@ async fn handle_doq_bi_stream(
     // returns and releases its `InboundRequestLimiter` permit.
     let peer_stopped = writer.stopped();
     tokio::pin!(peer_stopped);
+    let request = handler.handle_request(
+        request_msg,
+        remote_addr,
+        RequestMeta {
+            server_name,
+            url_path: None,
+        },
+    );
+    tokio::pin!(request);
     let response = tokio::select! {
         biased;
 
@@ -419,6 +452,7 @@ async fn handle_doq_bi_stream(
                         %code,
                         "Cancelling DoQ transaction after client STOP_SENDING"
                     );
+                    return Ok(());
                 }
                 Ok(None) => {
                     debug!(
@@ -434,17 +468,13 @@ async fn handle_doq_bi_stream(
                     );
                 }
             }
-            return Ok(());
+            // Transport closure (including local shutdown) must not discard
+            // accepted executor side effects. Explicit STOP_SENDING or the
+            // outer server-wide shutdown budget can still cancel this work.
+            request.await
         }
 
-        response = handler.handle_request(
-            request_msg,
-            remote_addr,
-            RequestMeta {
-                server_name,
-                url_path: None,
-            },
-        ) => response,
+        response = &mut request => response,
     };
 
     match writer.write_message_doq(&response.response).await {
@@ -568,7 +598,172 @@ impl PluginFactory for QuicServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::context::DnsContext;
+    use crate::plugin::executor::{ExecStep, Executor};
     use crate::plugin::test_utils::plugin_config;
+
+    #[derive(Debug)]
+    struct PendingExecutor {
+        entered: tokio::sync::Notify,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Plugin for PendingExecutor {
+        fn tag(&self) -> &str {
+            "doq_pending"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for PendingExecutor {
+        async fn execute(&self, _context: &mut DnsContext) -> Result<ExecStep> {
+            struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropSignal {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _signal = DropSignal(self.dropped.clone());
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    async fn pending_doq_request(peer_stop: bool, close_connection: bool) {
+        use tokio::time::timeout;
+
+        use crate::proto::{DNSClass, Message, Question, RecordType};
+
+        crate::infra::network::tls_config::install_default_provider();
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server-tls");
+        let mut tls = load_tls_config(
+            &Some(fixtures.join("cert.pem").to_string_lossy().into_owned()),
+            &Some(fixtures.join("key.pem").to_string_lossy().into_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        tls.alpn_protocols = vec![b"doq".to_vec()];
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listen = socket.local_addr().unwrap();
+        drop(socket);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = Arc::new(PendingExecutor {
+            entered: tokio::sync::Notify::new(),
+            dropped: dropped.clone(),
+        });
+        let server = QuicServer {
+            tag: "doq_pending_server".into(),
+            listen,
+            server_config: tls,
+            idle_timeout: None,
+            request_handle: Arc::new(RequestHandle {
+                entry_executor: executor.clone(),
+                metrics: None,
+            }),
+            metrics: Arc::new(ServerMetrics::new("doq_pending_server".into(), "quic")),
+            shutdown_tx: watch::channel(false).0,
+            task_handle: Mutex::new(None),
+        };
+        let (startup_tx, startup_rx) = oneshot::channel();
+        server.spawn_server_task(Some(startup_tx)).unwrap();
+        startup_rx.await.unwrap().unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/fixtures/server-tls/cert.pem").as_slice(),
+        ) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"doq".to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let connection = timeout(
+            Duration::from_secs(2),
+            client.connect(listen, "localhost").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let mut query = Message::new();
+        query.add_question(Question::new(
+            "pending.test.".parse().unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        let body = query.to_bytes().unwrap();
+        send.write_all(&(body.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&body).await.unwrap();
+        send.finish().unwrap();
+        timeout(Duration::from_secs(2), executor.entered.notified())
+            .await
+            .unwrap();
+
+        if peer_stop {
+            recv.stop(DOQ_REQUEST_CANCELLED.into()).unwrap();
+            timeout(Duration::from_secs(2), async {
+                while !dropped.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("STOP_SENDING must cancel pending executor");
+        } else if close_connection {
+            // Ordinary connection loss must not immediately discard accepted work.
+            connection.close(0u32.into(), b"client closing");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!dropped.load(Ordering::Acquire));
+        }
+        let shutdown = server.destroy();
+        tokio::pin!(shutdown);
+        if !peer_stop {
+            assert!(
+                timeout(Duration::from_millis(100), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !dropped.load(Ordering::Acquire),
+                "shutdown must allow accepted work to drain first"
+            );
+        }
+        timeout(Duration::from_secs(32), &mut shutdown)
+            .await
+            .expect("DoQ destroy must bound permanently pending accepted work")
+            .unwrap();
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "executor future must be dropped before destroy returns"
+        );
+        assert_eq!(
+            Arc::strong_count(&server.request_handle),
+            1,
+            "no stream task may retain its handler/permit after destroy"
+        );
+    }
+
+    #[tokio::test]
+    async fn doq_shutdown_bounds_pending_executor_after_connection_close() {
+        pending_doq_request(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn doq_shutdown_bounds_pending_executor_on_live_connection() {
+        pending_doq_request(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn doq_stop_sending_cancels_pending_executor() {
+        pending_doq_request(true, false).await;
+    }
 
     #[test]
     fn test_quic_factory_requires_args() {

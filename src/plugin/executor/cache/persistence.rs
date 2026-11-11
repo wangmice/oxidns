@@ -9,6 +9,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::fs;
 use tokio::fs::File;
@@ -27,7 +28,6 @@ use super::{
 use crate::infra::cache::ttl::TtlCacheHandle;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::system::file_len_if_exists;
 use crate::proto::{DNSClass, Message, RecordType};
 
 // Little-endian bytes spell "DSCACHE1". The magic lets us distinguish the
@@ -1112,6 +1112,20 @@ async fn read_cache_dump_file_bounded(
     Ok(Some(data))
 }
 
+/// Bound file-system waiting, not CPU decoding time. Tokio may finish an
+/// already-running OS read after timeout, but it cannot mutate the cache: all
+/// decoding and restoration happen only after the read future succeeds.
+pub(super) const LOAD_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LoadOutcome {
+    Missing,
+    Restored { entries: usize },
+}
+
+/// Restore the dump before the cache becomes available to request/API callers.
+/// Missing files are valid empty starting points. Other I/O errors, timeouts,
+/// and whole-file decode failures protect the original dump from later writes.
 pub(super) async fn load_cache_from_file(
     cache_map: &CacheMap,
     dump_path: &str,
@@ -1119,25 +1133,32 @@ pub(super) async fn load_cache_from_file(
     ecs_lookup_index: Arc<EcsLookupIndex>,
     policy: CacheLoadPolicy,
     max_entries: usize,
-) -> Result<()> {
-    let Some(file_len) = file_len_if_exists(dump_path).await? else {
-        return Ok(());
+) -> Result<LoadOutcome> {
+    let data = tokio::time::timeout(LOAD_IO_TIMEOUT, async {
+        let metadata = match fs::metadata(dump_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(DnsError::from(error)),
+        };
+        // Reject FIFOs/devices before opening: reads from them need not reach
+        // EOF and could otherwise occupy a blocking worker indefinitely.
+        if !metadata.is_file() {
+            return Err(DnsError::plugin("cache dump must be a regular file"));
+        }
+        read_cache_dump_file_bounded(dump_path, metadata.len())
+            .await?
+            .map(Some)
+            .ok_or_else(|| invalid_dump("cache dump exceeds file size limit"))
+    })
+    .await
+    .map_err(|_| DnsError::runtime("cache dump file I/O timed out"))??;
+    let Some(data) = data else {
+        return Ok(LoadOutcome::Missing);
     };
-
-    if file_len == 0 {
-        return Ok(());
-    }
-
-    //  Persistence is optional. An oversized dump is treated in the same spirit
-    //  as a corrupt/unsupported dump: log it and continue startup without
-    //  persisted cache.
-    let Some(data) = read_cache_dump_file_bounded(dump_path, file_len).await? else {
-        return Ok(());
-    };
-
+    // Decode before mutating the map. Zero-byte/truncated/incompatible files
+    // fail; a valid serialized empty collection remains writable.
     let cache_map = cache_map.clone();
-
-    let loaded = match tokio::task::spawn_blocking(move || {
+    let loaded = tokio::task::spawn_blocking(move || {
         load_cache_from_bytes_with_index_bounded::<MAX_PERSISTED_CACHE_DUMP_BYTES>(
             &cache_map,
             &data,
@@ -1149,32 +1170,11 @@ pub(super) async fn load_cache_from_file(
         )
     })
     .await
-    {
-        Ok(Ok(loaded)) => loaded,
-
-        Ok(Err(err)) => {
-            // Persistence is optional. A corrupt, legacy, unsupported or
-            // otherwise invalid dump must not prevent DNS service startup.
-            warn!(
-                "Failed to load cache dump from {}: {}; ignoring persisted cache",
-                dump_path, err
-            );
-
-            return Ok(());
-        }
-
-        Err(err) => {
-            return Err(DnsError::Runtime(format!(
-                "cache load worker failed: {err}"
-            )));
-        }
-    };
-
+    .map_err(|err| DnsError::runtime(format!("cache load worker failed: {err}")))??;
     if loaded > 0 {
         info!("Loaded {} cache entries from {}", loaded, dump_path);
     }
-
-    Ok(())
+    Ok(LoadOutcome::Restored { entries: loaded })
 }
 
 #[cfg(test)]
@@ -1259,7 +1259,6 @@ fn load_cache_from_bytes_with_index_bounded<const PREALLOCATION_LIMIT: usize>(
             )));
         }
     };
-
     if replace {
         cache_map.clear();
     }
@@ -1325,6 +1324,64 @@ mod tests {
             false
         });
         found.expect("cache entry should exist")
+    }
+
+    async fn load_test_file(map: &CacheMap, path: &str) -> Result<LoadOutcome> {
+        load_cache_from_file(
+            map,
+            path,
+            false,
+            Arc::new(EcsLookupIndex::new()),
+            CacheLoadPolicy::default(),
+            4,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn startup_load_outcomes_distinguish_missing_empty_and_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("outcome.dump");
+        let map = CacheMap::with_capacity(4);
+        assert_eq!(
+            load_test_file(&map, file.to_str().unwrap()).await.unwrap(),
+            LoadOutcome::Missing
+        );
+        std::fs::write(&file, dump_cache_to_bytes(&map).unwrap()).unwrap();
+        assert_eq!(
+            load_test_file(&map, file.to_str().unwrap()).await.unwrap(),
+            LoadOutcome::Restored { entries: 0 }
+        );
+        std::fs::write(&file, []).unwrap();
+        assert!(load_test_file(&map, file.to_str().unwrap()).await.is_err());
+        assert!(
+            load_test_file(&map, dir.path().to_str().unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_load_rejects_fifo_before_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fifo.dump");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let map = CacheMap::with_capacity(4);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            load_test_file(&map, file.to_str().unwrap()),
+        )
+        .await
+        .expect("a FIFO must be rejected without waiting for a writer")
+        .unwrap_err();
+        assert!(error.to_string().contains("regular file"));
     }
 
     fn make_entry() -> PersistedCacheEntry {
