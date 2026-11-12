@@ -499,6 +499,18 @@ mod tests {
     }
 
     #[test]
+    fn test_get_cap_buf_with_context_len_clamps_huge_content_length() {
+        let response = Response::builder()
+            .header(CONTENT_LENGTH, "99999999999")
+            .body(())
+            .expect("response should build");
+
+        let buf = get_cap_buf_with_context_len(&response, MAX_DOH_DNS_BODY_SIZE);
+
+        assert_eq!(buf.capacity(), u16::MAX as usize);
+    }
+
+    #[test]
     fn test_build_doh_request_uri_omits_default_https_port() {
         let mut connection_info = ConnectionInfo::with_addr("https://dns.example.test/dns-query")
             .expect("connection info should parse");

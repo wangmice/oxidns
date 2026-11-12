@@ -126,6 +126,14 @@ pub struct RequestResult {
 }
 
 impl RequestHandle {
+    /// Build an internal request handler without server-level metrics.
+    pub fn new(entry_executor: Arc<dyn Executor>) -> Self {
+        Self {
+            entry_executor,
+            metrics: None,
+        }
+    }
+
     #[hotpath::measure]
     pub async fn handle_request(
         &self,
@@ -376,10 +384,7 @@ mod tests {
     }
 
     fn make_request_handle(executor: Arc<dyn Executor>) -> RequestHandle {
-        RequestHandle {
-            entry_executor: executor,
-            metrics: None,
-        }
+        RequestHandle::new(executor)
     }
 
     #[derive(Debug, Default, Clone, PartialEq, Eq)]

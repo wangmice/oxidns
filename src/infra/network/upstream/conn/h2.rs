@@ -1376,6 +1376,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recv_enforces_dns_body_size_boundary() {
+        // Exercise the upstream exact-limit/one-byte-over regression through
+        // the retained receive API rather than an unused append helper.
+        for body_len in [MAX_DOH_DNS_BODY_SIZE, MAX_DOH_DNS_BODY_SIZE + 1] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let server_task = tokio::spawn(async move {
+                let mut connection = h2::server::handshake(server_io)
+                    .await
+                    .expect("server handshake should succeed");
+                let Some(Ok((_request, mut respond))) = connection.accept().await else {
+                    panic!("server should receive one request");
+                };
+                let response = http::Response::builder()
+                    .status(200)
+                    .header(http::header::CONTENT_TYPE, "application/dns-message")
+                    .body(())
+                    .expect("response should build");
+                let mut send_stream = respond
+                    .send_response(response, false)
+                    .expect("response headers should send");
+                send_stream
+                    .send_data(Bytes::from(vec![0x5A; body_len]), true)
+                    .expect("response body should queue");
+                while let Some(result) = connection.accept().await {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let (sender, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("client handshake should succeed");
+            let client_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut sender = sender.ready().await.expect("client sender should be ready");
+            let request = http::Request::builder()
+                .uri("https://dns.example.test/dns-query")
+                .body(())
+                .expect("request should build");
+            let (response_future, mut send_stream) = sender
+                .send_request(request, true)
+                .expect("request should send");
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                recv(response_future, &mut send_stream),
+            )
+            .await;
+            client_task.abort();
+            server_task.abort();
+            let _ = client_task.await;
+            let _ = server_task.await;
+
+            match (
+                body_len,
+                result.expect("bounded body receive must not stall"),
+            ) {
+                (MAX_DOH_DNS_BODY_SIZE, Ok(bytes)) => assert_eq!(bytes.len(), body_len),
+                (_, Err(H2RecvError::InvalidResponse(_))) if body_len > MAX_DOH_DNS_BODY_SIZE => {}
+                _ => panic!("exact-limit body must succeed and oversized body must be invalid"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn recv_classifies_rst_stream_as_stream_local() {
         let (client_io, server_io) = tokio::io::duplex(4096);
 
