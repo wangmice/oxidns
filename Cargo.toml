@@ -94,7 +94,7 @@ sha2 = "0.11"
 wincode = { version = "0.6", features = ["derive"] }
 oxidns-proto = { version = "0.1.8", path = "crates/proto" }
 oxidns-macros = { version = "0.1.1", path = "crates/macros" }
-hotpath = "0.30.2"
+hotpath = "0.31.2"
 
 # Optional upgrade dependencies and response snapshot compression.
 semver = { version = "1.0", optional = true }
@@ -140,7 +140,7 @@ regex = "1.13"
 cronexpr = { version = "1.7", optional = true }
 fast-socks5 = "1.0"
 mikrotik-rs = { version = "0.10", optional = true }
-rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+rusqlite = { version = "0.42", features = ["bundled"], optional = true }
 zoneparser = { package = "oxidns-zoneparser", version = "0.1.4", path = "crates/zoneparser", optional = true }
 
 # Service management
@@ -398,7 +398,7 @@ hotpath-callgrind = ["hotpath/hotpath-callgrind"]
 [dev-dependencies]
 criterion = "0.8.2"
 # Keep the Criterion adapter out of production builds.
-hotpath = { version = "0.30.2", features = ["criterion-0-8"] }
+hotpath = { version = "0.31.2", features = ["criterion-0-8"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 # Integration tests use hyper to spin up mock HTTP servers regardless of
