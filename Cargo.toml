@@ -396,7 +396,7 @@ hotpath-alloc = ["hotpath/hotpath-alloc"]
 hotpath-callgrind = ["hotpath/hotpath-callgrind"]
 
 [dev-dependencies]
-criterion = "0.8.2"
+# criterion = "0.8.2"
 # Keep the Criterion adapter out of production builds.
 hotpath = { version = "0.31.2", features = ["criterion-0-8"] }
 tempfile = "3.27.0"
