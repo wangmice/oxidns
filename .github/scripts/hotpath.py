@@ -17,6 +17,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / '.github/hotpath-benchmarks.json'
 ROUTINE = 'hotpath::criterion::routine'
+ASYNC_ROUTINE = 'hotpath::criterion::async_routine'
 
 
 def catalog(tier='core', path=CATALOG):
@@ -58,16 +59,25 @@ def catalog(tier='core', path=CATALOG):
 
 def entry(report, section):
     rows = report.get(section, {}).get('data', [])
-    matches = [row for row in rows if row['name'] == ROUTINE]
+    matches = [row for row in rows if row['name'] in (ROUTINE, ASYNC_ROUTINE)]
     if len(matches) != 1:
         raise ValueError(f'{section}: expected one per-iteration routine entry')
     return matches[0]
 
 
 def validate(report, identifier, iterations, kind):
-    metadata = report['user_metadata']
-    if (metadata['criterion_benchmark'], metadata['criterion_iterations']) != (identifier, str(iterations)):
-        raise ValueError('report benchmark/iteration identity mismatch')
+    # hotpath 0.31 moved adapter identity out of free-form user metadata.
+    if 'criterion' in report['meta']:
+        metadata = report['meta']['criterion']
+        if (not isinstance(metadata, dict)
+                or metadata.get('benchmark') != identifier
+                or type(metadata.get('iterations')) is not int
+                or metadata['iterations'] != iterations):
+            raise ValueError('report benchmark/iteration identity mismatch')
+    else:
+        metadata = report.get('user_metadata') or {}
+        if (metadata.get('criterion_benchmark'), metadata.get('criterion_iterations')) != (identifier, str(iterations)):
+            raise ValueError('report benchmark/iteration identity mismatch')
     if report['meta']['run'] != kind:
         raise ValueError(f'expected {kind} report')
     section = 'functions_timing' if kind == 'native' else 'functions_icount'

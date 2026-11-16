@@ -31,6 +31,37 @@ def combined():
 
 
 class ReportTest(unittest.TestCase):
+    def test_structured_criterion_metadata(self):
+        report = raw()
+        del report['user_metadata']
+        report['meta']['criterion'] = {
+            'benchmark': 'group/test', 'iterations': 10, 'version': '0.8'}
+        hotpath.validate(report, 'group/test', 10, 'native')
+        for field, value in [('benchmark', 'wrong'), ('iterations', '10'), ('iterations', True)]:
+            invalid = copy.deepcopy(report)
+            invalid['meta']['criterion'][field] = value
+            with self.assertRaises(ValueError):
+                hotpath.validate(invalid, 'group/test', 10, 'native')
+        # A legacy identity must not override malformed new-format metadata.
+        report['user_metadata'] = raw()['user_metadata']
+        for invalid_metadata in (None, {}, {'benchmark': 'wrong', 'iterations': 10}):
+            report['meta']['criterion'] = invalid_metadata
+            with self.assertRaises(ValueError):
+                hotpath.validate(report, 'group/test', 10, 'native')
+
+    def test_async_routine_metrics_and_ambiguous_rows(self):
+        report = combined()
+        for section in ('functions_timing', 'functions_alloc', 'functions_icount'):
+            source = report['callgrind'] if section == 'functions_icount' else report['native']
+            row = next(row for row in source[section]['data'] if row['name'] == hotpath.ROUTINE)
+            row['name'] = 'hotpath::criterion::async_routine'
+        hotpath.validate(report['native'], 'group/test', 10, 'native')
+        hotpath.validate(report['callgrind'], 'group/test', 10, 'callgrind')
+        self.assertEqual(hotpath.metrics(report), hotpath.metrics(combined()))
+        report['native']['functions_alloc']['data'].append(raw()['functions_alloc']['data'][0])
+        with self.assertRaises(ValueError):
+            hotpath.validate(report['native'], 'group/test', 10, 'native')
+
     def test_normalize_routine_not_outer_bench_or_rounded_average(self):
         result = hotpath.metrics(combined())
         self.assertEqual(result['ns_per_op'], 125)
