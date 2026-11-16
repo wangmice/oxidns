@@ -8,6 +8,61 @@
 
 [中文](README.md) | [English](README_EN.md) · [Documentation](https://oxidns.org/en/) · [Quick Start](https://oxidns.org/en/quickstart) · [Plugin Reference](https://oxidns.org/en/plugin-reference/overview)
 
+## Configuration differences from upstream
+
+This compares local `main` (`53e5518c`) with `origin/main` (`ad2046d3`, `svenshi/oxidns`), excluding build dependencies and CI configuration. Repository example values are not implicit application defaults: upgrading with an existing configuration does not rewrite its ports or upstream addresses.
+
+### Root `config.yaml`
+
+| Setting | Upstream | This branch | Purpose and operational impact |
+| --- | --- | --- | --- |
+| `runtime.provider_file_auto_reload` | Not available | Explicitly `false` | Adds opt-in rule-file watching, disabled by default; see below. |
+| `api.http.listen` | `:9199` | `:9198` | Moves the management API / WebUI to 9198 when using this file; update reverse proxies, firewall rules, and health checks. |
+| `forward.args.upstreams[0].addr` | `223.5.5.5` | `udp://8.8.8.8` | Switches from AliDNS to Google Public DNS. This remains unencrypted UDP on implicit port 53; verify reachability from the deployment network. |
+| `udp_server.args.listen` / `tcp_server.args.listen` | `:5335` | `:53353` | Moves both DNS listeners to 53353; update clients, port mappings, and forwarding rules together. |
+
+The branch also adds the commented example `#socks5: 127.0.0.1:1085`; **a comment does not enable a proxy**. The other configuration template, [`config.minimal.yaml`](config.minimal.yaml), is unchanged from this upstream revision.
+
+### New optional settings
+
+Plugin fields below belong under that plugin's `args`; `upstreams[]` means `forward.args.upstreams[]`.
+
+| Setting | Branch default | Purpose |
+| --- | --- | --- |
+| `runtime.provider_file_auto_reload` | `false` | When enabled, watches `domain_set.files`, `ip_set.files`, `adguard_rule.files`, `geosite.file`, and `geoip.file`. Coalesced file events reload only the affected provider; invalid updates retain the old snapshot. Direct matcher `&file` rules and `dynamic_domain_set.path` are excluded. |
+| `forward.on_error` | `fail` | `fail` propagates failure when all upstream attempts fail. `continue` records the failure and continues the sequence for explicit fallback; it creates no response, preserves any existing response, and does not treat DNS messages such as `SERVFAIL` / `REFUSED` as connection errors. |
+| `forward.upstreams[].keepalive_interval` | Disabled | Enables idle HTTP/2 PING for DoH2, QUIC keepalive for DoH3 / DoQ, or TCP keepalive for TCP / DoT. Accepts durations such as `10s`, with bare numbers in seconds. Must be positive and below a nonzero `idle_timeout`; QUIC also requires it below `3 × timeout`. Unsupported for UDP. DoH2 requires this value and `idle_timeout` below `2^32` milliseconds. |
+| `forward.upstreams[].use_post` | `false` | DoH / DoH3 still use GET by default; `true` sends the DNS message in a POST body. Both methods preserve fixed URL query parameters. Ignored for non-DoH protocols. |
+| `cache.lazy_refresh_concurrency` | `64` | Caps concurrent stale refreshes across keys per cache instance. Same-key refreshes remain deduplicated; saturation serves stale without queuing refresh work. |
+| `cache.lazy_refresh_timeout` | `10` seconds | Makes the formerly fixed 5-second background refresh timeout configurable; the new default avoids preempting the upstream's default 5-second deadline. |
+| `cache.lazy_refresh_failure_cooldown` | `30` seconds | Delays retries for a stale entry after a failed refresh, reducing repeated traffic during outages. All three refresh settings must be positive and only matter when lazy refresh actually runs. |
+| `udp_server.recv_buffer_size` | `1048576` bytes (1 MiB) | Makes the requested kernel UDP receive buffer configurable, replacing upstream's fixed 64 KiB request. Valid range: 256 KiB–16 MiB. Helps absorb bursts; OS limits still apply, and failure to set the buffer prevents listener startup. |
+
+### Changed semantics and migration notes
+
+- **Automatic DoH / DoH3 HTTP 429 backoff**: no new YAML setting is required. A rate-limited upstream enters cooldown and admits only one recovery probe; multi-upstream forwarding can use available alternatives. Even `concurrent: 1` can try another candidate sequentially during this recovery, while keeping at most one query in flight. Pooling and cooldown reduce repeated connections/requests, but cannot guarantee that public resolvers never rate-limit traffic.
+- **SOCKS5 now covers more transports**: upstream ignores proxies for UDP / DoQ / DoH3; this branch applies explicit `socks5` and `network.outbound` profile proxies to those protocols too. The proxy must support `UDP ASSOCIATE`. Configurations that previously connected directly because the proxy was ignored may now use it or fail if unsupported.
+- **TCP / DoT `idle_timeout` now closes inactive connections**: it measures transport read/write inactivity instead of configuring TCP keepalive. The actual source default is **30 seconds in both revisions**; upstream's “10 seconds” comment/manual is stale, not a changed default. Listener idle closure and upstream connection keepalive are separate settings.
+- **DoH URL parameters**: fixed query parameters are preserved, but a preconfigured `dns` parameter in `addr` is rejected to avoid conflicting with generated RFC 8484 parameters.
+- **Cache ECS behavior**: `cache.ecs_in_key` still defaults to `false`; this branch strips ECS from returned/stored responses and ignores ECS in the key, sharing the first cached result across ECS clients. Set `true` for scope-aware ECS isolation/reuse. Invalid request ECS bypasses caching, rather than rejecting the entire query.
+- **Incompatible cache dump format**: this branch writes versioned v4 dumps and rejects the unversioned dumps generated by the compared upstream revision. Back up `dump_file` before upgrading and prepare for a cold cache; do not share a cache file between old and new versions during rollback. Changing `ecs_in_key` also affects restore eligibility: enabling it rejects dumps without ECS-mode metadata or from disabled mode; disabling it discards scoped entries instead of merging their answers.
+- **Fixed admission limits, not new YAML settings**: each server instance admits at most 4096 in-flight requests; TCP / DoT allows 128 handlers per connection, HTTP/2 allows 128 concurrent streams per connection, and QUIC allows 100 bidirectional streams per connection. Saturated UDP drops packets; stream transports apply backpressure. These internal values are not configurable fields.
+- **Query recorder and nftset**: neither adds runtime configuration fields. Recording is best-effort: write failures or shutdown timeouts can lose records; records exceeding 4096 trace events are dropped, and response snapshots have a 16 MiB limit. nftset now coalesces batches and deduplicates canonical CIDRs before writing, requiring no YAML migration.
+- **Stricter DoH response validation**: successful responses must provide a valid `Content-Type: application/dns-message`; nonstandard upstreams omitting it or returning another media type may stop working.
+- **Cache persistence**: `dump_interval` still defaults to 600 seconds and is a minimum interval for automatic periodic dumps; low churn may delay them. Manual and normal shutdown dumps are exempt. Restore finishes before serving traffic, and automatic saving is enabled only after the candidate runtime fully starts, preventing failed startup/reload candidates from overwriting an existing dump.
+- **Stronger validation, not a startup rehearsal**: CLI `check`, API validation, and default save validation invoke plugin-specific hooks. The newly implemented hook is for `forward`, rejecting values such as `on_error: ignore`. This does not prove that every plugin argument, file, network dependency, or listener resource is operational.
+
+To validate and probe this branch's root `config.yaml` (start the service separately):
+
+```bash
+oxidns check -c config.yaml
+curl -fsS http://127.0.0.1:9198/api/health
+dig @127.0.0.1 -p 53353 example.com
+dig @127.0.0.1 -p 53353 example.com +tcp
+```
+
+Not all new settings are present in the default template; refresh limits, keepalive, and fallback should be configured for the deployment. The default file does not enable caching or proxying. See the repository's [global configuration](website/i18n/en/docusaurus-plugin-content-docs/current/configuration/global.md), [forward/cache reference](website/i18n/en/docusaurus-plugin-content-docs/current/plugin-reference/executor/resolution.mdx), [UDP/TCP reference](website/i18n/en/docusaurus-plugin-content-docs/current/plugin-reference/server/datagram-stream.mdx), and [provider reference](website/i18n/en/docusaurus-plugin-content-docs/current/plugin-reference/provider.mdx). The Quick Start below describes upstream release installation and ports, not this branch's root configuration. Upstream online documentation and installer-downloaded releases may not include these branch extensions.
+
 # OxiDNS
 
 **A high-performance DNS policy orchestration engine for complex networks.**
